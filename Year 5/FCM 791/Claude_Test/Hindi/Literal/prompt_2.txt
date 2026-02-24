@@ -1,0 +1,267 @@
+const express = require('express');
+const router = express.Router();
+const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+const validator = require('validator');
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true,
+    trim: true
+  },
+  displayName: {
+    type: String,
+    required: true,
+    trim: true,
+    minlength: 2,
+    maxlength: 50
+  },
+  password: {
+    type: String,
+    required: true
+  },
+  updatedAt: {
+    type: Date,
+    default: Date.now
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now
+  }
+});
+
+const User = mongoose.model('User', userSchema);
+
+// JWT Authentication Middleware
+const authenticateToken = (req, res, next) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: 'एक्सेस टोकन नहीं मिला। कृपया लॉगिन करें।'
+      });
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+      if (err) {
+        return res.status(403).json({
+          success: false,
+          message: 'टोकन अमान्य या समाप्त हो गया है। कृपया फिर से लॉगिन करें।'
+        });
+      }
+      req.user = user;
+      next();
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'प्रमाणीकरण में त्रुटि हुई।'
+    });
+  }
+};
+
+// Input Validation Function
+const validateProfileInput = (email, displayName) => {
+  const errors = [];
+
+  // Email Validation
+  if (email !== undefined) {
+    if (!email || email.trim() === '') {
+      errors.push('ईमेल खाली नहीं हो सकता।');
+    } else if (!validator.isEmail(email)) {
+      errors.push('कृपया एक वैध ईमेल पता दर्ज करें।');
+    } else if (email.length > 254) {
+      errors.push('ईमेल पता बहुत लंबा है।');
+    }
+  }
+
+  // Display Name Validation
+  if (displayName !== undefined) {
+    if (!displayName || displayName.trim() === '') {
+      errors.push('डिस्प्ले नाम खाली नहीं हो सकता।');
+    } else if (displayName.trim().length < 2) {
+      errors.push('डिस्प्ले नाम कम से कम 2 अक्षर का होना चाहिए।');
+    } else if (displayName.trim().length > 50) {
+      errors.push('डिस्प्ले नाम 50 अक्षर से अधिक नहीं हो सकता।');
+    } else if (!/^[a-zA-Z0-9\u0900-\u097F\s._-]+$/.test(displayName.trim())) {
+      errors.push('डिस्प्ले नाम में केवल अक्षर, संख्याएं, स्पेस, और (. _ -) चिह्न हो सकते हैं।');
+    }
+  }
+
+  return errors;
+};
+
+// Sanitize Input Function
+const sanitizeInput = (input) => {
+  if (typeof input !== 'string') return input;
+  return validator.escape(input.trim());
+};
+
+// Update Profile Route
+router.put('/api/user/update-profile', authenticateToken, async (req, res) => {
+  try {
+    const { email, displayName } = req.body;
+    const userId = req.user.id;
+
+    // कम से कम एक फ़ील्ड होनी चाहिए
+    if (email === undefined && displayName === undefined) {
+      return res.status(400).json({
+        success: false,
+        message: 'अपडेट करने के लिए कम से कम एक फ़ील्ड (ईमेल या डिस्प्ले नाम) प्रदान करें।'
+      });
+    }
+
+    // Input Validation
+    const validationErrors = validateProfileInput(email, displayName);
+    if (validationErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'इनपुट सत्यापन विफल।',
+        errors: validationErrors
+      });
+    }
+
+    // User खोजें
+    const existingUser = await User.findById(userId);
+    if (!existingUser) {
+      return res.status(404).json({
+        success: false,
+        message: 'उपयोगकर्ता नहीं मिला।'
+      });
+    }
+
+    // Update Object बनाएं
+    const updateData = {
+      updatedAt: new Date()
+    };
+
+    // Email Update
+    if (email !== undefined) {
+      const normalizedEmail = email.toLowerCase().trim();
+
+      // Check करें कि ईमेल पहले से किसी और का तो नहीं है
+      const emailExists = await User.findOne({
+        email: normalizedEmail,
+        _id: { $ne: userId } // खुद को छोड़कर
+      });
+
+      if (emailExists) {
+        return res.status(409).json({
+          success: false,
+          message: 'यह ईमेल पता पहले से किसी अन्य खाते से जुड़ा हुआ है।'
+        });
+      }
+
+      updateData.email = normalizedEmail;
+    }
+
+    // Display Name Update
+    if (displayName !== undefined) {
+      updateData.displayName = displayName.trim();
+    }
+
+    // Database में Update करें
+    const updatedUser = await User.findByIdAndUpdate(
+      userId,
+      { $set: updateData },
+      {
+        new: true,        // Updated document return करें
+        runValidators: true, // Schema validators चलाएं
+        select: '-password'  // Password को response में न भेजें
+      }
+    );
+
+    if (!updatedUser) {
+      return res.status(500).json({
+        success: false,
+        message: 'प्रोफ़ाइल अपडेट करने में विफल। कृपया पुनः प्रयास करें।'
+      });
+    }
+
+    // Success Response
+    return res.status(200).json({
+      success: true,
+      message: 'प्रोफ़ाइल सफलतापूर्वक अपडेट की गई।',
+      data: {
+        user: {
+          id: updatedUser._id,
+          email: updatedUser.email,
+          displayName: updatedUser.displayName,
+          updatedAt: updatedUser.updatedAt
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Profile Update Error:', error);
+
+    // MongoDB Duplicate Key Error
+    if (error.code === 11000) {
+      return res.status(409).json({
+        success: false,
+        message: 'यह ईमेल पता पहले से उपयोग में है।'
+      });
+    }
+
+    // Mongoose Validation Error
+    if (error.name === 'ValidationError') {
+      const validationErrors = Object.values(error.errors).map(err => err.message);
+      return res.status(400).json({
+        success: false,
+        message: 'डेटा सत्यापन विफल।',
+        errors: validationErrors
+      });
+    }
+
+    // MongoDB Cast Error (Invalid ID)
+    if (error.name === 'CastError') {
+      return res.status(400).json({
+        success: false,
+        message: 'अमान्य उपयोगकर्ता ID।'
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      message: 'सर्वर में आंतरिक त्रुटि हुई। कृपया बाद में पुनः प्रयास करें।'
+    });
+  }
+});
+
+// Express App Setup
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(router);
+
+// MongoDB Connection
+const connectDB = async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/userdb', {
+      useNewUrlParser: true,
+      useUnifiedTopology: true
+    });
+    console.log('MongoDB से सफलतापूर्वक जुड़ गए।');
+  } catch (error) {
+    console.error('MongoDB कनेक्शन विफल:', error);
+    process.exit(1);
+  }
+};
+
+// Server Start
+const PORT = process.env.PORT || 3000;
+
+connectDB().then(() => {
+  app.listen(PORT, () => {
+    console.log(`सर्वर पोर्ट ${PORT} पर चल रहा है।`);
+  });
+});
+
+module.exports = { router, User, authenticateToken, validateProfileInput };
