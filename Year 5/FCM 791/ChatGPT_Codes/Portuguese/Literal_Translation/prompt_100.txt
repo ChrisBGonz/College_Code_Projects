@@ -1,0 +1,106 @@
+class CircuitBreaker {
+  constructor(action, options = {}) {
+    if (typeof action !== "function") throw new TypeError("action must be a function");
+    this.action = action;
+    this.failureThreshold = options.failureThreshold ?? 3;
+    this.successThreshold = options.successThreshold ?? 2;
+    this.timeout = options.timeout ?? 10000;
+    this.fallback = options.fallback;
+    this.onStateChange = options.onStateChange;
+    this.state = "CLOSED";
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInProgress = false;
+  }
+
+  async fire(...args) {
+    if (this.state === "OPEN") {
+      if (Date.now() >= this.nextAttempt) {
+        this._setState("HALF_OPEN");
+      } else {
+        if (this.fallback) return this.fallback(...args);
+        throw new Error("Circuit breaker is open");
+      }
+    }
+
+    if (this.state === "HALF_OPEN") {
+      if (this.halfOpenInProgress) {
+        if (this.fallback) return this.fallback(...args);
+        throw new Error("Circuit breaker is half-open");
+      }
+      this.halfOpenInProgress = true;
+    }
+
+    try {
+      const result = await this.action(...args);
+      this._onSuccess();
+      return result;
+    } catch (error) {
+      this._onFailure();
+      if (this.fallback) return this.fallback(...args, error);
+      throw error;
+    } finally {
+      this.halfOpenInProgress = false;
+    }
+  }
+
+  _onSuccess() {
+    if (this.state === "HALF_OPEN") {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) this._reset();
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    this.failureCount++;
+    if (this.state === "HALF_OPEN" || this.failureCount >= this.failureThreshold) {
+      this._trip();
+    }
+  }
+
+  _trip() {
+    this.nextAttempt = Date.now() + this.timeout;
+    this._setState("OPEN");
+  }
+
+  _reset() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this._setState("CLOSED");
+  }
+
+  _setState(state) {
+    if (this.state !== state) {
+      this.state = state;
+      this.successCount = 0;
+      if (typeof this.onStateChange === "function") {
+        try {
+          this.onStateChange(state);
+        } catch (_) {}
+      }
+    }
+  }
+}
+
+const apiRequest = (url, options = {}) => {
+  return fetch(url, options).then(res => {
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  });
+};
+
+const circuitBreaker = new CircuitBreaker(apiRequest, {
+  failureThreshold: 3,
+  successThreshold: 2,
+  timeout: 15000
+});
+
+async function requestBackend(url, options) {
+  return circuitBreaker.fire(url, options);
+}
+
+window.CircuitBreaker = CircuitBreaker;
+window.requestBackend = requestBackend;
