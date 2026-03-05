@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+import os
+import sys
+import re
+import json
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+def get_latest_version(group, artifact):
+    query = f'g:"{group}"+AND+a:"{artifact}"'
+    url = 'https://search.maven.org/solrsearch/select?' + urllib.parse.urlencode({
+        'q': query,
+        'rows': 1,
+        'wt': 'json'
+    })
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'dep-updater'})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        docs = data.get('response', {}).get('docs', [])
+        if not docs:
+            return None
+        doc = docs[0]
+        return doc.get('latestVersion') or doc.get('version') or doc.get('v')
+    except Exception:
+        return None
+
+def local(tag):
+    if tag.startswith('{'):
+        return tag.split('}', 1)[1]
+    return tag
+
+def get_ns(tag):
+    if tag.startswith('{'):
+        return tag[1:].split('}', 1)[0]
+    return ''
+
+def indent(elem, level=0):
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for child in elem:
+            indent(child, level + 1)
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+    else:
+        if not elem.tail or not elem.tail.strip():
+            elem.tail = i
+
+def update_pom(path, cache):
+    try:
+        tree = ET.parse(path)
+    except ET.ParseError:
+        return False
+    root = tree.getroot()
+    ns = get_ns(root.tag)
+    if ns:
+        ET.register_namespace('', ns)
+
+    def q(tag):
+        return f'{{{ns}}}{tag}' if ns else tag
+
+    prop_map = {}
+    props = root.find(q('properties'))
+    if props is not None:
+        for child in list(props):
+            prop_map[local(child.tag)] = child
+
+    updated = False
+    if ns:
+        dep_paths = ['./m:dependencies/m:dependency', './m:dependencyManagement/m:dependencies/m:dependency']
+        nsmap = {'m': ns}
+    else:
+        dep_paths = ['./dependencies/dependency', './dependencyManagement/dependencies/dependency']
+        nsmap = None
+
+    deps = []
+    for p in dep_paths:
+        deps.extend(root.findall(p, nsmap) if nsmap is not None else root.findall(p))
+
+    for dep in deps:
+        gid_elem = dep.find(q('groupId'))
+        aid_elem = dep.find(q('artifactId'))
+        ver_elem = dep.find(q('version'))
+        if gid_elem is None or aid_elem is None or ver_elem is None:
+            continue
+        if gid_elem.text is None or aid_elem.text is None or ver_elem.text is None:
+            continue
+        g = gid_elem.text.strip()
+        a = aid_elem.text.strip()
+        vtext = ver_elem.text.strip()
+        if not g or not a or not vtext:
+            continue
+
+        m = re.fullmatch(r'\$\{([^}]+)\}', vtext)
+        if m:
+            prop_name = m.group(1)
+            if prop_name in ('project.version', 'pom.version', 'version'):
+                continue
+            prop_elem = prop_map.get(prop_name)
+            if prop_elem is None:
+                continue
+            current = (prop_elem.text or '').strip()
+            latest = cache.get((g, a))
+            if latest is None:
+                latest = get_latest_version(g, a)
+                cache[(g, a)] = latest
+            if latest and latest != current:
+                prop_elem.text = latest
+                updated = True
+        else:
+            if '${' in vtext or vtext.startswith('[') or vtext.startswith('('):
+                continue
+            latest = cache.get((g, a))
+            if latest is None:
+                latest = get_latest_version(g, a)
+                cache[(g, a)] = latest
+            if latest and latest != vtext:
+                ver_elem.text = latest
+                updated = True
+
+    if updated:
+        indent(root)
+        tree.write(path, encoding='utf-8', xml_declaration=True)
+    return updated
+
+def find_poms(start):
+    if os.path.isfile(start):
+        if os.path.basename(start) == 'pom.xml':
+            yield start
+        return
+    for dirpath, dirnames, filenames in os.walk(start):
+        dirnames[:] = [d for d in dirnames if d not in ('target', '.git', '.svn', '.idea', '.mvn', 'node_modules')]
+        if 'pom.xml' in filenames:
+            yield os.path.join(dirpath, 'pom.xml')
+
+def main():
+    root_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
+    cache = {}
+    for pom in find_poms(root_dir):
+        update_pom(pom, cache)
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

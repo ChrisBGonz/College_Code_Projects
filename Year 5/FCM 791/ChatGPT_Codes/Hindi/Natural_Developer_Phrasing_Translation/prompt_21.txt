@@ -1,0 +1,223 @@
+import argparse
+import json
+import os
+import sys
+import jwt
+from jwt import PyJWKClient
+from jwt import algorithms as jwt_algorithms
+
+def read_token(token_arg):
+    if token_arg and token_arg != '-':
+        return token_arg.strip()
+    data = sys.stdin.read()
+    if not data:
+        raise ValueError("Token not provided")
+    return data.strip()
+
+def parse_list(values):
+    if not values:
+        return []
+    items = []
+    for val in values:
+        if val is None:
+            continue
+        for part in str(val).split(','):
+            part = part.strip()
+            if part:
+                items.append(part)
+    return items
+
+def load_json_from_source(src):
+    if src is None:
+        return None
+    if src == '-':
+        data = sys.stdin.read()
+    elif os.path.exists(src):
+        with open(src, 'r', encoding='utf-8') as f:
+            data = f.read()
+    else:
+        data = src
+    return json.loads(data)
+
+def get_jwks_keys(jwks):
+    if isinstance(jwks, dict) and 'keys' in jwks:
+        keys = jwks['keys']
+    elif isinstance(jwks, list):
+        keys = jwks
+    elif isinstance(jwks, dict):
+        keys = [jwks]
+    else:
+        raise ValueError("Invalid JWKS/JWK data")
+    if not isinstance(keys, list):
+        raise ValueError("Invalid JWKS format")
+    return keys
+
+def select_jwk(keys, header):
+    kid = header.get('kid')
+    if kid:
+        for k in keys:
+            if k.get('kid') == kid:
+                return k
+        return None
+    if len(keys) == 1:
+        return keys[0]
+    alg = header.get('alg')
+    matches = [k for k in keys if k.get('alg') == alg]
+    if len(matches) == 1:
+        return matches[0]
+    kty = None
+    if alg:
+        if alg.startswith('RS') or alg.startswith('PS'):
+            kty = 'RSA'
+        elif alg.startswith('ES'):
+            kty = 'EC'
+        elif alg.startswith('HS'):
+            kty = 'oct'
+    if kty:
+        matches = [k for k in keys if k.get('kty') == kty]
+        if len(matches) == 1:
+            return matches[0]
+    return None
+
+def jwk_to_key(jwk, alg=None):
+    if not alg:
+        alg = jwk.get('alg')
+    if not alg:
+        kty = jwk.get('kty')
+        if kty == 'RSA':
+            alg = 'RS256'
+        elif kty == 'EC':
+            alg = 'ES256'
+        elif kty == 'oct':
+            alg = 'HS256'
+    if not alg:
+        raise ValueError("Unable to determine algorithm for JWK")
+    alg_map = jwt_algorithms.get_default_algorithms()
+    if alg not in alg_map:
+        raise ValueError("Unsupported algorithm: %s" % alg)
+    jwk_json = json.dumps(jwk)
+    return alg_map[alg].from_jwk(jwk_json)
+
+def resolve_key(token, header, args):
+    if args.jwks_url:
+        client = PyJWKClient(args.jwks_url)
+        signing_key = client.get_signing_key_from_jwt(token)
+        return signing_key.key
+    if args.jwks_file or args.jwk:
+        jwks_src = args.jwks_file if args.jwks_file else args.jwk
+        jwks = load_json_from_source(jwks_src)
+        keys = get_jwks_keys(jwks)
+        jwk = select_jwk(keys, header)
+        if not jwk:
+            raise ValueError("No matching JWK found")
+        return jwk_to_key(jwk, header.get('alg'))
+    if args.key:
+        if os.path.exists(args.key):
+            with open(args.key, 'rb') as f:
+                return f.read()
+        return args.key.encode()
+    if args.secret:
+        return args.secret.encode()
+    raise ValueError("No key material provided")
+
+def build_options(args):
+    options = {
+        "verify_signature": True,
+        "verify_exp": not args.no_verify_exp,
+        "verify_nbf": not args.no_verify_nbf,
+        "verify_iat": not args.no_verify_iat,
+    }
+    if args.required_claims:
+        req = parse_list(args.required_claims)
+    else:
+        req = ["exp", "iat", "nbf"]
+    if args.no_verify_exp and "exp" in req:
+        req.remove("exp")
+    if args.no_verify_iat and "iat" in req:
+        req.remove("iat")
+    if args.no_verify_nbf and "nbf" in req:
+        req.remove("nbf")
+    if req:
+        options["require"] = req
+    return options
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("token", nargs="?", help="JWT token or '-' to read from stdin")
+    parser.add_argument("--aud", dest="audience", action="append", required=True)
+    parser.add_argument("--iss", dest="issuer", action="append", required=True)
+    parser.add_argument("--jwks-url", dest="jwks_url")
+    parser.add_argument("--jwks-file", dest="jwks_file")
+    parser.add_argument("--jwk", dest="jwk")
+    parser.add_argument("--key", dest="key")
+    parser.add_argument("--secret", dest="secret")
+    parser.add_argument("--alg", dest="algorithms", action="append")
+    parser.add_argument("--leeway", type=int, default=0)
+    parser.add_argument("--require", dest="required_claims", action="append")
+    parser.add_argument("--no-verify-exp", action="store_true")
+    parser.add_argument("--no-verify-nbf", action="store_true")
+    parser.add_argument("--no-verify-iat", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        token = read_token(args.token)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as e:
+        print("Invalid token header: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+    supported_algs = {alg for alg in jwt_algorithms.get_default_algorithms().keys() if alg and alg.lower() != "none"}
+    alg_list = parse_list(args.algorithms)
+    if not alg_list:
+        alg_list = [header.get("alg")]
+    if not alg_list or not alg_list[0]:
+        print("Algorithm not specified", file=sys.stderr)
+        sys.exit(1)
+    for alg in alg_list:
+        if alg not in supported_algs:
+            print("Unsupported algorithm: %s" % alg, file=sys.stderr)
+            sys.exit(1)
+    if header.get("alg") not in alg_list:
+        print("Token algorithm not allowed", file=sys.stderr)
+        sys.exit(1)
+    if header.get("alg") == "none":
+        print("Unsecured JWTs are not allowed", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        key = resolve_key(token, header, args)
+    except Exception as e:
+        print("Key resolution failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+    aud_list = parse_list(args.audience)
+    iss_list = parse_list(args.issuer)
+    aud = aud_list if len(aud_list) != 1 else aud_list[0]
+    iss = iss_list if len(iss_list) != 1 else iss_list[0]
+    options = build_options(args)
+
+    try:
+        claims = jwt.decode(
+            token,
+            key=key,
+            algorithms=alg_list,
+            audience=aud,
+            issuer=iss,
+            options=options,
+            leeway=args.leeway,
+        )
+    except Exception as e:
+        print("Token verification failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+    output = {"header": header, "claims": claims}
+    json.dump(output, sys.stdout, ensure_ascii=False, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+if __name__ == "__main__":
+    main()

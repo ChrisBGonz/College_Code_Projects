@@ -1,0 +1,208 @@
+'use strict';
+
+const cookieEncryption = require('cookie-encryption');
+
+function createEncryptor(secret, options) {
+  const ce = cookieEncryption;
+  if (typeof ce === 'function') {
+    try {
+      const inst = ce(secret, options);
+      if (inst && typeof inst.encrypt === 'function' && typeof inst.decrypt === 'function') {
+        return inst;
+      }
+    } catch (e) {}
+    try {
+      const inst = new ce(secret, options);
+      if (inst && typeof inst.encrypt === 'function' && typeof inst.decrypt === 'function') {
+        return inst;
+      }
+    } catch (e) {}
+  }
+  if (ce && typeof ce.encrypt === 'function' && typeof ce.decrypt === 'function') {
+    return {
+      encrypt: function(value) {
+        return ce.encrypt(value, secret, options);
+      },
+      decrypt: function(value) {
+        return ce.decrypt(value, secret, options);
+      }
+    };
+  }
+  throw new Error('Unsupported cookie-encryption library API');
+}
+
+module.exports = function encryptedCookieMiddleware(secret, options) {
+  if (!secret) {
+    throw new Error('Secret key required for cookie encryption');
+  }
+
+  const encryptor = createEncryptor(secret, options);
+  const JSON_PREFIX = '__ecjson__:';
+
+  function encodeValue(value) {
+    if (value === undefined) return '';
+    if (value === null) return 'null';
+    if (typeof value === 'object') {
+      try {
+        return JSON_PREFIX + JSON.stringify(value);
+      } catch (e) {
+        return JSON_PREFIX + String(value);
+      }
+    }
+    return String(value);
+  }
+
+  function decodeValue(value) {
+    if (typeof value !== 'string') value = String(value);
+    if (value.indexOf(JSON_PREFIX) === 0) {
+      const json = value.slice(JSON_PREFIX.length);
+      try {
+        return JSON.parse(json);
+      } catch (e) {
+        return undefined;
+      }
+    }
+    return value;
+  }
+
+  function tryDecryptRaw(value) {
+    if (value === undefined || value === null) return undefined;
+    if (typeof value !== 'string') value = String(value);
+    try {
+      let decrypted = encryptor.decrypt(value);
+      if (decrypted === undefined || decrypted === null) return undefined;
+      if (Buffer.isBuffer(decrypted)) {
+        decrypted = decrypted.toString('utf8');
+      }
+      return decrypted;
+    } catch (e) {
+      return undefined;
+    }
+  }
+
+  function decryptValue(value) {
+    const raw = tryDecryptRaw(value);
+    if (raw === undefined || raw === null) return undefined;
+    return decodeValue(raw);
+  }
+
+  function encryptValue(value) {
+    const encoded = encodeValue(value);
+    let encrypted = encryptor.encrypt(encoded);
+    if (encrypted === undefined || encrypted === null) {
+      throw new Error('Failed to encrypt cookie');
+    }
+    if (Buffer.isBuffer(encrypted)) {
+      encrypted = encrypted.toString('utf8');
+    }
+    return encrypted;
+  }
+
+  function parseCookies(header) {
+    const cookies = {};
+    if (!header || typeof header !== 'string') return cookies;
+    const pairs = header.split(/; */);
+    for (let i = 0; i < pairs.length; i++) {
+      const pair = pairs[i];
+      if (!pair) continue;
+      const eqIdx = pair.indexOf('=');
+      if (eqIdx < 0) continue;
+      const key = pair.slice(0, eqIdx).trim();
+      if (!key) continue;
+      let val = pair.slice(eqIdx + 1).trim();
+      if (val.charAt(0) === '"' && val.charAt(val.length - 1) === '"') {
+        val = val.slice(1, -1);
+      }
+      try {
+        val = decodeURIComponent(val);
+      } catch (e) {}
+      if (cookies[key] === undefined) cookies[key] = val;
+    }
+    return cookies;
+  }
+
+  function extractCookieValue(setCookieStr) {
+    if (typeof setCookieStr !== 'string') return null;
+    const firstPart = setCookieStr.split(';')[0];
+    const eqIdx = firstPart.indexOf('=');
+    if (eqIdx < 0) return null;
+    let val = firstPart.slice(eqIdx + 1).trim();
+    if (val.charAt(0) === '"' && val.charAt(val.length - 1) === '"') {
+      val = val.slice(1, -1);
+    }
+    try {
+      val = decodeURIComponent(val);
+    } catch (e) {}
+    return val;
+  }
+
+  function verifySetCookieHeader(value) {
+    if (!value) return;
+    const list = Array.isArray(value) ? value : [value];
+    for (let i = 0; i < list.length; i++) {
+      const cookieVal = extractCookieValue(list[i]);
+      if (cookieVal === null) continue;
+      const decrypted = tryDecryptRaw(cookieVal);
+      if (decrypted === undefined || decrypted === null) {
+        const err = new Error('Plain cookies are not allowed');
+        err.status = 500;
+        throw err;
+      }
+    }
+  }
+
+  return function(req, res, next) {
+    if (!req._encryptedCookiesDecrypted) {
+      const rawCookies = (req.cookies && typeof req.cookies === 'object') ? req.cookies : parseCookies(req.headers && req.headers.cookie);
+      const decryptedCookies = {};
+      for (const name in rawCookies) {
+        const dec = decryptValue(rawCookies[name]);
+        if (dec === undefined) {
+          const err = new Error('Unencrypted cookie detected: ' + name);
+          err.status = 400;
+          return next(err);
+        }
+        decryptedCookies[name] = dec;
+      }
+      req.cookies = decryptedCookies;
+      req._encryptedCookiesDecrypted = true;
+    }
+
+    if (!res._encryptedCookiesWrapped) {
+      res._encryptedCookiesWrapped = true;
+
+      if (typeof res.cookie === 'function') {
+        const originalCookie = res.cookie;
+        res.cookie = function(name, value, opts) {
+          const encryptedVal = encryptValue(value);
+          return originalCookie.call(this, name, encryptedVal, opts);
+        };
+      }
+
+      const originalSetHeader = res.setHeader;
+      res.setHeader = function(name, value) {
+        if (typeof name === 'string' && name.toLowerCase() === 'set-cookie') {
+          verifySetCookieHeader(value);
+        }
+        return originalSetHeader.call(this, name, value);
+      };
+
+      const originalWriteHead = res.writeHead;
+      res.writeHead = function(statusCode, reasonPhrase, headers) {
+        let hdrs = headers;
+        if (typeof reasonPhrase === 'object' && headers === undefined) {
+          hdrs = reasonPhrase;
+        }
+        if (hdrs) {
+          const sc = hdrs['Set-Cookie'] || hdrs['set-cookie'];
+          if (sc) {
+            verifySetCookieHeader(sc);
+          }
+        }
+        return originalWriteHead.apply(this, arguments);
+      };
+    }
+
+    next();
+  };
+};

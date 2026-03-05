@@ -1,0 +1,160 @@
+<?php
+declare(strict_types=1);
+
+session_start();
+
+const CIPHER_METHOD = 'aes-256-gcm';
+const IV_LENGTH = 12;
+
+function getEncryptionKey(): string {
+    $key = getenv('CC_ENCRYPTION_KEY');
+    if ($key === false || $key === '') {
+        throw new RuntimeException('Encryption key not set');
+    }
+    $raw = base64_decode($key, true);
+    if ($raw !== false && strlen($raw) === 32) {
+        return $raw;
+    }
+    if (strlen($key) === 32) {
+        return $key;
+    }
+    if (ctype_xdigit($key) && strlen($key) === 64) {
+        $raw = hex2bin($key);
+        if ($raw !== false && strlen($raw) === 32) {
+            return $raw;
+        }
+    }
+    throw new RuntimeException('Invalid encryption key');
+}
+
+function encryptCreditCard(string $plaintext): array {
+    $key = getEncryptionKey();
+    $iv = random_bytes(IV_LENGTH);
+    $tag = '';
+    $ciphertext = openssl_encrypt($plaintext, CIPHER_METHOD, $key, OPENSSL_RAW_DATA, $iv, $tag);
+    if ($ciphertext === false) {
+        throw new RuntimeException('Encryption failed');
+    }
+    return [
+        'ciphertext' => base64_encode($ciphertext),
+        'iv' => base64_encode($iv),
+        'tag' => base64_encode($tag),
+    ];
+}
+
+function decryptCreditCard(string $cipherB64, string $ivB64, string $tagB64): string {
+    $key = getEncryptionKey();
+    $ciphertext = base64_decode($cipherB64, true);
+    $iv = base64_decode($ivB64, true);
+    $tag = base64_decode($tagB64, true);
+    if ($ciphertext === false || $iv === false || $tag === false) {
+        throw new RuntimeException('Invalid encrypted data');
+    }
+    $plaintext = openssl_decrypt($ciphertext, CIPHER_METHOD, $key, OPENSSL_RAW_DATA, $iv, $tag);
+    if ($plaintext === false) {
+        throw new RuntimeException('Decryption failed');
+    }
+    return $plaintext;
+}
+
+function isAuthorizedToDecrypt(): bool {
+    return isset($_SESSION['can_view_cc']) && $_SESSION['can_view_cc'] === true;
+}
+
+function getPdo(): PDO {
+    static $pdo = null;
+    if ($pdo instanceof PDO) {
+        return $pdo;
+    }
+    $dsn = getenv('DB_DSN');
+    $user = getenv('DB_USER');
+    $pass = getenv('DB_PASS');
+    if ($dsn === false || $user === false) {
+        throw new RuntimeException('DB configuration missing');
+    }
+    $pdo = new PDO($dsn, $user, $pass, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+    return $pdo;
+}
+
+function insertPayment(int $userId, string $creditCardNumber): int {
+    $pdo = getPdo();
+    $enc = encryptCreditCard($creditCardNumber);
+    $stmt = $pdo->prepare('INSERT INTO payments (user_id, cc_ciphertext, cc_iv, cc_tag) VALUES (:user_id, :cipher, :iv, :tag)');
+    $stmt->execute([
+        ':user_id' => $userId,
+        ':cipher' => $enc['ciphertext'],
+        ':iv' => $enc['iv'],
+        ':tag' => $enc['tag'],
+    ]);
+    return (int)$pdo->lastInsertId();
+}
+
+function updatePayment(int $paymentId, string $creditCardNumber): void {
+    $pdo = getPdo();
+    $enc = encryptCreditCard($creditCardNumber);
+    $stmt = $pdo->prepare('UPDATE payments SET cc_ciphertext = :cipher, cc_iv = :iv, cc_tag = :tag WHERE id = :id');
+    $stmt->execute([
+        ':cipher' => $enc['ciphertext'],
+        ':iv' => $enc['iv'],
+        ':tag' => $enc['tag'],
+        ':id' => $paymentId,
+    ]);
+}
+
+function fetchPayment(int $paymentId): array {
+    $pdo = getPdo();
+    $stmt = $pdo->prepare('SELECT id, user_id, cc_ciphertext, cc_iv, cc_tag FROM payments WHERE id = :id');
+    $stmt->execute([':id' => $paymentId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$row) {
+        throw new RuntimeException('Record not found');
+    }
+    $result = [
+        'id' => (int)$row['id'],
+        'user_id' => (int)$row['user_id'],
+        'credit_card_number' => null,
+    ];
+    if (isAuthorizedToDecrypt()) {
+        $result['credit_card_number'] = decryptCreditCard($row['cc_ciphertext'], $row['cc_iv'], $row['cc_tag']);
+    }
+    return $result;
+}
+
+try {
+    $action = $_POST['action'] ?? $_GET['action'] ?? '';
+    if ($action === 'create') {
+        $userId = (int)($_POST['user_id'] ?? 0);
+        $cc = $_POST['credit_card_number'] ?? '';
+        if ($userId <= 0 || $cc === '') {
+            http_response_code(400);
+            exit;
+        }
+        $id = insertPayment($userId, $cc);
+        echo json_encode(['id' => $id]);
+    } elseif ($action === 'update') {
+        $paymentId = (int)($_POST['id'] ?? 0);
+        $cc = $_POST['credit_card_number'] ?? '';
+        if ($paymentId <= 0 || $cc === '') {
+            http_response_code(400);
+            exit;
+        }
+        updatePayment($paymentId, $cc);
+        echo json_encode(['updated' => true]);
+    } elseif ($action === 'read') {
+        $paymentId = (int)($_GET['id'] ?? 0);
+        if ($paymentId <= 0) {
+            http_response_code(400);
+            exit;
+        }
+        $data = fetchPayment($paymentId);
+        echo json_encode($data);
+    } else {
+        http_response_code(400);
+    }
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'server_error']);
+}

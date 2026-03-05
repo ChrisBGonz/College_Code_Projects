@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+log(){ printf '%s\n' "$*" >&2; }
+die(){ log "Error: $*"; exit 1; }
+have_cmd(){ command -v "$1" >/dev/null 2>&1; }
+need_cmd(){ have_cmd "$1" || die "Missing dependency: $1"; }
+
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+case "$OS" in
+  linux) OS=linux ;;
+  darwin) OS=darwin ;;
+  *) die "Unsupported OS: $OS" ;;
+esac
+
+ARCH=$(uname -m)
+case "$ARCH" in
+  x86_64|amd64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l|armv7) ARCH=armv7 ;;
+  armv6l|armv6) ARCH=armv6 ;;
+  i386|i686) ARCH=386 ;;
+  *) ARCH="$ARCH" ;;
+esac
+
+if have_cmd curl; then
+  http_get(){ curl -fsSL "$1"; }
+  http_download(){ curl -fsSL -o "$2" "$1"; }
+  resolve_url(){ curl -fsSL -o /dev/null -w '%{url_effective}' "$1"; }
+  github_get(){ if [ -n "${GITHUB_TOKEN:-}" ]; then curl -fsSL -H "Authorization: token $GITHUB_TOKEN" "$1"; else curl -fsSL "$1"; fi; }
+elif have_cmd wget; then
+  http_get(){ wget -qO- "$1"; }
+  http_download(){ wget -qO "$2" "$1"; }
+  resolve_url(){ local loc; loc=$(wget --max-redirect=20 --spider -S "$1" 2>&1 | awk '/^  Location: /{print $2}' | tail -n1 | tr -d '\r'); echo "${loc:-$1}"; }
+  github_get(){ if [ -n "${GITHUB_TOKEN:-}" ]; then wget -qO- --header="Authorization: token $GITHUB_TOKEN" "$1"; else wget -qO- "$1"; fi; }
+else
+  die "curl or wget required"
+fi
+
+download_optional(){
+  local url="$1" dest="$2"
+  if http_download "$url" "$dest" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+select_asset(){
+  local best="" url name lower
+  for url in "$@"; do
+    name=$(basename "${url%%\?*}")
+    lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+    if [[ "$lower" =~ (sha256|sha1|sha512|md5|checksum|checksums|sbom|\.asc$|\.sig$|\.txt$) ]]; then
+      continue
+    fi
+    if [[ "$lower" =~ \.(deb|rpm|pkg)$ ]]; then
+      continue
+    fi
+    if [[ "$lower" =~ (linux|darwin|mac|osx|macos|windows|win32|win64|freebsd|openbsd|netbsd|solaris) ]]; then
+      case "$OS" in
+        linux) [[ "$lower" =~ (linux|gnu|unix) ]] || continue ;;
+        darwin) [[ "$lower" =~ (darwin|mac|osx|macos) ]] || continue ;;
+      esac
+    fi
+    if [[ "$lower" =~ (amd64|x86_64|x64|arm64|aarch64|armv7|armv6|armhf|386|i386|x86) ]]; then
+      case "$ARCH" in
+        amd64) [[ "$lower" =~ (amd64|x86_64|x64) ]] || continue ;;
+        arm64) [[ "$lower" =~ (arm64|aarch64) ]] || continue ;;
+        armv7) [[ "$lower" =~ (armv7|armhf) ]] || continue ;;
+        armv6) [[ "$lower" =~ (armv6) ]] || continue ;;
+        386) [[ "$lower" =~ (386|i386|x86) ]] || continue ;;
+      esac
+    fi
+    best="$url"
+    break
+  done
+  if [ -z "$best" ]; then
+    for url in "$@"; do
+      name=$(basename "${url%%\?*}")
+      lower=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+      [[ "$lower" =~ (sha256|sha1|sha512|md5|checksum|checksums|sbom|\.asc$|\.sig$|\.txt$) ]] && continue
+      [[ "$lower" =~ \.(deb|rpm|pkg)$ ]] && continue
+      best="$url"; break
+    done
+  fi
+  echo "$best"
+}
+
+verify_checksum(){
+  local asset="$1" checksum="$2"
+  local fname
+  fname=$(basename "$asset")
+  if have_cmd sha256sum; then
+    local line expected actual
+    line=$(grep -F "$fname" "$checksum" | head -n1 || true)
+    if [ -n "$line" ]; then
+      expected=$(echo "$line" | awk '{print $1}')
+      actual=$(sha256sum "$asset" | awk '{print $1}')
+      [ "$expected" = "$actual" ] || die "Checksum verification failed"
+      return 0
+    fi
+    if [ "$(wc -l < "$checksum")" -eq 1 ]; then
+      expected=$(awk '{print $1}' "$checksum")
+      actual=$(sha256sum "$asset" | awk '{print $1}')
+      [ "$expected" = "$actual" ] || die "Checksum verification failed"
+      return 0
+    fi
+    local out
+    out=$(cd "$(dirname "$asset")" && sha256sum -c "$checksum" --ignore-missing 2>/dev/null || true)
+    echo "$out" | grep -Fq "$fname: OK" || die "Checksum verification failed"
+  elif have_cmd shasum; then
+    local line expected actual
+    line=$(grep -F "$fname" "$checksum" | head -n1 || true)
+    if [ -n "$line" ]; then
+      expected=$(echo "$line" | awk '{print $1}')
+    else
+      expected=$(awk '{print $1}' "$checksum" | head -n1)
+    fi
+    actual=$(shasum -a 256 "$asset" | awk '{print $1}')
+    [ "$expected" = "$actual" ] || die "Checksum verification failed"
+  else
+    die "sha256sum or shasum required for checksum verification"
+  fi
+}
+
+verify_signature(){
+  local sig="$1" asset="$2"
+  need_cmd gpg
+  if [ -n "${PGP_KEY_URL:-}" ]; then
+    http_get "$PGP_KEY_URL" | gpg --import >/dev/null 2>&1 || die "Failed to import PGP key"
+  elif [ -n "${PGP_KEY_ID:-}" ]; then
+    gpg --keyserver hkps://keys.openpgp.org --recv-keys "$PGP_KEY_ID" >/dev/null 2>&1 || \
+    gpg --keyserver hkps://keyserver.ubuntu.com --recv-keys "$PGP_KEY_ID" >/dev/null 2>&1 || true
+  fi
+  gpg --verify "$sig" "$asset" >/dev/null 2>&1 || die "PGP verification failed"
+}
+
+extract_asset(){
+  local asset="$1" dest="$2"
+  mkdir -p "$dest"
+  case "$asset" in
+    *.tar.gz|*.tgz) need_cmd tar; tar -xzf "$asset" -C "$dest" ;;
+    *.tar.bz2|*.tbz|*.tbz2) need_cmd tar; tar -xjf "$asset" -C "$dest" ;;
+    *.tar.xz|*.txz) need_cmd tar; tar -xJf "$asset" -C "$dest" ;;
+    *.zip) need_cmd unzip; unzip -q "$asset" -d "$dest" ;;
+    *.gz) need_cmd gzip; gzip -dc "$asset" > "$dest/$(basename "${asset%.gz}")"; chmod +x "$dest/$(basename "${asset%.gz}")" ;;
+    *.bz2) need_cmd bzip2; bzip2 -dc "$asset" > "$dest/$(basename "${asset%.bz2}")"; chmod +x "$dest/$(basename "${asset%.bz2}")" ;;
+    *.xz) need_cmd xz; xz -dc "$asset" > "$dest/$(basename "${asset%.xz}")"; chmod +x "$dest/$(basename "${asset%.xz}")" ;;
+    *) cp "$asset" "$dest/" ;;
+  esac
+}
+
+find_binary(){
+  local dir="$1" name="$2"
+  local f
+  while IFS= read -r -d '' f; do
+    local base
+    base=$(basename "$f")
+    if [[ "$base" == "$name" || "$base" == "$name.exe" ]]; then
+      echo "$f"
+      return 0
+    fi
+  done < <(find "$dir" -type f -print0)
+  while IFS= read -r -d '' f; do
+    [ -f "$f" ] && [ -x "$f" ] || continue
+    echo "$f"
+    return 0
+  done < <(find "$dir" -type f -perm -111 -print0)
+  f=$(find "$dir" -type f | head -n1 || true)
+  [ -n "$f" ] || return 1
+  chmod +x "$f"
+  echo "$f"
+}
+
+install_binary(){
+  local src="$1" dest="$2"
+  if [ "$(id -u)" -eq 0 ]; then
+    cp "$src" "$dest"
+    chmod 755 "$dest"
+  else
+    need_cmd sudo
+    sudo cp "$src" "$dest"
+    sudo chmod 755 "$dest"
+  fi
+}
+
+validate_install(){
+  local bin="$1"
+  if "$bin" --version >/dev/null 2>&1; then return 0; fi
+  if "$bin" -v >/dev/null 2>&1; then return 0; fi
+  if "$bin" version >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
+URL="${1:-}"
+[ -n "$URL" ] || die "Usage: $0 <url>"
+
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+OWNER=""
+REPO=""
+if [[ "$URL" =~ github.com/([^/]+)/([^/]+) ]]; then
+  OWNER="${BASH_REMATCH[1]}"
+  REPO="${BASH_REMATCH[2]}"
+  REPO="${REPO%.git}"
+fi
+
+TOOL_NAME="${TOOL_NAME:-$REPO}"
+if [ -z "$TOOL_NAME" ]; then
+  TOOL_NAME=$(basename "${URL%%\?*}")
+  TOOL_NAME="${TOOL_NAME%%.*}"
+fi
+BIN_NAME="${BIN_NAME:-$TOOL_NAME}"
+
+ASSET_URL=""
+CHECKSUM_URL=""
+SIG_URL=""
+VERSION=""
+
+if [ -n "$OWNER" ] && [ -n "$REPO" ] && [[ ! "$URL" =~ /releases/download/ ]]; then
+  JSON=$(github_get "https://api.github.com/repos/$OWNER/$REPO/releases/latest") || die "Failed to fetch release info"
+  TAG=$(echo "$JSON" | grep -m1 '"tag_name":' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/' || true)
+  VERSION="$TAG"
+  ASSET_URLS=()
+  while IFS= read -r line; do
+    [ -n "$line" ] && ASSET_URLS+=("$line")
+  done < <(echo "$JSON" | grep -oE '"browser_download_url":[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/' || true)
+  [ ${#ASSET_URLS[@]} -gt 0 ] || die "No release assets found"
+  for u in "${ASSET_URLS[@]}"; do
+    lower=$(basename "${u%%\?*}" | tr '[:upper:]' '[:lower:]')
+    if [ -z "$CHECKSUM_URL" ] && [[ "$lower" =~ (sha256|checksum|checksums) ]]; then
+      CHECKSUM_URL="$u"
+    fi
+    if [ -z "$SIG_URL" ] && [[ "$lower" =~ \.(asc|sig)$ ]]; then
+      SIG_URL="$u"
+    fi
+  done
+  ASSET_URL=$(select_asset "${ASSET_URLS[@]}")
+else
+  ASSET_URL=$(resolve_url "$URL")
+  VERSION=$(echo "$ASSET_URL" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)
+fi
+
+[ -n "$ASSET_URL" ] || die "Unable to determine download URL"
+
+ASSET_FILE="$TMP_DIR/$(basename "${ASSET_URL%%\?*}")"
+http_download "$ASSET_URL" "$ASSET_FILE" || die "Failed to download asset"
+
+CHECKSUM_FILE=""
+SIG_FILE=""
+if [ -n "$CHECKSUM_URL" ]; then
+  CHECKSUM_FILE="$TMP_DIR/$(basename "${CHECKSUM_URL%%\?*}")"
+  http_download "$CHECKSUM_URL" "$CHECKSUM_FILE" || die "Failed to download checksum"
+fi
+if [ -n "$SIG_URL" ]; then
+  SIG_FILE="$TMP_DIR/$(basename "${SIG_URL%%\?*}")"
+  http_download "$SIG_URL" "$SIG_FILE" || die "Failed to download signature"
+fi
+
+BASE_URL="${ASSET_URL%%\?*}"
+if [ -z "$CHECKSUM_FILE" ]; then
+  for ext in ".sha256" ".sha256sum" ".sha256sums" ".sha256.txt" ".checksum" ".checksums" ".sum"; do
+    url="${BASE_URL}${ext}"
+    dest="$TMP_DIR/$(basename "$url")"
+    if download_optional "$url" "$dest"; then
+      CHECKSUM_FILE="$dest"
+      CHECKSUM_URL="$url"
+      break
+    fi
+  done
+fi
+if [ -z "$SIG_FILE" ]; then
+  for ext in ".asc" ".sig"; do
+    url="${BASE_URL}${ext}"
+    dest="$TMP_DIR/$(basename "$url")"
+    if download_optional "$url" "$dest"; then
+      SIG_FILE="$dest"
+      SIG_URL="$url"
+      break
+    fi
+  done
+fi
+
+if [ -n "$CHECKSUM_FILE" ]; then
+  verify_checksum "$ASSET_FILE" "$CHECKSUM_FILE"
+fi
+if [ -n "$SIG_FILE" ]; then
+  verify_signature "$SIG_FILE" "$ASSET_FILE"
+fi
+
+EXTRACT_DIR="$TMP_DIR/extract"
+extract_asset "$ASSET_FILE" "$EXTRACT_DIR"
+
+BIN_PATH=$(find_binary "$EXTRACT_DIR" "$BIN_NAME") || die "Executable not found"
+chmod +x "$BIN_PATH" || true
+
+if [ ! -d "$INSTALL_DIR" ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    mkdir -p "$INSTALL_DIR"
+  else
+    need_cmd sudo
+    sudo mkdir -p "$INSTALL_DIR"
+  fi
+fi
+
+DEST_NAME="${INSTALL_NAME:-$BIN_NAME}"
+if [ -z "$DEST_NAME" ]; then
+  DEST_NAME=$(basename "$BIN_PATH")
+fi
+DEST="$INSTALL_DIR/$DEST_NAME"
+
+install_binary "$BIN_PATH" "$DEST"
+
+if ! validate_install "$DEST"; then
+  die "Post-install validation failed"
+fi
+
+exit 0

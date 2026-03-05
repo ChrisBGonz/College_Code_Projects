@@ -1,0 +1,127 @@
+#include <jpeglib.h>
+#include <cstdio>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <csetjmp>
+
+struct Image {
+    int width;
+    int height;
+    int channels;
+    std::vector<unsigned char> data;
+};
+
+struct JpegErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+extern "C" {
+static void JpegErrorExit(j_common_ptr cinfo) {
+    JpegErrorManager* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    longjmp(err->setjmp_buffer, 1);
+}
+}
+
+static Image ReadJPEG(const std::string& filename) {
+    FILE* infile = std::fopen(filename.c_str(), "rb");
+    if (!infile) throw std::runtime_error("Cannot open input file");
+
+    jpeg_decompress_struct cinfo;
+    JpegErrorManager jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(infile);
+        throw std::runtime_error("JPEG decompress error");
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, infile);
+    jpeg_read_header(&cinfo, TRUE);
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    Image img;
+    img.width = cinfo.output_width;
+    img.height = cinfo.output_height;
+    img.channels = cinfo.output_components;
+    img.data.resize(static_cast<size_t>(img.width) * img.height * img.channels);
+
+    while (cinfo.output_scanline < cinfo.output_height) {
+        unsigned char* rowptr = &img.data[static_cast<size_t>(cinfo.output_scanline) * img.width * img.channels];
+        jpeg_read_scanlines(&cinfo, &rowptr, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    std::fclose(infile);
+    return img;
+}
+
+static void WriteJPEGGrayscale(const std::string& filename, const Image& img, int quality = 90) {
+    if (img.channels != 1) throw std::runtime_error("Image must be grayscale");
+
+    FILE* outfile = std::fopen(filename.c_str(), "wb");
+    if (!outfile) throw std::runtime_error("Cannot open output file");
+
+    jpeg_compress_struct cinfo;
+    JpegErrorManager jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        std::fclose(outfile);
+        throw std::runtime_error("JPEG compress error");
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = img.width;
+    cinfo.image_height = img.height;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+
+    jpeg_start_compress(&cinfo, TRUE);
+
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW rowptr = const_cast<JSAMPROW>(&img.data[static_cast<size_t>(cinfo.next_scanline) * img.width]);
+        jpeg_write_scanlines(&cinfo, &rowptr, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    std::fclose(outfile);
+}
+
+bool ProcessJPEG(const std::string& inputFile, const std::string& outputFile) {
+    try {
+        Image rgb = ReadJPEG(inputFile);
+
+        Image gray;
+        gray.width = rgb.width;
+        gray.height = rgb.height;
+        gray.channels = 1;
+        gray.data.resize(static_cast<size_t>(gray.width) * gray.height);
+
+        for (size_t i = 0, j = 0; i < gray.data.size(); ++i, j += 3) {
+            unsigned char r = rgb.data[j];
+            unsigned char g = rgb.data[j + 1];
+            unsigned char b = rgb.data[j + 2];
+            gray.data[i] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+
+        WriteJPEGGrayscale(outputFile, gray);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
