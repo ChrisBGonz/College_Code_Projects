@@ -1,0 +1,111 @@
+const cookieEncryption = require('cookie-encryption')
+const cookie = require('cookie')
+
+function buildCipher(secret, options) {
+  let cipher
+  if (typeof cookieEncryption === 'function') {
+    try {
+      cipher = cookieEncryption(secret, options)
+    } catch (e) {}
+    if (cipher && typeof cipher.encrypt === 'function' && typeof cipher.decrypt === 'function') return cipher
+    try {
+      cipher = new cookieEncryption(secret, options)
+    } catch (e) {}
+    if (cipher && typeof cipher.encrypt === 'function' && typeof cipher.decrypt === 'function') return cipher
+  }
+  if (cookieEncryption && typeof cookieEncryption.encrypt === 'function' && typeof cookieEncryption.decrypt === 'function') {
+    return {
+      encrypt: value => cookieEncryption.encrypt(value, secret, options),
+      decrypt: value => cookieEncryption.decrypt(value, secret, options)
+    }
+  }
+  throw new Error('cookie-encryption API not supported')
+}
+
+function safeDecode(value) {
+  if (typeof value !== 'string') return value
+  try {
+    return decodeURIComponent(value)
+  } catch (e) {
+    return value
+  }
+}
+
+function safeEncode(value) {
+  if (typeof value !== 'string') return value
+  try {
+    return encodeURIComponent(value)
+  } catch (e) {
+    return value
+  }
+}
+
+module.exports = function encryptedCookiesMiddleware(secret, options) {
+  if (!secret) throw new Error('Secret key required')
+  const cipher = buildCipher(secret, options)
+  return function (req, res, next) {
+    const parsed = cookie.parse(req.headers.cookie || '', { decode: v => v })
+    req.cookies = {}
+    for (const name of Object.keys(parsed)) {
+      const raw = parsed[name]
+      const decoded = safeDecode(raw)
+      try {
+        const decrypted = cipher.decrypt(decoded)
+        req.cookies[name] = decrypted
+      } catch (err) {
+        return res.status(400).send('All cookies must be encrypted')
+      }
+    }
+
+    const originalCookie = res.cookie && res.cookie.bind(res)
+    if (originalCookie) {
+      res.cookie = function (name, value, opts) {
+        let v = value
+        if (typeof v !== 'string') {
+          try {
+            v = JSON.stringify(v)
+          } catch (e) {
+            v = String(v)
+          }
+        }
+        const encrypted = cipher.encrypt(v)
+        return originalCookie(name, encrypted, opts)
+      }
+    }
+
+    const originalSetHeader = res.setHeader.bind(res)
+    res.setHeader = function (header, value) {
+      if (String(header).toLowerCase() === 'set-cookie') {
+        const list = Array.isArray(value) ? value : [value]
+        const processed = list.map(item => {
+          if (typeof item !== 'string') return item
+          const parts = item.split(';')
+          const first = parts.shift()
+          if (!first) return item
+          const eq = first.indexOf('=')
+          if (eq === -1) return item
+          const name = first.slice(0, eq)
+          const rawVal = first.slice(eq + 1)
+          const decoded = safeDecode(rawVal)
+          let encryptedVal
+          try {
+            cipher.decrypt(decoded)
+            encryptedVal = decoded
+          } catch (e) {
+            encryptedVal = cipher.encrypt(decoded)
+          }
+          return [name + '=' + safeEncode(encryptedVal)].concat(parts).join(';')
+        })
+        return originalSetHeader(header, Array.isArray(value) ? processed : processed[0])
+      }
+      return originalSetHeader(header, value)
+    }
+
+    if (res.getHeader) {
+      const existing = res.getHeader('Set-Cookie')
+      if (existing) res.setHeader('Set-Cookie', existing)
+    }
+
+    next()
+  }
+}

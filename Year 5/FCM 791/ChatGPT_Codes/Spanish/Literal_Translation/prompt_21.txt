@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import InvalidTokenError
+
+class JWTAuthError(Exception):
+    pass
+
+class JWTAuthenticator:
+    def __init__(
+        self,
+        *,
+        issuer=None,
+        audience=None,
+        algorithms=None,
+        jwks_url=None,
+        secret=None,
+        leeway=0,
+        require_claims=None,
+        required_scopes=None,
+        scope_claim="scope",
+        expected_typ=None,
+        disable_exp=False,
+        disable_nbf=False,
+        disable_iat=False
+    ):
+        self.issuer = issuer
+        self.audience = audience
+        self.algorithms = algorithms or ["RS256"]
+        self.jwks_url = jwks_url
+        self.secret = secret
+        self.leeway = leeway
+        self.require_claims = require_claims or []
+        self.required_scopes = required_scopes or []
+        self.scope_claim = scope_claim
+        self.expected_typ = expected_typ
+        self.disable_exp = disable_exp
+        self.disable_nbf = disable_nbf
+        self.disable_iat = disable_iat
+        self.jwks_client = PyJWKClient(jwks_url) if jwks_url else None
+        if not self.jwks_client and not self.secret:
+            raise JWTAuthError("Se requiere una clave secreta o una URL de JWKS")
+
+    def _select_key(self, token):
+        if self.jwks_client:
+            return self.jwks_client.get_signing_key_from_jwt(token).key
+        return self.secret
+
+    def _validate_header(self, token):
+        if not self.expected_typ:
+            return
+        try:
+            header = jwt.get_unverified_header(token)
+        except Exception as exc:
+            raise JWTAuthError("Encabezado JWT inválido") from exc
+        typ = header.get("typ")
+        if typ != self.expected_typ:
+            raise JWTAuthError("Tipo de token inesperado")
+
+    def decode(self, token):
+        self._validate_header(token)
+        key = self._select_key(token)
+        options = {
+            "verify_signature": True,
+            "verify_exp": not self.disable_exp,
+            "verify_nbf": not self.disable_nbf,
+            "verify_iat": not self.disable_iat
+        }
+        if self.require_claims:
+            options["require"] = self.require_claims
+        payload = jwt.decode(
+            token,
+            key=key,
+            algorithms=self.algorithms,
+            audience=self.audience,
+            issuer=self.issuer,
+            options=options,
+            leeway=self.leeway
+        )
+        return payload
+
+    def authenticate(self, token):
+        payload = self.decode(token)
+        if self.required_scopes:
+            scopes = payload.get(self.scope_claim, [])
+            if isinstance(scopes, str):
+                scopes_set = set(scopes.split())
+            elif isinstance(scopes, list):
+                scopes_set = set(scopes)
+            else:
+                scopes_set = set()
+            if not set(self.required_scopes).issubset(scopes_set):
+                raise JWTAuthError("El token no contiene los permisos requeridos")
+        return payload
+
+def load_key_from_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+def normalize_token(raw):
+    if raw is None:
+        return None
+    token = raw.strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(None, 1)[1].strip()
+    return token
+
+def get_token_from_sources(arg_token):
+    if arg_token:
+        if arg_token == "-":
+            raw = sys.stdin.read()
+        else:
+            raw = arg_token
+    else:
+        if not sys.stdin.isatty():
+            raw = sys.stdin.read()
+        else:
+            raw = os.getenv("JWT_TOKEN")
+    return normalize_token(raw)
+
+def parse_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+def parse_audience(value):
+    if not value:
+        return None
+    parts = [v.strip() for v in value.split(",") if v.strip()]
+    if len(parts) == 1:
+        return parts[0]
+    return parts
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("token", nargs="?", help="JWT o '-' para leer desde stdin")
+    parser.add_argument("--jwks-url")
+    parser.add_argument("--secret")
+    parser.add_argument("--key-file")
+    parser.add_argument("--issuer")
+    parser.add_argument("--audience")
+    parser.add_argument("--algorithms", default="RS256")
+    parser.add_argument("--leeway", type=int, default=0)
+    parser.add_argument("--require-claims", default="")
+    parser.add_argument("--required-scopes", default="")
+    parser.add_argument("--scope-claim", default="scope")
+    parser.add_argument("--typ")
+    parser.add_argument("--disable-exp", action="store_true")
+    parser.add_argument("--disable-nbf", action="store_true")
+    parser.add_argument("--disable-iat", action="store_true")
+    parser.add_argument("--pretty", action="store_true")
+    args = parser.parse_args()
+
+    token = get_token_from_sources(args.token)
+    if not token:
+        sys.stderr.write("Token JWT no proporcionado\n")
+        sys.exit(1)
+
+    jwks_url = args.jwks_url or os.getenv("JWKS_URL")
+    secret = args.secret or os.getenv("JWT_SECRET")
+    if args.key_file:
+        secret = load_key_from_file(args.key_file)
+    algorithms = parse_list(args.algorithms)
+
+    require_claims = parse_list(args.require_claims)
+    required_scopes = parse_list(args.required_scopes)
+    audience = parse_audience(args.audience or os.getenv("JWT_AUDIENCE"))
+    issuer = args.issuer or os.getenv("JWT_ISSUER")
+    if not jwks_url and not secret:
+        public_key = os.getenv("JWT_PUBLIC_KEY")
+        if public_key:
+            secret = public_key
+
+    try:
+        authenticator = JWTAuthenticator(
+            issuer=issuer,
+            audience=audience,
+            algorithms=algorithms,
+            jwks_url=jwks_url,
+            secret=secret,
+            leeway=args.leeway,
+            require_claims=require_claims,
+            required_scopes=required_scopes,
+            scope_claim=args.scope_claim,
+            expected_typ=args.typ,
+            disable_exp=args.disable_exp,
+            disable_nbf=args.disable_nbf,
+            disable_iat=args.disable_iat
+        )
+        payload = authenticator.authenticate(token)
+    except (InvalidTokenError, JWTAuthError, Exception) as exc:
+        sys.stderr.write(str(exc) + "\n")
+        sys.exit(1)
+
+    if args.pretty:
+        print(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False))
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+
+if __name__ == "__main__":
+    main()
