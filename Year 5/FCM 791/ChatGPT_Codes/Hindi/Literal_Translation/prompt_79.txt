@@ -1,0 +1,101 @@
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+def parse_manifest_line(line):
+    line = line.strip()
+    if not line or line.startswith('#'):
+        return None
+    m = re.match(r'^([a-fA-F0-9]{32,128})\s+\*?(.*)$', line)
+    if m:
+        h = m.group(1).lower()
+        p = m.group(2).strip()
+        if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+            p = p[1:-1]
+        if not p:
+            raise ValueError("Missing file path")
+        return p, h
+    m = re.match(r'^(.*\S)\s+([a-fA-F0-9]{32,128})$', line)
+    if m:
+        p = m.group(1).strip()
+        h = m.group(2).lower()
+        if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+            p = p[1:-1]
+        if not p:
+            raise ValueError("Missing file path")
+        return p, h
+    raise ValueError("Invalid manifest line")
+
+def load_manifest(path):
+    entries = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for lineno, line in enumerate(f, 1):
+            if not line.strip() or line.lstrip().startswith('#'):
+                continue
+            try:
+                parsed = parse_manifest_line(line)
+            except ValueError as e:
+                raise ValueError(f"{path}:{lineno}: {e}")
+            if parsed:
+                entries.append(parsed)
+    return entries
+
+def hash_file(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    parser = argparse.ArgumentParser(description="Verify project files against hashes in a manifest.")
+    parser.add_argument("manifest", help="Path to manifest file")
+    parser.add_argument("-a", "--algo", default="sha256", help="Hash algorithm (default: sha256)")
+    parser.add_argument("-q", "--quiet", action="store_true", help="Only output errors")
+    args = parser.parse_args()
+
+    try:
+        hashlib.new(args.algo)
+    except Exception:
+        print(f"Unsupported hash algorithm: {args.algo}", file=sys.stderr)
+        return 2
+
+    try:
+        entries = load_manifest(args.manifest)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    base_dir = os.path.dirname(os.path.abspath(args.manifest))
+    errors = 0
+
+    for rel_path, expected in entries:
+        path = rel_path
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(base_dir, path))
+        if not os.path.exists(path):
+            errors += 1
+            if not args.quiet:
+                print(f"MISSING {rel_path}")
+            continue
+        try:
+            actual = hash_file(path, args.algo)
+        except Exception as e:
+            errors += 1
+            if not args.quiet:
+                print(f"ERROR {rel_path}: {e}")
+            continue
+        if actual.lower() == expected.lower():
+            if not args.quiet:
+                print(f"OK {rel_path}")
+        else:
+            errors += 1
+            if not args.quiet:
+                print(f"FAIL {rel_path}")
+
+    return 0 if errors == 0 else 1
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import shlex
+import time
+import json
+
+def log(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+def env_bool(key, default=False):
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on", "y")
+
+def parse_list(val):
+    if not val:
+        return []
+    return [v.strip() for v in val.split(",") if v.strip()]
+
+def parse_kv_list(val):
+    if not val:
+        return []
+    s = val.strip()
+    if not s:
+        return []
+    if s.startswith("{"):
+        try:
+            data = json.loads(s)
+            if isinstance(data, dict):
+                return [f"{k}={v}" for k, v in data.items()]
+        except Exception:
+            pass
+    return [p.strip() for p in s.split(",") if p.strip()]
+
+def shell_join(cmd):
+    return " ".join(shlex.quote(str(c)) for c in cmd)
+
+REMOTE_HOST = os.getenv("DEPLOY_HOST") or os.getenv("REMOTE_HOST")
+SSH_PORT = os.getenv("SSH_PORT")
+SSH_KEY = os.getenv("SSH_KEY")
+DRY_RUN = env_bool("DRY_RUN")
+
+def run(cmd, input_data=None, check=True, silent=False):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = [str(c) for c in cmd]
+    if REMOTE_HOST:
+        ssh_cmd = ["ssh"]
+        if SSH_PORT:
+            ssh_cmd += ["-p", SSH_PORT]
+        if SSH_KEY:
+            ssh_cmd += ["-i", SSH_KEY]
+        ssh_cmd += ["-o", "StrictHostKeyChecking=no", REMOTE_HOST, shell_join(cmd_list)]
+        cmd_list = ssh_cmd
+    if not silent:
+        log("+ " + shell_join(cmd_list))
+    if DRY_RUN:
+        return ""
+    result = subprocess.run(cmd_list, input=input_data, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if result.stdout and not silent:
+        sys.stdout.write(result.stdout)
+        sys.stdout.flush()
+    if check and result.returncode != 0:
+        if silent and result.stdout:
+            sys.stdout.write(result.stdout)
+            sys.stdout.flush()
+        raise SystemExit(result.returncode)
+    return result.stdout or ""
+
+def default_container_name(image):
+    name = image.split("/")[-1]
+    name = name.replace(":", "-").replace("@", "-")
+    name = "".join(c if c.isalnum() or c in "_.-" else "-" for c in name)
+    return name or "app"
+
+def container_exists(name):
+    out = run(["docker", "ps", "-a", "-q", "-f", f"name=^{name}$"], check=False, silent=True)
+    return bool(out.strip())
+
+def remove_container(name):
+    if container_exists(name):
+        run(["docker", "rm", "-f", name])
+
+def wait_for_container(name, timeout=60, interval=2, wait_for_health=False):
+    if DRY_RUN:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        state = run(["docker", "inspect", "-f", "{{.State.Status}}", name], check=False, silent=True).strip()
+        if state == "running":
+            if wait_for_health:
+                health = run(["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name], check=False, silent=True).strip()
+                if health in ("healthy", "none"):
+                    return True
+                if health == "unhealthy":
+                    raise SystemExit("Container unhealthy")
+            else:
+                return True
+        elif state in ("exited", "dead"):
+            raise SystemExit("Container failed to start")
+        time.sleep(interval)
+    raise SystemExit("Timeout waiting for container")
+
+def main():
+    image = os.getenv("DOCKER_IMAGE") or os.getenv("IMAGE")
+    if not image:
+        log("DOCKER_IMAGE not set")
+        return 1
+
+    container_name = os.getenv("CONTAINER_NAME") or default_container_name(image)
+
+    username = os.getenv("DOCKER_USERNAME")
+    password = os.getenv("DOCKER_PASSWORD")
+    registry = os.getenv("DOCKER_REGISTRY")
+    if username and password:
+        password_in = password if password.endswith("\n") else password + "\n"
+        login_cmd = ["docker", "login"]
+        if registry:
+            login_cmd.append(registry)
+        login_cmd += ["-u", username, "--password-stdin"]
+        run(login_cmd, input_data=password_in)
+
+    run(["docker", "pull", image])
+
+    remove_container(container_name)
+
+    cmd = ["docker", "run", "-d", "--restart", "always", "--name", container_name]
+
+    network = os.getenv("NETWORK")
+    if network:
+        cmd += ["--network", network]
+
+    env_file = os.getenv("ENV_FILE")
+    if env_file:
+        cmd += ["--env-file", env_file]
+
+    for p in parse_list(os.getenv("PORTS") or os.getenv("DOCKER_PORTS")):
+        cmd += ["-p", p]
+
+    for v in parse_list(os.getenv("VOLUMES") or os.getenv("DOCKER_VOLUMES")):
+        cmd += ["-v", v]
+
+    for e in parse_kv_list(os.getenv("ENV_VARS") or os.getenv("DOCKER_ENV")):
+        cmd += ["-e", e]
+
+    for l in parse_kv_list(os.getenv("LABELS")):
+        cmd += ["--label", l]
+
+    extra = os.getenv("EXTRA_ARGS") or os.getenv("DOCKER_RUN_ARGS")
+    if extra:
+        cmd += shlex.split(extra)
+
+    cmd.append(image)
+
+    command = os.getenv("CONTAINER_COMMAND")
+    if command:
+        cmd += shlex.split(command)
+
+    run(cmd)
+
+    wait_start = env_bool("WAIT_FOR_START") or env_bool("WAIT_FOR_HEALTH")
+    if wait_start:
+        timeout = int(os.getenv("HEALTH_TIMEOUT") or os.getenv("WAIT_TIMEOUT") or "120")
+        interval = int(os.getenv("HEALTH_INTERVAL") or "2")
+        wait_for_container(container_name, timeout=timeout, interval=interval, wait_for_health=env_bool("WAIT_FOR_HEALTH"))
+
+    log("Deployment completed")
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        log("Interrupted")
+        sys.exit(1)
