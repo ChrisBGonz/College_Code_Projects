@@ -1,0 +1,90 @@
+import os
+from decimal import Decimal, InvalidOperation
+import stripe
+from flask import Flask, request, redirect, jsonify
+
+app = Flask(__name__)
+
+stripe.api_key = os.environ.get("STRIPE_SECRET_KEY")
+if not stripe.api_key:
+    raise RuntimeError("STRIPE_SECRET_KEY is required")
+
+BASE_URL = os.environ.get("BASE_URL")
+_sessions = {}
+
+def get_payload():
+    if request.is_json:
+        return request.get_json() or {}
+    if request.form:
+        return request.form.to_dict()
+    return {}
+
+def parse_amount(value):
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, TypeError):
+        return None
+    if amount <= 0:
+        return None
+    return int((amount * 100).to_integral_value())
+
+def get_base_url():
+    if BASE_URL:
+        return BASE_URL.rstrip("/")
+    return request.url_root.rstrip("/")
+
+@app.route("/pay", methods=["POST"])
+def pay():
+    data = get_payload()
+    success_url = data.get("success_url")
+    if not success_url:
+        return jsonify({"error": "success_url required"}), 400
+    cancel_url = data.get("cancel_url") or success_url
+    amount = parse_amount(data.get("amount"))
+    if amount is None:
+        return jsonify({"error": "invalid amount"}), 400
+    currency = data.get("currency", "usd")
+    description = data.get("description", "Pago")
+    base_url = get_base_url()
+    internal_success = f"{base_url}/gateway/success?session_id={{CHECKOUT_SESSION_ID}}"
+    internal_cancel = f"{base_url}/gateway/cancel?session_id={{CHECKOUT_SESSION_ID}}"
+
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        mode="payment",
+        line_items=[{
+            "price_data": {
+                "currency": currency,
+                "product_data": {"name": description},
+                "unit_amount": amount
+            },
+            "quantity": 1
+        }],
+        success_url=internal_success,
+        cancel_url=internal_cancel
+    )
+    _sessions[session.id] = {"success_url": success_url, "cancel_url": cancel_url}
+    return redirect(session.url, code=303)
+
+@app.route("/gateway/success")
+def gateway_success():
+    session_id = request.args.get("session_id")
+    if not session_id:
+        return "missing session_id", 400
+    data = _sessions.pop(session_id, None)
+    if not data:
+        return "invalid session", 404
+    return redirect(data["success_url"], code=302)
+
+@app.route("/gateway/cancel")
+def gateway_cancel():
+    session_id = request.args.get("session_id")
+    if not session_id:
+        return "missing session_id", 400
+    data = _sessions.pop(session_id, None)
+    if not data:
+        return "invalid session", 404
+    return redirect(data["cancel_url"], code=302)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

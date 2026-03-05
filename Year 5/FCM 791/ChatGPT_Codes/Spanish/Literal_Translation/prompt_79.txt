@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+import sys
+import os
+import hashlib
+import argparse
+import re
+
+HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
+ALGO_SET = {a.lower() for a in hashlib.algorithms_available}
+HASH_LEN_TO_ALGO = {32: 'md5', 40: 'sha1', 64: 'sha256', 128: 'sha512'}
+
+def normalize_algo(name):
+    if not name:
+        return None
+    name = name.lower()
+    return name if name in ALGO_SET else None
+
+def detect_algo(hash_str):
+    if not HEX_RE.match(hash_str):
+        return None
+    algo = HASH_LEN_TO_ALGO.get(len(hash_str))
+    if algo and algo in ALGO_SET:
+        return algo
+    return None
+
+def compute_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def parse_manifest_line(line, default_algo=None):
+    s = line.strip()
+    if not s or s.startswith('#'):
+        return None
+    parts = s.split()
+    if len(parts) < 2:
+        raise ValueError('Formato de línea inválido')
+    algo = None
+    hash_val = None
+    path = None
+    algo_prefix = normalize_algo(parts[0])
+    if len(parts) >= 3 and algo_prefix:
+        algo = algo_prefix
+        hash_val = parts[1]
+        path = line.split(None, 2)[2].strip()
+    else:
+        algo = detect_algo(parts[0])
+        if algo:
+            hash_val = parts[0]
+            path = line[len(parts[0]):].strip()
+        else:
+            algo = detect_algo(parts[-1])
+            if algo:
+                path, hash_val = line.rsplit(None, 1)
+                path = path.strip()
+            else:
+                raise ValueError('Hash no reconocible')
+    if path.startswith('*'):
+        path = path[1:].strip()
+    if default_algo:
+        algo = default_algo
+    if not algo:
+        raise ValueError('Algoritmo desconocido')
+    if not path:
+        raise ValueError('Ruta vacía')
+    return path, hash_val, algo
+
+def main():
+    parser = argparse.ArgumentParser(description='Verifica archivos según un manifiesto de hashes')
+    parser.add_argument('manifest', help='archivo de manifiesto')
+    parser.add_argument('-b', '--base', default='.', help='directorio base')
+    parser.add_argument('-a', '--algo', help='algoritmo de hash a usar')
+    parser.add_argument('-q', '--quiet', action='store_true', help='solo mostrar errores y discrepancias')
+    args = parser.parse_args()
+
+    default_algo = normalize_algo(args.algo) if args.algo else None
+    if args.algo and not default_algo:
+        print('Algoritmo no soportado: ' + args.algo, file=sys.stderr)
+        return 2
+
+    ok = mism = missing = errors = 0
+
+    try:
+        f = open(args.manifest, 'r', encoding='utf-8')
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    with f:
+        for lineno, line in enumerate(f, 1):
+            try:
+                parsed = parse_manifest_line(line, default_algo)
+            except ValueError as e:
+                errors += 1
+                print(f'LINEA_INVALIDA {lineno}: {e}', file=sys.stderr)
+                continue
+            if parsed is None:
+                continue
+            path, expected, algo = parsed
+            full_path = path if os.path.isabs(path) else os.path.normpath(os.path.join(args.base, path))
+            if not os.path.isfile(full_path):
+                missing += 1
+                print(f'FALTA {path}')
+                continue
+            try:
+                actual = compute_hash(full_path, algo)
+            except Exception as e:
+                errors += 1
+                print(f'ERROR {path}: {e}', file=sys.stderr)
+                continue
+            if actual.lower() == expected.lower():
+                ok += 1
+                if not args.quiet:
+                    print(f'OK {path}')
+            else:
+                mism += 1
+                print(f'NO_COINCIDE {path}')
+
+    if not args.quiet:
+        print(f'RESUMEN ok={ok} no_coincide={mism} falta={missing} errores={errors}')
+
+    return 0 if mism == 0 and missing == 0 and errors == 0 else 1
+
+if __name__ == '__main__':
+    sys.exit(main())
