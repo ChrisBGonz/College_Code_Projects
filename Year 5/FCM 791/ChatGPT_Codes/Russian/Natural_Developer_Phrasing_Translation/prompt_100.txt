@@ -1,0 +1,204 @@
+class CircuitBreaker {
+  constructor(action, options = {}) {
+    if (typeof action !== 'function') {
+      throw new Error('Action must be a function');
+    }
+    this.action = action;
+    this.failureThreshold = options.failureThreshold ?? 5;
+    this.successThreshold = options.successThreshold ?? 2;
+    this.resetTimeout = options.resetTimeout ?? 10000;
+    this.state = 'closed';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInFlight = false;
+  }
+
+  async fire(...args) {
+    if (this.state === 'open') {
+      if (Date.now() >= this.nextAttempt) {
+        this._halfOpen();
+      } else {
+        return Promise.reject(this._createError('CircuitBreaker: open'));
+      }
+    }
+
+    if (this.state === 'half-open') {
+      if (this.halfOpenInFlight) {
+        return Promise.reject(this._createError('CircuitBreaker: half-open (trial in progress)'));
+      }
+      this.halfOpenInFlight = true;
+    }
+
+    try {
+      const result = await this.action(...args);
+      this._success();
+      return result;
+    } catch (err) {
+      this._failure();
+      throw err;
+    } finally {
+      if (this.state === 'half-open') {
+        this.halfOpenInFlight = false;
+      }
+    }
+  }
+
+  _success() {
+    if (this.state === 'half-open') {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  _failure() {
+    if (this.state === 'half-open') {
+      this._open();
+    } else {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+  }
+
+  _open() {
+    this.state = 'open';
+    this.nextAttempt = Date.now() + this.resetTimeout;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenInFlight = false;
+  }
+
+  _halfOpen() {
+    this.state = 'half-open';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInFlight = false;
+  }
+
+  _close() {
+    this.state = 'closed';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInFlight = false;
+  }
+
+  getInfo() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      nextAttempt: this.nextAttempt
+    };
+  }
+
+  _createError(message) {
+    const err = new Error(message);
+    err.isCircuitBreaker = true;
+    err.state = this.state;
+    return err;
+  }
+}
+
+function createFetchCircuitBreaker(options = {}) {
+  const breaker = new CircuitBreaker((url, fetchOptions) => {
+    return fetch(url, fetchOptions).then(res => {
+      if (!res.ok) {
+        const err = new Error('HTTP ' + res.status);
+        err.status = res.status;
+        err.response = res;
+        throw err;
+      }
+      const contentType = res.headers.get('content-type') || '';
+      if (contentType.includes('application/json')) {
+        return res.json();
+      }
+      return res.text();
+    });
+  }, options);
+
+  const wrapped = (url, fetchOptions) => breaker.fire(url, fetchOptions);
+  wrapped.breaker = breaker;
+  return wrapped;
+}
+
+function init() {
+  const app = document.createElement('div');
+  app.style.fontFamily = 'sans-serif';
+  app.style.padding = '12px';
+  app.innerHTML = `
+    <h3>Circuit Breaker Demo</h3>
+    <div id="cb-state" style="margin-bottom:8px;"></div>
+    <div style="margin-bottom:8px;">
+      <button id="btn-ok">Successful request</button>
+      <button id="btn-fail">Failing request</button>
+    </div>
+    <pre id="cb-log" style="background:#f5f5f5;padding:8px;height:200px;overflow:auto;"></pre>
+  `;
+  document.body.appendChild(app);
+
+  const stateEl = app.querySelector('#cb-state');
+  const logEl = app.querySelector('#cb-log');
+  const btnOk = app.querySelector('#btn-ok');
+  const btnFail = app.querySelector('#btn-fail');
+
+  const api = createFetchCircuitBreaker({
+    failureThreshold: 3,
+    successThreshold: 2,
+    resetTimeout: 5000
+  });
+
+  function log(message) {
+    const ts = new Date().toLocaleTimeString();
+    logEl.textContent += `[${ts}] ${message}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function updateState() {
+    const info = api.breaker.getInfo();
+    let text = `state: ${info.state} | failures: ${info.failureCount} | successes: ${info.successCount}`;
+    if (info.state === 'open') {
+      const remaining = Math.max(0, info.nextAttempt - Date.now());
+      text += ` | retry in ${Math.ceil(remaining / 1000)}s`;
+    }
+    stateEl.textContent = text;
+  }
+
+  async function doRequest(url) {
+    updateState();
+    try {
+      const data = await api(url);
+      log('success: ' + (typeof data === 'string' ? data.slice(0, 80) : JSON.stringify(data)));
+    } catch (err) {
+      log('error: ' + (err && err.message ? err.message : String(err)));
+    } finally {
+      updateState();
+    }
+  }
+
+  btnOk.addEventListener('click', () => {
+    log('--- OK request');
+    doRequest('https://jsonplaceholder.typicode.com/posts/1');
+  });
+
+  btnFail.addEventListener('click', () => {
+    log('--- FAIL request');
+    doRequest('https://httpstat.us/500');
+  });
+
+  updateState();
+  setInterval(updateState, 500);
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', init);
+} else {
+  init();
+}

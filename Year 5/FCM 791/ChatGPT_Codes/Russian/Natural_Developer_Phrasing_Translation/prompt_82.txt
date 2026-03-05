@@ -1,0 +1,138 @@
+const querystring = require('querystring');
+
+function createRequestLogger(options = {}) {
+  const logger = normalizeLogger(options.logger);
+  const encoding = options.encoding || 'utf8';
+  const level = options.level || 'info';
+  const log = getLoggerFn(logger, level);
+  const logError = getLoggerFn(logger, 'error');
+
+  return function requestLogger(req, res, next) {
+    if (req._requestLogged) return next();
+
+    let finished = false;
+    let aborted = false;
+    const chunks = [];
+
+    const onData = chunk => {
+      chunks.push(chunk);
+    };
+
+    const onError = err => {
+      if (logError) logError(err);
+      next(err);
+    };
+
+    const onAborted = () => {
+      aborted = true;
+      finish();
+    };
+
+    const onEnd = () => {
+      finish();
+    };
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+
+      let rawBuffer;
+      if (chunks.length) {
+        rawBuffer = Buffer.concat(chunks);
+      } else if (req.rawBody !== undefined) {
+        rawBuffer = Buffer.isBuffer(req.rawBody)
+          ? req.rawBody
+          : Buffer.from(String(req.rawBody), encoding);
+      } else if (req.body !== undefined) {
+        if (Buffer.isBuffer(req.body)) rawBuffer = req.body;
+        else if (typeof req.body === 'string') rawBuffer = Buffer.from(req.body, encoding);
+        else rawBuffer = Buffer.from(JSON.stringify(req.body), encoding);
+      } else {
+        rawBuffer = Buffer.alloc(0);
+      }
+
+      const contentType = (req.headers['content-type'] || '').toLowerCase();
+      const rawString = rawBuffer.toString(encoding);
+      const parsedBody = req.body !== undefined ? req.body : parseBody(contentType, rawString);
+      const rawForLog = isTextType(contentType) ? rawString : rawBuffer;
+
+      req.rawBody = rawBuffer;
+      if (req.body === undefined) req.body = parsedBody;
+
+      const logEntry = {
+        method: req.method,
+        url: req.originalUrl || req.url,
+        headers: req.headers,
+        rawBody: rawForLog,
+        parsedBody: parsedBody
+      };
+
+      if (aborted) logEntry.aborted = true;
+
+      log(logEntry);
+
+      req._requestLogged = true;
+      next();
+    }
+
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAborted);
+
+    if (req.readableEnded || req.complete) {
+      finish();
+    }
+  };
+}
+
+function parseBody(contentType, raw) {
+  if (!raw || raw.length === 0) return undefined;
+  const ct = (contentType || '').toLowerCase();
+  if (ct.includes('application/json') || ct.includes('+json')) {
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      return raw;
+    }
+  }
+  if (ct.includes('application/x-www-form-urlencoded')) {
+    return querystring.parse(raw);
+  }
+  if (ct.startsWith('text/') || ct.includes('xml') || ct.includes('html') || ct.includes('javascript')) {
+    return raw;
+  }
+  return raw;
+}
+
+function isTextType(ct) {
+  if (!ct) return true;
+  const t = ct.toLowerCase();
+  return t.startsWith('text/') ||
+    t.includes('json') ||
+    t.includes('xml') ||
+    t.includes('html') ||
+    t.includes('x-www-form-urlencoded') ||
+    t.includes('javascript');
+}
+
+function normalizeLogger(logger) {
+  if (!logger) return console;
+  if (typeof logger === 'function') return { info: logger, error: logger };
+  return logger;
+}
+
+function getLoggerFn(logger, level) {
+  if (!logger) return console.log.bind(console);
+  if (typeof logger[level] === 'function') return logger[level].bind(logger);
+  if (typeof logger.info === 'function') return logger.info.bind(logger);
+  if (typeof logger.log === 'function') return logger.log.bind(logger);
+  return console.log.bind(console);
+}
+
+module.exports = createRequestLogger;

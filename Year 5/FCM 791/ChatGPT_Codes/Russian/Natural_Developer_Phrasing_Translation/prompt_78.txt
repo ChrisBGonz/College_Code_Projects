@@ -1,0 +1,600 @@
+package configmapper
+
+import (
+	"bytes"
+	"encoding"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+)
+
+func ApplyConfigFromFile(path string, target interface{}) error {
+	if target == nil {
+		return errors.New("target is nil")
+	}
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return errors.New("target must be a non-nil pointer")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var cfg interface{}
+	if err := dec.Decode(&cfg); err != nil {
+		return err
+	}
+	return applyValue(v, cfg)
+}
+
+func applyValue(dst reflect.Value, src interface{}) error {
+	if !dst.IsValid() {
+		return errors.New("invalid target")
+	}
+
+	if dst.Kind() == reflect.Pointer {
+		if dst.IsNil() {
+			if !dst.CanSet() {
+				return errors.New("cannot set nil pointer")
+			}
+			dst.Set(reflect.New(dst.Type().Elem()))
+		}
+		return applyValue(dst.Elem(), src)
+	}
+
+	if src == nil {
+		if dst.CanSet() {
+			dst.Set(reflect.Zero(dst.Type()))
+		}
+		return nil
+	}
+
+	if dst.CanAddr() {
+		if u, ok := dst.Addr().Interface().(json.Unmarshaler); ok {
+			b, _ := json.Marshal(src)
+			return u.UnmarshalJSON(b)
+		}
+		if u, ok := dst.Addr().Interface().(encoding.TextUnmarshaler); ok {
+			var text []byte
+			switch v := src.(type) {
+			case string:
+				text = []byte(v)
+			case json.Number:
+				text = []byte(v.String())
+			default:
+				b, _ := json.Marshal(v)
+				text = b
+			}
+			return u.UnmarshalText(text)
+		}
+	}
+
+	switch dst.Kind() {
+	case reflect.Struct:
+		m, ok := src.(map[string]interface{})
+		if !ok {
+			if dst.CanAddr() {
+				b, _ := json.Marshal(src)
+				return json.Unmarshal(b, dst.Addr().Interface())
+			}
+			return fmt.Errorf("expected object for %s", dst.Type())
+		}
+		for k, v := range m {
+			if strings.Contains(k, ".") {
+				if err := setByPath(dst, strings.Split(k, "."), v); err != nil {
+					return err
+				}
+				continue
+			}
+			f, ok := findField(dst, k)
+			if !ok || !f.CanSet() {
+				continue
+			}
+			if err := applyValue(f, v); err != nil {
+				return err
+			}
+		}
+		return nil
+	case reflect.Map:
+		m, ok := src.(map[string]interface{})
+		if !ok {
+			if dst.CanAddr() {
+				b, _ := json.Marshal(src)
+				return json.Unmarshal(b, dst.Addr().Interface())
+			}
+			return fmt.Errorf("expected object for %s", dst.Type())
+		}
+		if dst.IsNil() {
+			dst.Set(reflect.MakeMap(dst.Type()))
+		}
+		for k, v := range m {
+			key, err := convertKey(k, dst.Type().Key())
+			if err != nil {
+				continue
+			}
+			val := reflect.New(dst.Type().Elem()).Elem()
+			if err := applyValue(val, v); err != nil {
+				return err
+			}
+			dst.SetMapIndex(key, val)
+		}
+		return nil
+	case reflect.Slice:
+		if dst.Type().Elem().Kind() == reflect.Uint8 {
+			switch v := src.(type) {
+			case string:
+				dst.SetBytes([]byte(v))
+				return nil
+			case []byte:
+				dst.SetBytes(v)
+				return nil
+			}
+		}
+		arr, ok := src.([]interface{})
+		if !ok {
+			if dst.CanAddr() {
+				b, _ := json.Marshal(src)
+				return json.Unmarshal(b, dst.Addr().Interface())
+			}
+			return fmt.Errorf("expected array for %s", dst.Type())
+		}
+		slice := reflect.MakeSlice(dst.Type(), len(arr), len(arr))
+		for i, item := range arr {
+			if err := applyValue(slice.Index(i), item); err != nil {
+				return err
+			}
+		}
+		dst.Set(slice)
+		return nil
+	case reflect.Array:
+		arr, ok := src.([]interface{})
+		if !ok {
+			return fmt.Errorf("expected array for %s", dst.Type())
+		}
+		for i := 0; i < dst.Len() && i < len(arr); i++ {
+			if err := applyValue(dst.Index(i), arr[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	default:
+		return setPrimitive(dst, src)
+	}
+}
+
+func setByPath(root reflect.Value, path []string, value interface{}) error {
+	if len(path) == 0 {
+		return nil
+	}
+	if root.Kind() == reflect.Pointer {
+		if root.IsNil() {
+			if !root.CanSet() {
+				return errors.New("cannot set nil pointer")
+			}
+			root.Set(reflect.New(root.Type().Elem()))
+		}
+		return setByPath(root.Elem(), path, value)
+	}
+	if len(path) == 1 {
+		switch root.Kind() {
+		case reflect.Struct:
+			f, ok := findField(root, path[0])
+			if !ok || !f.CanSet() {
+				return nil
+			}
+			return applyValue(f, value)
+		case reflect.Map:
+			if root.IsNil() {
+				root.Set(reflect.MakeMap(root.Type()))
+			}
+			key, err := convertKey(path[0], root.Type().Key())
+			if err != nil {
+				return err
+			}
+			val := reflect.New(root.Type().Elem()).Elem()
+			if err := applyValue(val, value); err != nil {
+				return err
+			}
+			root.SetMapIndex(key, val)
+			return nil
+		case reflect.Slice:
+			idx, err := strconv.Atoi(path[0])
+			if err != nil {
+				return err
+			}
+			if idx < 0 {
+				return fmt.Errorf("negative index")
+			}
+			if idx >= root.Len() {
+				newLen := idx + 1
+				newSlice := reflect.MakeSlice(root.Type(), newLen, newLen)
+				reflect.Copy(newSlice, root)
+				root.Set(newSlice)
+			}
+			return applyValue(root.Index(idx), value)
+		case reflect.Array:
+			idx, err := strconv.Atoi(path[0])
+			if err != nil {
+				return err
+			}
+			if idx < 0 || idx >= root.Len() {
+				return fmt.Errorf("index out of range")
+			}
+			return applyValue(root.Index(idx), value)
+		default:
+			return applyValue(root, value)
+		}
+	}
+
+	head := path[0]
+	tail := path[1:]
+
+	switch root.Kind() {
+	case reflect.Struct:
+		f, ok := findField(root, head)
+		if !ok {
+			return nil
+		}
+		return setByPath(f, tail, value)
+	case reflect.Map:
+		if root.IsNil() {
+			root.Set(reflect.MakeMap(root.Type()))
+		}
+		key, err := convertKey(head, root.Type().Key())
+		if err != nil {
+			return err
+		}
+		elem := root.MapIndex(key)
+		if !elem.IsValid() {
+			elem = reflect.New(root.Type().Elem()).Elem()
+		} else {
+			tmp := reflect.New(root.Type().Elem()).Elem()
+			tmp.Set(elem)
+			elem = tmp
+		}
+		if err := setByPath(elem, tail, value); err != nil {
+			return err
+		}
+		root.SetMapIndex(key, elem)
+		return nil
+	case reflect.Slice:
+		idx, err := strconv.Atoi(head)
+		if err != nil {
+			return err
+		}
+		if idx < 0 {
+			return fmt.Errorf("negative index")
+		}
+		if idx >= root.Len() {
+			newLen := idx + 1
+			newSlice := reflect.MakeSlice(root.Type(), newLen, newLen)
+			reflect.Copy(newSlice, root)
+			root.Set(newSlice)
+		}
+		return setByPath(root.Index(idx), tail, value)
+	case reflect.Array:
+		idx, err := strconv.Atoi(head)
+		if err != nil {
+			return err
+		}
+		if idx < 0 || idx >= root.Len() {
+			return fmt.Errorf("index out of range")
+		}
+		return setByPath(root.Index(idx), tail, value)
+	default:
+		return fmt.Errorf("cannot traverse %s", root.Kind())
+	}
+}
+
+func findField(v reflect.Value, name string) (reflect.Value, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		tag = strings.Split(tag, ",")[0]
+		if tag == "-" {
+			continue
+		}
+		if tag == "" {
+			tag = f.Name
+		}
+		if strings.EqualFold(tag, name) || strings.EqualFold(f.Name, name) {
+			return v.Field(i), true
+		}
+		if f.Anonymous && f.Type.Kind() == reflect.Struct {
+			fv := v.Field(i)
+			if fv.Kind() == reflect.Pointer {
+				if fv.IsNil() {
+					fv.Set(reflect.New(fv.Type().Elem()))
+				}
+				fv = fv.Elem()
+			}
+			if fv.IsValid() && fv.Kind() == reflect.Struct {
+				if res, ok := findField(fv, name); ok {
+					return res, true
+				}
+			}
+		}
+	}
+	return reflect.Value{}, false
+}
+
+func setPrimitive(dst reflect.Value, src interface{}) error {
+	if !dst.CanSet() {
+		return nil
+	}
+	if src == nil {
+		dst.Set(reflect.Zero(dst.Type()))
+		return nil
+	}
+	switch dst.Kind() {
+	case reflect.String:
+		dst.SetString(toString(src))
+		return nil
+	case reflect.Bool:
+		b, err := toBool(src)
+		if err != nil {
+			return err
+		}
+		dst.SetBool(b)
+		return nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := toInt64(src)
+		if err != nil {
+			return err
+		}
+		dst.SetInt(i)
+		return nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u, err := toUint64(src)
+		if err != nil {
+			return err
+		}
+		dst.SetUint(u)
+		return nil
+	case reflect.Float32, reflect.Float64:
+		f, err := toFloat64(src)
+		if err != nil {
+			return err
+		}
+		dst.SetFloat(f)
+		return nil
+	case reflect.Interface:
+		dst.Set(reflect.ValueOf(src))
+		return nil
+	default:
+		if dst.CanAddr() {
+			b, err := json.Marshal(src)
+			if err != nil {
+				return err
+			}
+			return json.Unmarshal(b, dst.Addr().Interface())
+		}
+		return fmt.Errorf("unsupported kind %s", dst.Kind())
+	}
+}
+
+func toString(v interface{}) string {
+	switch s := v.(type) {
+	case string:
+		return s
+	case json.Number:
+		return s.String()
+	case []byte:
+		return string(s)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func toBool(v interface{}) (bool, error) {
+	switch b := v.(type) {
+	case bool:
+		return b, nil
+	case string:
+		return strconv.ParseBool(b)
+	case json.Number:
+		i, err := b.Int64()
+		if err == nil {
+			return i != 0, nil
+		}
+		f, err := b.Float64()
+		if err == nil {
+			return f != 0, nil
+		}
+		return false, err
+	case float64:
+		return b != 0, nil
+	case float32:
+		return b != 0, nil
+	case int, int8, int16, int32, int64:
+		return reflect.ValueOf(v).Int() != 0, nil
+	case uint, uint8, uint16, uint32, uint64:
+		return reflect.ValueOf(v).Uint() != 0, nil
+	default:
+		return false, fmt.Errorf("cannot convert %T to bool", v)
+	}
+}
+
+func toInt64(v interface{}) (int64, error) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), nil
+	case int8:
+		return int64(n), nil
+	case int16:
+		return int64(n), nil
+	case int32:
+		return int64(n), nil
+	case int64:
+		return n, nil
+	case uint:
+		return int64(n), nil
+	case uint8:
+		return int64(n), nil
+	case uint16:
+		return int64(n), nil
+	case uint32:
+		return int64(n), nil
+	case uint64:
+		return int64(n), nil
+	case float64:
+		return int64(n), nil
+	case float32:
+		return int64(n), nil
+	case json.Number:
+		return n.Int64()
+	case string:
+		return strconv.ParseInt(n, 10, 64)
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int64", v)
+	}
+}
+
+func toUint64(v interface{}) (uint64, error) {
+	switch n := v.(type) {
+	case uint:
+		return uint64(n), nil
+	case uint8:
+		return uint64(n), nil
+	case uint16:
+		return uint64(n), nil
+	case uint32:
+		return uint64(n), nil
+	case uint64:
+		return n, nil
+	case int:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int8:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int16:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int32:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case float64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case float32:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case json.Number:
+		i, err := n.Int64()
+		if err == nil {
+			return toUint64(i)
+		}
+		f, err := n.Float64()
+		if err == nil {
+			return toUint64(f)
+		}
+		return 0, err
+	case string:
+		return strconv.ParseUint(n, 10, 64)
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to uint64", v)
+	}
+}
+
+func toFloat64(v interface{}) (float64, error) {
+	switch n := v.(type) {
+	case float64:
+		return n, nil
+	case float32:
+		return float64(n), nil
+	case int:
+		return float64(n), nil
+	case int8:
+		return float64(n), nil
+	case int16:
+		return float64(n), nil
+	case int32:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	case uint:
+		return float64(n), nil
+	case uint8:
+		return float64(n), nil
+	case uint16:
+		return float64(n), nil
+	case uint32:
+		return float64(n), nil
+	case uint64:
+		return float64(n), nil
+	case json.Number:
+		return n.Float64()
+	case string:
+		return strconv.ParseFloat(n, 64)
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", v)
+	}
+}
+
+func convertKey(s string, t reflect.Type) (reflect.Value, error) {
+	switch t.Kind() {
+	case reflect.String:
+		return reflect.ValueOf(s).Convert(t), nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		v := reflect.New(t).Elem()
+		v.SetInt(i)
+		return v, nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		v := reflect.New(t).Elem()
+		v.SetUint(u)
+		return v, nil
+	default:
+		return reflect.ValueOf(s).Convert(t), nil
+	}
+}

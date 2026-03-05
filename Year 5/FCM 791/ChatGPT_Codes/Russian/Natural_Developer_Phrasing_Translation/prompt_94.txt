@@ -1,0 +1,81 @@
+'use strict';
+
+const { AsyncLocalStorage } = require('async_hooks');
+
+const asyncLocalStorage = new AsyncLocalStorage();
+let handlersInstalled = false;
+
+function contextMiddleware(req, res, next) {
+  asyncLocalStorage.run({ req, res }, () => next());
+}
+
+function normalizeError(err) {
+  if (err instanceof Error) return err;
+  if (err && typeof err === 'object') {
+    const e = new Error(err.message || 'Error');
+    if (err.status || err.statusCode) e.statusCode = err.status || err.statusCode;
+    if (err.code !== undefined) e.code = err.code;
+    if (err.details !== undefined) e.details = err.details;
+    e.data = err;
+    return e;
+  }
+  if (typeof err === 'string') return new Error(err);
+  const e = new Error('Unknown error');
+  e.data = err;
+  return e;
+}
+
+function buildPayload(err) {
+  const status = Number(err.statusCode || err.status) || 500;
+  const payload = {
+    status,
+    name: err.name || 'Error',
+    message: err.message || 'Internal Server Error'
+  };
+  if (err.code !== undefined) payload.code = err.code;
+  if (err.details !== undefined) payload.details = err.details;
+  if (process.env.NODE_ENV !== 'production' && err.stack) payload.stack = err.stack;
+  if (err.data !== undefined && process.env.NODE_ENV !== 'production') payload.data = err.data;
+  return { status, payload };
+}
+
+function sendError(res, err) {
+  if (res.headersSent || res.writableEnded) return;
+  const { status, payload } = buildPayload(err);
+  res.status(status).json(payload);
+}
+
+function errorHandler(err, req, res, next) {
+  if (res.headersSent) return next(err);
+  sendError(res, normalizeError(err));
+}
+
+function handleUnhandled(raw) {
+  const err = normalizeError(raw);
+  const store = asyncLocalStorage.getStore();
+  if (store && store.res && !store.res.headersSent && !store.res.writableEnded) {
+    sendError(store.res, err);
+  } else {
+    console.error(err);
+  }
+}
+
+function installProcessHandlers() {
+  if (handlersInstalled) return;
+  handlersInstalled = true;
+  process.on('uncaughtException', handleUnhandled);
+  process.on('unhandledRejection', handleUnhandled);
+}
+
+const asyncHandler = fn => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+installProcessHandlers();
+
+module.exports = {
+  contextMiddleware,
+  errorHandler,
+  asyncHandler,
+  installProcessHandlers
+};

@@ -1,0 +1,153 @@
+import os
+import json
+import yaml
+from flask import Flask, request, render_template_string, redirect, url_for, jsonify, flash, get_flashed_messages
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-key")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STORAGE_FILE = os.path.join(BASE_DIR, "profiles.json")
+
+TEMPLATE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>YAML Profile Loader</title>
+<style>
+body{font-family:Arial, sans-serif;margin:40px;}
+form{margin-bottom:20px;padding:10px;border:1px solid #ccc;}
+ul{list-style:none;padding:0;}
+li{margin:4px 0;}
+.message{color:green;}
+</style>
+</head>
+<body>
+<h1>Upload YAML Config</h1>
+<form method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+<input type="file" name="config" required>
+<button type="submit">Upload</button>
+</form>
+{% if messages %}
+<ul>
+{% for m in messages %}
+<li class="message">{{ m }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+<h2>Profiles</h2>
+{% if profiles %}
+<ul>
+{% for pid, profile in profiles.items() %}
+<li><a href="{{ url_for('get_profile', user_id=pid) }}">{{ pid }}</a>{% if profile.get('name') %} - {{ profile.get('name') }}{% endif %}</li>
+{% endfor %}
+</ul>
+{% else %}
+<p>No profiles yet.</p>
+{% endif %}
+</body>
+</html>
+"""
+
+def load_profiles():
+    if not os.path.exists(STORAGE_FILE):
+        return {}
+    try:
+        with open(STORAGE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        return {}
+    return {}
+
+def save_profiles(profiles):
+    tmp = STORAGE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(profiles, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, STORAGE_FILE)
+
+def make_json_safe(obj):
+    if isinstance(obj, dict):
+        return {str(k): make_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [make_json_safe(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [make_json_safe(v) for v in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    return str(obj)
+
+def get_profile_payload(config):
+    if not isinstance(config, dict):
+        raise ValueError("YAML root must be a mapping")
+    if "profile" in config and isinstance(config["profile"], dict):
+        return config["profile"]
+    return config
+
+def update_profile(profile_data):
+    profile_data = make_json_safe(profile_data)
+    user_id = profile_data.get("user_id") or profile_data.get("id") or profile_data.get("username")
+    if not user_id:
+        raise ValueError("user_id is required in config")
+    user_id = str(user_id)
+    profiles = load_profiles()
+    existing = profiles.get(user_id, {})
+    if not isinstance(existing, dict):
+        existing = {}
+    new_profile = {}
+    new_profile.update(existing)
+    new_profile.update(profile_data)
+    new_profile["user_id"] = user_id
+    profiles[user_id] = new_profile
+    save_profiles(profiles)
+    return new_profile
+
+@app.route("/", methods=["GET"])
+def index():
+    profiles = load_profiles()
+    messages = get_flashed_messages()
+    return render_template_string(TEMPLATE, profiles=profiles, messages=messages)
+
+@app.route("/upload", methods=["POST"])
+def upload():
+    if "config" not in request.files:
+        flash("No file part")
+        return redirect(url_for("index"))
+    file = request.files["config"]
+    if file.filename == "":
+        flash("No selected file")
+        return redirect(url_for("index"))
+    try:
+        raw = file.read()
+        config = yaml.safe_load(raw)
+    except Exception as e:
+        flash("YAML parsing error: " + str(e))
+        return redirect(url_for("index"))
+    if config is None:
+        flash("Empty YAML")
+        return redirect(url_for("index"))
+    try:
+        profile_data = get_profile_payload(config)
+        updated = update_profile(profile_data)
+    except Exception as e:
+        flash("Profile update error: " + str(e))
+        return redirect(url_for("index"))
+    flash("Profile " + str(updated.get("user_id")) + " updated")
+    return redirect(url_for("index"))
+
+@app.route("/profiles/<user_id>", methods=["GET"])
+def get_profile(user_id):
+    profiles = load_profiles()
+    profile = profiles.get(user_id)
+    if profile is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(profile)
+
+@app.route("/profiles", methods=["GET"])
+def list_profiles():
+    profiles = load_profiles()
+    return jsonify(profiles)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)

@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import shlex
+import time
+import argparse
+import urllib.request
+
+def run_cmd(cmd, capture=False):
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    print("+ " + " ".join(shlex.quote(c) for c in cmd), flush=True)
+    if capture:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    else:
+        result = subprocess.run(cmd)
+    if result.returncode != 0:
+        if capture:
+            if result.stdout:
+                sys.stdout.write(result.stdout)
+            if result.stderr:
+                sys.stderr.write(result.stderr)
+        sys.exit(result.returncode)
+    return result.stdout.strip() if capture else ""
+
+def list_containers(all=False):
+    cmd = ["docker", "ps"]
+    if all:
+        cmd.append("-a")
+    cmd += ["--format", "{{.Names}}"]
+    out = run_cmd(cmd, capture=True)
+    return {line.strip() for line in out.splitlines() if line.strip()}
+
+def container_running(name):
+    return name in list_containers(all=False)
+
+def container_exists(name):
+    return name in list_containers(all=True)
+
+def stop_and_remove(name):
+    if container_running(name):
+        run_cmd(["docker", "stop", name])
+    if container_exists(name):
+        run_cmd(["docker", "rm", name])
+
+def default_container_name(image):
+    name = image.split("/")[-1]
+    name = name.split("@")[0]
+    name = name.split(":")[0]
+    return "".join(c if c.isalnum() or c in "._-" else "-" for c in name) or "app"
+
+def deploy(image, container, run_args, env_file):
+    run_cmd(["docker", "pull", image])
+    if container_exists(container):
+        stop_and_remove(container)
+    cmd = ["docker", "run", "-d", "--name", container, "--restart", "always"]
+    if env_file:
+        cmd += ["--env-file", env_file]
+    if run_args:
+        cmd += shlex.split(run_args)
+    cmd.append(image)
+    run_cmd(cmd)
+
+def healthcheck(url, timeout, interval):
+    if not url:
+        return True
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                status = resp.getcode()
+                if 200 <= status < 400:
+                    return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
+
+def main():
+    parser = argparse.ArgumentParser(description="Pull docker image and deploy to production")
+    parser.add_argument("--image", default=os.getenv("DOCKER_IMAGE"))
+    parser.add_argument("--container", default=os.getenv("CONTAINER_NAME"))
+    parser.add_argument("--run-args", default=os.getenv("DOCKER_RUN_ARGS", ""))
+    parser.add_argument("--env-file", default=os.getenv("DOCKER_ENV_FILE"))
+    parser.add_argument("--healthcheck-url", default=os.getenv("HEALTHCHECK_URL"))
+    parser.add_argument("--healthcheck-timeout", type=int, default=int(os.getenv("HEALTHCHECK_TIMEOUT", "60")))
+    parser.add_argument("--healthcheck-interval", type=float, default=float(os.getenv("HEALTHCHECK_INTERVAL", "3")))
+    args = parser.parse_args()
+
+    image = args.image
+    if not image:
+        print("Docker image not specified. Use --image or DOCKER_IMAGE env var.", file=sys.stderr)
+        sys.exit(1)
+
+    container = args.container or default_container_name(image)
+
+    deploy(image, container, args.run_args, args.env_file)
+
+    if args.healthcheck_url:
+        if not healthcheck(args.healthcheck_url, args.healthcheck_timeout, args.healthcheck_interval):
+            print("Healthcheck failed", file=sys.stderr)
+            sys.exit(1)
+
+if __name__ == "__main__":
+    main()

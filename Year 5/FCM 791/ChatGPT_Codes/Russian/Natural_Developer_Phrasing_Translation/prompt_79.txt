@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import hashlib
+import shlex
+import re
+
+def normalize_algo_name(name):
+    if name is None:
+        return ''
+    return ''.join(ch for ch in name.lower() if ch.isalnum())
+
+def build_algo_map():
+    algos = {}
+    for a in hashlib.algorithms_available:
+        algos[normalize_algo_name(a)] = a
+    aliases = {
+        'sha1': 'sha1',
+        'sha224': 'sha224',
+        'sha256': 'sha256',
+        'sha384': 'sha384',
+        'sha512': 'sha512',
+        'md5': 'md5',
+        'md4': 'md4',
+        'ripemd160': 'ripemd160',
+        'blake2b': 'blake2b',
+        'blake2s': 'blake2s',
+        'sha3_224': 'sha3_224',
+        'sha3_256': 'sha3_256',
+        'sha3_384': 'sha3_384',
+        'sha3_512': 'sha3_512',
+    }
+    for k, v in aliases.items():
+        if v in hashlib.algorithms_available:
+            algos.setdefault(normalize_algo_name(k), v)
+    return algos
+
+ALGO_MAP = build_algo_map()
+
+def resolve_algo(name):
+    if not name:
+        return None
+    norm = normalize_algo_name(name)
+    if norm in ALGO_MAP:
+        return ALGO_MAP[norm]
+    try:
+        hashlib.new(name)
+        return name
+    except Exception:
+        return None
+
+LENGTH_GUESS = {32: 'md5', 40: 'sha1', 56: 'sha224', 64: 'sha256', 96: 'sha384', 128: 'sha512'}
+
+def looks_like_hash(s):
+    if not s:
+        return False
+    if s.startswith(('0x', '0X')):
+        s = s[2:]
+    if len(s) not in LENGTH_GUESS:
+        return False
+    for ch in s:
+        if ch not in '0123456789abcdefABCDEF':
+            return False
+    return True
+
+def guess_algo_from_hash(h):
+    if not h:
+        return None
+    if h.startswith(('0x', '0X')):
+        h = h[2:]
+    algo = LENGTH_GUESS.get(len(h))
+    if algo:
+        return resolve_algo(algo)
+    return None
+
+ALGO_DIRECTIVE_RE = re.compile(r'^(?:algo(?:rithm)?|hash|digest)\s*[:=]\s*(\S+)\s*$', re.IGNORECASE)
+
+def parse_algo_directive(line):
+    m = ALGO_DIRECTIVE_RE.match(line.strip())
+    if m:
+        return m.group(1)
+    return None
+
+def strip_star(path):
+    if path.startswith('*'):
+        return path[1:]
+    return path
+
+def parse_manifest_line(line, default_algo):
+    try:
+        tokens = shlex.split(line, posix=True)
+    except ValueError:
+        tokens = line.split()
+    if not tokens:
+        return None
+
+    for i, t in enumerate(tokens):
+        if ':' in t:
+            a, b = t.split(':', 1)
+            algo = resolve_algo(a)
+            if algo and b:
+                expected = b
+                path_tokens = tokens[:i] + tokens[i+1:]
+                path = ' '.join(path_tokens)
+                path = strip_star(path)
+                return (algo, expected, path)
+
+    algo_indices = [i for i, t in enumerate(tokens) if resolve_algo(t)]
+    hash_indices = [i for i, t in enumerate(tokens) if looks_like_hash(t)]
+
+    if algo_indices and hash_indices:
+        for ai in algo_indices:
+            for hi in hash_indices:
+                if ai == hi:
+                    continue
+                algo = resolve_algo(tokens[ai])
+                expected = tokens[hi]
+                path_tokens = [t for j, t in enumerate(tokens) if j not in (ai, hi)]
+                path = ' '.join(path_tokens)
+                path = strip_star(path)
+                return (algo, expected, path)
+
+    if algo_indices:
+        ai = algo_indices[0]
+        algo = resolve_algo(tokens[ai])
+        if ai == 0 and len(tokens) >= 3:
+            expected = tokens[1]
+            path = ' '.join(tokens[2:])
+            path = strip_star(path)
+            return (algo, expected, path)
+        if ai == 1 and len(tokens) >= 3:
+            expected = tokens[0]
+            path = ' '.join(tokens[2:])
+            path = strip_star(path)
+            return (algo, expected, path)
+        if ai == len(tokens) - 1 and len(tokens) >= 3:
+            expected = tokens[-2]
+            path = ' '.join(tokens[:-2])
+            path = strip_star(path)
+            return (algo, expected, path)
+        if ai == len(tokens) - 2 and len(tokens) >= 3:
+            expected = tokens[-1]
+            path = ' '.join(tokens[:-2])
+            path = strip_star(path)
+            return (algo, expected, path)
+
+    if hash_indices:
+        hi = hash_indices[0]
+        expected = tokens[hi]
+        path_tokens = [t for j, t in enumerate(tokens) if j != hi]
+        path = ' '.join(path_tokens)
+        path = strip_star(path)
+        algo = default_algo or guess_algo_from_hash(expected)
+        return (algo, expected, path)
+
+    if len(tokens) >= 2:
+        expected = tokens[0]
+        path = ' '.join(tokens[1:])
+        path = strip_star(path)
+        algo = default_algo or guess_algo_from_hash(expected)
+        return (algo, expected, path)
+
+    return None
+
+def compute_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    parser = argparse.ArgumentParser(description='Validate files against manifest hashes')
+    parser.add_argument('manifest', help='Manifest file path')
+    parser.add_argument('-a', '--algorithm', help='Default hash algorithm')
+    parser.add_argument('-r', '--root', help='Root directory for file paths')
+    parser.add_argument('-e', '--encoding', default='utf-8-sig', help='Manifest file encoding')
+    parser.add_argument('-q', '--quiet', action='store_true', help='Suppress non-error output')
+    args = parser.parse_args()
+
+    default_algo = resolve_algo(args.algorithm) if args.algorithm else None
+    if args.algorithm and not default_algo:
+        print(f"UNKNOWN_ALGORITHM\t{args.algorithm}", file=sys.stderr)
+        sys.exit(2)
+
+    base_dir = os.path.abspath(args.root) if args.root else os.path.dirname(os.path.abspath(args.manifest))
+
+    missing = mismatch = error_count = 0
+
+    try:
+        fh = open(args.manifest, 'r', encoding=args.encoding, errors='replace')
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    with fh:
+        for line_no, line in enumerate(fh, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(('#', ';')):
+                continue
+
+            algo_dir = parse_algo_directive(stripped)
+            if algo_dir:
+                new_algo = resolve_algo(algo_dir)
+                if not new_algo:
+                    print(f"UNKNOWN_ALGORITHM\t{algo_dir}\tline {line_no}", file=sys.stderr)
+                    error_count += 1
+                else:
+                    default_algo = new_algo
+                continue
+
+            entry = parse_manifest_line(stripped, default_algo)
+            if not entry:
+                continue
+            algo, expected, relpath = entry
+            if not relpath:
+                print(f"INVALID_ENTRY\tline {line_no}", file=sys.stderr)
+                error_count += 1
+                continue
+            if not algo:
+                print(f"UNKNOWN_ALGORITHM\tline {line_no}\t{relpath}", file=sys.stderr)
+                error_count += 1
+                continue
+
+            path = relpath
+            if not os.path.isabs(path):
+                path = os.path.normpath(os.path.join(base_dir, path))
+
+            if not os.path.exists(path):
+                print(f"MISSING\t{relpath}")
+                missing += 1
+                continue
+            if not os.path.isfile(path):
+                print(f"NOTFILE\t{relpath}")
+                missing += 1
+                continue
+            try:
+                actual = compute_hash(path, algo)
+            except Exception as e:
+                print(f"ERROR\t{relpath}\t{e}", file=sys.stderr)
+                error_count += 1
+                continue
+            if actual.lower() != expected.lower():
+                print(f"MISMATCH\t{relpath}\t{algo}\t{expected}\t{actual}")
+                mismatch += 1
+
+    if missing or mismatch or error_count:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
