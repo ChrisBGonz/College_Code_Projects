@@ -1,0 +1,158 @@
+package config
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"strings"
+)
+
+func ApplyConfig(path string, target interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var raw map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	return ApplyMap(raw, target)
+}
+
+func ApplyMap(raw map[string]interface{}, target interface{}) error {
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer to struct")
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return fmt.Errorf("target must point to a struct")
+	}
+	t := v.Type()
+	for key, val := range raw {
+		field, ok := findField(v, t, key)
+		if !ok {
+			continue
+		}
+		if err := setValue(field, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func findField(v reflect.Value, t reflect.Type, key string) (reflect.Value, bool) {
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		tagName := strings.Split(tag, ",")[0]
+		if tagName == "-" {
+			continue
+		}
+		if tagName == "" {
+			tagName = f.Name
+		}
+		if tagName == key || f.Name == key {
+			return v.Field(i), true
+		}
+	}
+	return reflect.Value{}, false
+}
+
+func setValue(field reflect.Value, val interface{}) error {
+	if !field.CanSet() {
+		return nil
+	}
+	if val == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+	if field.Kind() == reflect.Ptr {
+		elemType := field.Type().Elem()
+		elemVal := reflect.New(elemType).Elem()
+		if err := setValue(elemVal, val); err != nil {
+			return err
+		}
+		ptr := reflect.New(elemType)
+		ptr.Elem().Set(elemVal)
+		field.Set(ptr)
+		return nil
+	}
+	switch field.Kind() {
+	case reflect.String:
+		if s, ok := val.(string); ok {
+			field.SetString(s)
+			return nil
+		}
+	case reflect.Bool:
+		if b, ok := val.(bool); ok {
+			field.SetBool(b)
+			return nil
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := val.(type) {
+		case json.Number:
+			i, err := v.Int64()
+			if err != nil {
+				return err
+			}
+			field.SetInt(i)
+			return nil
+		case float64:
+			field.SetInt(int64(v))
+			return nil
+		case int:
+			field.SetInt(int64(v))
+			return nil
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		switch v := val.(type) {
+		case json.Number:
+			i, err := v.Int64()
+			if err != nil {
+				return err
+			}
+			field.SetUint(uint64(i))
+			return nil
+		case float64:
+			field.SetUint(uint64(v))
+			return nil
+		case int:
+			field.SetUint(uint64(v))
+			return nil
+		}
+	case reflect.Float32, reflect.Float64:
+		switch v := val.(type) {
+		case json.Number:
+			f, err := v.Float64()
+			if err != nil {
+				return err
+			}
+			field.SetFloat(f)
+			return nil
+		case float64:
+			field.SetFloat(v)
+			return nil
+		case int:
+			field.SetFloat(float64(v))
+			return nil
+		}
+	}
+	b, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	temp := reflect.New(field.Type())
+	if err := json.Unmarshal(b, temp.Interface()); err != nil {
+		return err
+	}
+	field.Set(temp.Elem())
+	return nil
+}

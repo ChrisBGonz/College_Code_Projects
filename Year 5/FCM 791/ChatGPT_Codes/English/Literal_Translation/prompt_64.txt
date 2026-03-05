@@ -1,0 +1,86 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Http;
+
+public class RememberMeToken
+{
+    public string UserId { get; set; }
+    public string TokenHash { get; set; }
+    public DateTimeOffset ExpiresUtc { get; set; }
+}
+
+public interface IRememberMeTokenStore
+{
+    Task SaveAsync(RememberMeToken token);
+    Task<RememberMeToken> FindByHashAsync(string tokenHash);
+    Task DeleteAsync(string tokenHash);
+}
+
+public static class RememberMeService
+{
+    private const string CookieName = "remember_me";
+
+    public static async Task IssueAsync(HttpContext context, string userId, bool rememberMe, IRememberMeTokenStore store, TimeSpan? lifetime = null)
+    {
+        if (!rememberMe)
+        {
+            context.Response.Cookies.Delete(CookieName);
+            return;
+        }
+
+        var token = GenerateToken();
+        var hash = HashToken(token);
+        var expires = DateTimeOffset.UtcNow.Add(lifetime ?? TimeSpan.FromDays(30));
+
+        await store.SaveAsync(new RememberMeToken
+        {
+            UserId = userId,
+            TokenHash = hash,
+            ExpiresUtc = expires
+        });
+
+        context.Response.Cookies.Append(CookieName, token, new CookieOptions
+        {
+            Expires = expires,
+            HttpOnly = true,
+            Secure = context.Request.IsHttps,
+            SameSite = SameSiteMode.Lax
+        });
+    }
+
+    public static async Task<string> ValidateAsync(HttpContext context, IRememberMeTokenStore store)
+    {
+        if (!context.Request.Cookies.TryGetValue(CookieName, out var token))
+            return null;
+
+        var hash = HashToken(token);
+        var record = await store.FindByHashAsync(hash);
+
+        if (record == null || record.ExpiresUtc <= DateTimeOffset.UtcNow)
+        {
+            context.Response.Cookies.Delete(CookieName);
+            if (record != null)
+                await store.DeleteAsync(hash);
+            return null;
+        }
+
+        return record.UserId;
+    }
+
+    private static string GenerateToken()
+    {
+        var bytes = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+    }
+
+    private static string HashToken(string token)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+        return Convert.ToBase64String(bytes);
+    }
+}

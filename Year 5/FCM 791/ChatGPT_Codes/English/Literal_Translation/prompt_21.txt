@@ -1,0 +1,280 @@
+import os
+import sys
+import json
+import time
+import uuid
+import argparse
+import datetime
+import jwt
+from jwt import InvalidTokenError
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+
+DEFAULT_KEYSTORE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jwt_keystore.json")
+
+def generate_rsa_keypair():
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048, backend=default_backend())
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_pem = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    return private_pem.decode("utf-8"), public_pem.decode("utf-8")
+
+def load_private_key(pem):
+    if isinstance(pem, str):
+        pem_bytes = pem.encode("utf-8")
+    else:
+        pem_bytes = pem
+    return serialization.load_pem_private_key(pem_bytes, password=None, backend=default_backend())
+
+def load_public_key(pem):
+    if isinstance(pem, str):
+        pem_bytes = pem.encode("utf-8")
+    else:
+        pem_bytes = pem
+    return serialization.load_pem_public_key(pem_bytes, backend=default_backend())
+
+def parse_claims(items):
+    result = {}
+    if not items:
+        return result
+    for item in items:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        try:
+            result[key] = json.loads(value)
+        except Exception:
+            result[key] = value
+    return result
+
+def parse_audience(value):
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    if "," in value:
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return value
+
+def normalize_roles(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [str(value)]
+
+def normalize_scopes(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return value.split()
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return [str(value)]
+
+class KeyStore:
+    def __init__(self, keys):
+        self.keys = keys or []
+
+    @classmethod
+    def load(cls, path):
+        if os.path.exists(path):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
+                keys = data.get("keys", [])
+            except Exception:
+                keys = []
+        else:
+            keys = []
+        ks = cls(keys)
+        if not ks.keys:
+            ks.rotate()
+            ks.save(path)
+        return ks
+
+    def save(self, path):
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"keys": self.keys}, f)
+        os.replace(tmp, path)
+
+    def rotate(self):
+        kid = uuid.uuid4().hex
+        private_pem, public_pem = generate_rsa_keypair()
+        self.keys.append({
+            "kid": kid,
+            "private_pem": private_pem,
+            "public_pem": public_pem,
+            "created": int(time.time())
+        })
+        return kid
+
+    def get_signing_key(self, kid=None):
+        if not self.keys:
+            raise KeyError("No keys available")
+        if kid:
+            for k in self.keys:
+                if k["kid"] == kid:
+                    return k
+            raise KeyError("Unknown kid")
+        return max(self.keys, key=lambda k: k.get("created", 0))
+
+    def get_private_key(self, kid=None):
+        key = self.get_signing_key(kid)
+        return load_private_key(key["private_pem"])
+
+    def get_public_key(self, kid):
+        for k in self.keys:
+            if k["kid"] == kid:
+                return load_public_key(k["public_pem"])
+        raise KeyError("Unknown kid")
+
+    def jwks(self):
+        jwk_keys = []
+        for k in self.keys:
+            public_key = load_public_key(k["public_pem"])
+            jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(public_key))
+            jwk["kid"] = k["kid"]
+            jwk["use"] = "sig"
+            jwk["alg"] = "RS256"
+            jwk_keys.append(jwk)
+        return {"keys": jwk_keys}
+
+def issue_token(keystore, subject, audience, issuer, roles=None, scopes=None, ttl=3600, nbf=0, kid=None, extra=None):
+    now = datetime.datetime.utcnow()
+    payload = {
+        "iss": issuer,
+        "sub": subject,
+        "aud": audience,
+        "iat": now,
+        "nbf": now + datetime.timedelta(seconds=nbf),
+        "exp": now + datetime.timedelta(seconds=ttl),
+        "jti": uuid.uuid4().hex
+    }
+    if roles:
+        payload["roles"] = roles
+    if scopes:
+        payload["scp"] = scopes
+    if extra:
+        payload.update(extra)
+    private_key = keystore.get_private_key(kid)
+    signing = keystore.get_signing_key(kid)
+    headers = {"kid": signing["kid"], "typ": "JWT"}
+    token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
+    return token
+
+def decode_and_validate(token, keystore, audience, issuer, leeway=0, require_roles=None, require_scopes=None):
+    header = jwt.get_unverified_header(token)
+    kid = header.get("kid")
+    if not kid:
+        raise InvalidTokenError("Missing kid")
+    public_key = keystore.get_public_key(kid)
+    options = {"require": ["exp", "iat", "nbf", "iss", "sub", "aud", "jti"]}
+    claims = jwt.decode(token, public_key, algorithms=["RS256"], audience=audience, issuer=issuer, options=options, leeway=leeway)
+    if require_roles:
+        roles = normalize_roles(claims.get("roles"))
+        missing = set(require_roles) - set(roles)
+        if missing:
+            raise PermissionError("Missing roles: " + ",".join(sorted(missing)))
+    if require_scopes:
+        scopes = normalize_scopes(claims.get("scp"))
+        missing = set(require_scopes) - set(scopes)
+        if missing:
+            raise PermissionError("Missing scopes: " + ",".join(sorted(missing)))
+    return claims
+
+def main():
+    parser = argparse.ArgumentParser(description="JWT authentication and decoding utility")
+    parser.add_argument("--keystore", default=DEFAULT_KEYSTORE_PATH)
+    subparsers = parser.add_subparsers(dest="command")
+
+    p_issue = subparsers.add_parser("issue")
+    p_issue.add_argument("--sub", required=True)
+    p_issue.add_argument("--aud", required=True)
+    p_issue.add_argument("--issuer", default="auth.example")
+    p_issue.add_argument("--role", action="append", default=[])
+    p_issue.add_argument("--scope", action="append", default=[])
+    p_issue.add_argument("--ttl", type=int, default=3600)
+    p_issue.add_argument("--nbf", type=int, default=0)
+    p_issue.add_argument("--kid")
+    p_issue.add_argument("--claim", action="append", default=[])
+
+    p_verify = subparsers.add_parser("verify")
+    p_verify.add_argument("--token")
+    p_verify.add_argument("--aud", required=True)
+    p_verify.add_argument("--issuer", default="auth.example")
+    p_verify.add_argument("--leeway", type=int, default=0)
+    p_verify.add_argument("--require-role", action="append", default=[])
+    p_verify.add_argument("--require-scope", action="append", default=[])
+
+    p_jwks = subparsers.add_parser("jwks")
+    p_rotate = subparsers.add_parser("rotate")
+    p_keys = subparsers.add_parser("keys")
+
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        sys.exit(1)
+
+    keystore = KeyStore.load(args.keystore)
+
+    if args.command == "issue":
+        audience = parse_audience(args.aud)
+        extra = parse_claims(args.claim)
+        token = issue_token(
+            keystore,
+            subject=args.sub,
+            audience=audience,
+            issuer=args.issuer,
+            roles=args.role,
+            scopes=args.scope,
+            ttl=args.ttl,
+            nbf=args.nbf,
+            kid=args.kid,
+            extra=extra
+        )
+        print(token)
+    elif args.command == "verify":
+        token = args.token or sys.stdin.read().strip()
+        if not token:
+            print("Token is required", file=sys.stderr)
+            sys.exit(1)
+        try:
+            audience = parse_audience(args.aud)
+            claims = decode_and_validate(
+                token,
+                keystore,
+                audience=audience,
+                issuer=args.issuer,
+                leeway=args.leeway,
+                require_roles=args.require_role,
+                require_scopes=args.require_scope
+            )
+            print(json.dumps(claims, indent=2, sort_keys=True))
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+    elif args.command == "jwks":
+        print(json.dumps(keystore.jwks(), indent=2))
+    elif args.command == "rotate":
+        kid = keystore.rotate()
+        keystore.save(args.keystore)
+        print(kid)
+    elif args.command == "keys":
+        keys_info = [{"kid": k["kid"], "created": k.get("created")} for k in keystore.keys]
+        print(json.dumps(keys_info, indent=2))
+
+if __name__ == "__main__":
+    main()

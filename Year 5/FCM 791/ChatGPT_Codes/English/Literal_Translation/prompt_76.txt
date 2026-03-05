@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import shlex
+import time
+import json
+
+def log(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+def run_cmd(cmd, capture=False, check=True, input_data=None, env=None, suppress_log=False):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = list(cmd)
+    if not suppress_log:
+        log("Executing: " + " ".join(shlex.quote(c) for c in cmd_list))
+    result = subprocess.run(
+        cmd_list,
+        input=input_data,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        env=env
+    )
+    if check and result.returncode != 0:
+        if capture:
+            if result.stdout:
+                log("STDOUT:\n" + result.stdout)
+            if result.stderr:
+                log("STDERR:\n" + result.stderr)
+        log(f"Command failed with exit code {result.returncode}")
+        sys.exit(result.returncode)
+    return result
+
+def getenv(name, default=None, required=False):
+    val = os.getenv(name, default)
+    if required and (val is None or val == ""):
+        log(f"Missing required environment variable: {name}")
+        sys.exit(2)
+    return val
+
+def parse_csv(value):
+    if not value:
+        return []
+    parts = [p.strip() for p in value.split(',')]
+    return [p for p in parts if p]
+
+def parse_kv(value):
+    items = parse_csv(value)
+    kvs = []
+    for item in items:
+        if '=' not in item:
+            continue
+        key, val = item.split('=', 1)
+        kvs.append((key, val))
+    return kvs
+
+def default_container_name(image):
+    image = image.split('@', 1)[0]
+    if ':' in image and image.rfind(':') > image.rfind('/'):
+        image = image[:image.rfind(':')]
+    return image.split('/')[-1]
+
+def extract_registry(image):
+    part = image.split('/')[0]
+    if '.' in part or ':' in part or part == 'localhost':
+        return part
+    return None
+
+def get_container_id(name):
+    res = run_cmd(['docker', 'ps', '-a', '--filter', f'name=^{name}$', '--format', '{{.ID}}'], capture=True, check=False)
+    if res.returncode != 0:
+        return None
+    cid = res.stdout.strip()
+    return cid if cid else None
+
+def wait_for_health(name, timeout):
+    start = time.time()
+    while time.time() - start < timeout:
+        res = run_cmd(['docker', 'inspect', name], capture=True, check=False, suppress_log=True)
+        if res.returncode != 0:
+            time.sleep(2)
+            continue
+        try:
+            data = json.loads(res.stdout)[0]
+        except Exception:
+            time.sleep(2)
+            continue
+        state = data.get('State', {})
+        if not state:
+            time.sleep(2)
+            continue
+        if not state.get('Running', False):
+            log("Container is not running")
+            return False
+        health = state.get('Health')
+        if not health:
+            return True
+        status = health.get('Status')
+        if status == 'healthy':
+            return True
+        if status == 'unhealthy':
+            log("Container reported unhealthy")
+            return False
+        time.sleep(2)
+    log("Health check timed out")
+    return False
+
+def main():
+    image = getenv('IMAGE')
+    if not image:
+        image_name = getenv('IMAGE_NAME', required=True)
+        tag = getenv('IMAGE_TAG', 'latest')
+        image = image_name
+        if ':' not in image_name or image_name.rfind(':') < image_name.rfind('/'):
+            image = f"{image_name}:{tag}"
+    registry = getenv('DOCKER_REGISTRY')
+    if registry:
+        if not image.startswith(registry + '/'):
+            image = f"{registry}/{image}"
+    registry_for_login = getenv('DOCKER_REGISTRY_FOR_LOGIN')
+    if not registry_for_login:
+        registry_for_login = registry or extract_registry(image)
+    username = getenv('DOCKER_REGISTRY_USER')
+    password = getenv('DOCKER_REGISTRY_PASSWORD')
+    if username and password:
+        login_cmd = ['docker', 'login']
+        if registry_for_login:
+            login_cmd.append(registry_for_login)
+        login_cmd += ['-u', username, '--password-stdin']
+        run_cmd(login_cmd, input_data=password + "\n", suppress_log=False)
+    container_name = getenv('CONTAINER_NAME') or default_container_name(image)
+    ports = parse_csv(getenv('PORTS'))
+    env_vars = parse_kv(getenv('ENV_VARS'))
+    volumes = parse_csv(getenv('VOLUMES'))
+    network = getenv('NETWORK')
+    restart_policy = getenv('RESTART_POLICY', 'always')
+    extra_args = getenv('DOCKER_RUN_ARGS')
+    command = getenv('CONTAINER_CMD')
+    pull_retries = int(getenv('PULL_RETRIES', '1'))
+    pull_delay = int(getenv('PULL_RETRY_DELAY', '5'))
+    for attempt in range(1, pull_retries + 1):
+        log(f"Pulling image (attempt {attempt}/{pull_retries}): {image}")
+        res = run_cmd(['docker', 'pull', image], check=False)
+        if res.returncode == 0:
+            break
+        if attempt < pull_retries:
+            time.sleep(pull_delay)
+        else:
+            sys.exit(res.returncode)
+    if get_container_id(container_name):
+        log(f"Removing existing container: {container_name}")
+        run_cmd(['docker', 'rm', '-f', container_name], check=False)
+    run_cmd_list = ['docker', 'run', '-d', '--name', container_name, '--restart', restart_policy]
+    if network:
+        run_cmd_list += ['--network', network]
+    for p in ports:
+        run_cmd_list += ['-p', p]
+    for k, v in env_vars:
+        run_cmd_list += ['-e', f'{k}={v}']
+    for v in volumes:
+        run_cmd_list += ['-v', v]
+    if extra_args:
+        run_cmd_list += shlex.split(extra_args)
+    run_cmd_list.append(image)
+    if command:
+        run_cmd_list += shlex.split(command)
+    run_cmd(run_cmd_list)
+    if getenv('WAIT_FOR_HEALTH', 'true').lower() in ('1', 'true', 'yes'):
+        timeout = int(getenv('HEALTH_TIMEOUT', '60'))
+        if not wait_for_health(container_name, timeout):
+            log("Deployment failed during health check")
+            sys.exit(1)
+    log("Deployment successful")
+
+if __name__ == '__main__':
+    main()
