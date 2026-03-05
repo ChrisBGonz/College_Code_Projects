@@ -1,0 +1,186 @@
+using System;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+
+public class DeleteUserRequest
+{
+    public string UserId { get; set; }
+    public bool HardDelete { get; set; }
+    public string RowVersion { get; set; }
+    public string Nonce { get; set; }
+}
+
+public interface IAuditLogger
+{
+    Task LogAsync(AuditLogEntry entry, CancellationToken ct = default);
+}
+
+public class AuditLogEntry
+{
+    public string Action { get; set; }
+    public string OperatorId { get; set; }
+    public string TargetId { get; set; }
+    public DateTimeOffset Timestamp { get; set; }
+    public string Result { get; set; }
+    public string IpAddress { get; set; }
+    public string UserAgent { get; set; }
+}
+
+public interface INonceStore
+{
+    Task<bool> TryConsumeAsync(string nonce, string operatorId, CancellationToken ct = default);
+}
+
+public class ApplicationUser : IdentityUser
+{
+    public bool IsDeleted { get; set; }
+    public DateTimeOffset? DeletedAt { get; set; }
+    public string DeletedById { get; set; }
+    public byte[] RowVersion { get; set; }
+}
+
+public class ApplicationDbContext : DbContext
+{
+    public DbSet<ApplicationUser> Users { get; set; }
+}
+
+[Authorize]
+public class UserAdminController : Controller
+{
+    private readonly ApplicationDbContext _db;
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly IAuditLogger _auditLogger;
+    private readonly INonceStore _nonceStore;
+    private readonly ILogger<UserAdminController> _logger;
+
+    public UserAdminController(
+        ApplicationDbContext db,
+        UserManager<ApplicationUser> userManager,
+        IAuditLogger auditLogger,
+        INonceStore nonceStore,
+        ILogger<UserAdminController> logger)
+    {
+        _db = db;
+        _userManager = userManager;
+        _auditLogger = auditLogger;
+        _nonceStore = nonceStore;
+        _logger = logger;
+    }
+
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> DeleteUser([FromBody] DeleteUserRequest request, CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        string result = "Failed";
+        string operatorId = User?.Identity?.IsAuthenticated == true ? _userManager.GetUserId(User) : null;
+
+        try
+        {
+            if (request == null)
+                return BadRequest("Request body is required.");
+            if (string.IsNullOrWhiteSpace(request.UserId))
+                return BadRequest("Invalid user ID.");
+            if (string.IsNullOrWhiteSpace(request.Nonce))
+                return BadRequest("Missing request token.");
+            if (string.IsNullOrWhiteSpace(operatorId))
+                return Unauthorized("Not authenticated.");
+            if (!await _nonceStore.TryConsumeAsync(request.Nonce, operatorId, ct))
+                return Unauthorized("Invalid or expired request token.");
+
+            var operatorUser = await _userManager.GetUserAsync(User);
+            if (operatorUser == null)
+                return Unauthorized("Not authenticated.");
+
+            var isAdmin = await _userManager.IsInRoleAsync(operatorUser, "Admin");
+            if (!isAdmin)
+            {
+                result = "Denied: insufficient privileges";
+                return Forbid("Administrator permission required.");
+            }
+
+            if (operatorUser.Id == request.UserId)
+                return BadRequest("You cannot delete yourself.");
+
+            var targetUser = await _db.Users.FirstOrDefaultAsync(u => u.Id == request.UserId, ct);
+            if (targetUser == null || targetUser.IsDeleted)
+                return NotFound("User not found.");
+
+            var targetIsAdmin = await _userManager.IsInRoleAsync(targetUser, "Admin");
+            if (targetIsAdmin && targetUser.Id != operatorUser.Id)
+            {
+                result = "Denied: target is admin";
+                return Forbid("Cannot delete another administrator.");
+            }
+
+            if (string.IsNullOrWhiteSpace(request.RowVersion))
+                return BadRequest("Row version is required for concurrency control.");
+
+            byte[] rowVersion;
+            try
+            {
+                rowVersion = Convert.FromBase64String(request.RowVersion);
+            }
+            catch
+            {
+                return BadRequest("Invalid row version.");
+            }
+
+            if (targetUser.RowVersion == null || !targetUser.RowVersion.SequenceEqual(rowVersion))
+                return Conflict("The user record has been modified. Please refresh and try again.");
+
+            if (!request.HardDelete)
+            {
+                targetUser.IsDeleted = true;
+                targetUser.DeletedAt = now;
+                targetUser.DeletedById = operatorUser.Id;
+                _db.Users.Update(targetUser);
+            }
+            else
+            {
+                _db.Users.Remove(targetUser);
+            }
+
+            await _db.SaveChangesAsync(ct);
+
+            result = "Success";
+            return Ok(new { message = "User deleted." });
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            result = "Concurrency error";
+            return Conflict("The user record has been modified. Please retry.");
+        }
+        catch (Exception ex)
+        {
+            result = "Error";
+            _logger?.LogError(ex, "DeleteUser failed");
+            return StatusCode(500, "Failed to delete user.");
+        }
+        finally
+        {
+            try
+            {
+                await _auditLogger.LogAsync(new AuditLogEntry
+                {
+                    Action = "DeleteUser",
+                    OperatorId = operatorId,
+                    TargetId = request?.UserId,
+                    Timestamp = now,
+                    Result = result,
+                    IpAddress = HttpContext?.Connection?.RemoteIpAddress?.ToString(),
+                    UserAgent = HttpContext?.Request?.Headers["User-Agent"].ToString()
+                }, ct);
+            }
+            catch
+            {
+            }
+        }
+    }
+}

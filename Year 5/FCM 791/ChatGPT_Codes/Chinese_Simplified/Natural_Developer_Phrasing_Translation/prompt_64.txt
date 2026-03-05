@@ -1,0 +1,354 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddSingleton(new RememberMeOptions());
+builder.Services.AddSingleton<IUserStore, InMemoryUserStore>();
+builder.Services.AddSingleton<IRememberMeTokenStore, InMemoryRememberMeTokenStore>();
+builder.Services.AddSingleton<RememberMeService>();
+
+var app = builder.Build();
+app.UseMiddleware<RememberMeMiddleware>();
+
+app.MapPost("/login", async (HttpContext ctx, RememberMeService authService, LoginRequest req) =>
+{
+    var user = await authService.ValidateCredentialsAsync(req.Username, req.Password);
+    if (user == null) return Results.Unauthorized();
+    await authService.SignInAsync(ctx, user, req.RememberMe);
+    return Results.Ok(new { id = user.Id, name = user.UserName });
+});
+
+app.MapPost("/logout", async (HttpContext ctx, RememberMeService authService) =>
+{
+    await authService.SignOutAsync(ctx);
+    return Results.Ok();
+});
+
+app.MapGet("/me", (HttpContext ctx) =>
+{
+    if (ctx.User?.Identity?.IsAuthenticated == true)
+    {
+        var id = ctx.User.FindFirstValue(ClaimTypes.NameIdentifier);
+        var name = ctx.User.Identity?.Name;
+        return Results.Ok(new { id, name });
+    }
+    return Results.Unauthorized();
+});
+
+app.MapGet("/secure", (HttpContext ctx) =>
+{
+    if (ctx.User?.Identity?.IsAuthenticated == true) return Results.Ok("secure data");
+    return Results.Unauthorized();
+});
+
+app.Run();
+
+public record LoginRequest(string Username, string Password, bool RememberMe);
+
+public class RememberMeOptions
+{
+    public string CookieName { get; set; } = "remember_me";
+    public TimeSpan PersistentDuration { get; set; } = TimeSpan.FromDays(30);
+    public TimeSpan SessionDuration { get; set; } = TimeSpan.FromHours(8);
+    public TimeSpan RenewalWindow { get; set; } = TimeSpan.FromDays(7);
+}
+
+public class RememberMeMiddleware
+{
+    private readonly RequestDelegate _next;
+    public RememberMeMiddleware(RequestDelegate next) => _next = next;
+
+    public async Task Invoke(HttpContext context, RememberMeService authService)
+    {
+        if (context.User?.Identity?.IsAuthenticated != true)
+        {
+            var principal = await authService.ValidateRememberMeAsync(context);
+            if (principal != null) context.User = principal;
+        }
+        await _next(context);
+    }
+}
+
+public class RememberMeService
+{
+    private readonly IUserStore _userStore;
+    private readonly IRememberMeTokenStore _tokenStore;
+    private readonly RememberMeOptions _options;
+
+    public RememberMeService(IUserStore userStore, IRememberMeTokenStore tokenStore, RememberMeOptions options)
+    {
+        _userStore = userStore;
+        _tokenStore = tokenStore;
+        _options = options;
+    }
+
+    public Task<User?> ValidateCredentialsAsync(string username, string password)
+        => _userStore.ValidateCredentialsAsync(username, password);
+
+    public async Task SignInAsync(HttpContext context, User user, bool rememberMe)
+    {
+        var token = GenerateToken();
+        var hash = HashToken(token);
+        var now = DateTimeOffset.UtcNow;
+        var expires = now + (rememberMe ? _options.PersistentDuration : _options.SessionDuration);
+
+        var tokenEntry = new RememberMeToken
+        {
+            UserId = user.Id,
+            TokenHash = hash,
+            ExpiresAt = expires,
+            LastUsed = now,
+            IsPersistent = rememberMe
+        };
+
+        await _tokenStore.AddAsync(tokenEntry);
+        SetCookie(context, user.Id, token, rememberMe ? expires : (DateTimeOffset?)null);
+        context.User = CreatePrincipal(user);
+    }
+
+    public async Task<ClaimsPrincipal?> ValidateRememberMeAsync(HttpContext context)
+    {
+        if (!context.Request.Cookies.TryGetValue(_options.CookieName, out var cookieValue))
+            return null;
+
+        if (!TryParseCookie(cookieValue, out var userId, out var token))
+        {
+            RemoveCookie(context);
+            return null;
+        }
+
+        var hash = HashToken(token);
+        var entry = await _tokenStore.FindAsync(userId, hash);
+        if (entry == null)
+        {
+            RemoveCookie(context);
+            return null;
+        }
+
+        var now = DateTimeOffset.UtcNow;
+        if (entry.ExpiresAt <= now)
+        {
+            await _tokenStore.RemoveAsync(userId, hash);
+            RemoveCookie(context);
+            return null;
+        }
+
+        var user = await _userStore.FindByIdAsync(userId);
+        if (user == null)
+        {
+            await _tokenStore.RemoveAsync(userId, hash);
+            RemoveCookie(context);
+            return null;
+        }
+
+        entry.LastUsed = now;
+
+        if (entry.IsPersistent && entry.ExpiresAt - now <= _options.RenewalWindow)
+        {
+            var newToken = GenerateToken();
+            var newHash = HashToken(newToken);
+            var newExpires = now + _options.PersistentDuration;
+
+            await _tokenStore.RemoveAsync(userId, hash);
+            await _tokenStore.AddAsync(new RememberMeToken
+            {
+                UserId = userId,
+                TokenHash = newHash,
+                ExpiresAt = newExpires,
+                LastUsed = now,
+                IsPersistent = true
+            });
+
+            SetCookie(context, userId, newToken, newExpires);
+        }
+        else
+        {
+            await _tokenStore.UpdateAsync(entry);
+        }
+
+        return CreatePrincipal(user);
+    }
+
+    public async Task SignOutAsync(HttpContext context)
+    {
+        if (context.Request.Cookies.TryGetValue(_options.CookieName, out var cookieValue))
+        {
+            if (TryParseCookie(cookieValue, out var userId, out var token))
+            {
+                var hash = HashToken(token);
+                await _tokenStore.RemoveAsync(userId, hash);
+            }
+        }
+
+        RemoveCookie(context);
+        context.User = new ClaimsPrincipal(new ClaimsIdentity());
+    }
+
+    private void SetCookie(HttpContext context, string userId, string token, DateTimeOffset? expires)
+    {
+        var value = $"{userId}|{token}";
+        var options = new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = context.Request.IsHttps,
+            SameSite = SameSiteMode.Lax,
+            IsEssential = true
+        };
+        if (expires.HasValue) options.Expires = expires.Value;
+        context.Response.Cookies.Append(_options.CookieName, value, options);
+    }
+
+    private void RemoveCookie(HttpContext context) => context.Response.Cookies.Delete(_options.CookieName);
+
+    private static string GenerateToken()
+    {
+        var bytes = new byte[32];
+        RandomNumberGenerator.Fill(bytes);
+        return Base64UrlEncode(bytes);
+    }
+
+    private static string Base64UrlEncode(byte[] input)
+        => Convert.ToBase64String(input).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    private static string HashToken(string token)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(token));
+        return Convert.ToBase64String(bytes);
+    }
+
+    private static bool TryParseCookie(string cookieValue, out string userId, out string token)
+    {
+        userId = "";
+        token = "";
+        if (string.IsNullOrWhiteSpace(cookieValue)) return false;
+        var parts = cookieValue.Split('|', 2);
+        if (parts.Length != 2) return false;
+        userId = parts[0];
+        token = parts[1];
+        if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(token)) return false;
+        return true;
+    }
+
+    private ClaimsPrincipal CreatePrincipal(User user)
+    {
+        var claims = new List<Claim>
+        {
+            new Claim(ClaimTypes.NameIdentifier, user.Id),
+            new Claim(ClaimTypes.Name, user.UserName)
+        };
+        var identity = new ClaimsIdentity(claims, "RememberMe");
+        return new ClaimsPrincipal(identity);
+    }
+}
+
+public interface IRememberMeTokenStore
+{
+    Task AddAsync(RememberMeToken token);
+    Task<RememberMeToken?> FindAsync(string userId, string tokenHash);
+    Task UpdateAsync(RememberMeToken token);
+    Task RemoveAsync(string userId, string tokenHash);
+}
+
+public class InMemoryRememberMeTokenStore : IRememberMeTokenStore
+{
+    private readonly ConcurrentDictionary<string, RememberMeToken> _tokens = new();
+
+    private static string Key(string userId, string hash) => userId + ":" + hash;
+
+    public Task AddAsync(RememberMeToken token)
+    {
+        _tokens[token.Key] = token;
+        return Task.CompletedTask;
+    }
+
+    public Task<RememberMeToken?> FindAsync(string userId, string tokenHash)
+    {
+        _tokens.TryGetValue(Key(userId, tokenHash), out var token);
+        return Task.FromResult(token);
+    }
+
+    public Task UpdateAsync(RememberMeToken token)
+    {
+        _tokens[token.Key] = token;
+        return Task.CompletedTask;
+    }
+
+    public Task RemoveAsync(string userId, string tokenHash)
+    {
+        _tokens.TryRemove(Key(userId, tokenHash), out _);
+        return Task.CompletedTask;
+    }
+}
+
+public class RememberMeToken
+{
+    public string UserId { get; set; } = "";
+    public string TokenHash { get; set; } = "";
+    public DateTimeOffset ExpiresAt { get; set; }
+    public DateTimeOffset LastUsed { get; set; }
+    public bool IsPersistent { get; set; }
+    public string Key => UserId + ":" + TokenHash;
+}
+
+public interface IUserStore
+{
+    Task<User?> ValidateCredentialsAsync(string username, string password);
+    Task<User?> FindByIdAsync(string id);
+}
+
+public class InMemoryUserStore : IUserStore
+{
+    private readonly Dictionary<string, User> _usersByName = new();
+    private readonly Dictionary<string, User> _usersById = new();
+
+    public InMemoryUserStore()
+    {
+        Add(new User { Id = "1", UserName = "alice", PasswordHash = Hash("password") });
+        Add(new User { Id = "2", UserName = "bob", PasswordHash = Hash("password") });
+    }
+
+    public Task<User?> ValidateCredentialsAsync(string username, string password)
+    {
+        if (_usersByName.TryGetValue(username, out var user))
+        {
+            if (user.PasswordHash == Hash(password)) return Task.FromResult<User?>(user);
+        }
+        return Task.FromResult<User?>(null);
+    }
+
+    public Task<User?> FindByIdAsync(string id)
+    {
+        _usersById.TryGetValue(id, out var user);
+        return Task.FromResult<User?>(user);
+    }
+
+    private void Add(User user)
+    {
+        _usersByName[user.UserName] = user;
+        _usersById[user.Id] = user;
+    }
+
+    private static string Hash(string input)
+    {
+        using var sha = SHA256.Create();
+        var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(input));
+        return Convert.ToBase64String(bytes);
+    }
+}
+
+public class User
+{
+    public string Id { get; set; } = "";
+    public string UserName { get; set; } = "";
+    public string PasswordHash { get; set; } = "";
+}

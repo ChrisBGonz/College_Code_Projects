@@ -1,0 +1,172 @@
+import socket
+import argparse
+import sys
+
+MAGIC = b'LGCY'
+MSG_HELLO = 0x01
+MSG_HELLO_ACK = 0x02
+MSG_DATA = 0x03
+MSG_DATA_ACK = 0x04
+MSG_BYE = 0x05
+MSG_ERROR = 0xFF
+
+def xor_bytes(data, key):
+    if not key:
+        return data
+    if isinstance(key, str):
+        key = key.encode()
+    key_len = len(key)
+    return bytes(b ^ key[i % key_len] for i, b in enumerate(data))
+
+def recvall(sock, n):
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf.extend(chunk)
+    return bytes(buf)
+
+class LegacyClient:
+    def __init__(self, host, port, key, timeout=10):
+        self.host = host
+        self.port = port
+        self.key = key
+        self.timeout = timeout
+        self.sock = None
+
+    def connect(self):
+        self.sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock.settimeout(self.timeout)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def send_packet(self, msg_type, payload=b''):
+        if isinstance(payload, str):
+            payload = payload.encode()
+        data = bytes([msg_type]) + payload
+        encrypted = xor_bytes(data, self.key)
+        header = MAGIC + len(encrypted).to_bytes(4, 'big')
+        self.sock.sendall(header + encrypted)
+
+    def recv_packet(self):
+        header = recvall(self.sock, 8)
+        if header is None:
+            return None, None
+        if header[:4] != MAGIC:
+            raise ValueError("Invalid magic header")
+        length = int.from_bytes(header[4:], 'big')
+        if length == 0:
+            return None, b''
+        encrypted = recvall(self.sock, length)
+        if encrypted is None:
+            return None, None
+        data = xor_bytes(encrypted, self.key)
+        if not data:
+            return None, b''
+        return data[0], data[1:]
+
+    def handshake(self, client_id):
+        self.send_packet(MSG_HELLO, client_id)
+        try:
+            msg_type, payload = self.recv_packet()
+        except socket.timeout:
+            return False
+        return msg_type == MSG_HELLO_ACK
+
+    def send_data(self, text):
+        self.send_packet(MSG_DATA, text)
+
+    def recv_data(self):
+        msg_type, payload = self.recv_packet()
+        if msg_type is None:
+            return None
+        if msg_type == MSG_ERROR:
+            return payload
+        if msg_type in (MSG_DATA, MSG_DATA_ACK):
+            return payload
+        return payload
+
+def interactive(client):
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        line = line.rstrip('\n')
+        if line.lower() in ('quit', 'exit'):
+            try:
+                client.send_packet(MSG_BYE, b'')
+            except Exception:
+                pass
+            break
+        client.send_data(line)
+        try:
+            resp = client.recv_data()
+        except Exception:
+            break
+        if resp is None:
+            break
+        try:
+            text = resp.decode()
+        except Exception:
+            text = resp.decode(errors='replace')
+        sys.stdout.write(text + '\n')
+        sys.stdout.flush()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('host')
+    parser.add_argument('port', type=int)
+    parser.add_argument('-k', '--key', default='legacy-key')
+    parser.add_argument('-m', '--message')
+    parser.add_argument('--id', default='python-client')
+    parser.add_argument('--no-handshake', action='store_true')
+    parser.add_argument('--timeout', type=float, default=10)
+    args = parser.parse_args()
+
+    client = LegacyClient(args.host, args.port, args.key, args.timeout)
+    try:
+        client.connect()
+    except Exception as e:
+        sys.stderr.write(str(e) + '\n')
+        return 1
+
+    if not args.no_handshake:
+        try:
+            client.handshake(args.id)
+        except Exception:
+            pass
+
+    try:
+        if args.message is not None:
+            client.send_data(args.message)
+            try:
+                resp = client.recv_data()
+            except Exception:
+                resp = None
+            if resp is not None:
+                try:
+                    sys.stdout.buffer.write(resp + b'\n')
+                except Exception:
+                    try:
+                        sys.stdout.write(resp.decode(errors='replace') + '\n')
+                    except Exception:
+                        pass
+        else:
+            interactive(client)
+    finally:
+        client.close()
+    return 0
+
+if __name__ == '__main__':
+    sys.exit(main())

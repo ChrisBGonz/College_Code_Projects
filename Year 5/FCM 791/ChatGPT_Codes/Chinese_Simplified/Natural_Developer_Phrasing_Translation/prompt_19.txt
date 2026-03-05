@@ -1,0 +1,64 @@
+import logging
+import uuid
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+try:
+    from sqlalchemy.exc import OperationalError, DatabaseError
+except Exception:
+    class OperationalError(Exception):
+        pass
+    class DatabaseError(Exception):
+        pass
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("fastapi_app")
+
+class DBConnectionError(Exception):
+    def __init__(self, message="Database connection error", code=None):
+        self.message = message
+        self.code = code
+        super().__init__(message)
+
+def get_trace_id(request: Request):
+    trace_id = request.headers.get("X-Trace-Id")
+    if not trace_id:
+        trace_id = str(uuid.uuid4())
+    return trace_id
+
+def error_response(message, trace_id=None, code=None):
+    error = {"message": message}
+    if code is not None:
+        error["code"] = code
+    if trace_id is not None:
+        error["trace_id"] = trace_id
+    return {"error": error}
+
+app = FastAPI()
+
+@app.exception_handler(DBConnectionError)
+async def db_connection_error_handler(request: Request, exc: DBConnectionError):
+    trace_id = get_trace_id(request)
+    logger.error("DB connection error: %s", exc.message, exc_info=exc, extra={"trace_id": trace_id})
+    code = exc.code or "DB_CONN_ERROR"
+    return JSONResponse(status_code=503, content=error_response(exc.message, trace_id, code))
+
+@app.exception_handler(OperationalError)
+async def sqlalchemy_operational_error_handler(request: Request, exc: OperationalError):
+    trace_id = get_trace_id(request)
+    logger.error("OperationalError (DB connection): %s", str(exc), exc_info=exc, extra={"trace_id": trace_id})
+    return JSONResponse(status_code=503, content=error_response("Database connection error", trace_id, "DB_CONN_ERROR"))
+
+@app.exception_handler(DatabaseError)
+async def sqlalchemy_database_error_handler(request: Request, exc: DatabaseError):
+    trace_id = get_trace_id(request)
+    logger.error("DatabaseError: %s", str(exc), exc_info=exc, extra={"trace_id": trace_id})
+    return JSONResponse(status_code=500, content=error_response("Database error", trace_id, "DB_ERROR"))
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.get("/simulate_db_error")
+async def simulate_db_error():
+    raise DBConnectionError()

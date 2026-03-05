@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+TOOL="${TOOL:-trivy}"
+REPO="${REPO:-aquasecurity/trivy}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+API_URL="https://api.github.com/repos/$REPO/releases/latest"
+QUIET=0
+FORCE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -f|--force) FORCE=1;;
+    -q|--quiet) QUIET=1;;
+    *) ;;
+  esac
+  shift
+done
+
+log() { [[ "$QUIET" -eq 1 ]] || printf '%s\n' "$*" >&2; }
+die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+for cmd in curl tar grep awk sed uname mktemp find install; do need_cmd "$cmd"; done
+
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA_CMD="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  die "missing sha256 utility"
+fi
+
+get_latest_version() {
+  local json tag
+  local headers=(-H "Accept: application/vnd.github+json" -H "User-Agent: ${TOOL}-installer")
+  if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+    headers+=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+  fi
+  json=$(curl -fsSL "${headers[@]}" "$API_URL") || return 1
+  if command -v jq >/dev/null 2>&1; then
+    tag=$(printf '%s' "$json" | jq -r '.tag_name // empty')
+  else
+    tag=$(printf '%s' "$json" | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+  fi
+  tag=${tag#v}
+  printf '%s' "$tag"
+}
+
+VERSION=$(get_latest_version) || die "unable to fetch latest version"
+[[ -n "$VERSION" ]] || die "latest version is empty"
+
+OS=$(uname -s)
+ARCH=$(uname -m)
+
+case "$OS" in
+  Linux) OS_TAG="Linux";;
+  Darwin) OS_TAG="macOS";;
+  *) die "unsupported OS: $OS";;
+esac
+
+case "$ARCH" in
+  x86_64|amd64) ARCH_TAG="64bit";;
+  aarch64|arm64) ARCH_TAG="ARM64";;
+  armv7l|armv6l) ARCH_TAG="ARM";;
+  *) die "unsupported architecture: $ARCH";;
+esac
+
+ASSET="${TOOL}_${VERSION}_${OS_TAG}-${ARCH_TAG}.tar.gz"
+CHECKSUMS="${TOOL}_${VERSION}_checksums.txt"
+BASE_URL="https://github.com/$REPO/releases/download/v${VERSION}"
+DOWNLOAD_URL="${BASE_URL}/${ASSET}"
+CHECKSUM_URL="${BASE_URL}/${CHECKSUMS}"
+
+INSTALLED_VER=""
+if command -v "$TOOL" >/dev/null 2>&1; then
+  INSTALLED_VER=$("$TOOL" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+fi
+if [[ "$FORCE" -eq 0 && -n "$INSTALLED_VER" && "$INSTALLED_VER" == "$VERSION" ]]; then
+  log "$TOOL $VERSION already installed"
+  exit 0
+fi
+
+TMP=$(mktemp -d)
+cleanup(){ rm -rf "$TMP"; }
+trap cleanup EXIT INT TERM
+
+log "Downloading $TOOL $VERSION"
+curl -fsSL -o "$TMP/$ASSET" "$DOWNLOAD_URL" || die "download failed: $DOWNLOAD_URL"
+
+if curl -fsSL -o "$TMP/$CHECKSUMS" "$CHECKSUM_URL"; then
+  expected=$(grep " $ASSET" "$TMP/$CHECKSUMS" | awk '{print $1}' || true)
+  if [[ -n "$expected" ]]; then
+    actual=$($SHA_CMD "$TMP/$ASSET" | awk '{print $1}')
+    [[ "$expected" == "$actual" ]] || die "checksum mismatch"
+  else
+    log "checksum entry not found, skipping verification"
+  fi
+else
+  log "checksum file download failed, skipping verification"
+fi
+
+tar -xzf "$TMP/$ASSET" -C "$TMP"
+
+BIN_PATH=$(find "$TMP" -maxdepth 2 -type f -name "$TOOL" -perm -u+x | head -n1 || true)
+[[ -n "$BIN_PATH" ]] || die "binary not found in archive"
+
+if [[ ! -w "$INSTALL_DIR" ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    die "no write permission to $INSTALL_DIR and sudo not available"
+  fi
+else
+  SUDO=""
+fi
+
+$SUDO install -m 0755 "$BIN_PATH" "$INSTALL_DIR/$TOOL"
+
+NEW_VER=$("$INSTALL_DIR/$TOOL" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)
+if [[ -n "$NEW_VER" && "$NEW_VER" != "$VERSION" ]]; then
+  log "installed version $NEW_VER differs from expected $VERSION"
+fi
+
+OPTIONAL_DEPS=(git rpm dpkg docker podman)
+for dep in "${OPTIONAL_DEPS[@]}"; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    log "optional dependency not found: $dep"
+  fi
+done
+
+log "$TOOL installation completed"
+exit 0

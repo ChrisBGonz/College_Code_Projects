@@ -1,0 +1,103 @@
+#include <cstdio>
+#include <vector>
+#include <setjmp.h>
+
+extern "C" {
+#include <jpeglib.h>
+}
+
+struct JpegErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void jpegErrorExit(j_common_ptr cinfo) {
+    JpegErrorManager* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    longjmp(err->setjmp_buffer, 1);
+}
+
+bool ProcessImageWithLibjpeg(const char* inputPath, const char* outputPath) {
+    FILE* infile = std::fopen(inputPath, "rb");
+    if (!infile) return false;
+
+    jpeg_decompress_struct dinfo;
+    JpegErrorManager jerr;
+    dinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&dinfo);
+        std::fclose(infile);
+        return false;
+    }
+
+    jpeg_create_decompress(&dinfo);
+    jpeg_stdio_src(&dinfo, infile);
+    jpeg_read_header(&dinfo, TRUE);
+    dinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&dinfo);
+
+    int width = dinfo.output_width;
+    int height = dinfo.output_height;
+    int channels = dinfo.output_components;
+    int row_stride = width * channels;
+
+    std::vector<unsigned char> rgb(width * height * channels);
+
+    while (dinfo.output_scanline < dinfo.output_height) {
+        JSAMPROW row_pointer[1];
+        row_pointer[0] = &rgb[dinfo.output_scanline * row_stride];
+        jpeg_read_scanlines(&dinfo, row_pointer, 1);
+    }
+
+    jpeg_finish_decompress(&dinfo);
+    jpeg_destroy_decompress(&dinfo);
+    std::fclose(infile);
+
+    std::vector<unsigned char> gray(width * height);
+    for (int i = 0, j = 0; i < width * height; ++i, j += 3) {
+        unsigned char r = rgb[j];
+        unsigned char g = rgb[j + 1];
+        unsigned char b = rgb[j + 2];
+        gray[i] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+    }
+
+    FILE* outfile = std::fopen(outputPath, "wb");
+    if (!outfile) return false;
+
+    jpeg_compress_struct cinfo;
+    JpegErrorManager jerr2;
+    cinfo.err = jpeg_std_error(&jerr2.pub);
+    jerr2.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr2.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        std::fclose(outfile);
+        return false;
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 90, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int row_stride_out = width;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row_pointer[1];
+        row_pointer[0] = &gray[cinfo.next_scanline * row_stride_out];
+        jpeg_write_scanlines(&cinfo, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    std::fclose(outfile);
+
+    return true;
+}

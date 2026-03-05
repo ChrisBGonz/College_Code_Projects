@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import subprocess
+import sys
+import shlex
+import logging
+import re
+
+def normalize_registry(registry):
+    if not registry:
+        return None
+    reg = registry.strip()
+    if reg.startswith("http://"):
+        reg = reg[7:]
+    elif reg.startswith("https://"):
+        reg = reg[8:]
+    return reg.rstrip('/')
+
+def parse_list(value):
+    if not value:
+        return []
+    if isinstance(value, list):
+        return list(value)
+    value = value.strip()
+    if not value:
+        return []
+    if ',' in value:
+        parts = []
+        for p in value.split(','):
+            p = p.strip()
+            if p:
+                parts.append(p)
+        return parts
+    return shlex.split(value)
+
+def run_cmd(cmd, dry_run=False, input_data=None, check=True, capture=False):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = list(cmd)
+    logging.info("Running: %s", " ".join(shlex.quote(c) for c in cmd_list))
+    if dry_run:
+        return None
+    kwargs = {"universal_newlines": True}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    result = subprocess.run(cmd_list, input=input_data, **kwargs)
+    if check and result.returncode != 0:
+        err = ""
+        if capture:
+            if result.stderr:
+                err = result.stderr.strip()
+            elif result.stdout:
+                err = result.stdout.strip()
+        raise RuntimeError(err or f"Command failed with exit code {result.returncode}")
+    return result
+
+def docker_login(registry, username, password, dry_run=False):
+    if not username or not password:
+        logging.info("Docker credentials not provided, skipping login.")
+        return
+    cmd = ["docker", "login"]
+    if registry:
+        cmd.append(registry)
+    cmd += ["-u", username, "--password-stdin"]
+    run_cmd(cmd, dry_run=dry_run, input_data=password + "\n", check=True, capture=True)
+    logging.info("Docker login succeeded.")
+
+def is_fully_qualified(image):
+    first = image.split('/')[0]
+    return '.' in first or ':' in first or first == 'localhost'
+
+def prefix_registry(image, registry):
+    if not registry:
+        return image
+    reg = registry.rstrip('/')
+    if image.startswith(reg + "/") or image == reg:
+        return image
+    if is_fully_qualified(image):
+        return image
+    return reg + "/" + image
+
+def image_with_tag(image, tag):
+    if '@' in image:
+        return image
+    last = image.split('/')[-1]
+    if ':' in last:
+        return image
+    if tag:
+        return f"{image}:{tag}"
+    return image
+
+def image_name_to_container(image):
+    base = image.split('/')[-1]
+    if '@' in base:
+        base = base.split('@')[0]
+    if ':' in base:
+        base = base.split(':')[0]
+    return base
+
+def container_exists(name):
+    pattern = f"^{re.escape(name)}$"
+    result = run_cmd(["docker", "ps", "-aq", "-f", f"name={pattern}"], capture=True, check=False)
+    if not result:
+        return False
+    return bool(result.stdout.strip())
+
+def stop_remove_container(name, dry_run=False):
+    if dry_run:
+        run_cmd(["docker", "stop", name], dry_run=True, check=False)
+        run_cmd(["docker", "rm", name], dry_run=True, check=False)
+        return
+    if not container_exists(name):
+        logging.info("Container %s does not exist.", name)
+        return
+    logging.info("Stopping container %s", name)
+    run_cmd(["docker", "stop", name], check=False)
+    logging.info("Removing container %s", name)
+    run_cmd(["docker", "rm", name], check=False)
+
+def build_run_command(image, name, ports, envs, env_files, volumes, network, restart, extra_args, command, detach=True):
+    cmd = ["docker", "run"]
+    if detach:
+        cmd.append("-d")
+    cmd += ["--name", name]
+    if restart:
+        cmd += ["--restart", restart]
+    for p in ports:
+        cmd += ["-p", p]
+    for e in envs:
+        cmd += ["-e", e]
+    for ef in env_files:
+        cmd += ["--env-file", ef]
+    for v in volumes:
+        cmd += ["-v", v]
+    if network:
+        cmd += ["--network", network]
+    if extra_args:
+        cmd += shlex.split(extra_args)
+    cmd.append(image)
+    if command:
+        cmd += command
+    return cmd
+
+def main():
+    parser = argparse.ArgumentParser(description="Pull and deploy a Docker image.")
+    parser.add_argument("--image", default=os.environ.get("IMAGE"), help="Image name")
+    parser.add_argument("--tag", default=os.environ.get("TAG", "latest"), help="Image tag")
+    parser.add_argument("--registry", default=os.environ.get("REGISTRY"), help="Registry URL")
+    parser.add_argument("--container-name", default=os.environ.get("CONTAINER_NAME"), help="Container name")
+    parser.add_argument("--port", dest="ports", action="append", default=[], help="Port mapping")
+    parser.add_argument("--env", dest="envs", action="append", default=[], help="Environment variable")
+    parser.add_argument("--env-file", dest="env_files", action="append", default=[], help="Env file path")
+    parser.add_argument("--volume", dest="volumes", action="append", default=[], help="Volume mapping")
+    parser.add_argument("--network", default=os.environ.get("NETWORK"), help="Docker network")
+    parser.add_argument("--restart", default=os.environ.get("RESTART", "always"), help="Restart policy")
+    parser.add_argument("--run-args", default=os.environ.get("RUN_ARGS"), help="Extra docker run args")
+    parser.add_argument("--pull-only", action="store_true", help="Only pull image")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    parser.add_argument("--no-detach", action="store_true", help="Run container in foreground")
+    parser.add_argument("--log-level", default=os.environ.get("LOG_LEVEL", "INFO"), help="Log level")
+    parser.add_argument("cmd", nargs=argparse.REMAINDER, help="Command to run in container")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=getattr(logging, args.log_level.upper(), logging.INFO),
+                        format="%(asctime)s %(levelname)s: %(message)s")
+
+    registry = normalize_registry(args.registry or os.environ.get("REGISTRY"))
+
+    image = args.image or os.environ.get("IMAGE")
+    if not image:
+        logging.error("Image name is required.")
+        sys.exit(1)
+
+    image = prefix_registry(image, registry)
+    image = image_with_tag(image, args.tag)
+
+    container_name = args.container_name or os.environ.get("CONTAINER_NAME")
+    if not container_name:
+        container_name = image_name_to_container(image)
+
+    ports = list(args.ports) + parse_list(os.environ.get("PORTS"))
+    envs = list(args.envs) + parse_list(os.environ.get("ENV_VARS")) + parse_list(os.environ.get("ENV"))
+    env_files = list(args.env_files) + parse_list(os.environ.get("ENV_FILES")) + parse_list(os.environ.get("ENV_FILE"))
+    volumes = list(args.volumes) + parse_list(os.environ.get("VOLUMES"))
+    network = args.network or os.environ.get("NETWORK")
+    restart = args.restart
+    extra_args = args.run_args or os.environ.get("RUN_ARGS")
+    detach = not args.no_detach
+
+    cmd = list(args.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        env_cmd = os.environ.get("CONTAINER_CMD")
+        if env_cmd:
+            cmd = shlex.split(env_cmd)
+
+    username = os.environ.get("DOCKER_USERNAME")
+    password = os.environ.get("DOCKER_PASSWORD")
+
+    try:
+        docker_login(registry, username, password, dry_run=args.dry_run)
+        logging.info("Pulling image %s", image)
+        run_cmd(["docker", "pull", image], dry_run=args.dry_run, check=True)
+        if args.pull_only:
+            logging.info("Pull-only mode, deployment skipped.")
+            return
+        stop_remove_container(container_name, dry_run=args.dry_run)
+        run_cmd(build_run_command(image, container_name, ports, envs, env_files, volumes, network, restart, extra_args, cmd, detach),
+                dry_run=args.dry_run, check=True)
+        logging.info("Deployment completed.")
+    except Exception as e:
+        logging.error("Deployment failed: %s", e)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

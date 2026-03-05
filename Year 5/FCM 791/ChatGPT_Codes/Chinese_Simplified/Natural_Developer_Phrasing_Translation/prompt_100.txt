@@ -1,0 +1,177 @@
+class CircuitBreakerError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'CircuitBreakerError';
+  }
+}
+
+class CircuitOpenError extends CircuitBreakerError {
+  constructor(message) {
+    super(message || 'Circuit is open');
+    this.name = 'CircuitOpenError';
+  }
+}
+
+class CircuitHalfOpenError extends CircuitBreakerError {
+  constructor(message) {
+    super(message || 'Circuit is half-open');
+    this.name = 'CircuitHalfOpenError';
+  }
+}
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    const {
+      failureThreshold = 5,
+      timeout = 10000,
+      cooldownTime = 30000,
+      halfOpenMax = 1
+    } = options;
+    this.failureThreshold = failureThreshold;
+    this.timeout = timeout;
+    this.cooldownTime = cooldownTime;
+    this.halfOpenMax = halfOpenMax;
+    this.state = 'CLOSED';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+    this.nextAttempt = 0;
+  }
+
+  exec(action) {
+    if (typeof action !== 'function') {
+      return Promise.reject(new Error('Action must be a function'));
+    }
+
+    const now = Date.now();
+
+    if (this.state === 'OPEN') {
+      if (now >= this.nextAttempt) {
+        this._halfOpen();
+      } else {
+        return Promise.reject(new CircuitOpenError());
+      }
+    }
+
+    if (this.state === 'HALF_OPEN') {
+      if (this.halfOpenAttempts >= this.halfOpenMax) {
+        return Promise.reject(new CircuitHalfOpenError());
+      }
+      this.halfOpenAttempts += 1;
+    }
+
+    let promise;
+    try {
+      promise = Promise.resolve(action());
+    } catch (err) {
+      promise = Promise.reject(err);
+    }
+
+    return this._withTimeout(promise, this.timeout)
+      .then(result => {
+        this._onSuccess();
+        return result;
+      })
+      .catch(err => {
+        this._onFailure();
+        throw err;
+      });
+  }
+
+  _withTimeout(promise, ms) {
+    if (!ms || ms <= 0 || ms === Infinity) {
+      return promise;
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Timeout'));
+      }, ms);
+      promise.then(
+        value => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        err => {
+          clearTimeout(timer);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  _onSuccess() {
+    if (this.state === 'HALF_OPEN') {
+      this.successCount += 1;
+      if (this.successCount >= this.halfOpenMax) {
+        this._close();
+      }
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === 'HALF_OPEN') {
+      this._open();
+    } else {
+      this.failureCount += 1;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+  }
+
+  _open() {
+    this.state = 'OPEN';
+    this.nextAttempt = Date.now() + this.cooldownTime;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  _halfOpen() {
+    this.state = 'HALF_OPEN';
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  _close() {
+    this.state = 'CLOSED';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  wrap(fn) {
+    return (...args) => this.exec(() => fn(...args));
+  }
+
+  wrapFetch(fetchImpl) {
+    const f = fetchImpl || (typeof fetch !== 'undefined' ? fetch.bind(typeof window !== 'undefined' ? window : null) : null);
+    if (!f) throw new Error('fetch is not available');
+    return (input, init) => this.exec(() => f(input, init));
+  }
+}
+
+function createCircuitBreakerFetch(options = {}, fetchImpl) {
+  const breaker = new CircuitBreaker(options);
+  const wrappedFetch = breaker.wrapFetch(fetchImpl);
+  wrappedFetch.breaker = breaker;
+  return wrappedFetch;
+}
+
+const fetchWithBreaker = createCircuitBreakerFetch({
+  failureThreshold: 3,
+  timeout: 5000,
+  cooldownTime: 10000,
+  halfOpenMax: 2
+});
+
+function getData() {
+  return fetchWithBreaker('/api/data')
+    .then(res => res.json());
+}
+
+getData()
+  .then(data => console.log('data:', data))
+  .catch(err => console.error('error:', err));

@@ -1,0 +1,200 @@
+import os
+import re
+import yaml
+from flask import Flask, request, jsonify, redirect, url_for, render_template_string
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'profiles')
+os.makedirs(DATA_DIR, exist_ok=True)
+
+profiles = {}
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Profile Config Upload</title>
+</head>
+<body>
+  <h1>Upload YAML Profile Config</h1>
+  {% if error %}<p style="color:red;">{{ error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+    <input type="file" name="file" accept=".yaml,.yml" required>
+    <button type="submit">Upload</button>
+  </form>
+  <h2>Profiles</h2>
+  <ul>
+  {% for username, profile in profiles.items() %}
+    <li><a href="{{ url_for('profile_view', username=username) }}">{{ username }}</a></li>
+  {% else %}
+    <li>No profiles</li>
+  {% endfor %}
+  </ul>
+</body>
+</html>
+"""
+
+PROFILE_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Profile {{ username }}</title>
+</head>
+<body>
+  <h1>Profile: {{ username }}</h1>
+  <pre>{{ profile_yaml }}</pre>
+  <a href="{{ url_for('index') }}">Back</a>
+</body>
+</html>
+"""
+
+ERROR_TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Error</title>
+</head>
+<body>
+  <h1>Error</h1>
+  <p>{{ message }}</p>
+  <a href="{{ url_for('index') }}">Back</a>
+</body>
+</html>
+"""
+
+USERNAME_RE = re.compile(r'[^a-zA-Z0-9_.-]+')
+
+def sanitize_username(username):
+    username = str(username).strip()
+    username = USERNAME_RE.sub('_', username)
+    return username
+
+def load_profiles():
+    profiles.clear()
+    for fname in os.listdir(DATA_DIR):
+        if not fname.lower().endswith(('.yaml', '.yml')):
+            continue
+        path = os.path.join(DATA_DIR, fname)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                continue
+            username = data.get('username') or os.path.splitext(fname)[0]
+            username = sanitize_username(username)
+            if not username:
+                continue
+            profile = dict(data)
+            profile.pop('username', None)
+            profiles[username] = profile
+        except Exception:
+            continue
+
+def save_profile(username, profile):
+    username = sanitize_username(username)
+    if not username:
+        return
+    data = dict(profile)
+    data['username'] = username
+    path = os.path.join(DATA_DIR, f"{username}.yaml")
+    with open(path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+
+def extract_profile(data, filename=None):
+    if not isinstance(data, dict):
+        raise ValueError("YAML 根节点必须是映射")
+    if 'profile' in data and isinstance(data['profile'], dict):
+        profile_data = data['profile']
+        username = data.get('username') or profile_data.get('username')
+    else:
+        profile_data = data
+        username = data.get('username')
+    if not username and filename:
+        username = os.path.splitext(os.path.basename(filename))[0]
+    if not username:
+        raise ValueError("缺少用户名(username)")
+    username = sanitize_username(username)
+    if not username:
+        raise ValueError("无效的用户名")
+    profile = dict(profile_data)
+    profile.pop('username', None)
+    return username, profile
+
+def wants_html():
+    best = request.accept_mimetypes.best
+    if best is None:
+        return True
+    return request.accept_mimetypes['text/html'] >= request.accept_mimetypes['application/json']
+
+def render_index(error=None):
+    return render_template_string(INDEX_TEMPLATE, profiles=profiles, error=error)
+
+def error_response(message, code=400, show_form=True):
+    if wants_html():
+        if show_form:
+            return render_index(error=message), code
+        return render_template_string(ERROR_TEMPLATE, message=message), code
+    return jsonify({'error': message}), code
+
+@app.route('/')
+def index():
+    return render_index()
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        return error_response("未找到上传文件", 400)
+    file = request.files['file']
+    if file.filename == '':
+        return error_response("未选择文件", 400)
+    filename = file.filename
+    if filename and not filename.lower().endswith(('.yaml', '.yml')):
+        return error_response("仅支持 YAML 文件(.yaml/.yml)", 400)
+    try:
+        raw = file.read()
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode('utf-8', errors='ignore')
+        data = yaml.safe_load(raw)
+    except Exception:
+        return error_response("YAML 解析失败", 400)
+    try:
+        username, profile = extract_profile(data, filename=filename)
+    except ValueError as e:
+        return error_response(str(e), 400)
+    profiles[username] = profile
+    save_profile(username, profile)
+    if wants_html():
+        return redirect(url_for('profile_view', username=username))
+    return jsonify({'status': 'ok', 'username': username, 'profile': profile})
+
+@app.route('/profile/<username>', methods=['GET'])
+def profile_view(username):
+    if username not in profiles:
+        username = sanitize_username(username)
+    profile = profiles.get(username)
+    if profile is None:
+        return error_response("未找到用户资料", 404, show_form=False)
+    if wants_html():
+        data = {'username': username}
+        if isinstance(profile, dict):
+            data.update(profile)
+        profile_yaml = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+        return render_template_string(PROFILE_TEMPLATE, username=username, profile=profile, profile_yaml=profile_yaml)
+    return jsonify({'username': username, 'profile': profile})
+
+@app.route('/profiles', methods=['GET'])
+def list_profiles():
+    if wants_html():
+        return render_index()
+    return jsonify({'profiles': profiles})
+
+load_profiles()
+
+if __name__ == '__main__':
+    app.run(debug=True)

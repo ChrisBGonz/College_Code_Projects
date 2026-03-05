@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+import os
+import sys
+import hashlib
+import argparse
+import fnmatch
+import re
+
+HEX_RE = re.compile(r'^[0-9a-fA-F]+$')
+
+def is_hex(s):
+    return bool(HEX_RE.match(s))
+
+def normalize_path(p):
+    p = p.strip()
+    if p.startswith('\ufeff'):
+        p = p.lstrip('\ufeff')
+    if len(p) >= 2 and p[0] == p[-1] and p[0] in ("'", '"'):
+        p = p[1:-1]
+    p = p.replace('\\', '/')
+    while p.startswith('./'):
+        p = p[2:]
+    p = os.path.normpath(p)
+    p = p.replace('\\', '/')
+    if p == '.':
+        return ''
+    return p
+
+def parse_manifest(path):
+    entries = []
+    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('\ufeff'):
+                line = line.lstrip('\ufeff')
+            hash_str = None
+            file_path = None
+            tokens = line.split()
+            if len(tokens) >= 2:
+                if is_hex(tokens[0]):
+                    hash_str = tokens[0]
+                    file_path = ' '.join(tokens[1:])
+                elif is_hex(tokens[-1]):
+                    hash_str = tokens[-1]
+                    file_path = ' '.join(tokens[:-1])
+            if hash_str is None:
+                for sep in (':', '='):
+                    if sep in line:
+                        parts = [p.strip() for p in line.split(sep, 1)]
+                        if len(parts) == 2:
+                            if is_hex(parts[0]):
+                                hash_str = parts[0]
+                                file_path = parts[1]
+                                break
+                            elif is_hex(parts[1]):
+                                hash_str = parts[1]
+                                file_path = parts[0]
+                                break
+            if not hash_str or not file_path:
+                continue
+            if file_path and file_path[0] in ('*', '?'):
+                file_path = file_path[1:]
+            file_path = normalize_path(file_path)
+            if not file_path:
+                continue
+            entries.append((file_path, hash_str.lower()))
+    return entries
+
+def guess_algo(hash_str):
+    length = len(hash_str)
+    mapping = {
+        32: 'md5',
+        40: 'sha1',
+        56: 'sha224',
+        64: 'sha256',
+        96: 'sha384',
+        128: 'sha512',
+    }
+    return mapping.get(length)
+
+def compute_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def has_wildcards(pat):
+    return any(ch in pat for ch in '*?[')
+
+def match_pattern(path, pat):
+    if fnmatch.fnmatch(path, pat):
+        return True
+    if not has_wildcards(pat):
+        if path == pat or path.startswith(pat + '/'):
+            return True
+    return False
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('manifest', nargs='?', default='manifest.txt')
+    parser.add_argument('-r', '--root', default=None)
+    parser.add_argument('-a', '--algo', default=None)
+    parser.add_argument('--no-extra', action='store_true')
+    parser.add_argument('--ignore', action='append', default=[])
+    parser.add_argument('--include-manifest', action='store_true')
+    args = parser.parse_args()
+
+    manifest_path = args.manifest
+    try:
+        entries = parse_manifest(manifest_path)
+    except FileNotFoundError:
+        sys.stderr.write(f'清单文件不存在: {manifest_path}\n')
+        return 2
+    except Exception as e:
+        sys.stderr.write(f'读取清单失败: {e}\n')
+        return 2
+
+    root_abs = os.path.abspath(args.root if args.root is not None else os.path.dirname(os.path.abspath(manifest_path)) or '.')
+
+    ignore_patterns = []
+    for pat in args.ignore:
+        for p in pat.split(','):
+            p = p.strip()
+            if not p:
+                continue
+            ignore_patterns.append(normalize_path(p))
+    if not args.include_manifest:
+        try:
+            manifest_rel = os.path.relpath(os.path.abspath(manifest_path), root_abs)
+            manifest_rel = normalize_path(manifest_rel)
+            if manifest_rel and not manifest_rel.startswith('..'):
+                ignore_patterns.append(manifest_rel)
+        except Exception:
+            pass
+
+    algo_override = args.algo.lower() if args.algo else None
+    if algo_override:
+        try:
+            hashlib.new(algo_override)
+        except Exception:
+            sys.stderr.write(f'未知的哈希算法: {algo_override}\n')
+            return 2
+
+    issues = False
+    manifest_set = set()
+    for path, expected in entries:
+        if not os.path.isabs(path):
+            manifest_set.add(path)
+        abs_path = path if os.path.isabs(path) else os.path.normpath(os.path.join(root_abs, *path.split('/')))
+        if not os.path.isfile(abs_path):
+            print(f'缺失 {path}')
+            issues = True
+            continue
+        algo = algo_override or guess_algo(expected)
+        if not algo:
+            sys.stderr.write(f'无法确定算法: {path}\n')
+            print(f'不匹配 {path}')
+            issues = True
+            continue
+        try:
+            actual = compute_hash(abs_path, algo).lower()
+        except Exception as e:
+            sys.stderr.write(f'{path}: {e}\n')
+            print(f'不匹配 {path}')
+            issues = True
+            continue
+        if actual == expected:
+            print(f'匹配 {path}')
+        else:
+            print(f'不匹配 {path}')
+            issues = True
+
+    if not args.no_extra:
+        def should_ignore(rel):
+            for pat in ignore_patterns:
+                if match_pattern(rel, pat):
+                    return True
+            return False
+
+        extras = []
+        for dirpath, dirnames, filenames in os.walk(root_abs):
+            rel_dir = os.path.relpath(dirpath, root_abs)
+            if rel_dir == '.':
+                rel_dir = ''
+            rel_dir = normalize_path(rel_dir) if rel_dir else ''
+            new_dirnames = []
+            for d in dirnames:
+                rel = d if not rel_dir else rel_dir + '/' + d
+                rel_norm = normalize_path(rel)
+                if should_ignore(rel_norm):
+                    continue
+                new_dirnames.append(d)
+            dirnames[:] = new_dirnames
+            for fn in filenames:
+                rel = fn if not rel_dir else rel_dir + '/' + fn
+                rel_norm = normalize_path(rel)
+                if should_ignore(rel_norm):
+                    continue
+                if rel_norm in manifest_set:
+                    continue
+                extras.append(rel_norm)
+        for rel in sorted(set(extras)):
+            print(f'多余 {rel}')
+            issues = True
+
+    return 1 if issues else 0
+
+if __name__ == '__main__':
+    sys.exit(main())

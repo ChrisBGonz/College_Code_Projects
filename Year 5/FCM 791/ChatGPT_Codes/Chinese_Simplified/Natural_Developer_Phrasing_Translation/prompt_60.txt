@@ -1,0 +1,222 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', true);
+
+const DATA_FILE = path.join(__dirname, 'voting-data.json');
+
+function generateId() {
+  return crypto.randomBytes(8).toString('hex');
+}
+
+function loadData() {
+  try {
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    const obj = JSON.parse(raw);
+    if (!obj.polls || typeof obj.polls !== 'object') obj.polls = {};
+    if (!obj.votes || typeof obj.votes !== 'object') obj.votes = {};
+    return obj;
+  } catch (e) {
+    return { polls: {}, votes: {} };
+  }
+}
+
+const data = loadData();
+
+function normalizeData() {
+  for (const id in data.polls) {
+    const poll = data.polls[id];
+    if (!poll.id) poll.id = id;
+    if (!Array.isArray(poll.options)) poll.options = [];
+    poll.options = poll.options.map(opt => {
+      const text = (opt && opt.text !== undefined ? opt.text : '').toString();
+      const votes = Number.isFinite(opt && opt.votes) ? opt.votes : 0;
+      const oid = opt && opt.id ? String(opt.id) : generateId();
+      return { id: oid, text: text, votes: votes };
+    });
+    if (!poll.rules || typeof poll.rules !== 'object') poll.rules = {};
+    if (!Number.isFinite(poll.rules.maxVotesPerIp) || poll.rules.maxVotesPerIp < 1) poll.rules.maxVotesPerIp = 1;
+    if (!Number.isFinite(poll.rules.windowMs) || poll.rules.windowMs < 0) poll.rules.windowMs = 0;
+    if (!data.votes[id] || typeof data.votes[id] !== 'object') data.votes[id] = {};
+  }
+}
+
+normalizeData();
+
+let saving = false;
+let pendingSave = false;
+function saveData() {
+  if (saving) {
+    pendingSave = true;
+    return;
+  }
+  saving = true;
+  fs.writeFile(DATA_FILE, JSON.stringify(data), err => {
+    saving = false;
+    if (pendingSave) {
+      pendingSave = false;
+      saveData();
+    }
+  });
+}
+
+function getClientIp(req) {
+  let ip = '';
+  const forwarded = req.headers['x-forwarded-for'];
+  const real = req.headers['x-real-ip'];
+  if (forwarded) {
+    ip = Array.isArray(forwarded) ? forwarded[0] : forwarded.split(',')[0];
+  } else if (real) {
+    ip = Array.isArray(real) ? real[0] : real;
+  } else {
+    ip = (req.socket && req.socket.remoteAddress) || req.ip || '';
+  }
+  ip = String(ip).trim();
+  if (ip.startsWith('::ffff:')) ip = ip.substring(7);
+  if (ip === '::1') ip = '127.0.0.1';
+  return ip || 'unknown';
+}
+
+function sanitizeOptions(options) {
+  const list = [];
+  for (let i = 0; i < options.length; i++) {
+    const opt = options[i];
+    let text = '';
+    let id;
+    if (typeof opt === 'string' || typeof opt === 'number' || typeof opt === 'boolean') {
+      text = String(opt);
+    } else if (opt && typeof opt === 'object') {
+      if (opt.text !== undefined) text = String(opt.text);
+      else if (opt.label !== undefined) text = String(opt.label);
+      else if (opt.value !== undefined) text = String(opt.value);
+      if (opt.id !== undefined && opt.id !== null) id = String(opt.id);
+    } else {
+      text = String(opt);
+    }
+    text = text.trim();
+    if (!id) id = generateId();
+    list.push({ id: id, text: text, votes: 0 });
+  }
+  return list;
+}
+
+function pollSummary(poll) {
+  return {
+    id: poll.id,
+    question: poll.question,
+    options: poll.options,
+    createdAt: poll.createdAt,
+    rules: poll.rules
+  };
+}
+
+app.get('/', (req, res) => {
+  res.json({ status: 'ok' });
+});
+
+app.get('/polls', (req, res) => {
+  const list = Object.values(data.polls).map(pollSummary);
+  res.json(list);
+});
+
+app.post('/polls', (req, res) => {
+  const body = req.body || {};
+  const question = body.question;
+  const options = body.options;
+  const rules = body.rules;
+  if (!question || typeof question !== 'string' || !question.trim()) {
+    return res.status(400).json({ error: 'question required' });
+  }
+  if (!Array.isArray(options)) {
+    return res.status(400).json({ error: 'options must be array' });
+  }
+  const normalizedOptions = sanitizeOptions(options).filter(o => o.text.length > 0);
+  if (normalizedOptions.length < 2) {
+    return res.status(400).json({ error: 'at least two options required' });
+  }
+  const id = generateId();
+  const poll = {
+    id: id,
+    question: question.trim(),
+    options: normalizedOptions,
+    createdAt: Date.now(),
+    rules: { maxVotesPerIp: 1, windowMs: 0 }
+  };
+  if (rules && typeof rules === 'object') {
+    if (Number.isFinite(rules.maxVotesPerIp) && rules.maxVotesPerIp > 0) poll.rules.maxVotesPerIp = Math.floor(rules.maxVotesPerIp);
+    if (Number.isFinite(rules.windowMs) && rules.windowMs >= 0) poll.rules.windowMs = Math.floor(rules.windowMs);
+  }
+  data.polls[id] = poll;
+  data.votes[id] = {};
+  saveData();
+  res.status(201).json(pollSummary(poll));
+});
+
+app.get('/polls/:id', (req, res) => {
+  const poll = data.polls[req.params.id];
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+  res.json(pollSummary(poll));
+});
+
+app.get('/polls/:id/results', (req, res) => {
+  const poll = data.polls[req.params.id];
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+  const results = poll.options.map(o => ({ id: o.id, text: o.text, votes: o.votes || 0 }));
+  res.json({ pollId: poll.id, question: poll.question, options: results });
+});
+
+app.delete('/polls/:id', (req, res) => {
+  const id = req.params.id;
+  if (!data.polls[id]) return res.status(404).json({ error: 'poll not found' });
+  delete data.polls[id];
+  delete data.votes[id];
+  saveData();
+  res.json({ success: true });
+});
+
+app.post('/polls/:id/vote', (req, res) => {
+  const id = req.params.id;
+  const poll = data.polls[id];
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+  const ip = getClientIp(req);
+  const body = req.body || {};
+  let option = null;
+  if (body.optionId !== undefined && body.optionId !== null) {
+    option = poll.options.find(o => o.id === String(body.optionId));
+  }
+  if (!option && body.optionIndex !== undefined && body.optionIndex !== null) {
+    const idx = parseInt(body.optionIndex, 10);
+    if (!isNaN(idx) && idx >= 0 && idx < poll.options.length) option = poll.options[idx];
+  }
+  if (!option) return res.status(400).json({ error: 'invalid option' });
+  const rule = poll.rules || { maxVotesPerIp: 1, windowMs: 0 };
+  const now = Date.now();
+  if (!data.votes[id]) data.votes[id] = {};
+  let ipVotes = data.votes[id][ip] || [];
+  if (rule.windowMs && rule.windowMs > 0) {
+    ipVotes = ipVotes.filter(ts => now - ts < rule.windowMs);
+  }
+  if (rule.maxVotesPerIp && rule.maxVotesPerIp > 0 && ipVotes.length >= rule.maxVotesPerIp) {
+    data.votes[id][ip] = ipVotes;
+    saveData();
+    return res.status(429).json({ error: 'vote limit reached', limit: rule.maxVotesPerIp, windowMs: rule.windowMs });
+  }
+  ipVotes.push(now);
+  data.votes[id][ip] = ipVotes;
+  option.votes = (option.votes || 0) + 1;
+  saveData();
+  res.json({ success: true, pollId: id, optionId: option.id, votes: option.votes });
+});
+
+app.use((err, req, res, next) => {
+  res.status(500).json({ error: 'internal error' });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('Voting service running on port ' + PORT);
+});

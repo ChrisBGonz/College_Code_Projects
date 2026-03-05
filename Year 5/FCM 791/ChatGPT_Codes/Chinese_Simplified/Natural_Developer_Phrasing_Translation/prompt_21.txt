@@ -1,0 +1,447 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+import base64
+
+import jwt
+from jwt import PyJWKClient
+from jwt.algorithms import RSAAlgorithm, ECAlgorithm, HMACAlgorithm
+try:
+    from jwt.algorithms import OKPAlgorithm
+except Exception:
+    OKPAlgorithm = None
+from jwt.exceptions import InvalidTokenError
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography import x509
+
+def b64url_decode(data):
+    if data is None:
+        return None
+    if isinstance(data, str):
+        data = data.encode()
+    data = data.strip()
+    if not data:
+        return b""
+    padding = b'=' * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
+
+def read_file(path):
+    with open(path, 'rb') as f:
+        return f.read()
+
+def is_json(data):
+    if data is None:
+        return False
+    if isinstance(data, bytes):
+        s = data.lstrip()
+        return s.startswith(b'{') or s.startswith(b'[')
+    if isinstance(data, str):
+        s = data.lstrip()
+        return s.startswith('{') or s.startswith('[')
+    return False
+
+def _load_with_backend(loader, *args, **kwargs):
+    try:
+        return loader(*args, **kwargs)
+    except TypeError:
+        if 'backend' in kwargs:
+            kwargs.pop('backend')
+        return loader(*args, **kwargs)
+
+def load_key_from_bytes(data, password=None):
+    try:
+        cert = _load_with_backend(x509.load_pem_x509_certificate, data, backend=default_backend())
+        return cert.public_key()
+    except Exception:
+        pass
+    try:
+        cert = _load_with_backend(x509.load_der_x509_certificate, data, backend=default_backend())
+        return cert.public_key()
+    except Exception:
+        pass
+    try:
+        return _load_with_backend(serialization.load_pem_private_key, data, password=password, backend=default_backend())
+    except Exception:
+        pass
+    try:
+        return _load_with_backend(serialization.load_der_private_key, data, password=password, backend=default_backend())
+    except Exception:
+        pass
+    try:
+        return _load_with_backend(serialization.load_pem_public_key, data, backend=default_backend())
+    except Exception:
+        pass
+    try:
+        return _load_with_backend(serialization.load_der_public_key, data, backend=default_backend())
+    except Exception:
+        pass
+    raise ValueError("Unsupported key/cert format")
+
+def jwk_to_key(jwk):
+    kty = jwk.get('kty')
+    jwk_json = json.dumps(jwk)
+    if kty == 'RSA':
+        return RSAAlgorithm.from_jwk(jwk_json)
+    if kty == 'EC':
+        return ECAlgorithm.from_jwk(jwk_json)
+    if kty == 'oct':
+        return HMACAlgorithm.from_jwk(jwk_json)
+    if kty == 'OKP' and OKPAlgorithm:
+        return OKPAlgorithm.from_jwk(jwk_json)
+    raise ValueError("Unsupported JWK key type: %s" % kty)
+
+class KeyStore:
+    def __init__(self):
+        self.keys = {}
+        self.default = None
+
+    def add(self, key, kid=None):
+        if kid:
+            self.keys[kid] = key
+        else:
+            if self.default is None:
+                self.default = key
+            else:
+                gen_id = "key{}".format(len(self.keys)+1)
+                self.keys[gen_id] = key
+
+    def add_store(self, store):
+        if store is None:
+            return
+        for kid, key in store.keys.items():
+            self.keys[kid] = key
+        if store.default is not None:
+            if self.default is None:
+                self.default = store.default
+            else:
+                gen_id = "key{}".format(len(self.keys)+1)
+                self.keys[gen_id] = store.default
+
+    def get_by_kid(self, kid):
+        if kid and kid in self.keys:
+            return self.keys[kid]
+        return None
+
+    def all(self):
+        res = []
+        if self.default is not None:
+            res.append(self.default)
+        res.extend(self.keys.values())
+        return res
+
+    def count(self):
+        return len(self.keys) + (1 if self.default is not None else 0)
+
+def load_key_source(path, kid=None, password=None):
+    data = read_file(path)
+    obj = None
+    if is_json(data):
+        try:
+            obj = json.loads(data.decode('utf-8'))
+        except Exception:
+            try:
+                obj = json.loads(data)
+            except Exception:
+                obj = None
+    if isinstance(obj, dict):
+        if 'keys' in obj:
+            store = KeyStore()
+            for jwk in obj.get('keys', []):
+                try:
+                    key = jwk_to_key(jwk)
+                except Exception:
+                    continue
+                store.add(key, jwk.get('kid'))
+            return store, None
+        else:
+            key = jwk_to_key(obj)
+            if kid is None:
+                kid = obj.get('kid')
+            return key, kid
+    key = load_key_from_bytes(data, password=password)
+    return key, kid
+
+def parse_kid_path(entry):
+    if entry is None:
+        return None, None
+    if '=' in entry:
+        kid, path = entry.split('=', 1)
+        kid = kid.strip() or None
+        path = path.strip()
+        return kid, path
+    return None, entry
+
+class KeyResolver:
+    def __init__(self):
+        self.secret = None
+        self.key_store = KeyStore()
+        self.jwks_store = None
+        self.jwk_client = None
+
+    def set_secret(self, secret, b64=False):
+        if secret is None:
+            return
+        if b64:
+            self.secret = b64url_decode(secret)
+        else:
+            self.secret = secret.encode() if isinstance(secret, str) else secret
+
+    def set_jwks_url(self, url):
+        if url:
+            self.jwk_client = PyJWKClient(url)
+
+    def set_jwks_store(self, store):
+        self.jwks_store = store
+
+    def add_key(self, key, kid=None):
+        self.key_store.add(key, kid)
+
+    def merge_store(self, store):
+        self.key_store.add_store(store)
+
+    def resolve(self, token, header, alg):
+        kid = header.get('kid') if header else None
+        if self.jwk_client:
+            try:
+                key = self.jwk_client.get_signing_key_from_jwt(token).key
+                return [key]
+            except Exception:
+                pass
+        if self.jwks_store:
+            key = self.jwks_store.get_by_kid(kid)
+            if key:
+                return [key]
+        key = self.key_store.get_by_kid(kid)
+        if key:
+            return [key]
+        candidates = []
+        if self.jwks_store:
+            candidates.extend(self.jwks_store.all())
+        candidates.extend(self.key_store.all())
+        if self.secret is not None and (alg is None or alg.startswith('HS')):
+            candidates.append(self.secret)
+        uniq = []
+        seen = set()
+        for k in candidates:
+            if k is None:
+                continue
+            i = id(k)
+            if i in seen:
+                continue
+            seen.add(i)
+            uniq.append(k)
+        return uniq
+
+def parse_algorithms(alg_args):
+    if not alg_args:
+        return None
+    if isinstance(alg_args, str):
+        alg_args = [alg_args]
+    algs = []
+    for item in alg_args:
+        if not item:
+            continue
+        algs.extend([a.strip() for a in item.split(',') if a.strip()])
+    return algs or None
+
+def determine_algorithms(header_alg, user_alg_args, allow_none, no_verify):
+    algs = parse_algorithms(user_alg_args)
+    if not algs:
+        if header_alg:
+            algs = [header_alg]
+        else:
+            algs = list(jwt.algorithms.get_default_algorithms().keys())
+    if not allow_none:
+        algs = [a for a in algs if a.lower() != 'none']
+    if header_alg and header_alg not in algs and not no_verify:
+        raise ValueError("Algorithm not allowed: %s" % header_alg)
+    if not algs:
+        raise ValueError("No allowed algorithms")
+    return algs
+
+def parse_audience(aud_args):
+    if not aud_args:
+        return None
+    aud_list = []
+    for item in aud_args:
+        if item:
+            aud_list.extend([a.strip() for a in item.split(',') if a.strip()])
+    if not aud_list:
+        return None
+    return aud_list[0] if len(aud_list) == 1 else aud_list
+
+def parse_require(req_args):
+    if not req_args:
+        return None
+    req_list = []
+    for item in req_args:
+        if item:
+            req_list.extend([a.strip() for a in item.split(',') if a.strip()])
+    return req_list or None
+
+def build_options(args, header_alg, issuer=None, audience=None):
+    verify_sig = not args.no_verify and header_alg != 'none'
+    options = {
+        "verify_signature": verify_sig,
+        "verify_exp": (not args.no_verify) and (not args.ignore_exp),
+        "verify_nbf": (not args.no_verify) and (not args.ignore_nbf),
+        "verify_iat": (not args.no_verify) and (not args.ignore_iat),
+        "verify_iss": (not args.no_verify) and (not args.ignore_iss) and issuer is not None,
+        "verify_aud": (not args.no_verify) and (not args.ignore_aud) and audience is not None,
+    }
+    req = parse_require(args.require)
+    if req:
+        options["require"] = req
+    return options
+
+def load_token(args):
+    token = None
+    if args.token:
+        token = args.token
+    elif args.token_file:
+        data = read_file(args.token_file)
+        try:
+            token = data.decode('utf-8')
+        except Exception:
+            token = data.decode()
+    else:
+        if not sys.stdin.isatty():
+            token = sys.stdin.read()
+    if token is None:
+        return None
+    token = token.strip()
+    if token.lower().startswith('bearer '):
+        token = token[7:].strip()
+    return token
+
+def decode_token(token, algorithms, options, resolver, issuer, audience, leeway, header):
+    if not options.get("verify_signature"):
+        claims = jwt.decode(token, options=options, algorithms=algorithms, audience=audience, issuer=issuer, leeway=leeway)
+        return claims, None
+    keys = resolver.resolve(token, header, header.get('alg') if header else None)
+    if not keys:
+        raise ValueError("No verification key available")
+    last_exc = None
+    for key in keys:
+        try:
+            claims = jwt.decode(token, key=key, algorithms=algorithms, audience=audience, issuer=issuer, options=options, leeway=leeway)
+            return claims, key
+        except InvalidTokenError as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise last_exc
+    raise ValueError("Token verification failed")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="JWT authentication and decoding tool")
+    parser.add_argument("-t", "--token", help="JWT string")
+    parser.add_argument("--token-file", help="File containing JWT")
+    parser.add_argument("--secret", help="HMAC secret")
+    parser.add_argument("--secret-b64", action="store_true", help="Secret is base64url encoded")
+    parser.add_argument("--key", action="append", help="Key file (kid=path supported)")
+    parser.add_argument("--cert", action="append", help="Certificate file (kid=path supported)")
+    parser.add_argument("--jwks-url", help="JWKS endpoint URL")
+    parser.add_argument("--jwks-file", help="JWKS file")
+    parser.add_argument("--alg", action="append", help="Allowed algorithm(s), comma separated or repeated")
+    parser.add_argument("--issuer", help="Expected issuer")
+    parser.add_argument("--audience", action="append", help="Expected audience (comma separated or repeated)")
+    parser.add_argument("--leeway", type=int, default=0, help="Leeway seconds")
+    parser.add_argument("--no-verify", action="store_true", help="Disable signature and claim verification")
+    parser.add_argument("--ignore-exp", action="store_true", help="Ignore exp claim")
+    parser.add_argument("--ignore-nbf", action="store_true", help="Ignore nbf claim")
+    parser.add_argument("--ignore-iat", action="store_true", help="Ignore iat claim")
+    parser.add_argument("--ignore-iss", action="store_true", help="Ignore iss claim")
+    parser.add_argument("--ignore-aud", action="store_true", help="Ignore aud claim")
+    parser.add_argument("--require", action="append", help="Require claim (comma separated or repeated)")
+    parser.add_argument("--allow-none", action="store_true", help="Allow 'none' algorithm")
+    parser.add_argument("--password", help="Password for encrypted private key")
+    parser.add_argument("--password-file", help="File containing password")
+    parser.add_argument("--output", help="Output file")
+    parser.add_argument("--compact", action="store_true", help="Compact JSON output")
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+    token = load_token(args)
+    if not token:
+        print("No token provided", file=sys.stderr)
+        sys.exit(1)
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as e:
+        print("Invalid token header: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    if header.get('alg') == 'none' and not args.allow_none and not args.no_verify:
+        print("Algorithm 'none' is not allowed", file=sys.stderr)
+        sys.exit(1)
+    try:
+        algorithms = determine_algorithms(header.get('alg'), args.alg, args.allow_none, args.no_verify)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    audience = parse_audience(args.audience)
+    issuer = args.issuer
+    options = build_options(args, header.get('alg'), issuer=issuer, audience=audience)
+    resolver = KeyResolver()
+    if args.secret:
+        resolver.set_secret(args.secret, args.secret_b64)
+    if args.jwks_url:
+        resolver.set_jwks_url(args.jwks_url)
+    if args.jwks_file:
+        obj, kid = load_key_source(args.jwks_file)
+        if isinstance(obj, KeyStore):
+            resolver.set_jwks_store(obj)
+        else:
+            resolver.add_key(obj, kid)
+    password = None
+    if args.password_file:
+        password = read_file(args.password_file).strip()
+    elif args.password:
+        password = args.password.encode() if isinstance(args.password, str) else args.password
+    for entry in args.key or []:
+        kid, path = parse_kid_path(entry)
+        if not path:
+            continue
+        obj, k = load_key_source(path, kid=kid, password=password)
+        if isinstance(obj, KeyStore):
+            resolver.merge_store(obj)
+        else:
+            resolver.add_key(obj, k)
+    for entry in args.cert or []:
+        kid, path = parse_kid_path(entry)
+        if not path:
+            continue
+        obj, k = load_key_source(path, kid=kid, password=password)
+        if isinstance(obj, KeyStore):
+            resolver.merge_store(obj)
+        else:
+            resolver.add_key(obj, k)
+    try:
+        claims, used_key = decode_token(token, algorithms, options, resolver, issuer, audience, args.leeway, header)
+    except Exception as e:
+        print("Token verification failed: %s" % e, file=sys.stderr)
+        sys.exit(1)
+    result = {
+        "header": header,
+        "claims": claims,
+        "verified": options.get("verify_signature"),
+    }
+    if header.get('alg'):
+        result["algorithm"] = header.get('alg')
+    if header.get('kid'):
+        result["key_id"] = header.get('kid')
+    if used_key is not None:
+        result["key_type"] = type(used_key).__name__
+    out = json.dumps(result, ensure_ascii=False, indent=None if args.compact else 2)
+    if args.output:
+        with open(args.output, 'w', encoding='utf-8') as f:
+            f.write(out)
+    else:
+        print(out)
+
+if __name__ == "__main__":
+    main()
