@@ -1,0 +1,92 @@
+import socket
+import struct
+import argparse
+import sys
+import threading
+
+def xor_data(data, key):
+    if not key:
+        return data
+    klen = len(key)
+    return bytes(b ^ key[i % klen] for i, b in enumerate(data))
+
+def read_exact(sock, n):
+    data = b''
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        data += chunk
+    return data
+
+def send_packet(sock, payload, key):
+    enc = xor_data(payload, key)
+    header = struct.pack('!I', len(enc))
+    sock.sendall(header + enc)
+
+def recv_packet(sock, key):
+    header = read_exact(sock, 4)
+    length = struct.unpack('!I', header)[0]
+    if length == 0:
+        return b''
+    enc = read_exact(sock, length)
+    return xor_data(enc, key)
+
+def main():
+    parser = argparse.ArgumentParser(description="XOR TCP client")
+    parser.add_argument('host')
+    parser.add_argument('port', type=int)
+    parser.add_argument('key')
+    parser.add_argument('-m', '--message', help='Send single message and exit')
+    parser.add_argument('--hex-key', action='store_true', help='Interpret key as hex string')
+    parser.add_argument('--timeout', type=float, default=10.0)
+    args = parser.parse_args()
+
+    key_bytes = bytes.fromhex(args.key) if args.hex_key else args.key.encode()
+
+    sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    if args.message is not None:
+        send_packet(sock, args.message.encode(), key_bytes)
+        try:
+            response = recv_packet(sock, key_bytes)
+            if response:
+                sys.stdout.buffer.write(response)
+                sys.stdout.buffer.flush()
+        except Exception:
+            pass
+        sock.close()
+        return
+
+    stop_event = threading.Event()
+
+    def recv_loop():
+        try:
+            while True:
+                data = recv_packet(sock, key_bytes)
+                if data:
+                    sys.stdout.buffer.write(data)
+                    sys.stdout.buffer.flush()
+        except Exception:
+            pass
+        stop_event.set()
+
+    threading.Thread(target=recv_loop, daemon=True).start()
+
+    try:
+        for line in sys.stdin.buffer:
+            if stop_event.is_set():
+                break
+            send_packet(sock, line, key_bytes)
+    except KeyboardInterrupt:
+        pass
+
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+    sock.close()
+
+if __name__ == '__main__':
+    main()

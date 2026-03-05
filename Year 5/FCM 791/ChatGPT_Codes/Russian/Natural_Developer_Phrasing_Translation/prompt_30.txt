@@ -1,0 +1,108 @@
+#include <cstdio>
+#include <vector>
+#include <setjmp.h>
+
+extern "C" {
+#include <jpeglib.h>
+}
+
+struct JpegErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void JpegErrorExit(j_common_ptr cinfo) {
+    JpegErrorManager* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(err->setjmp_buffer, 1);
+}
+
+bool ConvertJpegToGrayscale(const char* input_path, const char* output_path) {
+    FILE* infile = fopen(input_path, "rb");
+    if (!infile) return false;
+
+    jpeg_decompress_struct dinfo;
+    JpegErrorManager jerr;
+    dinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = JpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&dinfo);
+        fclose(infile);
+        return false;
+    }
+
+    jpeg_create_decompress(&dinfo);
+    jpeg_stdio_src(&dinfo, infile);
+    jpeg_read_header(&dinfo, TRUE);
+    jpeg_start_decompress(&dinfo);
+
+    int width = dinfo.output_width;
+    int height = dinfo.output_height;
+    int channels = dinfo.output_components;
+    if (channels != 1 && channels != 3) {
+        jpeg_finish_decompress(&dinfo);
+        jpeg_destroy_decompress(&dinfo);
+        fclose(infile);
+        return false;
+    }
+
+    std::vector<unsigned char> gray(width * height);
+    std::vector<unsigned char> row(width * channels);
+    JSAMPROW row_pointer[1];
+    row_pointer[0] = row.data();
+
+    for (int y = 0; y < height; ++y) {
+        jpeg_read_scanlines(&dinfo, row_pointer, 1);
+        for (int x = 0; x < width; ++x) {
+            unsigned char r, g, b;
+            if (channels == 3) {
+                r = row[x * 3];
+                g = row[x * 3 + 1];
+                b = row[x * 3 + 2];
+            } else {
+                r = g = b = row[x];
+            }
+            gray[y * width + x] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+        }
+    }
+
+    jpeg_finish_decompress(&dinfo);
+    jpeg_destroy_decompress(&dinfo);
+    fclose(infile);
+
+    FILE* outfile = fopen(output_path, "wb");
+    if (!outfile) return false;
+
+    jpeg_compress_struct cinfo;
+    JpegErrorManager jerr2;
+    cinfo.err = jpeg_std_error(&jerr2.pub);
+    jerr2.pub.error_exit = JpegErrorExit;
+
+    if (setjmp(jerr2.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        fclose(outfile);
+        return false;
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, 90, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    JSAMPROW out_row[1];
+    while (cinfo.next_scanline < cinfo.image_height) {
+        out_row[0] = &gray[cinfo.next_scanline * width];
+        jpeg_write_scanlines(&cinfo, out_row, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(outfile);
+    return true;
+}

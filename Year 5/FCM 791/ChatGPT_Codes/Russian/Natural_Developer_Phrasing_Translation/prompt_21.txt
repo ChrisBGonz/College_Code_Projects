@@ -1,0 +1,182 @@
+import argparse
+import json
+import sys
+import time
+import urllib.request
+import jwt
+
+_jwks_cache = {}
+
+
+def parse_csv(value):
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        items = []
+        for v in value:
+            if v is None:
+                continue
+            items.extend(parse_csv(v) or [])
+        return items or None
+    items = [v.strip() for v in str(value).split(",") if v.strip()]
+    return items or None
+
+
+def read_token(args):
+    if args.token:
+        return args.token.strip()
+    if args.token_file:
+        with open(args.token_file, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return sys.stdin.read().strip()
+
+
+def fetch_jwks(url):
+    with urllib.request.urlopen(url) as resp:
+        data = resp.read()
+    return json.loads(data.decode("utf-8"))
+
+
+def get_jwks(url, ttl):
+    now = time.time()
+    cached = _jwks_cache.get(url)
+    if cached and cached[1] > now:
+        return cached[0]
+    jwks = fetch_jwks(url)
+    _jwks_cache[url] = (jwks, now + ttl)
+    return jwks
+
+
+def jwk_to_key(jwk, alg):
+    if not alg:
+        alg = jwk.get("alg")
+    if not alg:
+        raise ValueError("Algorithm not specified for JWK")
+    algorithms = jwt.algorithms.get_default_algorithms()
+    algo = algorithms.get(alg)
+    if not algo:
+        raise ValueError("Unsupported algorithm: %s" % alg)
+    return algo.from_jwk(json.dumps(jwk))
+
+
+def select_key_from_jwks(jwks, header):
+    keys = jwks.get("keys") or []
+    keys = [k for k in keys if k.get("use", "sig") == "sig"]
+    if not keys:
+        raise ValueError("JWKS contains no signing keys")
+    kid = header.get("kid")
+    if kid:
+        keys = [k for k in keys if k.get("kid") == kid]
+        if not keys:
+            raise KeyError("No matching key for kid")
+    alg = header.get("alg")
+    if alg:
+        alg_keys = [k for k in keys if k.get("alg") in (None, alg)]
+        if alg_keys:
+            keys = alg_keys
+    if len(keys) != 1:
+        if len(keys) == 0:
+            raise KeyError("No matching key found")
+        raise ValueError("Multiple matching keys; specify kid")
+    return jwk_to_key(keys[0], alg)
+
+
+def get_key_from_sources(token, args, header):
+    alg = header.get("alg")
+    if not alg:
+        raise ValueError("Missing alg in token header")
+    if alg.lower() == "none":
+        raise ValueError("Unsecured JWT is not allowed")
+    if alg.startswith("HS") and args.secret is not None:
+        return args.secret
+    if args.jwks_url:
+        jwks = get_jwks(args.jwks_url, args.cache_ttl)
+        try:
+            return select_key_from_jwks(jwks, header)
+        except Exception:
+            jwks = fetch_jwks(args.jwks_url)
+            _jwks_cache[args.jwks_url] = (jwks, time.time() + args.cache_ttl)
+            return select_key_from_jwks(jwks, header)
+    if args.jwks_file:
+        with open(args.jwks_file, "r", encoding="utf-8") as f:
+            jwks = json.load(f)
+        return select_key_from_jwks(jwks, header)
+    if args.public_key:
+        key_data = args.public_key
+        if key_data.startswith("@"):
+            with open(key_data[1:], "r", encoding="utf-8") as f:
+                key_data = f.read()
+        return key_data
+    if alg.startswith("HS"):
+        raise ValueError("HMAC algorithm requires --secret or JWKS")
+    raise ValueError("No key source provided")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("token", nargs="?", help="JWT token")
+    parser.add_argument("--token-file", help="Read token from file")
+    parser.add_argument("--jwks-url", help="JWKS endpoint URL")
+    parser.add_argument("--jwks-file", help="JWKS JSON file")
+    parser.add_argument("--issuer", help="Expected issuer (iss)")
+    parser.add_argument("--audience", help="Expected audience (aud), comma-separated for multiple")
+    parser.add_argument("--algorithms", help="Allowed algorithms, comma-separated")
+    parser.add_argument("--secret", help="Shared secret for HS* algorithms")
+    parser.add_argument("--public-key", help="Public key PEM or @file")
+    parser.add_argument("--leeway", type=int, default=0, help="Leeway seconds for exp/nbf")
+    parser.add_argument("--cache-ttl", type=int, default=300, help="JWKS cache TTL seconds")
+    parser.add_argument("--output", choices=["payload", "full"], default="full")
+    args = parser.parse_args()
+
+    token = read_token(args)
+    if not token:
+        print("Token not provided", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        header = jwt.get_unverified_header(token)
+    except Exception as e:
+        print("Invalid token header: %s" % e, file=sys.stderr)
+        sys.exit(1)
+
+    allowed_algs = parse_csv(args.algorithms)
+    header_alg = header.get("alg")
+    if allowed_algs is None:
+        if not header_alg:
+            print("Algorithm not specified", file=sys.stderr)
+            sys.exit(1)
+        allowed_algs = [header_alg]
+    if header_alg and header_alg not in allowed_algs:
+        print("Algorithm not allowed", file=sys.stderr)
+        sys.exit(1)
+
+    audience = parse_csv(args.audience)
+    if audience is not None and len(audience) == 1:
+        audience = audience[0]
+
+    try:
+        key = get_key_from_sources(token, args, header)
+        payload = jwt.decode(
+            token,
+            key,
+            algorithms=allowed_algs,
+            issuer=args.issuer,
+            audience=audience,
+            leeway=args.leeway,
+            options={
+                "verify_signature": True,
+                "verify_exp": True,
+                "verify_nbf": True,
+            },
+        )
+        if args.output == "payload":
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps({"header": header, "payload": payload}, ensure_ascii=False, indent=2))
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

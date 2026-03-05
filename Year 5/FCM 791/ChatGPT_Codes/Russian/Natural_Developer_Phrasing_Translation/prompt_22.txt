@@ -1,0 +1,520 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+usage() { echo "Usage: $0 <url> [install_root] [bin_dir]" >&2; exit 1; }
+
+URL="${1:-}"
+[[ -z "$URL" ]] && usage
+INSTALL_ROOT="${2:-/opt}"
+BIN_DIR="${3:-/usr/local/bin}"
+
+LOG_FILE="${LOG_FILE:-/tmp/security-tool-install.log}"
+if ! touch "$LOG_FILE" 2>/dev/null; then
+  LOG_FILE="/tmp/security-tool-install.log"
+  touch "$LOG_FILE" 2>/dev/null || true
+fi
+
+log(){ echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+warn(){ echo "[$(date '+%F %T')] WARN: $*" | tee -a "$LOG_FILE" >&2; }
+fatal(){ echo "[$(date '+%F %T')] ERROR: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
+
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || fatal "Missing dependency: $1"; }
+
+if command -v curl >/dev/null 2>&1; then
+  DL_CMD="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL_CMD="wget"
+else
+  fatal "curl or wget required"
+fi
+
+download_file() {
+  local url="$1" dest="$2"
+  if [[ $DL_CMD == "curl" ]]; then
+    curl -fsSL "$url" -o "$dest"
+  else
+    wget -qO "$dest" "$url"
+  fi
+}
+
+fetch_content() {
+  local url="$1"
+  if [[ $DL_CMD == "curl" ]]; then
+    curl -fsSL "$url"
+  else
+    wget -qO- "$url"
+  fi
+}
+
+url_exists() {
+  local url="$1"
+  if [[ $DL_CMD == "curl" ]]; then
+    curl -fsI "$url" >/dev/null 2>&1 || curl -fsSL -o /dev/null "$url" >/dev/null 2>&1
+  else
+    wget --spider -q "$url"
+  fi
+}
+
+fetch_api() {
+  local url="$1"
+  if [[ $DL_CMD == "curl" ]]; then
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      curl -fsSL -H "Authorization: token $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "$url"
+    else
+      curl -fsSL -H "Accept: application/vnd.github+json" "$url"
+    fi
+  else
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+      wget -qO- --header="Authorization: token $GITHUB_TOKEN" --header="Accept: application/vnd.github+json" "$url"
+    else
+      wget -qO- --header="Accept: application/vnd.github+json" "$url"
+    fi
+  fi
+}
+
+is_archive() {
+  case "$1" in
+    *.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.tar|*.zip|*.gz|*.bz2|*.xz) return 0;;
+    *) return 1;;
+  esac
+}
+
+ensure_extractor() {
+  case "$1" in
+    *.tar.gz|*.tgz|*.tar.bz2|*.tbz2|*.tar.xz|*.txz|*.tar) require_cmd tar ;;
+    *.zip) require_cmd unzip ;;
+    *.gz) require_cmd gzip ;;
+    *.bz2) require_cmd bzip2 ;;
+    *.xz) require_cmd xz ;;
+  esac
+}
+
+extract_archive() {
+  local file="$1" dest="$2"
+  mkdir -p "$dest"
+  case "$file" in
+    *.tar.gz|*.tgz) tar -xzf "$file" -C "$dest" ;;
+    *.tar.bz2|*.tbz2) tar -xjf "$file" -C "$dest" ;;
+    *.tar.xz|*.txz) tar -xJf "$file" -C "$dest" ;;
+    *.tar) tar -xf "$file" -C "$dest" ;;
+    *.zip) unzip -q "$file" -d "$dest" ;;
+    *.gz) gzip -dc "$file" > "$dest/$(basename "${file%.gz}")" ;;
+    *.bz2) bzip2 -dc "$file" > "$dest/$(basename "${file%.bz2}")" ;;
+    *.xz) xz -dc "$file" > "$dest/$(basename "${file%.xz}")" ;;
+    *) return 1 ;;
+  esac
+}
+
+derive_tool_name() {
+  local name="$1"
+  name="${name%%\?*}"
+  name="${name%%.tar.gz}"
+  name="${name%%.tgz}"
+  name="${name%%.tar.bz2}"
+  name="${name%%.tbz2}"
+  name="${name%%.tar.xz}"
+  name="${name%%.txz}"
+  name="${name%%.tar}"
+  name="${name%%.zip}"
+  name="${name%%.gz}"
+  name="${name%%.bz2}"
+  name="${name%%.xz}"
+  name="${name%%.bin}"
+  name="${name%%.run}"
+  name="${name%%.sh}"
+  local cleaned="$name"
+  cleaned=$(echo "$cleaned" | sed -E 's/([_-]?v?[0-9]+([._-][0-9A-Za-z]+)*)$//')
+  cleaned=$(echo "$cleaned" | sed -E 's/(linux|darwin|windows|macos|osx|freebsd)[-_]?(amd64|x86_64|x64|arm64|aarch64|armv7|armv6|386|32|64)$//i')
+  cleaned=$(echo "$cleaned" | sed -E 's/[-_]+$//')
+  if [[ -z "$cleaned" ]]; then cleaned="$name"; fi
+  echo "$cleaned"
+}
+
+select_asset() {
+  local os arch
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m)
+  local arch_list=()
+  case "$arch" in
+    x86_64|amd64) arch_list=("amd64" "x86_64" "x64" "64");;
+    aarch64|arm64) arch_list=("arm64" "aarch64");;
+    armv7l|armv7*) arch_list=("armv7" "armhf");;
+    armv6l|armv6*) arch_list=("armv6");;
+    i386|i686) arch_list=("386" "x86" "i386" "i686" "32");;
+    *) arch_list=("$arch");;
+  esac
+  local os_list=("$os")
+  if [[ $os == "darwin" ]]; then os_list+=("macos" "osx"); fi
+  if [[ $os == "linux" ]]; then os_list+=("linux"); fi
+  if [[ $os == "freebsd" ]]; then os_list+=("freebsd"); fi
+  if [[ $os == windows* ]]; then os_list+=("windows" "win"); fi
+
+  local candidates=()
+  for u in "${asset_urls[@]}"; do
+    local l
+    l=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+    if [[ $l == *.sha256* || $l == *.sha512* || $l == *.sig || $l == *.asc || $l == *.gpg ]]; then
+      continue
+    fi
+    candidates+=("$u")
+  done
+  local best=""
+  for u in "${candidates[@]}"; do
+    local l
+    l=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+    local os_match=0 arch_match=0
+    for o in "${os_list[@]}"; do [[ $l == *"$o"* ]] && os_match=1 && break; done
+    for a in "${arch_list[@]}"; do [[ $l == *"$a"* ]] && arch_match=1 && break; done
+    if [[ $os_match -eq 1 && $arch_match -eq 1 ]]; then best="$u"; break; fi
+  done
+  if [[ -z $best ]]; then
+    for u in "${candidates[@]}"; do
+      local l
+      l=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+      for a in "${arch_list[@]}"; do
+        if [[ $l == *"$a"* ]]; then best="$u"; break; fi
+      done
+      [[ -n $best ]] && break
+    done
+  fi
+  if [[ -z $best && ${#candidates[@]} -gt 0 ]]; then best="${candidates[0]}"; fi
+  echo "$best"
+}
+
+get_algo() {
+  local l
+  l=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  if [[ $l == *.sha512* ]]; then
+    echo "sha512sum"
+  else
+    echo "sha256sum"
+  fi
+}
+
+verify_hash_file() {
+  local algo_cmd="$1" checksum_file="$2" target="$3"
+  local clean="$TMP/$(basename "$checksum_file").clean"
+  tr -d '\r' < "$checksum_file" > "$clean"
+  checksum_file="$clean"
+  local fname
+  fname=$(basename "$target")
+  if grep -q "$fname" "$checksum_file"; then
+    local line hash
+    line=$(grep "$fname" "$checksum_file" | head -n1)
+    hash=$(echo "$line" | awk '{print $1}')
+    [[ -z $hash ]] && return 1
+    echo "$hash  $target" | "$algo_cmd" -c - >/dev/null 2>&1
+  else
+    local hash
+    hash=$(grep -oE '[A-Fa-f0-9]{32,128}' "$checksum_file" | head -n1 || true)
+    [[ -z $hash ]] && return 1
+    echo "$hash  $target" | "$algo_cmd" -c - >/dev/null 2>&1
+  fi
+}
+
+verify_download() {
+  local file="$1"
+  local verified=0
+  if [[ ${#checksum_urls[@]} -gt 0 ]]; then
+    for cu in "${checksum_urls[@]}"; do
+      local algo
+      algo=$(get_algo "$cu")
+      require_cmd "$algo"
+      local checksum_file="$TMP/$(basename "${cu%%\?*}")"
+      log "Downloading checksum: $cu"
+      if ! download_file "$cu" "$checksum_file"; then
+        fatal "Failed to download checksum: $cu"
+      fi
+      if verify_hash_file "$algo" "$checksum_file" "$file"; then
+        log "Checksum verified with $cu"
+        verified=1
+        break
+      else
+        fatal "Checksum verification failed with $cu"
+      fi
+    done
+  fi
+  if [[ ${#signature_urls[@]} -gt 0 ]]; then
+    if command -v gpg >/dev/null 2>&1; then
+      for su in "${signature_urls[@]}"; do
+        local sig_file="$TMP/$(basename "${su%%\?*}")"
+        log "Downloading signature: $su"
+        if ! download_file "$su" "$sig_file"; then
+          fatal "Failed to download signature: $su"
+        fi
+        if gpg --verify "$sig_file" "$file" >/dev/null 2>&1; then
+          log "Signature verified with $su"
+          verified=1
+          break
+        else
+          fatal "Signature verification failed for $su"
+        fi
+      done
+    else
+      warn "gpg not installed; skipping signature verification"
+    fi
+  fi
+  if [[ $verified -eq 0 ]]; then
+    if [[ ${#checksum_urls[@]} -gt 0 || ${#signature_urls[@]} -gt 0 ]]; then
+      warn "Verification could not be completed"
+    else
+      log "No checksum/signature available"
+    fi
+  fi
+}
+
+check_writable_dir() {
+  local dir="$1"
+  if [[ -d "$dir" ]]; then
+    [[ -w "$dir" ]]
+  else
+    local parent
+    parent=$(dirname "$dir")
+    [[ -w "$parent" ]]
+  fi
+}
+
+SUDO=""
+if [[ $EUID -ne 0 ]]; then
+  need_root=0
+  if ! check_writable_dir "$INSTALL_ROOT"; then need_root=1; fi
+  if ! check_writable_dir "$BIN_DIR"; then need_root=1; fi
+  if [[ $need_root -eq 1 ]]; then
+    if ! command -v sudo >/dev/null 2>&1; then
+      fatal "Root privileges required (sudo not found)"
+    fi
+    if sudo -n true 2>/dev/null; then
+      SUDO="sudo -n"
+    else
+      fatal "Root privileges required (passwordless sudo needed)"
+    fi
+  fi
+fi
+
+run_root() { if [[ -n "${SUDO:-}" ]]; then $SUDO "$@"; else "$@"; fi; }
+
+run_root_write() {
+  local file="$1" content="$2"
+  if [[ -n "${SUDO:-}" ]]; then
+    printf "%s\n" "$content" | $SUDO tee "$file" >/dev/null
+  else
+    printf "%s\n" "$content" > "$file"
+  fi
+}
+
+find_executable() {
+  local dir="$1" name="$2"
+  local execs=()
+  if [[ -n "${SUDO:-}" ]]; then
+    mapfile -t execs < <($SUDO find "$dir" -type f -perm -111 ! -path '*/.*' 2>/dev/null || true)
+  else
+    mapfile -t execs < <(find "$dir" -type f -perm -111 ! -path '*/.*' 2>/dev/null || true)
+  fi
+  local matches=()
+  if [[ -n "$name" ]]; then
+    for f in "${execs[@]}"; do
+      local base
+      base=$(basename "$f")
+      if [[ "$base" == "$name" || "$base" == "$name".* || "$base" == "$name"* ]]; then
+        matches+=("$f")
+      fi
+    done
+  fi
+  if [[ ${#matches[@]} -gt 0 ]]; then
+    echo "${matches[0]}"
+    return 0
+  fi
+  if [[ ${#execs[@]} -eq 1 ]]; then
+    echo "${execs[0]}"
+    return 0
+  fi
+  if [[ ${#execs[@]} -gt 1 ]]; then
+    local shortest="${execs[0]}"
+    local shortest_len=${#shortest}
+    for f in "${execs[@]}"; do
+      if [[ ${#f} -lt $shortest_len ]]; then
+        shortest="$f"
+        shortest_len=${#f}
+      fi
+    done
+    echo "$shortest"
+    return 0
+  fi
+  local files=()
+  if [[ -n "${SUDO:-}" ]]; then
+    mapfile -t files < <($SUDO find "$dir" -type f ! -path '*/.*' 2>/dev/null || true)
+  else
+    mapfile -t files < <(find "$dir" -type f ! -path '*/.*' 2>/dev/null || true)
+  fi
+  if [[ ${#files[@]} -eq 1 ]]; then
+    echo "${files[0]}"
+    return 0
+  fi
+  return 1
+}
+
+add_to_path() {
+  local bin_dir="$1" name="$2"
+  if [[ ":$PATH:" != *":$bin_dir:"* ]]; then
+    export PATH="$PATH:$bin_dir"
+    if [[ -n "${SUDO:-}" ]]; then
+      run_root_write "/etc/profile.d/${name}.sh" "export PATH=\$PATH:$bin_dir"
+    else
+      printf "\nexport PATH=\$PATH:%s\n" "$bin_dir" >> "$HOME/.profile"
+    fi
+    log "Added $bin_dir to PATH"
+  fi
+}
+
+show_version() {
+  local bin="$1"
+  if [[ -x "$bin" ]]; then
+    local out=""
+    for flag in "--version" "-v" "version"; do
+      if "$bin" "$flag" >/dev/null 2>&1; then
+        out=$("$bin" "$flag" 2>/dev/null | head -n1)
+        break
+      fi
+    done
+    if [[ -n "$out" ]]; then
+      log "Installed version: $out"
+    fi
+  fi
+}
+
+log "Starting installation"
+
+asset_url=""
+asset_urls=()
+checksum_urls=()
+signature_urls=()
+owner=""
+repo=""
+tag_name=""
+is_repo=0
+
+if [[ $URL =~ ^https?://github.com/([^/]+)/([^/]+)(/.*)?$ ]]; then
+  owner="${BASH_REMATCH[1]}"
+  repo="${BASH_REMATCH[2]%\.git}"
+  extra="${BASH_REMATCH[3]}"
+  if [[ -z "$extra" || "$extra" == "/" ]]; then
+    is_repo=1
+  else
+    case "$extra" in
+      /releases/download/*|/releases/latest/download/*|*/download/*) is_repo=0 ;;
+      *)
+        if [[ $extra =~ \.[A-Za-z0-9]{1,5}([?].*)?$ ]]; then
+          is_repo=0
+        else
+          is_repo=1
+        fi
+      ;;
+    esac
+  fi
+fi
+
+if [[ $is_repo -eq 1 ]]; then
+  log "Fetching latest release from GitHub: $owner/$repo"
+  api="https://api.github.com/repos/$owner/$repo/releases/latest"
+  json=$(fetch_api "$api") || fatal "Failed to fetch release info"
+  if echo "$json" | grep -q '"message": "Not Found"'; then
+    fatal "Repository not found or no releases"
+  fi
+  tag_name=$(echo "$json" | grep -m1 -oE '"tag_name":[^"]+"' | sed -E 's/.*"([^"]+)"/\1/' || true)
+  mapfile -t asset_urls < <(echo "$json" | grep -oE '"browser_download_url":[^"]+"' | sed -E 's/.*"([^"]+)"/\1/' || true)
+  [[ ${#asset_urls[@]} -eq 0 ]] && fatal "No release assets found"
+  for u in "${asset_urls[@]}"; do
+    l=$(echo "$u" | tr '[:upper:]' '[:lower:]')
+    if [[ $l == *.sha256* || $l == *.sha256sum* || $l == *.sha512* || $l == *.sha512sum* ]]; then
+      checksum_urls+=("$u")
+    elif [[ $l == *.sig || $l == *.asc || $l == *.gpg ]]; then
+      signature_urls+=("$u")
+    fi
+  done
+  asset_url=$(select_asset)
+  [[ -z "$asset_url" ]] && fatal "Failed to select suitable asset"
+else
+  asset_url="$URL"
+  base_no_query="${asset_url%%\?*}"
+  for ext in .sha256 .sha256sum .sha512 .sha512sum; do
+    if url_exists "${base_no_query}${ext}"; then
+      checksum_urls+=("${base_no_query}${ext}")
+    fi
+  done
+  for ext in .sig .asc .gpg; do
+    if url_exists "${base_no_query}${ext}"; then
+      signature_urls+=("${base_no_query}${ext}")
+    fi
+  done
+fi
+
+file_name=$(basename "${asset_url%%\?*}")
+if [[ -z "$file_name" ]]; then
+  file_name="downloaded_file"
+fi
+
+tool_name="${TOOL_NAME:-}"
+if [[ -z "$tool_name" ]]; then
+  if [[ -n "${repo:-}" ]]; then
+    tool_name="$repo"
+  else
+    tool_name=$(derive_tool_name "$file_name")
+  fi
+fi
+if [[ -z "$tool_name" ]]; then tool_name="tool"; fi
+tool_name="${tool_name// /-}"
+tool_name="${tool_name//\//-}"
+
+if [[ -n "${tag_name:-}" ]]; then
+  log "Latest release: $tag_name"
+fi
+log "Selected asset: $asset_url"
+log "Tool name: $tool_name"
+
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
+
+asset_file="$TMP/$file_name"
+log "Downloading to $asset_file"
+if ! download_file "$asset_url" "$asset_file"; then
+  fatal "Download failed"
+fi
+
+verify_download "$asset_file"
+
+install_dir="$INSTALL_ROOT/$tool_name"
+if is_archive "$file_name"; then
+  log "Extracting archive"
+  ensure_extractor "$file_name"
+  extract_dir="$TMP/extract"
+  if ! extract_archive "$asset_file" "$extract_dir"; then
+    fatal "Extraction failed"
+  fi
+  log "Installing to $install_dir"
+  run_root rm -rf "$install_dir"
+  run_root mkdir -p "$install_dir"
+  run_root cp -a "$extract_dir"/. "$install_dir"/
+  run_root chmod -R a+rX "$install_dir" || true
+  exec_path=$(find_executable "$install_dir" "$tool_name" || true)
+  if [[ -z "${exec_path:-}" ]]; then
+    fatal "Executable not found after extraction"
+  fi
+  run_root chmod 755 "$exec_path"
+else
+  log "Installing binary"
+  run_root rm -rf "$install_dir"
+  run_root mkdir -p "$install_dir"
+  run_root cp "$asset_file" "$install_dir/$tool_name"
+  run_root chmod 755 "$install_dir/$tool_name"
+  exec_path="$install_dir/$tool_name"
+fi
+
+run_root mkdir -p "$BIN_DIR"
+run_root ln -sf "$exec_path" "$BIN_DIR/$tool_name"
+
+add_to_path "$BIN_DIR" "$tool_name"
+
+log "Installation complete"
+log "Executable: $BIN_DIR/$tool_name"
+show_version "$BIN_DIR/$tool_name"

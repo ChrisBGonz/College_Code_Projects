@@ -1,0 +1,57 @@
+import os
+import logging
+from fastapi import FastAPI, Depends, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import OperationalError, DBAPIError
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("app")
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
+
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class DBConnectionError(Exception):
+    def __init__(self, original: Exception):
+        self.original = original
+        super().__init__(str(original))
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    except OperationalError as e:
+        raise DBConnectionError(e) from e
+    except DBAPIError as e:
+        if getattr(e, "connection_invalidated", False):
+            raise DBConnectionError(e) from e
+        raise
+    finally:
+        db.close()
+
+app = FastAPI()
+
+@app.exception_handler(DBConnectionError)
+async def db_connection_error_handler(request: Request, exc: DBConnectionError):
+    original = exc.original
+    exc_info = (type(original), original, original.__traceback__) if original else False
+    logger.error(
+        "Database connection error on %s %s: %s",
+        request.method,
+        request.url.path,
+        original or exc,
+        exc_info=exc_info,
+    )
+    return JSONResponse(status_code=503, content={"detail": "Database unavailable"})
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
+
+@app.get("/items")
+def read_items(db: Session = Depends(get_db)):
+    value = db.execute(text("SELECT 1")).scalar()
+    return {"result": value}

@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+import os
+import sys
+import re
+import urllib.request
+import xml.etree.ElementTree as ET
+from functools import lru_cache
+
+REPO_URL = os.environ.get('MAVEN_REPO_URL', 'https://repo1.maven.org/maven2')
+SKIP_DIRS = {'.git', '.idea', '.mvn', 'target', 'node_modules', 'build', 'out', '.gradle'}
+
+try:
+    from packaging.version import Version
+    def version_key(v): return Version(v)
+except Exception:
+    try:
+        from distutils.version import LooseVersion
+        def version_key(v): return LooseVersion(v)
+    except Exception:
+        def version_key(v): return v
+
+def is_newer(v1, v2):
+    try:
+        return version_key(v1) > version_key(v2)
+    except Exception:
+        return v1 > v2
+
+@lru_cache(maxsize=None)
+def get_latest_version(group_id, artifact_id):
+    path = group_id.replace('.', '/') + '/' + artifact_id + '/maven-metadata.xml'
+    url = REPO_URL.rstrip('/') + '/' + path
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'maven-latest-updater'})
+        with urllib.request.urlopen(req) as resp:
+            data = resp.read()
+    except Exception:
+        return None
+    try:
+        md = ET.fromstring(data)
+    except Exception:
+        return None
+    latest = md.findtext('./versioning/latest') or md.findtext('./versioning/release')
+    if latest:
+        return latest.strip()
+    versions = [v.text.strip() for v in md.findall('./versioning/versions/version') if v.text]
+    if not versions:
+        return None
+    try:
+        return max(versions, key=version_key)
+    except Exception:
+        return max(versions)
+
+def find_pom_files(root):
+    if os.path.isfile(root):
+        return [root]
+    pom_files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+        if 'pom.xml' in filenames:
+            pom_files.append(os.path.join(dirpath, 'pom.xml'))
+    return pom_files
+
+def update_pom(pom_path):
+    try:
+        tree = ET.parse(pom_path)
+    except Exception:
+        return
+    root = tree.getroot()
+    ns_uri = ''
+    if root.tag.startswith('{'):
+        ns_uri = root.tag.split('}')[0][1:]
+        ET.register_namespace('', ns_uri)
+    def q(tag):
+        return f'{{{ns_uri}}}{tag}' if ns_uri else tag
+    def local(tag):
+        return tag.split('}', 1)[1] if '}' in tag else tag
+    parent_map = {c: p for p in root.iter() for c in p}
+    property_elements = {}
+    for props in root.iter(q('properties')):
+        for child in list(props):
+            name = local(child.tag)
+            property_elements.setdefault(name, []).append(child)
+    property_values = {}
+    for name, elems in property_elements.items():
+        text = elems[0].text.strip() if elems and elems[0].text else ''
+        property_values[name] = text
+    def find_text(elem, tag):
+        e = elem.find(q(tag))
+        return e.text.strip() if e is not None and e.text else ''
+    project_groupId = find_text(root, 'groupId')
+    project_artifactId = find_text(root, 'artifactId')
+    project_version = find_text(root, 'version')
+    parent_elem = root.find(q('parent'))
+    parent_groupId = parent_artifactId = parent_version = ''
+    if parent_elem is not None:
+        parent_groupId = find_text(parent_elem, 'groupId')
+        parent_artifactId = find_text(parent_elem, 'artifactId')
+        parent_version = find_text(parent_elem, 'version')
+        if not project_groupId:
+            project_groupId = parent_groupId
+        if not project_version:
+            project_version = parent_version
+    builtin = {
+        'project.groupId': project_groupId,
+        'project.artifactId': project_artifactId,
+        'project.version': project_version,
+        'pom.groupId': project_groupId,
+        'pom.artifactId': project_artifactId,
+        'pom.version': project_version,
+        'groupId': project_groupId,
+        'artifactId': project_artifactId,
+        'version': project_version,
+        'parent.groupId': parent_groupId,
+        'parent.artifactId': parent_artifactId,
+        'parent.version': parent_version,
+    }
+    for k, v in builtin.items():
+        if v:
+            property_values.setdefault(k, v)
+    resolved_cache = {}
+    def resolve_property(name, stack=None):
+        if name in resolved_cache:
+            return resolved_cache[name]
+        if stack is None:
+            stack = set()
+        if name in stack:
+            return None
+        if name not in property_values:
+            return None
+        stack.add(name)
+        val = property_values[name] or ''
+        def repl(m):
+            rv = resolve_property(m.group(1), stack)
+            return rv if rv is not None else m.group(0)
+        res = re.sub(r'\$\{([^}]+)\}', repl, val)
+        resolved_cache[name] = res
+        stack.remove(name)
+        return res
+    def resolve_text(text):
+        if text is None:
+            return None
+        def repl(m):
+            rv = resolve_property(m.group(1))
+            return rv if rv is not None else m.group(0)
+        return re.sub(r'\$\{([^}]+)\}', repl, text)
+    def is_plugin_dependency(dep):
+        p = parent_map.get(dep)
+        while p is not None:
+            name = local(p.tag)
+            if name in ('plugin', 'pluginManagement', 'reportPlugin', 'reportPlugins'):
+                return True
+            p = parent_map.get(p)
+        return False
+    property_updates = {}
+    updated = False
+    for dep in root.iter(q('dependency')):
+        if is_plugin_dependency(dep):
+            continue
+        groupId_elem = dep.find(q('groupId'))
+        artifactId_elem = dep.find(q('artifactId'))
+        if groupId_elem is None or artifactId_elem is None:
+            continue
+        groupId_text = groupId_elem.text.strip() if groupId_elem.text else ''
+        artifactId_text = artifactId_elem.text.strip() if artifactId_elem.text else ''
+        if not groupId_text or not artifactId_text:
+            continue
+        groupId_res = resolve_text(groupId_text)
+        artifactId_res = resolve_text(artifactId_text)
+        if groupId_res is None or artifactId_res is None:
+            continue
+        if '${' in groupId_res or '${' in artifactId_res:
+            continue
+        latest = get_latest_version(groupId_res, artifactId_res)
+        if not latest:
+            continue
+        version_elem = dep.find(q('version'))
+        if version_elem is None or version_elem.text is None:
+            continue
+        version_text = version_elem.text.strip()
+        if not version_text:
+            continue
+        if version_text.startswith('${') and version_text.endswith('}'):
+            prop_name = version_text[2:-1]
+            if prop_name in property_elements:
+                existing = property_updates.get(prop_name)
+                if existing is None or is_newer(latest, existing):
+                    property_updates[prop_name] = latest
+            else:
+                if prop_name.startswith('project.') or prop_name.startswith('pom.') or prop_name.startswith('parent.') or prop_name in ('project.version', 'version', 'parent.version'):
+                    continue
+                if version_text != latest:
+                    version_elem.text = latest
+                    updated = True
+        else:
+            if version_text != latest:
+                version_elem.text = latest
+                updated = True
+    for prop, ver in property_updates.items():
+        elems = property_elements.get(prop, [])
+        for elem in elems:
+            current = elem.text.strip() if elem.text else ''
+            if current != ver:
+                elem.text = ver
+                updated = True
+    if updated:
+        tree.write(pom_path, encoding='utf-8', xml_declaration=True)
+
+def main():
+    global REPO_URL
+    if len(sys.argv) > 2:
+        REPO_URL = sys.argv[2]
+    root = sys.argv[1] if len(sys.argv) > 1 else os.getcwd()
+    for pom in find_pom_files(root):
+        update_pom(pom)
+
+if __name__ == '__main__':
+    main()
