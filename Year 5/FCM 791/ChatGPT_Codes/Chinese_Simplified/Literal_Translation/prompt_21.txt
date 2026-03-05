@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+from typing import Any, Dict, List, Optional
+
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import PyJWTError, InvalidTokenError
+
+
+def _read_file(path: str) -> str:
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        return data.decode("utf-8")
+    except Exception:
+        return data.decode("latin-1")
+
+
+def _parse_csv(value) -> List[str]:
+    if not value:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        result: List[str] = []
+        for v in value:
+            result.extend(_parse_csv(v))
+        return result
+    return [v for v in (x.strip() for x in str(value).split(",")) if v]
+
+
+def _merge_unique(*lists: List[str]) -> List[str]:
+    seen = set()
+    result: List[str] = []
+    for lst in lists:
+        for item in lst:
+            if item not in seen:
+                seen.add(item)
+                result.append(item)
+    return result
+
+
+def _parse_literal(val: str) -> Any:
+    if val is None:
+        return None
+    s = val.strip()
+    if s == "":
+        return ""
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
+
+
+def _parse_claim_pairs(pairs) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    for pair in _parse_csv(pairs):
+        if not pair:
+            continue
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            result[k] = _parse_literal(v)
+        else:
+            result[pair] = True
+    return result
+
+
+def _normalize_token(token: Optional[str]) -> str:
+    if token is None:
+        return ""
+    token = token.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
+def _load_key(value: Optional[str], file_path: Optional[str], env_name: Optional[str]) -> Optional[str]:
+    if file_path:
+        return _read_file(file_path).strip()
+    if value:
+        if value.startswith("@"):
+            return _read_file(value[1:]).strip()
+        if value.startswith("file://"):
+            return _read_file(value[7:]).strip()
+        return value
+    if env_name:
+        env_value = os.getenv(env_name)
+        if env_value:
+            if env_value.startswith("@"):
+                return _read_file(env_value[1:]).strip()
+            if env_value.startswith("file://"):
+                return _read_file(env_value[7:]).strip()
+            return env_value
+    return None
+
+
+class JWTAuthenticator:
+    def __init__(
+        self,
+        secret: Optional[str] = None,
+        public_key: Optional[str] = None,
+        jwks_url: Optional[str] = None,
+        algorithms: Optional[List[str]] = None,
+        audience: Optional[Any] = None,
+        issuer: Optional[str] = None,
+        leeway: int = 0,
+        required_claims: Optional[List[str]] = None,
+        required_scopes: Optional[List[str]] = None,
+        required_roles: Optional[List[str]] = None,
+        claim_values: Optional[Dict[str, Any]] = None,
+        verify_signature: bool = True,
+    ):
+        self.secret = secret
+        self.public_key = public_key
+        self.jwks_url = jwks_url
+        self.algorithms = algorithms or ["HS256"]
+        self.audience = audience
+        self.issuer = issuer
+        self.leeway = leeway
+        self.required_claims = required_claims or []
+        self.required_scopes = required_scopes or []
+        self.required_roles = required_roles or []
+        self.claim_values = claim_values or {}
+        self.verify_signature = verify_signature
+        self._jwks_client = PyJWKClient(jwks_url) if jwks_url else None
+
+    def _get_key(self, token: str):
+        if not self.verify_signature:
+            return None
+        if self._jwks_client is not None:
+            return self._jwks_client.get_signing_key_from_jwt(token).key
+        if self.public_key is not None:
+            return self.public_key
+        if self.secret is not None:
+            return self.secret
+        raise InvalidTokenError("No verification key available")
+
+    def _build_options(self) -> Dict[str, Any]:
+        options: Dict[str, Any] = {"require": self.required_claims}
+        if self.audience is None:
+            options["verify_aud"] = False
+        return options
+
+    def decode(self, token: str):
+        header = jwt.get_unverified_header(token)
+        key = self._get_key(token)
+        options = self._build_options()
+        if not self.verify_signature:
+            options["verify_signature"] = False
+        kwargs: Dict[str, Any] = {
+            "key": key,
+            "audience": self.audience,
+            "issuer": self.issuer,
+            "leeway": self.leeway,
+            "options": options,
+        }
+        if self.verify_signature:
+            kwargs["algorithms"] = self.algorithms
+        payload = jwt.decode(token, **kwargs)
+        self._validate_custom(payload)
+        return header, payload
+
+    def _validate_custom(self, payload: Dict[str, Any]):
+        if self.required_scopes:
+            scopes = payload.get("scope") or payload.get("scp") or payload.get("scopes")
+            if scopes is None:
+                raise InvalidTokenError("Required scope claim missing")
+            scope_set = self._normalize_claim_set(scopes)
+            missing = set(self.required_scopes) - scope_set
+            if missing:
+                raise InvalidTokenError("Missing required scopes: " + ", ".join(sorted(missing)))
+        if self.required_roles:
+            roles = payload.get("roles") or payload.get("role") or payload.get("permissions")
+            if roles is None:
+                raise InvalidTokenError("Required roles claim missing")
+            role_set = self._normalize_claim_set(roles)
+            missing = set(self.required_roles) - role_set
+            if missing:
+                raise InvalidTokenError("Missing required roles: " + ", ".join(sorted(missing)))
+        if self.claim_values:
+            for k, expected in self.claim_values.items():
+                if k not in payload:
+                    raise InvalidTokenError("Missing claim: " + k)
+                actual = payload[k]
+                if not self._match_claim(actual, expected):
+                    raise InvalidTokenError("Claim {} mismatch".format(k))
+
+    @staticmethod
+    def _normalize_claim_set(value) -> set:
+        if isinstance(value, str):
+            return set(item for item in value.replace(",", " ").split() if item)
+        if isinstance(value, (list, tuple, set)):
+            return set(value)
+        return {value}
+
+    @staticmethod
+    def _match_claim(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, (list, tuple, set)):
+            expected_set = set(expected)
+            if isinstance(actual, (list, tuple, set)):
+                return expected_set.issubset(set(actual))
+            return actual in expected_set
+        if isinstance(actual, (list, tuple, set)):
+            return expected in set(actual)
+        return actual == expected
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="JWT authentication and decoding utility")
+    parser.add_argument("--token", help="JWT string (Bearer prefix allowed)")
+    parser.add_argument("--token-file", help="Path to file containing JWT")
+    parser.add_argument("--secret", help="HMAC secret or @file")
+    parser.add_argument("--secret-file", help="Path to secret file")
+    parser.add_argument("--public-key", help="Public key PEM or @file")
+    parser.add_argument("--public-key-file", help="Path to public key PEM file")
+    parser.add_argument("--jwks-url", help="JWKS URL for key discovery")
+    parser.add_argument("--algorithms", help="Comma separated allowed algorithms")
+    parser.add_argument("--audience", action="append", help="Expected audience (repeatable)")
+    parser.add_argument("--issuer", help="Expected issuer")
+    parser.add_argument("--leeway", type=int, default=0, help="Leeway seconds for exp/nbf validation")
+    parser.add_argument("--require", action="append", help="Required claim (repeatable)")
+    parser.add_argument("--scope", action="append", help="Required scope (repeatable)")
+    parser.add_argument("--role", action="append", help="Required role (repeatable)")
+    parser.add_argument("--claim", action="append", help="Required claim value key=value")
+    parser.add_argument("--no-verify", action="store_true", help="Disable signature verification")
+    parser.add_argument("--show-header", action="store_true", help="Output header and payload")
+    parser.add_argument("--pretty", action="store_true", help="Pretty print JSON")
+    return parser
+
+
+def _resolve_token(args) -> str:
+    token = None
+    if args.token_file:
+        token = _read_file(args.token_file)
+    if not token:
+        token = args.token or os.getenv("JWT_TOKEN")
+    if not token and not sys.stdin.isatty():
+        token = sys.stdin.read()
+    return _normalize_token(token)
+
+
+def main():
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    token = _resolve_token(args)
+    if not token:
+        sys.stderr.write("JWT token is required\n")
+        sys.exit(2)
+
+    secret = _load_key(args.secret, args.secret_file, "JWT_SECRET")
+    public_key = _load_key(args.public_key, args.public_key_file, "JWT_PUBLIC_KEY")
+    jwks_url = args.jwks_url or os.getenv("JWT_JWKS_URL")
+
+    algorithms = _parse_csv(args.algorithms) or _parse_csv(os.getenv("JWT_ALGORITHMS"))
+    if not algorithms:
+        algorithms = ["RS256", "HS256", "ES256", "PS256"]
+
+    audience_list = _merge_unique(_parse_csv(os.getenv("JWT_AUDIENCE")), _parse_csv(args.audience))
+    if len(audience_list) == 0:
+        audience = None
+    elif len(audience_list) == 1:
+        audience = audience_list[0]
+    else:
+        audience = audience_list
+
+    issuer = args.issuer or os.getenv("JWT_ISSUER")
+
+    required_claims = _merge_unique(
+        _parse_csv(os.getenv("JWT_REQUIRED_CLAIMS")),
+        _parse_csv(args.require),
+    )
+    required_scopes = _merge_unique(
+        _parse_csv(os.getenv("JWT_REQUIRED_SCOPES")),
+        _parse_csv(args.scope),
+    )
+    required_roles = _merge_unique(
+        _parse_csv(os.getenv("JWT_REQUIRED_ROLES")),
+        _parse_csv(args.role),
+    )
+
+    claim_values = _parse_claim_pairs(os.getenv("JWT_REQUIRED_CLAIM_VALUES"))
+    claim_values.update(_parse_claim_pairs(args.claim))
+
+    verify_signature = not args.no_verify
+    if verify_signature and not (jwks_url or public_key or secret):
+        sys.stderr.write("Verification key or JWKS URL is required\n")
+        sys.exit(2)
+
+    authenticator = JWTAuthenticator(
+        secret=secret,
+        public_key=public_key,
+        jwks_url=jwks_url,
+        algorithms=algorithms,
+        audience=audience,
+        issuer=issuer,
+        leeway=args.leeway,
+        required_claims=required_claims,
+        required_scopes=required_scopes,
+        required_roles=required_roles,
+        claim_values=claim_values,
+        verify_signature=verify_signature,
+    )
+
+    try:
+        header, payload = authenticator.decode(token)
+    except PyJWTError as e:
+        sys.stderr.write("Invalid token: " + str(e) + "\n")
+        sys.exit(1)
+    except Exception as e:
+        sys.stderr.write("Error: " + str(e) + "\n")
+        sys.exit(1)
+
+    result = {"header": header, "payload": payload} if args.show_header else payload
+
+    json_kwargs = {"ensure_ascii": False, "default": str}
+    if args.pretty:
+        json_kwargs.update({"indent": 2, "sort_keys": True})
+    else:
+        json_kwargs.update({"separators": (",", ":")})
+    print(json.dumps(result, **json_kwargs))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,118 @@
+const STATE_CLOSED = 'CLOSED';
+const STATE_OPEN = 'OPEN';
+const STATE_HALF_OPEN = 'HALF_OPEN';
+
+class CircuitBreaker {
+  constructor(action, options) {
+    if (typeof action !== 'function') {
+      throw new Error('Action must be a function');
+    }
+    options = options || {};
+    this.action = action;
+    this.failureThreshold = typeof options.failureThreshold === 'number' ? options.failureThreshold : 5;
+    this.successThreshold = typeof options.successThreshold === 'number' ? options.successThreshold : 2;
+    this.timeout = typeof options.timeout === 'number' ? options.timeout : 10000;
+    this.fallback = typeof options.fallback === 'function' ? options.fallback : null;
+    this.onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : null;
+
+    this.state = STATE_CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInProgress = false;
+  }
+
+  _setState(state) {
+    if (this.state !== state) {
+      this.state = state;
+      if (this.onStateChange) {
+        this.onStateChange(state);
+      }
+    }
+  }
+
+  async fire(...args) {
+    if (this.state === STATE_OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._setState(STATE_HALF_OPEN);
+      } else {
+        if (this.fallback) return this.fallback(...args);
+        throw new Error('Circuit breaker is open');
+      }
+    }
+
+    const isHalfOpen = this.state === STATE_HALF_OPEN;
+    if (isHalfOpen) {
+      if (this.halfOpenInProgress) {
+        if (this.fallback) return this.fallback(...args);
+        throw new Error('Circuit breaker is half-open');
+      }
+      this.halfOpenInProgress = true;
+    }
+
+    try {
+      const result = await this.action(...args);
+      this._onSuccess();
+      return result;
+    } catch (err) {
+      this._onFailure();
+      throw err;
+    } finally {
+      if (isHalfOpen) {
+        this.halfOpenInProgress = false;
+      }
+    }
+  }
+
+  _onSuccess() {
+    if (this.state === STATE_HALF_OPEN) {
+      this.successCount += 1;
+      if (this.successCount >= this.successThreshold) {
+        this.close();
+      }
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === STATE_HALF_OPEN) {
+      this.open();
+    } else {
+      this.failureCount += 1;
+      if (this.failureCount >= this.failureThreshold) {
+        this.open();
+      }
+    }
+  }
+
+  open() {
+    this._setState(STATE_OPEN);
+    this.nextAttempt = Date.now() + this.timeout;
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  close() {
+    this._setState(STATE_CLOSED);
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  reset() {
+    this.close();
+  }
+
+  getState() {
+    return this.state;
+  }
+}
+
+function createFetchCircuitBreaker(options) {
+  return new CircuitBreaker((url, config) => fetch(url, config), options || {});
+}
+
+if (typeof window !== 'undefined') {
+  window.CircuitBreaker = CircuitBreaker;
+  window.createFetchCircuitBreaker = createFetchCircuitBreaker;
+}

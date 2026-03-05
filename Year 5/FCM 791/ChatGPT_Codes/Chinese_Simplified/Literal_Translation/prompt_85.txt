@@ -1,0 +1,89 @@
+<?php
+session_start();
+
+function isAdmin() {
+    return isset($_SESSION['is_admin']) && $_SESSION['is_admin'] === true;
+}
+
+function shouldSendAlert($key, $interval = 300) {
+    $file = sys_get_temp_dir() . '/admin_alert_' . hash('sha256', $key);
+    $now = time();
+    if (file_exists($file)) {
+        $last = @filemtime($file);
+        if ($last !== false && ($now - $last) < $interval) {
+            return false;
+        }
+    }
+    @touch($file);
+    return true;
+}
+
+function sendAdminAlert($message) {
+    $sent = false;
+
+    $email = getenv('ALERT_EMAIL');
+    if ($email) {
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $from = getenv('ALERT_FROM');
+        if (!$from) {
+            $from = 'noreply@' . preg_replace('/:\d+$/', '', $host);
+        }
+        $subject = 'Admin Access Alert';
+        $headers = "From: {$from}\r\n" .
+                   "Content-Type: text/plain; charset=UTF-8\r\n";
+        if (@mail($email, $subject, $message, $headers)) {
+            $sent = true;
+        }
+    }
+
+    $webhook = getenv('SLACK_WEBHOOK_URL');
+    if ($webhook) {
+        $payload = json_encode(['text' => $message], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $ch = curl_init($webhook);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 3);
+        $response = curl_exec($ch);
+        if ($response !== false) {
+            $sent = true;
+        }
+        curl_close($ch);
+    }
+
+    if (!$sent) {
+        error_log($message);
+    }
+}
+
+$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+if (preg_match('#^/admin(?:/|$)#', $path)) {
+    if (!isAdmin()) {
+        $ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? '';
+        $method = $_SERVER['REQUEST_METHOD'] ?? '';
+        $host = $_SERVER['HTTP_HOST'] ?? '';
+        $ref = $_SERVER['HTTP_REFERER'] ?? '';
+        $query = $_SERVER['QUERY_STRING'] ?? '';
+        $fullUri = $path . ($query !== '' ? '?' . $query : '');
+
+        $message = "Unauthorized admin access attempt\n";
+        $message .= "Time: " . date('c') . "\n";
+        $message .= "IP: " . $ip . "\n";
+        $message .= "Method: " . $method . "\n";
+        $message .= "Host: " . $host . "\n";
+        $message .= "URI: " . $fullUri . "\n";
+        $message .= "User-Agent: " . $userAgent . "\n";
+        $message .= "Referrer: " . $ref . "\n";
+
+        if (shouldSendAlert($ip . '|' . $userAgent)) {
+            sendAdminAlert($message);
+        }
+
+        http_response_code(403);
+        echo "Forbidden";
+        exit;
+    }
+}

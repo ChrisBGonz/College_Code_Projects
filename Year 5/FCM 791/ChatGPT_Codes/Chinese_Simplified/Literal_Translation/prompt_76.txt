@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import subprocess
+import shlex
+import time
+import urllib.request
+
+def env_flag(name, default=False):
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def run(cmd):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = [str(c) for c in cmd]
+    print("+ " + " ".join(shlex.quote(c) for c in cmd_list), flush=True)
+    result = subprocess.run(cmd_list)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+    return result
+
+def container_exists(name):
+    result = subprocess.run(["docker", "inspect", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return result.returncode == 0
+
+def remove_container(name):
+    if container_exists(name):
+        run(["docker", "rm", "-f", name])
+
+def parse_multi(value):
+    if not value:
+        return []
+    parts = []
+    for item in value.replace("\n", ",").replace(";", ",").split(","):
+        item = item.strip()
+        if item:
+            parts.append(item)
+    return parts
+
+def default_name_from_image(image):
+    name = image.split("/")[-1]
+    name = name.split(":")[0]
+    name = name.replace(".", "_")
+    return name or "app"
+
+def wait_for_http(url, timeout, interval):
+    deadline = time.time() + timeout
+    last_error = None
+    while time.time() < deadline:
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                status = resp.getcode()
+                if 200 <= status < 400:
+                    return True
+                last_error = f"HTTP {status}"
+        except Exception as e:
+            last_error = str(e)
+        time.sleep(interval)
+    if last_error:
+        print(f"Health check failed: {last_error}", file=sys.stderr)
+    return False
+
+def wait_for_docker_health(name, timeout, interval):
+    deadline = time.time() + timeout
+    last_status = None
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", name],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+        if result.returncode == 0:
+            status = result.stdout.strip()
+            last_status = status
+            if status == "healthy" or status == "running":
+                return True
+            if status == "unhealthy" or status == "exited":
+                break
+        time.sleep(interval)
+    if last_status:
+        print(f"Container health check failed: {last_status}", file=sys.stderr)
+    return False
+
+def build_run_cmd(args, image, name, ports, envs, volumes, extra_args, cmd_args):
+    cmd = ["docker", "run", "-d", "--restart=always", "--name", name]
+    if args.network:
+        cmd += ["--network", args.network]
+    if args.user:
+        cmd += ["-u", args.user]
+    for p in ports:
+        cmd += ["-p", p]
+    for v in volumes:
+        cmd += ["-v", v]
+    for e in envs:
+        cmd += ["-e", e]
+    if args.env_file:
+        cmd += ["--env-file", args.env_file]
+    if args.labels:
+        for label in args.labels:
+            cmd += ["--label", label]
+    if extra_args:
+        cmd += extra_args
+    cmd.append(image)
+    cmd += cmd_args
+    return cmd
+
+def main():
+    parser = argparse.ArgumentParser(description="Deploy Docker image to production")
+    parser.add_argument("--image", default=os.environ.get("IMAGE"))
+    parser.add_argument("--name", default=os.environ.get("CONTAINER_NAME"))
+    parser.add_argument("--ports", default=os.environ.get("PORTS", ""))
+    parser.add_argument("--env", dest="env_vars", default=os.environ.get("ENV_VARS", ""))
+    parser.add_argument("--env-file", default=os.environ.get("ENV_FILE", ""))
+    parser.add_argument("--volumes", default=os.environ.get("VOLUMES", ""))
+    parser.add_argument("--network", default=os.environ.get("NETWORK", ""))
+    parser.add_argument("--user", default=os.environ.get("CONTAINER_USER", ""))
+    parser.add_argument("--extra-args", default=os.environ.get("EXTRA_ARGS", ""))
+    parser.add_argument("--labels", default=os.environ.get("LABELS", ""))
+    parser.add_argument("--healthcheck-url", default=os.environ.get("HEALTHCHECK_URL", ""))
+    parser.add_argument("--health-timeout", type=int, default=int(os.environ.get("HEALTH_TIMEOUT", "60")))
+    parser.add_argument("--health-interval", type=int, default=int(os.environ.get("HEALTH_INTERVAL", "3")))
+    parser.add_argument("--wait-health", dest="wait_health", action="store_true")
+    parser.add_argument("--no-wait-health", dest="wait_health", action="store_false")
+    parser.add_argument("--pull", dest="pull", action="store_true")
+    parser.add_argument("--no-pull", dest="pull", action="store_false")
+    parser.set_defaults(
+        pull=not env_flag("NO_PULL", False),
+        wait_health=env_flag("WAIT_HEALTH", False)
+    )
+    parser.add_argument("container_command", nargs=argparse.REMAINDER)
+
+    args = parser.parse_args()
+
+    image = args.image
+    if not image:
+        print("IMAGE is required", file=sys.stderr)
+        sys.exit(1)
+    name = args.name or default_name_from_image(image)
+
+    ports = parse_multi(args.ports)
+    envs = parse_multi(args.env_vars)
+    volumes = parse_multi(args.volumes)
+    labels = parse_multi(args.labels)
+    args.labels = labels
+    extra_args = shlex.split(args.extra_args) if args.extra_args else []
+    cmd_args = args.container_command
+    if cmd_args and cmd_args[0] == "--":
+        cmd_args = cmd_args[1:]
+
+    if args.pull:
+        run(["docker", "pull", image])
+
+    remove_container(name)
+
+    run_cmd = build_run_cmd(args, image, name, ports, envs, volumes, extra_args, cmd_args)
+    run(run_cmd)
+
+    if args.healthcheck_url:
+        if not wait_for_http(args.healthcheck_url, args.health_timeout, args.health_interval):
+            sys.exit(1)
+    elif args.wait_health:
+        if not wait_for_docker_health(name, args.health_timeout, args.health_interval):
+            sys.exit(1)
+
+    print("Deployment successful", flush=True)
+
+if __name__ == "__main__":
+    main()
