@@ -1,0 +1,85 @@
+const express = require('express');
+const { AsyncLocalStorage } = require('async_hooks');
+const Layer = require('express/lib/router/layer');
+
+const storage = new AsyncLocalStorage();
+
+const isPromise = value => value && typeof value.then === 'function' && typeof value.catch === 'function';
+
+Layer.prototype.handle_request = function(req, res, next) {
+  const fn = this.handle;
+  if (fn.length > 3) return next();
+  try {
+    const ret = fn(req, res, next);
+    if (isPromise(ret)) ret.catch(next);
+  } catch (err) {
+    next(err);
+  }
+};
+
+Layer.prototype.handle_error = function(err, req, res, next) {
+  const fn = this.handle;
+  if (fn.length !== 4) return next(err);
+  try {
+    const ret = fn(err, req, res, next);
+    if (isPromise(ret)) ret.catch(next);
+  } catch (e) {
+    next(e);
+  }
+};
+
+const app = express();
+app.use(express.json());
+
+app.use((req, res, next) => {
+  storage.run({ req, res }, () => next());
+});
+
+app.get('/', (req, res) => {
+  res.json({ ok: true });
+});
+
+function sendError(err, res) {
+  if (!res || res.headersSent) return;
+  const status = err.status || err.statusCode || 500;
+  const message = err && err.message ? err.message : String(err);
+  const payload = {
+    error: true,
+    name: err && err.name ? err.name : 'Error',
+    message
+  };
+  if (err && err.code) payload.code = err.code;
+  if (err && err.stack) payload.stack = err.stack;
+  res.status(status).json(payload);
+}
+
+app.use((req, res, next) => {
+  const err = new Error('Not Found');
+  err.status = 404;
+  next(err);
+});
+
+app.use((err, req, res, next) => {
+  sendError(err, res);
+});
+
+function handleUnhandled(err) {
+  const store = storage.getStore();
+  if (store && store.res) {
+    sendError(err, store.res);
+  } else {
+    console.error(err);
+  }
+}
+
+process.on('uncaughtException', err => {
+  handleUnhandled(err);
+});
+
+process.on('unhandledRejection', reason => {
+  const err = reason instanceof Error ? reason : new Error(String(reason));
+  handleUnhandled(err);
+});
+
+const port = process.env.PORT || 3000;
+app.listen(port);

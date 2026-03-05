@@ -1,0 +1,91 @@
+import os
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+GATEWAY_API_URL = os.environ.get("GATEWAY_API_URL", "https://example.com/api/payment")
+API_KEY = os.environ.get("GATEWAY_API_KEY", "")
+DEFAULT_AMOUNT = os.environ.get("AMOUNT", "1000")
+DEFAULT_CURRENCY = os.environ.get("CURRENCY", "JPY")
+DEFAULT_DESCRIPTION = os.environ.get("DESCRIPTION", "Order")
+TIMEOUT = float(os.environ.get("TIMEOUT", "10"))
+
+def find_success_url(obj):
+    if isinstance(obj, dict):
+        if "success_url" in obj and isinstance(obj["success_url"], str):
+            return obj["success_url"]
+        for v in obj.values():
+            res = find_success_url(v)
+            if res:
+                return res
+    elif isinstance(obj, list):
+        for v in obj:
+            res = find_success_url(v)
+            if res:
+                return res
+    return None
+
+def create_payment_session(amount, currency, description, extra=None):
+    payload = {"amount": amount, "currency": currency, "description": description}
+    if extra:
+        payload.update(extra)
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(GATEWAY_API_URL, data=data, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if API_KEY:
+        req.add_header("Authorization", f"Bearer {API_KEY}")
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8")
+        raise RuntimeError(f"Gateway returned {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Gateway connection error: {e.reason}")
+    try:
+        response_data = json.loads(body) if body else {}
+    except Exception:
+        response_data = {"raw": body}
+    success_url = find_success_url(response_data)
+    return success_url, response_data
+
+class PaymentHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path not in ("/", "/pay"):
+            self.send_response(404)
+            self.end_headers()
+            return
+        params = urllib.parse.parse_qs(parsed.query)
+        amount = params.get("amount", [DEFAULT_AMOUNT])[0]
+        currency = params.get("currency", [DEFAULT_CURRENCY])[0]
+        description = params.get("description", [DEFAULT_DESCRIPTION])[0]
+        extra = {k: v[0] for k, v in params.items() if k not in ("amount", "currency", "description")}
+        try:
+            success_url, data = create_payment_session(amount, currency, description, extra)
+        except Exception as e:
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": str(e)}).encode("utf-8"))
+            return
+        if not success_url:
+            self.send_response(502)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "success_url not found", "response": data}).encode("utf-8"))
+            return
+        self.send_response(302)
+        self.send_header("Location", success_url)
+        self.end_headers()
+
+def run():
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    httpd = HTTPServer((host, port), PaymentHandler)
+    httpd.serve_forever()
+
+if __name__ == "__main__":
+    run()

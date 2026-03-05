@@ -1,0 +1,171 @@
+import os
+import sys
+import time
+import shlex
+import subprocess
+
+def log(msg):
+    sys.stdout.write(msg + "\n")
+    sys.stdout.flush()
+
+def err(msg):
+    sys.stderr.write(msg + "\n")
+    sys.stderr.flush()
+
+def run(cmd, check=True, capture=False):
+    if isinstance(cmd, str):
+        cmd_display = cmd
+    else:
+        cmd_display = " ".join(shlex.quote(c) for c in cmd)
+    log(f"> {cmd_display}")
+    result = subprocess.run(cmd, shell=isinstance(cmd, str), stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None, text=True)
+    if check and result.returncode != 0:
+        if capture:
+            err(result.stderr.strip())
+        raise RuntimeError(f"Command failed: {cmd_display}")
+    return result
+
+def docker_login():
+    username = os.getenv("DOCKER_USERNAME")
+    password = os.getenv("DOCKER_PASSWORD")
+    registry = os.getenv("DOCKER_REGISTRY", "")
+    if username and password:
+        cmd = ["docker", "login"]
+        if registry:
+            cmd.append(registry)
+        cmd += ["-u", username, "--password-stdin"]
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, e = p.communicate(password + "\n")
+        if p.returncode != 0:
+            err(e.strip())
+            raise RuntimeError("Docker login failed")
+        log(out.strip())
+
+def container_id(name, all_containers=True):
+    cmd = ["docker", "ps", "-q", "-f", f"name=^{name}$"]
+    if all_containers:
+        cmd.insert(2, "-a")
+    result = run(cmd, capture=True, check=False)
+    return result.stdout.strip()
+
+def container_running(name):
+    cmd = ["docker", "ps", "-q", "-f", f"name=^{name}$"]
+    result = run(cmd, capture=True, check=False)
+    return bool(result.stdout.strip())
+
+def stop_and_remove(name):
+    cid = container_id(name, all_containers=True)
+    if not cid:
+        return
+    if container_running(name):
+        run(["docker", "stop", name])
+    run(["docker", "rm", name])
+
+def parse_list(value):
+    if not value:
+        return []
+    parts = []
+    for item in value.split(","):
+        item = item.strip()
+        if item:
+            parts.append(item)
+    return parts
+
+def build_run_command(image, name):
+    cmd = ["docker", "run", "-d", "--name", name]
+    restart = os.getenv("RESTART_POLICY", "always")
+    if restart:
+        cmd += ["--restart", restart]
+
+    network = os.getenv("NETWORK")
+    if network:
+        cmd += ["--network", network]
+
+    ports = parse_list(os.getenv("PORTS"))
+    for p in ports:
+        cmd += ["-p", p]
+
+    env_file = os.getenv("ENV_FILE")
+    if env_file:
+        cmd += ["--env-file", env_file]
+
+    env_vars = parse_list(os.getenv("ENV_VARS"))
+    for e in env_vars:
+        cmd += ["-e", e]
+
+    volumes = parse_list(os.getenv("VOLUMES"))
+    for v in volumes:
+        cmd += ["-v", v]
+
+    labels = parse_list(os.getenv("LABELS"))
+    for l in labels:
+        cmd += ["--label", l]
+
+    extra_args = os.getenv("EXTRA_ARGS")
+    if extra_args:
+        cmd += shlex.split(extra_args)
+
+    cmd.append(image)
+
+    container_cmd = os.getenv("CONTAINER_COMMAND")
+    if container_cmd:
+        cmd += shlex.split(container_cmd)
+
+    return cmd
+
+def wait_for_healthy(name):
+    timeout = int(os.getenv("HEALTH_TIMEOUT", "120"))
+    interval = int(os.getenv("HEALTH_INTERVAL", "5"))
+    end_time = time.time() + timeout
+    while time.time() < end_time:
+        res = run(["docker", "inspect", name], capture=True)
+        if not res.stdout:
+            time.sleep(interval)
+            continue
+        try:
+            import json
+            info = json.loads(res.stdout)[0]
+            state = info.get("State", {})
+            health = state.get("Health")
+            status = state.get("Status")
+            if health:
+                hstatus = health.get("Status")
+                if hstatus == "healthy":
+                    return True
+                if hstatus == "unhealthy":
+                    err("Container reported unhealthy")
+                    return False
+            else:
+                if status == "running":
+                    return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    err("Health check timeout")
+    return False
+
+def main():
+    image = os.getenv("IMAGE")
+    if not image:
+        err("IMAGE environment variable is required")
+        sys.exit(1)
+    name = os.getenv("CONTAINER_NAME")
+    if not name:
+        # derive from image
+        name = image.split("/")[-1].split(":")[0].replace(".", "_").replace("-", "_")
+    try:
+        docker_login()
+        run(["docker", "pull", image])
+        stop_and_remove(name)
+        cmd = build_run_command(image, name)
+        run(cmd)
+        if not wait_for_healthy(name):
+            err("Deployment failed: container not healthy")
+            sys.exit(1)
+        log("Deployment succeeded")
+    except Exception as e:
+        err(str(e))
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

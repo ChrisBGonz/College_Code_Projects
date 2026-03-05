@@ -1,0 +1,329 @@
+<?php
+declare(strict_types=1);
+
+session_start();
+
+const DB_FILE = __DIR__ . '/data.sqlite';
+const MAX_ATTEMPTS = 5;
+const LOCK_TIME = 900;
+
+$db = new PDO('sqlite:' . DB_FILE);
+$db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+$db->exec("CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT UNIQUE NOT NULL,
+    password_hash TEXT NOT NULL,
+    secret_question TEXT NOT NULL,
+    secret_answer_hash TEXT NOT NULL,
+    recovery_attempts INTEGER DEFAULT 0,
+    recovery_locked_until INTEGER DEFAULT 0,
+    created_at INTEGER NOT NULL
+)");
+
+if (empty($_SESSION['csrf'])) {
+    $_SESSION['csrf'] = bin2hex(random_bytes(32));
+}
+$csrf = $_SESSION['csrf'];
+
+function h(string $s): string {
+    return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function normalize_answer(string $a): string {
+    $a = trim($a);
+    if (function_exists('mb_strtolower')) {
+        $a = mb_strtolower($a, 'UTF-8');
+    } else {
+        $a = strtolower($a);
+    }
+    return $a;
+}
+
+function verify_csrf(): void {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $token = $_POST['csrf'] ?? '';
+        if (!hash_equals($_SESSION['csrf'] ?? '', $token)) {
+            http_response_code(400);
+            echo "Bad Request";
+            exit;
+        }
+    }
+}
+
+function renderHeader(string $title): void {
+    echo "<!doctype html><html lang='ja'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>" . h($title) . "</title></head><body>";
+}
+
+function renderFooter(): void {
+    echo "</body></html>";
+}
+
+function renderRequestForm(string $csrf, string $email = ''): void {
+    echo "<h1>アカウント復旧</h1>";
+    echo "<form method='post'>";
+    echo "<input type='hidden' name='action' value='request'>";
+    echo "<input type='hidden' name='csrf' value='" . h($csrf) . "'>";
+    echo "<label>メールアドレス: <input type='email' name='email' value='" . h($email) . "' required></label><br>";
+    echo "<button type='submit'>次へ</button>";
+    echo "</form>";
+}
+
+function renderQuestionForm(string $question, string $csrf): void {
+    echo "<h1>秘密の質問</h1>";
+    echo "<form method='post'>";
+    echo "<input type='hidden' name='action' value='answer'>";
+    echo "<input type='hidden' name='csrf' value='" . h($csrf) . "'>";
+    echo "<p>" . h($question) . "</p>";
+    echo "<label>答え: <input type='text' name='answer' required></label><br>";
+    echo "<button type='submit'>確認</button>";
+    echo "</form>";
+}
+
+function renderResetForm(string $csrf): void {
+    echo "<form method='post'>";
+    echo "<input type='hidden' name='action' value='reset'>";
+    echo "<input type='hidden' name='csrf' value='" . h($csrf) . "'>";
+    echo "<label>新しいパスワード: <input type='password' name='password' required></label><br>";
+    echo "<label>新しいパスワード(確認): <input type='password' name='password_confirm' required></label><br>";
+    echo "<button type='submit'>変更</button>";
+    echo "</form>";
+}
+
+function renderRegisterForm(string $csrf, array $values = []): void {
+    $email = $values['email'] ?? '';
+    $question = $values['question'] ?? '';
+    echo "<h1>新規登録</h1>";
+    echo "<form method='post'>";
+    echo "<input type='hidden' name='action' value='register'>";
+    echo "<input type='hidden' name='csrf' value='" . h($csrf) . "'>";
+    echo "<label>メールアドレス: <input type='email' name='email' value='" . h($email) . "' required></label><br>";
+    echo "<label>パスワード: <input type='password' name='password' required></label><br>";
+    echo "<label>秘密の質問: <input type='text' name='question' value='" . h($question) . "' required></label><br>";
+    echo "<label>答え: <input type='text' name='answer' required></label><br>";
+    echo "<button type='submit'>登録</button>";
+    echo "</form>";
+}
+
+function handleRegister(PDO $db, string $csrf): void {
+    $errors = [];
+    $values = [];
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $email = trim($_POST['email'] ?? '');
+        $values['email'] = $email;
+        $emailValid = filter_var($email, FILTER_VALIDATE_EMAIL);
+        if (!$emailValid) {
+            $errors[] = '有効なメールアドレスを入力してください。';
+        }
+        $password = $_POST['password'] ?? '';
+        if (strlen($password) < 8) {
+            $errors[] = 'パスワードは8文字以上にしてください。';
+        }
+        $question = trim($_POST['question'] ?? '');
+        $values['question'] = $question;
+        if ($question === '') {
+            $errors[] = '秘密の質問を入力してください。';
+        }
+        $answer = trim($_POST['answer'] ?? '');
+        if ($answer === '') {
+            $errors[] = '秘密の質問の答えを入力してください。';
+        }
+        if (!$errors) {
+            $stmt = $db->prepare('INSERT INTO users (email, password_hash, secret_question, secret_answer_hash, created_at) VALUES (?, ?, ?, ?, ?)');
+            try {
+                $stmt->execute([
+                    $emailValid,
+                    password_hash($password, PASSWORD_DEFAULT),
+                    $question,
+                    password_hash(normalize_answer($answer), PASSWORD_DEFAULT),
+                    time()
+                ]);
+                renderHeader('新規登録');
+                echo "<p>登録が完了しました。</p>";
+                echo "<p><a href='?action=request'>アカウント復旧へ</a></p>";
+                renderFooter();
+                return;
+            } catch (PDOException $e) {
+                if ($e->getCode() === '23000') {
+                    $errors[] = 'このメールアドレスは既に登録されています。';
+                } else {
+                    $errors[] = '登録に失敗しました。';
+                }
+            }
+        }
+    }
+    renderHeader('新規登録');
+    if ($errors) {
+        echo "<ul>";
+        foreach ($errors as $e) {
+            echo "<li>" . h($e) . "</li>";
+        }
+        echo "</ul>";
+    }
+    renderRegisterForm($csrf, $values);
+    echo "<p><a href='?action=request'>アカウント復旧へ</a></p>";
+    renderFooter();
+}
+
+function handleRequest(PDO $db, string $csrf): void {
+    $message = '';
+    $email = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $email = trim($_POST['email'] ?? '');
+        $emailValid = filter_var($email, FILTER_VALIDATE_EMAIL);
+        if (!$emailValid) {
+            $message = '有効なメールアドレスを入力してください。';
+        } else {
+            $stmt = $db->prepare('SELECT id, secret_question, recovery_locked_until FROM users WHERE email = ?');
+            $stmt->execute([$emailValid]);
+            $user = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$user) {
+                $message = 'このメールアドレスのアカウントは見つかりませんでした。';
+            } elseif ((int)$user['recovery_locked_until'] > time()) {
+                $message = '試行回数が多すぎます。しばらくしてから再試行してください。';
+            } else {
+                $_SESSION['recover_user_id'] = (int)$user['id'];
+                renderHeader('秘密の質問');
+                echo "<p>次の秘密の質問に答えてください。</p>";
+                renderQuestionForm($user['secret_question'], $csrf);
+                renderFooter();
+                return;
+            }
+        }
+    }
+    renderHeader('アカウント復旧');
+    if ($message) {
+        echo "<p>" . h($message) . "</p>";
+    }
+    renderRequestForm($csrf, $email);
+    echo "<p><a href='?action=register'>新規登録</a></p>";
+    renderFooter();
+}
+
+function handleAnswer(PDO $db, string $csrf): void {
+    $userId = $_SESSION['recover_user_id'] ?? 0;
+    if (!$userId) {
+        header('Location: ?action=request');
+        exit;
+    }
+    $stmt = $db->prepare('SELECT * FROM users WHERE id = ?');
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user) {
+        unset($_SESSION['recover_user_id']);
+        header('Location: ?action=request');
+        exit;
+    }
+    if ((int)$user['recovery_locked_until'] > time()) {
+        renderHeader('アカウント復旧');
+        echo "<p>試行回数が多すぎます。しばらくしてから再試行してください。</p>";
+        renderFooter();
+        return;
+    }
+    $answer = trim($_POST['answer'] ?? '');
+    if ($answer === '') {
+        renderHeader('秘密の質問');
+        echo "<p>答えを入力してください。</p>";
+        renderQuestionForm($user['secret_question'], $csrf);
+        renderFooter();
+        return;
+    }
+    if (password_verify(normalize_answer($answer), $user['secret_answer_hash'])) {
+        $stmt = $db->prepare('UPDATE users SET recovery_attempts = 0, recovery_locked_until = 0 WHERE id = ?');
+        $stmt->execute([$userId]);
+        $_SESSION['recover_verified'] = $userId;
+        unset($_SESSION['recover_user_id']);
+        header('Location: ?action=reset');
+        exit;
+    } else {
+        $attempts = (int)$user['recovery_attempts'] + 1;
+        $locked_until = (int)$user['recovery_locked_until'];
+        $message = '答えが間違っています。';
+        if ($attempts >= MAX_ATTEMPTS) {
+            $locked_until = time() + LOCK_TIME;
+            $attempts = 0;
+            $message = '試行回数が多すぎます。しばらくしてから再試行してください。';
+            unset($_SESSION['recover_user_id']);
+        }
+        $stmt = $db->prepare('UPDATE users SET recovery_attempts = ?, recovery_locked_until = ? WHERE id = ?');
+        $stmt->execute([$attempts, $locked_until, $userId]);
+        renderHeader('秘密の質問');
+        echo "<p>" . h($message) . "</p>";
+        if ($locked_until <= time()) {
+            renderQuestionForm($user['secret_question'], $csrf);
+        } else {
+            echo "<p><a href='?action=request'>最初からやり直す</a></p>";
+        }
+        renderFooter();
+    }
+}
+
+function handleReset(PDO $db, string $csrf): void {
+    $userId = $_SESSION['recover_verified'] ?? 0;
+    if (!$userId) {
+        header('Location: ?action=request');
+        exit;
+    }
+    $stmt = $db->prepare('SELECT id FROM users WHERE id = ?');
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$user) {
+        unset($_SESSION['recover_verified']);
+        header('Location: ?action=request');
+        exit;
+    }
+    $errors = [];
+    $success = false;
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $password = $_POST['password'] ?? '';
+        $passwordConfirm = $_POST['password_confirm'] ?? '';
+        if (strlen($password) < 8) {
+            $errors[] = 'パスワードは8文字以上にしてください。';
+        }
+        if ($password !== $passwordConfirm) {
+            $errors[] = 'パスワードが一致しません。';
+        }
+        if (!$errors) {
+            $stmt = $db->prepare('UPDATE users SET password_hash = ?, recovery_attempts = 0, recovery_locked_until = 0 WHERE id = ?');
+            $stmt->execute([password_hash($password, PASSWORD_DEFAULT), $userId]);
+            $success = true;
+            unset($_SESSION['recover_verified']);
+        }
+    }
+    renderHeader('パスワード再設定');
+    if ($success) {
+        echo "<p>パスワードを変更しました。</p>";
+        echo "<p><a href='?action=request'>アカウント復旧へ</a></p>";
+    } else {
+        if ($errors) {
+            echo "<ul>";
+            foreach ($errors as $e) {
+                echo "<li>" . h($e) . "</li>";
+            }
+            echo "</ul>";
+        }
+        renderResetForm($csrf);
+    }
+    renderFooter();
+}
+
+verify_csrf();
+
+$action = $_POST['action'] ?? $_GET['action'] ?? 'request';
+
+switch ($action) {
+    case 'register':
+        handleRegister($db, $csrf);
+        break;
+    case 'request':
+        handleRequest($db, $csrf);
+        break;
+    case 'answer':
+        handleAnswer($db, $csrf);
+        break;
+    case 'reset':
+        handleReset($db, $csrf);
+        break;
+    default:
+        header('Location: ?action=request');
+        exit;
+}

@@ -1,0 +1,119 @@
+package config
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"strings"
+)
+
+func ApplyConfigFromJSON(path string, target interface{}) error {
+	if target == nil {
+		return fmt.Errorf("target is nil")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	rv := reflect.ValueOf(target)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("target must be non-nil pointer to struct")
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("target must point to struct")
+	}
+	return applyMapToStruct(m, rv)
+}
+
+func applyMapToStruct(m map[string]interface{}, sv reflect.Value) error {
+	for key, val := range m {
+		fv, ok := findFieldByKey(sv, key)
+		if !ok || !fv.CanSet() {
+			continue
+		}
+		if val == nil {
+			fv.Set(reflect.Zero(fv.Type()))
+			continue
+		}
+		if sub, ok := val.(map[string]interface{}); ok {
+			switch fv.Kind() {
+			case reflect.Struct:
+				if err := applyMapToStruct(sub, fv); err != nil {
+					return err
+				}
+				continue
+			case reflect.Ptr:
+				if fv.Type().Elem().Kind() == reflect.Struct {
+					if fv.IsNil() {
+						fv.Set(reflect.New(fv.Type().Elem()))
+					}
+					if err := applyMapToStruct(sub, fv.Elem()); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+		}
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		if fv.Kind() == reflect.Ptr {
+			if fv.IsNil() {
+				fv.Set(reflect.New(fv.Type().Elem()))
+			}
+			if err := json.Unmarshal(b, fv.Interface()); err != nil {
+				return err
+			}
+		} else {
+			if err := json.Unmarshal(b, fv.Addr().Interface()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func findFieldByKey(sv reflect.Value, key string) (reflect.Value, bool) {
+	t := sv.Type()
+	keyLower := strings.ToLower(key)
+	for i := 0; i < t.NumField(); i++ {
+		sf := t.Field(i)
+		if sf.PkgPath != "" {
+			continue
+		}
+		fv := sv.Field(i)
+		if sf.Anonymous {
+			if fv.Kind() == reflect.Struct {
+				if f, ok := findFieldByKey(fv, key); ok {
+					return f, true
+				}
+			} else if fv.Kind() == reflect.Ptr && fv.Type().Elem().Kind() == reflect.Struct {
+				if fv.IsNil() && fv.CanSet() {
+					fv.Set(reflect.New(fv.Type().Elem()))
+				}
+				if f, ok := findFieldByKey(fv.Elem(), key); ok {
+					return f, true
+				}
+			}
+		}
+		tag := sf.Tag.Get("json")
+		name := strings.Split(tag, ",")[0]
+		if name == "" {
+			name = sf.Name
+		}
+		if name == "-" {
+			continue
+		}
+		if strings.EqualFold(name, key) || strings.EqualFold(sf.Name, key) || strings.ToLower(sf.Name) == keyLower {
+			return fv, true
+		}
+	}
+	return reflect.Value{}, false
+}

@@ -1,0 +1,155 @@
+class CircuitBreakerOpenError extends Error {
+  constructor(message) {
+    super(message || 'Circuit breaker is open');
+    this.name = 'CircuitBreakerOpenError';
+  }
+}
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    const ft = Number.isFinite(options.failureThreshold) ? options.failureThreshold : 3;
+    const st = Number.isFinite(options.successThreshold) ? options.successThreshold : 1;
+    const to = Number.isFinite(options.timeout) ? options.timeout : 10000;
+    const ho = Number.isFinite(options.halfOpenMax) ? options.halfOpenMax : 1;
+    this.failureThreshold = ft > 0 ? ft : 1;
+    this.successThreshold = st > 0 ? st : 1;
+    this.timeout = to >= 0 ? to : 0;
+    this.halfOpenMax = ho > 0 ? ho : 1;
+    if (this.halfOpenMax < this.successThreshold) this.halfOpenMax = this.successThreshold;
+    this.state = 'CLOSED';
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+    this.nextAttempt = 0;
+    this.onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : null;
+  }
+
+  async exec(action) {
+    if (typeof action !== 'function') {
+      throw new Error('Action must be a function returning a Promise');
+    }
+
+    if (this.state === 'OPEN') {
+      if (Date.now() >= this.nextAttempt) {
+        this._halfOpen();
+      } else {
+        throw new CircuitBreakerOpenError();
+      }
+    }
+
+    if (this.state === 'HALF_OPEN') {
+      if (this.halfOpenAttempts >= this.halfOpenMax) {
+        this._open();
+        throw new CircuitBreakerOpenError('Circuit breaker half-open; max test requests reached');
+      }
+      this.halfOpenAttempts++;
+    }
+
+    try {
+      const result = await action();
+      this._onSuccess();
+      return result;
+    } catch (err) {
+      this._onFailure();
+      throw err;
+    }
+  }
+
+  _onSuccess() {
+    if (this.state === 'HALF_OPEN') {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      } else if (this.halfOpenAttempts >= this.halfOpenMax) {
+        this._open();
+      }
+    } else if (this.state === 'CLOSED') {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === 'HALF_OPEN') {
+      this._open();
+      return;
+    }
+    if (this.state === 'CLOSED') {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+  }
+
+  _open() {
+    this._setState('OPEN');
+    this.nextAttempt = Date.now() + this.timeout;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  _halfOpen() {
+    this._setState('HALF_OPEN');
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  _close() {
+    this._setState('CLOSED');
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenAttempts = 0;
+  }
+
+  _setState(state) {
+    if (this.state !== state) {
+      this.state = state;
+      if (this.onStateChange) {
+        try { this.onStateChange(state); } catch (e) {}
+      }
+    }
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  isOpen() {
+    return this.state === 'OPEN';
+  }
+
+  isClosed() {
+    return this.state === 'CLOSED';
+  }
+
+  isHalfOpen() {
+    return this.state === 'HALF_OPEN';
+  }
+
+  getStats() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      halfOpenAttempts: this.halfOpenAttempts,
+      nextAttempt: this.nextAttempt
+    };
+  }
+
+  reset() {
+    this._close();
+  }
+
+  wrap(fn) {
+    return (...args) => this.exec(() => fn(...args));
+  }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { CircuitBreaker, CircuitBreakerOpenError };
+} else if (typeof globalThis !== 'undefined') {
+  globalThis.CircuitBreaker = CircuitBreaker;
+  globalThis.CircuitBreakerOpenError = CircuitBreakerOpenError;
+}

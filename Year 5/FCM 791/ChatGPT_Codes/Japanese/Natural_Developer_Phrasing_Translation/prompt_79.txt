@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import hashlib
+import re
+import posixpath
+
+def normalize_path(p):
+    p = p.strip()
+    if not p:
+        return ''
+    p = p.replace('\\', '/')
+    while p.startswith('./'):
+        p = p[2:]
+    p = posixpath.normpath(p)
+    if p == '.':
+        p = ''
+    return p
+
+def parse_manifest(manifest_path, root):
+    entries = {}
+    lengths = set()
+    algo_from_manifest = None
+    duplicates = []
+    algo_re = re.compile(r'^\s*(?:#\s*)?(?:algorithm|algo|hash)\s*[:=]\s*([a-z0-9_+-]+)\s*$', re.I)
+    line_re = re.compile(r'^\s*([0-9A-Fa-f]+)\s+(.*)$')
+    with open(manifest_path, 'r', encoding='utf-8-sig', errors='replace') as f:
+        for line in f:
+            line = line.rstrip('\n\r')
+            if not line.strip():
+                continue
+            m_algo = algo_re.match(line)
+            if m_algo:
+                algo_from_manifest = m_algo.group(1).lower()
+                continue
+            stripped = line.strip()
+            if stripped.startswith('#') or stripped.startswith(';'):
+                continue
+            m = line_re.match(stripped)
+            if not m:
+                continue
+            hash_val = m.group(1).lower()
+            path_part = m.group(2).strip()
+            if path_part.startswith('*') or path_part.startswith('?'):
+                path_part = path_part[1:].strip()
+            if (path_part.startswith('"') and path_part.endswith('"')) or (path_part.startswith("'") and path_part.endswith("'")):
+                path_part = path_part[1:-1]
+            if path_part.startswith('./'):
+                path_part = path_part[2:]
+            if os.path.isabs(path_part):
+                try:
+                    path_part = os.path.relpath(path_part, root)
+                except Exception:
+                    pass
+            norm = normalize_path(path_part)
+            if not norm:
+                continue
+            if norm in entries and entries[norm] != hash_val:
+                duplicates.append((norm, entries[norm], hash_val))
+            entries[norm] = hash_val
+            lengths.add(len(hash_val))
+    return entries, lengths, algo_from_manifest, duplicates
+
+def guess_algorithm(lengths):
+    mapping = {32: 'md5', 40: 'sha1', 56: 'sha224', 64: 'sha256', 96: 'sha384', 128: 'sha512'}
+    if len(lengths) == 1:
+        return mapping.get(next(iter(lengths)))
+    return None
+
+def compute_hash(path, algo, block_size=65536):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(block_size), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('manifest', help='manifest file path')
+    parser.add_argument('-r', '--root', help='root directory to scan (default: manifest directory)')
+    parser.add_argument('-a', '--algo', '--algorithm', dest='algo', help='hash algorithm (e.g., sha256)')
+    parser.add_argument('-v', '--verbose', action='store_true', help='show matched files')
+    args = parser.parse_args()
+
+    manifest_path = os.path.abspath(args.manifest)
+    if not os.path.isfile(manifest_path):
+        sys.stderr.write('Manifest file not found: %s\n' % manifest_path)
+        sys.exit(2)
+
+    root = os.path.abspath(args.root) if args.root else os.path.dirname(manifest_path)
+    if not os.path.isdir(root):
+        sys.stderr.write('Root directory not found: %s\n' % root)
+        sys.exit(2)
+
+    entries, lengths, algo_from_manifest, duplicates = parse_manifest(manifest_path, root)
+    algo = args.algo or algo_from_manifest or guess_algorithm(lengths)
+    if not algo:
+        algo = 'sha256'
+        sys.stderr.write('Warning: hash algorithm not specified; defaulting to sha256\n')
+    try:
+        hashlib.new(algo)
+    except Exception:
+        sys.stderr.write('Unsupported hash algorithm: %s\n' % algo)
+        sys.exit(2)
+
+    seen = set()
+    matched = 0
+    mismatched = []
+    extra = []
+    errors = []
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        for filename in filenames:
+            full = os.path.join(dirpath, filename)
+            if not os.path.isfile(full):
+                continue
+            rel = normalize_path(os.path.relpath(full, root))
+            try:
+                digest = compute_hash(full, algo)
+            except Exception as e:
+                errors.append((rel, str(e)))
+                sys.stdout.write('ERROR %s %s\n' % (rel, e))
+                continue
+            if rel in entries:
+                expected = entries[rel].lower()
+                seen.add(rel)
+                if digest.lower() == expected:
+                    matched += 1
+                    if args.verbose:
+                        sys.stdout.write('OK %s\n' % rel)
+                else:
+                    mismatched.append((rel, expected, digest))
+                    sys.stdout.write('MISMATCH %s %s %s\n' % (rel, expected, digest))
+            else:
+                extra.append((rel, digest))
+                sys.stdout.write('EXTRA %s %s\n' % (rel, digest))
+
+    missing = []
+    for path, expected in entries.items():
+        if path not in seen:
+            missing.append((path, expected))
+            sys.stdout.write('MISSING %s %s\n' % (path, expected))
+
+    for path, h1, h2 in duplicates:
+        sys.stdout.write('DUPLICATE %s %s %s\n' % (path, h1, h2))
+
+    sys.stdout.write('SUMMARY\n')
+    sys.stdout.write('Algorithm: %s\n' % algo)
+    sys.stdout.write('Manifest entries: %d\n' % len(entries))
+    sys.stdout.write('Matched: %d\n' % matched)
+    sys.stdout.write('Mismatched: %d\n' % len(mismatched))
+    sys.stdout.write('Missing: %d\n' % len(missing))
+    sys.stdout.write('Extra: %d\n' % len(extra))
+    sys.stdout.write('Errors: %d\n' % len(errors))
+
+    if mismatched or missing or extra or errors or duplicates:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
