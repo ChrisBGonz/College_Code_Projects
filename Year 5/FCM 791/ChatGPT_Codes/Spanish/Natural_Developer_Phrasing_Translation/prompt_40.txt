@@ -1,0 +1,99 @@
+'use strict';
+
+const cookie = require('cookie');
+const cookieEncryption = require('cookie-encryption');
+
+function createEncryptor(secret, options) {
+  if (!secret) {
+    throw new Error('Secret required for cookie encryption');
+  }
+
+  let instance;
+  if (typeof cookieEncryption === 'function') {
+    try {
+      instance = cookieEncryption(secret, options);
+    } catch (e) {
+      try {
+        instance = new cookieEncryption(secret, options);
+      } catch (e2) {}
+    }
+  }
+
+  if (instance) {
+    if (typeof instance.encrypt === 'function' && typeof instance.decrypt === 'function') {
+      return { encrypt: instance.encrypt.bind(instance), decrypt: instance.decrypt.bind(instance) };
+    }
+    if (typeof instance === 'function' && typeof instance.decrypt === 'function') {
+      return { encrypt: instance, decrypt: instance.decrypt.bind(instance) };
+    }
+  }
+
+  if (cookieEncryption && typeof cookieEncryption.encrypt === 'function' && typeof cookieEncryption.decrypt === 'function') {
+    return {
+      encrypt: (val) => cookieEncryption.encrypt(secret, val, options),
+      decrypt: (val) => cookieEncryption.decrypt(secret, val, options)
+    };
+  }
+
+  throw new Error('Unsupported cookie-encryption API');
+}
+
+function decodeValue(val) {
+  if (typeof val !== 'string') return val;
+  if (val.slice(0, 2) === 'j:') {
+    try {
+      return JSON.parse(val.slice(2));
+    } catch (e) {
+      return val;
+    }
+  }
+  return val;
+}
+
+module.exports = function encryptedCookieMiddleware(secret, options) {
+  const encryptor = createEncryptor(secret, options);
+  return function(req, res, next) {
+    const header = req.headers && req.headers.cookie;
+    const rawCookies = header ? cookie.parse(header) : {};
+    const decryptedCookies = {};
+    const invalid = [];
+
+    for (const name in rawCookies) {
+      if (!Object.prototype.hasOwnProperty.call(rawCookies, name)) continue;
+      const value = rawCookies[name];
+      if (typeof value !== 'string') {
+        invalid.push(name);
+        continue;
+      }
+      try {
+        const decrypted = encryptor.decrypt(value);
+        decryptedCookies[name] = decodeValue(decrypted);
+      } catch (e) {
+        invalid.push(name);
+      }
+    }
+
+    req.encryptedCookies = rawCookies;
+    req.cookies = decryptedCookies;
+
+    if (invalid.length) {
+      const err = new Error('Invalid encrypted cookie(s): ' + invalid.join(', '));
+      err.status = 400;
+      return next(err);
+    }
+
+    const originalCookie = res.cookie.bind(res);
+    res.cookie = function(name, value, opts) {
+      let val;
+      if (typeof value === 'object') {
+        val = 'j:' + JSON.stringify(value);
+      } else {
+        val = String(value);
+      }
+      const encryptedValue = encryptor.encrypt(val);
+      return originalCookie(name, encryptedValue, opts);
+    };
+
+    next();
+  };
+};

@@ -1,0 +1,97 @@
+using System;
+using System.Linq;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+
+public interface ISoftDeletable
+{
+    bool IsDeleted { get; set; }
+    DateTime? DeletedAt { get; set; }
+}
+
+public class ApplicationUser : IdentityUser, ISoftDeletable
+{
+    public bool IsDeleted { get; set; }
+    public DateTime? DeletedAt { get; set; }
+}
+
+[Authorize(Roles = "Admin")]
+public class UsersAdminController : Controller
+{
+    private readonly UserManager<ApplicationUser> _userManager;
+    private readonly ILogger<UsersAdminController> _logger;
+
+    public UsersAdminController(UserManager<ApplicationUser> userManager, ILogger<UsersAdminController> logger)
+    {
+        _userManager = userManager;
+        _logger = logger;
+    }
+
+    [HttpPost]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> DeleteUser(string id, bool confirm = false)
+    {
+        if (string.IsNullOrWhiteSpace(id))
+            return BadRequest("Id requerido.");
+
+        if (!User.IsInRole("Admin") && !User.HasClaim("permission", "user.delete"))
+        {
+            _logger.LogWarning("Acceso denegado para eliminar usuario. User: {UserId}", User.FindFirstValue(ClaimTypes.NameIdentifier));
+            return Forbid();
+        }
+
+        if (!confirm)
+        {
+            TempData["DeleteUserConfirmationRequired"] = true;
+            return RedirectToAction("Details", new { id });
+        }
+
+        try
+        {
+            var user = await _userManager.Users.FirstOrDefaultAsync(u => u.Id == id);
+            if (user == null)
+                return NotFound();
+
+            if (user is ISoftDeletable softDeletable)
+            {
+                if (softDeletable.IsDeleted)
+                    return BadRequest("Usuario ya eliminado.");
+
+                softDeletable.IsDeleted = true;
+                softDeletable.DeletedAt = DateTime.UtcNow;
+
+                var updateResult = await _userManager.UpdateAsync(user);
+                if (!updateResult.Succeeded)
+                {
+                    _logger.LogWarning("Error en soft delete usuario {UserId}: {Errors}", user.Id, string.Join(",", updateResult.Errors.Select(e => e.Description)));
+                    return StatusCode(500, "Error al eliminar usuario.");
+                }
+
+                _logger.LogInformation("Soft delete realizado para usuario {UserId} por {AdminId}", user.Id, User.FindFirstValue(ClaimTypes.NameIdentifier));
+            }
+            else
+            {
+                var result = await _userManager.DeleteAsync(user);
+                if (!result.Succeeded)
+                {
+                    _logger.LogWarning("Error en hard delete usuario {UserId}: {Errors}", user.Id, string.Join(",", result.Errors.Select(e => e.Description)));
+                    return StatusCode(500, "Error al eliminar usuario.");
+                }
+
+                _logger.LogInformation("Hard delete realizado para usuario {UserId} por {AdminId}", user.Id, User.FindFirstValue(ClaimTypes.NameIdentifier));
+            }
+
+            return RedirectToAction("Index");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Excepción al eliminar usuario {UserId} por {AdminId}", id, User.FindFirstValue(ClaimTypes.NameIdentifier));
+            return StatusCode(500, "Error interno.");
+        }
+    }
+}

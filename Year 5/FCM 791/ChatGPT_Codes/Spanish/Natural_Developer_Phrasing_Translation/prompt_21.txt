@@ -1,0 +1,447 @@
+import os
+import json
+import uuid
+import argparse
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
+
+import jwt
+from jwt import InvalidTokenError
+from jwt.algorithms import RSAAlgorithm
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+def utcnow():
+    return datetime.now(timezone.utc)
+
+def generate_rsa_keypair(key_size: int = 2048):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=key_size)
+    public_key = private_key.public_key()
+    return private_key, public_key
+
+def serialize_private(private_key):
+    return private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+
+def serialize_public(public_key):
+    return public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+
+def load_private_key(data: bytes):
+    return serialization.load_pem_private_key(data, password=None)
+
+def load_public_key(data: bytes):
+    return serialization.load_pem_public_key(data)
+
+def read_json(path: str, default: Any = None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return default if default is not None else {}
+
+def write_json(path: str, data: Any):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+class KeyStore:
+    def __init__(self, directory: str, algorithm: str = "RS256"):
+        self.directory = directory
+        self.algorithm = algorithm
+        os.makedirs(directory, exist_ok=True)
+        self.meta_path = os.path.join(directory, "meta.json")
+        self.keys: Dict[str, Any] = {}
+        self.active_kid: Optional[str] = None
+        self._load()
+
+    def _load(self):
+        meta = read_json(self.meta_path, {})
+        self.active_kid = meta.get("active_kid")
+        for kid in meta.get("kids", []):
+            priv_path = os.path.join(self.directory, f"{kid}.pem")
+            pub_path = os.path.join(self.directory, f"{kid}.pub.pem")
+            if os.path.exists(priv_path) and os.path.exists(pub_path):
+                with open(priv_path, "rb") as f:
+                    priv_data = f.read()
+                with open(pub_path, "rb") as f:
+                    pub_data = f.read()
+                try:
+                    priv = load_private_key(priv_data)
+                    pub = load_public_key(pub_data)
+                except Exception:
+                    continue
+                self.keys[kid] = (priv, pub)
+        if not self.keys:
+            self.rotate()
+        elif self.active_kid not in self.keys:
+            self.active_kid = next(iter(self.keys))
+            self._save_meta()
+
+    def _save_meta(self):
+        meta = {"active_kid": self.active_kid, "kids": list(self.keys.keys())}
+        write_json(self.meta_path, meta)
+
+    def _save_keypair(self, kid: str, priv, pub):
+        priv_path = os.path.join(self.directory, f"{kid}.pem")
+        pub_path = os.path.join(self.directory, f"{kid}.pub.pem")
+        with open(priv_path, "wb") as f:
+            f.write(serialize_private(priv))
+        with open(pub_path, "wb") as f:
+            f.write(serialize_public(pub))
+
+    def rotate(self, key_size: int = 2048):
+        kid = uuid.uuid4().hex
+        priv, pub = generate_rsa_keypair(key_size)
+        self.keys[kid] = (priv, pub)
+        self.active_kid = kid
+        self._save_keypair(kid, priv, pub)
+        self._save_meta()
+        return kid
+
+    def get_private_key(self, kid: Optional[str] = None):
+        kid = kid or self.active_kid
+        if kid not in self.keys:
+            raise KeyError("Unknown kid")
+        return self.keys[kid][0]
+
+    def get_public_key(self, kid: str):
+        if kid not in self.keys:
+            raise KeyError("Unknown kid")
+        return self.keys[kid][1]
+
+    def jwks(self):
+        keys = []
+        for kid, (_, pub) in self.keys.items():
+            jwk_dict = json.loads(RSAAlgorithm.to_jwk(pub))
+            jwk_dict.update({"kid": kid, "use": "sig", "alg": self.algorithm})
+            keys.append(jwk_dict)
+        return {"keys": keys}
+
+class JWTAuthManager:
+    def __init__(self, keystore: KeyStore, issuer: str, audience: Any,
+                 access_ttl: int = 900, refresh_ttl: int = 2592000, leeway: int = 60):
+        self.keystore = keystore
+        self.issuer = issuer
+        self.audience = audience
+        self.access_ttl = access_ttl
+        self.refresh_ttl = refresh_ttl
+        self.leeway = leeway
+        self.revoked_path = os.path.join(keystore.directory, "revoked.json")
+        self.revoked = set(read_json(self.revoked_path, {}).get("revoked", []))
+
+    def _save_revoked(self):
+        write_json(self.revoked_path, {"revoked": list(self.revoked)})
+
+    def issue_token(
+        self,
+        subject: str,
+        token_type: str = "access",
+        scopes: Optional[List[str]] = None,
+        roles: Optional[List[str]] = None,
+        permissions: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        audience: Any = None,
+        extra_claims: Optional[Dict[str, Any]] = None,
+        authorized_party: Optional[str] = None,
+        authentication_methods: Optional[List[str]] = None,
+        confirmation: Optional[Dict[str, Any]] = None,
+        nonce: Optional[str] = None,
+    ):
+        if token_type not in ("access", "refresh"):
+            raise ValueError("Invalid token type")
+        now = utcnow()
+        ttl = self.access_ttl if token_type == "access" else self.refresh_ttl
+        payload: Dict[str, Any] = {
+            "iss": self.issuer,
+            "aud": audience if audience is not None else self.audience,
+            "sub": str(subject),
+            "iat": now,
+            "nbf": now,
+            "exp": now + timedelta(seconds=ttl),
+            "jti": uuid.uuid4().hex,
+            "typ": token_type,
+            "scope": list(scopes) if scopes else [],
+            "roles": list(roles) if roles else [],
+            "permissions": permissions or {},
+            "ctx": context or {},
+        }
+        if authorized_party:
+            payload["azp"] = authorized_party
+        if authentication_methods:
+            payload["amr"] = list(authentication_methods)
+        if confirmation:
+            payload["cnf"] = confirmation
+        if nonce:
+            payload["nonce"] = nonce
+        if extra_claims:
+            for k, v in extra_claims.items():
+                if k not in payload:
+                    payload[k] = v
+        headers = {"kid": self.keystore.active_kid, "typ": "JWT"}
+        token = jwt.encode(
+            payload,
+            self.keystore.get_private_key(),
+            algorithm=self.keystore.algorithm,
+            headers=headers,
+        )
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        return token
+
+    def decode_token(self, token: str, verify: bool = True):
+        try:
+            headers = jwt.get_unverified_header(token)
+        except InvalidTokenError:
+            raise
+        kid = headers.get("kid")
+        if verify:
+            if not kid:
+                raise InvalidTokenError("Missing kid")
+            try:
+                key = self.keystore.get_public_key(kid)
+            except KeyError:
+                raise InvalidTokenError("Unknown kid")
+            options = {
+                "require": ["exp", "iat", "nbf", "iss", "aud", "sub", "jti"],
+                "verify_signature": True,
+            }
+            payload = jwt.decode(
+                token,
+                key=key,
+                algorithms=[self.keystore.algorithm],
+                audience=self.audience,
+                issuer=self.issuer,
+                leeway=self.leeway,
+                options=options,
+            )
+            jti = payload.get("jti")
+            if jti in self.revoked:
+                raise InvalidTokenError("Token revoked")
+            self._validate_complex_claims(payload)
+            return payload
+        else:
+            options = {
+                "verify_signature": False,
+                "verify_exp": False,
+                "verify_aud": False,
+                "verify_iss": False,
+                "verify_nbf": False,
+                "verify_iat": False,
+            }
+            return jwt.decode(token, options=options)
+
+    def _validate_complex_claims(self, payload: Dict[str, Any]):
+        typ = payload.get("typ")
+        if typ not in ("access", "refresh"):
+            raise InvalidTokenError("Invalid typ")
+        scopes = payload.get("scope", [])
+        if not isinstance(scopes, list) or any(not isinstance(s, str) for s in scopes):
+            raise InvalidTokenError("Invalid scope")
+        roles = payload.get("roles", [])
+        if not isinstance(roles, list) or any(not isinstance(r, str) for r in roles):
+            raise InvalidTokenError("Invalid roles")
+        permissions = payload.get("permissions", {})
+        if not isinstance(permissions, dict):
+            raise InvalidTokenError("Invalid permissions")
+        resources = permissions.get("resources")
+        if resources is not None:
+            if not isinstance(resources, list):
+                raise InvalidTokenError("Invalid resources")
+            for res in resources:
+                if not isinstance(res, dict):
+                    raise InvalidTokenError("Invalid resource entry")
+                if "id" not in res or "actions" not in res:
+                    raise InvalidTokenError("Invalid resource entry")
+                if not isinstance(res["actions"], list) or any(
+                    not isinstance(a, str) for a in res["actions"]
+                ):
+                    raise InvalidTokenError("Invalid resource actions")
+        ctx = payload.get("ctx", {})
+        if ctx is not None and not isinstance(ctx, dict):
+            raise InvalidTokenError("Invalid ctx")
+        if "tenant" in ctx and not isinstance(ctx["tenant"], str):
+            raise InvalidTokenError("Invalid tenant")
+        if "device" in ctx and not isinstance(ctx["device"], dict):
+            raise InvalidTokenError("Invalid device")
+        amr = payload.get("amr")
+        if amr is not None:
+            if not isinstance(amr, list) or any(not isinstance(m, str) for m in amr):
+                raise InvalidTokenError("Invalid amr")
+        cnf = payload.get("cnf")
+        if cnf is not None:
+            if not isinstance(cnf, dict):
+                raise InvalidTokenError("Invalid cnf")
+            if not any(k in cnf for k in ("jkt", "x5t#S256", "kid")):
+                raise InvalidTokenError("Invalid cnf")
+        aud = payload.get("aud")
+        if isinstance(aud, list) and len(aud) > 1 and "azp" not in payload:
+            raise InvalidTokenError("azp required for multiple audiences")
+        if "azp" in payload and not isinstance(payload["azp"], str):
+            raise InvalidTokenError("Invalid azp")
+        nonce = payload.get("nonce")
+        if nonce is not None and not isinstance(nonce, str):
+            raise InvalidTokenError("Invalid nonce")
+
+    def revoke_token(self, token: str):
+        payload = self.decode_token(token, verify=False)
+        jti = payload.get("jti")
+        if not jti:
+            raise ValueError("Missing jti")
+        self.revoked.add(jti)
+        self._save_revoked()
+        return jti
+
+    def introspect(self, token: str):
+        try:
+            payload = self.decode_token(token, verify=True)
+            return {"active": True, "payload": payload}
+        except Exception as e:
+            return {"active": False, "error": str(e)}
+
+    def ensure_scopes(self, payload: Dict[str, Any], required_scopes: List[str]):
+        token_scopes = set(payload.get("scope", []))
+        missing = [s for s in required_scopes if s not in token_scopes]
+        if missing:
+            raise InvalidTokenError("Missing scopes: " + ",".join(missing))
+
+    def ensure_roles(self, payload: Dict[str, Any], required_roles: List[str]):
+        token_roles = set(payload.get("roles", []))
+        missing = [r for r in required_roles if r not in token_roles]
+        if missing:
+            raise InvalidTokenError("Missing roles: " + ",".join(missing))
+
+def parse_list(value: Optional[str]) -> List[str]:
+    if value is None:
+        return []
+    value = value.strip()
+    if not value:
+        return []
+    if value.startswith("["):
+        return json.loads(value)
+    return [v for v in value.split(",") if v]
+
+def parse_json(value: Optional[str], default: Any = None):
+    if value is None:
+        return default if default is not None else {}
+    value = value.strip()
+    if not value:
+        return default if default is not None else {}
+    return json.loads(value)
+
+def parse_audience(value: Optional[str]):
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    if value.startswith("[") or "," in value:
+        return parse_list(value)
+    return value
+
+def build_manager():
+    key_dir = os.environ.get("JWT_KEY_DIR", os.path.join(os.getcwd(), "jwt_keys"))
+    issuer = os.environ.get("JWT_ISSUER", "https://auth.example.com")
+    aud_env = os.environ.get("JWT_AUDIENCE", "api")
+    audience = parse_audience(aud_env)
+    access_ttl = int(os.environ.get("JWT_ACCESS_TTL", "900"))
+    refresh_ttl = int(os.environ.get("JWT_REFRESH_TTL", "2592000"))
+    leeway = int(os.environ.get("JWT_LEEWAY", "60"))
+    keystore = KeyStore(key_dir)
+    return JWTAuthManager(keystore, issuer, audience, access_ttl, refresh_ttl, leeway)
+
+def print_json(data: Any):
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, indent=2, default=str))
+
+def main():
+    manager = build_manager()
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd")
+
+    issue = sub.add_parser("issue")
+    issue.add_argument("sub")
+    issue.add_argument("--type", choices=["access", "refresh"], default="access")
+    issue.add_argument("--scopes", default="")
+    issue.add_argument("--roles", default="")
+    issue.add_argument("--permissions", default="{}")
+    issue.add_argument("--context", default="{}")
+    issue.add_argument("--aud", default=None)
+    issue.add_argument("--azp", default=None)
+    issue.add_argument("--amr", default="")
+    issue.add_argument("--cnf", default="")
+    issue.add_argument("--nonce", default=None)
+    issue.add_argument("--extra", default="{}")
+
+    decode = sub.add_parser("decode")
+    decode.add_argument("token")
+    decode.add_argument("--no-verify", action="store_true")
+
+    revoke = sub.add_parser("revoke")
+    revoke.add_argument("token")
+
+    rotate = sub.add_parser("rotate")
+    rotate.add_argument("--size", type=int, default=2048)
+
+    jwks = sub.add_parser("jwks")
+
+    intro = sub.add_parser("introspect")
+    intro.add_argument("token")
+
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
+    args = parser.parse_args()
+
+    try:
+        if args.cmd == "issue":
+            scopes = parse_list(args.scopes)
+            roles = parse_list(args.roles)
+            permissions = parse_json(args.permissions, {})
+            context = parse_json(args.context, {})
+            amr = parse_list(args.amr)
+            cnf = parse_json(args.cnf, None) if args.cnf else None
+            extra = parse_json(args.extra, {})
+            audience = parse_audience(args.aud) if args.aud else None
+            token = manager.issue_token(
+                subject=args.sub,
+                token_type=args.type,
+                scopes=scopes,
+                roles=roles,
+                permissions=permissions,
+                context=context,
+                audience=audience,
+                extra_claims=extra,
+                authorized_party=args.azp,
+                authentication_methods=amr if amr else None,
+                confirmation=cnf,
+                nonce=args.nonce,
+            )
+            sys.stdout.write(token)
+        elif args.cmd == "decode":
+            payload = manager.decode_token(args.token, verify=not args.no_verify)
+            print_json(payload)
+        elif args.cmd == "revoke":
+            jti = manager.revoke_token(args.token)
+            print_json({"revoked": jti})
+        elif args.cmd == "rotate":
+            kid = manager.keystore.rotate(args.size)
+            print_json({"active_kid": kid})
+        elif args.cmd == "jwks":
+            print_json(manager.keystore.jwks())
+        elif args.cmd == "introspect":
+            result = manager.introspect(args.token)
+            print_json(result)
+        else:
+            parser.print_help()
+    except Exception as e:
+        sys.stderr.write(str(e))
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
