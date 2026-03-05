@@ -1,0 +1,381 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+log() { printf '%s\n' "$*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+require_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+usage() {
+  cat >&2 <<EOF
+Usage: $0 --url URL [--name NAME] [--dir DIR] [--version VER] [--checksum SHA] [--checksum-url URL] [--bin BIN]
+EOF
+}
+
+get_os() {
+  local os
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  case "$os" in
+    linux|darwin|freebsd|openbsd|netbsd) ;;
+    msys*|mingw*|cygwin*) os="windows" ;;
+  esac
+  echo "$os"
+}
+
+get_arch() {
+  local arch
+  arch=$(uname -m)
+  case "$arch" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    armv7l|armv7) arch="armv7" ;;
+    armv6l|armv6) arch="armv6" ;;
+    i386|i686) arch="386" ;;
+  esac
+  echo "$arch"
+}
+
+extract_version() {
+  local s="$1"
+  if [[ "$s" =~ ([vV]?[0-9]+(\.[0-9]+)+([.-]?[0-9A-Za-z]+)*) ]]; then
+    echo "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+resolve_latest_url() {
+  local u="$1"
+  local eff
+  eff=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$u") || return 1
+  if [[ -n "$eff" ]]; then
+    echo "$eff"
+  else
+    echo "$u"
+  fi
+}
+
+determine_latest_version() {
+  local u="$1"
+  local eff ver html owner repo api json
+  eff=$(resolve_latest_url "$u" 2>/dev/null || true)
+  ver=""
+  if [[ -n "$eff" ]]; then
+    ver=$(extract_version "$eff" || true)
+  fi
+  if [[ -z "$ver" ]]; then
+    html=$(curl -fsSL "$u" || true)
+    if [[ -n "$html" ]]; then
+      ver=$(extract_version "$html" || true)
+    fi
+  fi
+  if [[ -z "$ver" && "$u" =~ github.com/([^/]+)/([^/]+) ]]; then
+    owner="${BASH_REMATCH[1]}"
+    repo="${BASH_REMATCH[2]}"
+    repo="${repo%.git}"
+    api="https://api.github.com/repos/$owner/$repo/releases/latest"
+    json=$(curl -fsSL "$api" || true)
+    if [[ -n "$json" ]]; then
+      ver=$(printf '%s\n' "$json" | awk -F'"' '/"tag_name":/ {print $4; exit}')
+    fi
+  fi
+  [[ -n "$ver" ]] || return 1
+  echo "$ver"
+}
+
+download_file() {
+  local u="$1" dest="$2"
+  curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 15 -o "$dest" "$u"
+}
+
+calculate_sha256() {
+  local file="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$file" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$file" | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -sha256 "$file" | awk '{print $NF}'
+  else
+    return 1
+  fi
+}
+
+fetch_checksum_for() {
+  local url="$1"
+  local base
+  base="$(basename "${url%%\?*}")"
+  local dir="${url%/*}"
+  local candidates=(
+    "$url.sha256"
+    "$url.sha256sum"
+    "$url.sha256.txt"
+    "$dir/${base}.sha256"
+    "$dir/${base}.sha256sum"
+    "$dir/${base}.sha256.txt"
+    "$dir/sha256sums.txt"
+    "$dir/SHA256SUMS"
+    "$dir/checksums.txt"
+  )
+  local c content line
+  for c in "${candidates[@]}"; do
+    if curl -fsSLI "$c" >/dev/null 2>&1; then
+      content=$(curl -fsSL "$c" || true)
+      if [[ -n "$content" ]]; then
+        line=$(printf '%s\n' "$content" | grep -m1 "$base" || true)
+        if [[ -n "$line" ]]; then
+          echo "$line" | awk '{print $1}'
+        else
+          echo "$content" | awk 'NR==1{print $1}'
+        fi
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+verify_checksum() {
+  local file="$1" url="$2"
+  local expected=""
+  if [[ -n "${CHECKSUM:-}" ]]; then
+    expected="$CHECKSUM"
+  elif [[ -n "${CHECKSUM_URL:-}" ]]; then
+    expected=$(curl -fsSL "$CHECKSUM_URL" | awk '{print $1}' | head -n1 || true)
+  else
+    expected=$(fetch_checksum_for "$url" || true)
+  fi
+
+  if [[ -n "$expected" ]]; then
+    local actual
+    actual=$(calculate_sha256 "$file") || die "No SHA256 tool available"
+    if [[ "$actual" != "$expected" ]]; then
+      die "Checksum mismatch"
+    fi
+    log "Checksum OK"
+  else
+    log "Checksum not available, performing basic validation"
+    if command -v file >/dev/null 2>&1; then
+      local ftype
+      ftype=$(file -b "$file" || true)
+      if [[ "$ftype" == *HTML* ]]; then
+        die "Downloaded file appears to be HTML; check URL"
+      fi
+    fi
+  fi
+}
+
+find_binary() {
+  local root="$1" name="$2"
+  if [[ -f "$root/$name" ]]; then
+    echo "$root/$name"
+    return 0
+  fi
+  local f
+  f=$(find "$root" -type f -name "$name" -perm -111 2>/dev/null | head -n1)
+  if [[ -n "$f" ]]; then
+    echo "$f"
+    return 0
+  fi
+  f=$(find "$root" -type f -perm -111 2>/dev/null | head -n1)
+  if [[ -n "$f" ]]; then
+    echo "$f"
+    return 0
+  fi
+  return 1
+}
+
+install_package() {
+  local file="$1"
+  if [[ "$file" == *.deb ]]; then
+    require_cmd dpkg
+    if [[ ${EUID:-$(id -u)} -ne 0 && -z "${SUDO:-}" ]]; then
+      die "Root privileges required to install .deb"
+    fi
+    $SUDO dpkg -i "$file"
+    return 0
+  elif [[ "$file" == *.rpm ]]; then
+    require_cmd rpm
+    if [[ ${EUID:-$(id -u)} -ne 0 && -z "${SUDO:-}" ]]; then
+      die "Root privileges required to install .rpm"
+    fi
+    $SUDO rpm -Uvh --quiet "$file"
+    return 0
+  fi
+  return 1
+}
+
+install_binary() {
+  local src="$1" dest="$2"
+  if command -v install >/dev/null 2>&1; then
+    $SUDO install -m 0755 "$src" "$dest"
+  else
+    $SUDO cp -f "$src" "$dest"
+    $SUDO chmod 0755 "$dest"
+  fi
+}
+
+URL="${TOOL_URL:-}"
+TOOL_NAME="${TOOL_NAME:-}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+VERSION="${VERSION:-}"
+CHECKSUM="${CHECKSUM:-}"
+CHECKSUM_URL="${CHECKSUM_URL:-}"
+BIN_NAME="${BIN_NAME:-}"
+SUDO=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--url) URL="$2"; shift 2 ;;
+    -n|--name) TOOL_NAME="$2"; shift 2 ;;
+    -d|--dir) INSTALL_DIR="$2"; shift 2 ;;
+    -v|--version) VERSION="$2"; shift 2 ;;
+    --checksum) CHECKSUM="$2"; shift 2 ;;
+    --checksum-url) CHECKSUM_URL="$2"; shift 2 ;;
+    --bin) BIN_NAME="$2"; shift 2 ;;
+    -h|--help) usage; exit 0 ;;
+    *) if [[ -z "$URL" ]]; then URL="$1"; shift; else shift; fi ;;
+  esac
+done
+
+[[ -n "$URL" ]] || die "URL not specified"
+
+if [[ -z "$TOOL_NAME" ]]; then
+  base=$(basename "${URL%%\?*}")
+  base="${base%%.tar.gz}"
+  base="${base%%.tgz}"
+  base="${base%%.tar.bz2}"
+  base="${base%%.tbz2}"
+  base="${base%%.tar.xz}"
+  base="${base%%.txz}"
+  base="${base%%.zip}"
+  base="${base%%.gz}"
+  base="${base%%.bz2}"
+  base="${base%%.xz}"
+  base="${base%%.deb}"
+  base="${base%%.rpm}"
+  base="${base%%-*}"
+  base="${base%%_*}"
+  TOOL_NAME="${base:-securitytool}"
+fi
+if [[ -z "$BIN_NAME" ]]; then BIN_NAME="$TOOL_NAME"; fi
+
+require_cmd curl
+
+OS=$(get_os)
+ARCH=$(get_arch)
+
+URL="${URL//\{os\}/$OS}"
+URL="${URL//\{arch\}/$ARCH}"
+URL="${URL//\{OS\}/$OS}"
+URL="${URL//\{ARCH\}/$ARCH}"
+URL="${URL//\{\{os\}\}/$OS}"
+URL="${URL//\{\{arch\}\}/$ARCH}"
+URL="${URL//\{\{OS\}\}/$OS}"
+URL="${URL//\{\{ARCH\}\}/$ARCH}"
+
+if [[ "$URL" == *"{version}"* || "$URL" == *"{VERSION}"* || "$URL" == *"{{version}}"* ]]; then
+  if [[ -z "$VERSION" ]]; then
+    tmp_url="$URL"
+    tmp_url="${tmp_url//\{version\}/latest}"
+    tmp_url="${tmp_url//\{VERSION\}/latest}"
+    tmp_url="${tmp_url//\{\{version\}\}/latest}"
+    VERSION=$(determine_latest_version "$tmp_url") || die "Cannot determine latest version"
+  fi
+  URL="${URL//\{version\}/$VERSION}"
+  URL="${URL//\{VERSION\}/$VERSION}"
+  URL="${URL//\{\{version\}\}/$VERSION}"
+elif [[ "$URL" == *latest* ]]; then
+  eff=$(resolve_latest_url "$URL" || true)
+  if [[ -n "$eff" ]]; then
+    URL="$eff"
+    if [[ -z "$VERSION" ]]; then VERSION=$(extract_version "$URL" || true); fi
+  fi
+fi
+
+if [[ -z "$VERSION" ]]; then VERSION=$(extract_version "$URL" || true); fi
+
+tmpdir=$(mktemp -d 2>/dev/null || mktemp -d -t 'toolinstall')
+cleanup() { rm -rf "$tmpdir"; }
+trap cleanup EXIT
+
+archive="$tmpdir/$(basename "${URL%%\?*}")"
+
+log "Downloading $URL"
+download_file "$URL" "$archive"
+[[ -s "$archive" ]] || die "Downloaded file is empty"
+
+verify_checksum "$archive" "$URL"
+
+if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  fi
+fi
+if [[ -z "$SUDO" && ! -w "$INSTALL_DIR" ]]; then
+  die "No permission to write to $INSTALL_DIR"
+fi
+
+if install_package "$archive"; then
+  log "Installation complete"
+  exit 0
+fi
+
+extract_dir="$tmpdir/extract"
+mkdir -p "$extract_dir"
+
+case "$archive" in
+  *.tar.gz|*.tgz)
+    require_cmd tar
+    tar -xzf "$archive" -C "$extract_dir"
+    ;;
+  *.tar.bz2|*.tbz2)
+    require_cmd tar
+    tar -xjf "$archive" -C "$extract_dir"
+    ;;
+  *.tar.xz|*.txz)
+    require_cmd tar
+    tar -xJf "$archive" -C "$extract_dir"
+    ;;
+  *.zip)
+    require_cmd unzip
+    unzip -q "$archive" -d "$extract_dir"
+    ;;
+  *.gz)
+    require_cmd gzip
+    gzip -dc "$archive" > "$extract_dir/$BIN_NAME"
+    chmod +x "$extract_dir/$BIN_NAME"
+    ;;
+  *.bz2)
+    require_cmd bzip2
+    bzip2 -dc "$archive" > "$extract_dir/$BIN_NAME"
+    chmod +x "$extract_dir/$BIN_NAME"
+    ;;
+  *.xz)
+    require_cmd xz
+    xz -dc "$archive" > "$extract_dir/$BIN_NAME"
+    chmod +x "$extract_dir/$BIN_NAME"
+    ;;
+  *)
+    extract_dir=""
+    ;;
+esac
+
+if [[ -z "$extract_dir" ]]; then
+  bin="$archive"
+else
+  bin=$(find_binary "$extract_dir" "$BIN_NAME") || die "Binary not found in archive"
+fi
+
+if [[ ! -x "$bin" ]]; then
+  chmod +x "$bin" || true
+fi
+
+$SUDO mkdir -p "$INSTALL_DIR"
+install_binary "$bin" "$INSTALL_DIR/$BIN_NAME"
+
+if [[ -n "$VERSION" ]]; then
+  log "Installed $BIN_NAME $VERSION to $INSTALL_DIR"
+else
+  log "Installed $BIN_NAME to $INSTALL_DIR"
+fi

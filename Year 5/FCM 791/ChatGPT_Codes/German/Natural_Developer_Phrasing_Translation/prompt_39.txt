@@ -1,0 +1,136 @@
+import socket
+import struct
+import argparse
+import sys
+import threading
+import signal
+
+def xor_cipher(data, key):
+    if not key:
+        return data
+    return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+
+class LegacyClient:
+    def __init__(self, host, port, key=b"", timeout=10.0):
+        self.host = host
+        self.port = port
+        self.key = key
+        self.timeout = timeout
+        self.sock = None
+        self.lock = threading.Lock()
+
+    def connect(self):
+        self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+    def send_frame(self, payload: bytes):
+        enc = xor_cipher(payload, self.key)
+        header = struct.pack("!I", len(enc))
+        with self.lock:
+            self.sock.sendall(header + enc)
+
+    def recv_frame(self):
+        header = self._recv_all(4)
+        if not header:
+            return None
+        length = struct.unpack("!I", header)[0]
+        data = self._recv_all(length)
+        if data is None:
+            return None
+        return xor_cipher(data, self.key)
+
+    def _recv_all(self, n):
+        buf = b""
+        while len(buf) < n:
+            chunk = self.sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+        return buf
+
+def recv_loop(client, raw):
+    while True:
+        data = client.recv_frame()
+        if data is None:
+            break
+        if raw:
+            sys.stdout.buffer.write(data + b"\n")
+            sys.stdout.buffer.flush()
+        else:
+            try:
+                text = data.decode("utf-8", errors="replace")
+            except Exception:
+                text = repr(data)
+            sys.stdout.write(text + "\n")
+            sys.stdout.flush()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("host")
+    parser.add_argument("port", type=int)
+    parser.add_argument("-k", "--key", default="")
+    parser.add_argument("-m", "--message")
+    parser.add_argument("--raw", action="store_true")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    args = parser.parse_args()
+
+    key_bytes = args.key.encode("utf-8") if args.key else b""
+    client = LegacyClient(args.host, args.port, key=key_bytes, timeout=args.timeout)
+
+    def shutdown(*_):
+        client.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    client.connect()
+
+    if args.message is not None:
+        if args.raw:
+            payload = bytes.fromhex(args.message) if all(c in "0123456789abcdefABCDEF" for c in args.message.replace(" ", "")) else args.message.encode("utf-8", errors="ignore")
+        else:
+            payload = args.message.encode("utf-8")
+        client.send_frame(payload)
+        response = client.recv_frame()
+        if response is not None:
+            if args.raw:
+                sys.stdout.buffer.write(response + b"\n")
+                sys.stdout.buffer.flush()
+            else:
+                sys.stdout.write(response.decode("utf-8", errors="replace") + "\n")
+        client.close()
+        return
+
+    t = threading.Thread(target=recv_loop, args=(client, args.raw), daemon=True)
+    t.start()
+
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            break
+        if line.endswith(b"\n"):
+            line = line[:-1]
+        if args.raw:
+            payload = line
+        else:
+            payload = line
+        if not payload:
+            continue
+        client.send_frame(payload)
+
+    client.close()
+
+if __name__ == "__main__":
+    main()

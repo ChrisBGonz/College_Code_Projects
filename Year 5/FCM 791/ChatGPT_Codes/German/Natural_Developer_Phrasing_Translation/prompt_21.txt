@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import json
+import time
+import uuid
+import base64
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, List, Iterable, Callable
+from urllib.request import urlopen, Request
+from urllib.error import URLError, HTTPError
+
+import jwt
+from jwt import algorithms
+
+
+class JWTAuthError(Exception):
+    pass
+
+
+class TokenRevokedError(JWTAuthError):
+    pass
+
+
+class ScopeError(JWTAuthError):
+    pass
+
+
+class RoleError(JWTAuthError):
+    pass
+
+
+class TokenRevocationStore:
+    def __init__(self):
+        self._revoked = set()
+
+    def revoke(self, jti: Optional[str]) -> None:
+        if jti:
+            self._revoked.add(jti)
+
+    def is_revoked(self, jti: Optional[str]) -> bool:
+        return bool(jti and jti in self._revoked)
+
+
+class JWKSClient:
+    def __init__(self, url: str, cache_ttl: int = 300, timeout: int = 5, headers: Optional[Dict[str, str]] = None):
+        self.url = url
+        self.cache_ttl = cache_ttl
+        self.timeout = timeout
+        self.headers = headers or {}
+        self._keys: Dict[str, Dict[str, Any]] = {}
+        self._last_fetch = 0.0
+
+    def _refresh(self) -> None:
+        now = time.time()
+        if self._keys and now - self._last_fetch < self.cache_ttl:
+            return
+        req = Request(self.url, headers=self.headers)
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                data = resp.read()
+        except (HTTPError, URLError) as e:
+            raise JWTAuthError("Failed to fetch JWKS") from e
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except Exception as e:
+            raise JWTAuthError("Invalid JWKS payload") from e
+        keys = payload.get("keys", [])
+        self._keys = {}
+        for i, k in enumerate(keys):
+            if k.get("use") not in (None, "sig"):
+                continue
+            kid = k.get("kid") or f"_{i}"
+            self._keys[kid] = k
+        self._last_fetch = now
+
+    def get_jwk(self, kid: Optional[str] = None) -> Dict[str, Any]:
+        self._refresh()
+        if kid and kid in self._keys:
+            return self._keys[kid]
+        if len(self._keys) == 1:
+            return next(iter(self._keys.values()))
+        raise JWTAuthError("No matching JWK found")
+
+    def get_key(self, kid: Optional[str] = None) -> Any:
+        jwk = self.get_jwk(kid)
+        kty = jwk.get("kty")
+        if kty == "RSA":
+            return algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+        if kty == "EC":
+            return algorithms.ECAlgorithm.from_jwk(json.dumps(jwk))
+        if kty == "oct":
+            return self._decode_symmetric_key(jwk.get("k"))
+        raise JWTAuthError("Unsupported JWK key type")
+
+    @staticmethod
+    def _decode_symmetric_key(k: Optional[str]) -> bytes:
+        if not k:
+            raise JWTAuthError("Invalid symmetric JWK")
+        padding = "=" * (-len(k) % 4)
+        return base64.urlsafe_b64decode(k + padding)
+
+
+@dataclass
+class JWTConfig:
+    issuer: Optional[str] = None
+    audience: Optional[Any] = None
+    algorithms: List[str] = field(default_factory=lambda: ["HS256"])
+    leeway: int = 0
+    required_claims: List[str] = field(default_factory=lambda: ["exp", "iat", "nbf", "sub", "jti"])
+    typ: Optional[str] = "JWT"
+
+
+class JWTAuthenticator:
+    def __init__(
+        self,
+        config: JWTConfig,
+        secret: Optional[Any] = None,
+        private_key: Optional[Any] = None,
+        public_key: Optional[Any] = None,
+        public_keys: Optional[Dict[str, Any]] = None,
+        jwks_url: Optional[str] = None,
+        revocation_store: Optional[TokenRevocationStore] = None,
+    ):
+        self.config = config
+        self.secret = secret
+        self.private_key = private_key
+        self.public_key = public_key
+        self.public_keys = public_keys or {}
+        self.jwks_client = JWKSClient(jwks_url) if jwks_url else None
+        self.revocation_store = revocation_store or TokenRevocationStore()
+
+    def _get_signing_key(self, alg: str) -> Any:
+        if alg.startswith("HS"):
+            if not self.secret:
+                raise JWTAuthError("Missing HMAC secret")
+            return self.secret
+        if not self.private_key:
+            raise JWTAuthError("Missing private key")
+        return self.private_key
+
+    def _resolve_verification_key(self, header: Dict[str, Any]) -> Any:
+        alg = header.get("alg")
+        if not alg or alg == "none":
+            raise JWTAuthError("Invalid algorithm")
+        if self.config.algorithms and alg not in self.config.algorithms:
+            raise JWTAuthError("Algorithm not allowed")
+        if alg.startswith("HS"):
+            if not self.secret:
+                raise JWTAuthError("Missing HMAC secret")
+            return self.secret
+        kid = header.get("kid")
+        if kid and kid in self.public_keys:
+            return self.public_keys[kid]
+        if self.public_key:
+            return self.public_key
+        if self.jwks_client:
+            return self.jwks_client.get_key(kid)
+        raise JWTAuthError("Verification key not found")
+
+    def encode(
+        self,
+        subject: str,
+        expires_in: int = 3600,
+        not_before: int = 0,
+        additional_claims: Optional[Dict[str, Any]] = None,
+        roles: Optional[Iterable[str]] = None,
+        scopes: Optional[Iterable[str]] = None,
+        audience: Optional[Any] = None,
+        issuer: Optional[str] = None,
+        algorithm: Optional[str] = None,
+        headers: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        now = int(time.time())
+        payload: Dict[str, Any] = {
+            "sub": subject,
+            "iat": now,
+            "nbf": now + max(0, int(not_before)),
+            "exp": now + max(1, int(expires_in)),
+            "jti": uuid.uuid4().hex,
+        }
+        iss = issuer if issuer is not None else self.config.issuer
+        aud = audience if audience is not None else self.config.audience
+        if iss:
+            payload["iss"] = iss
+        if aud:
+            payload["aud"] = aud
+        if roles:
+            payload["roles"] = list(roles)
+        if scopes:
+            if isinstance(scopes, str):
+                payload["scope"] = scopes
+            else:
+                scope_list = list(scopes)
+                if all(isinstance(s, str) for s in scope_list):
+                    payload["scope"] = " ".join(scope_list)
+                else:
+                    payload["scope"] = scope_list
+        if additional_claims:
+            payload.update(additional_claims)
+        alg = algorithm or (self.config.algorithms[0] if self.config.algorithms else "HS256")
+        key = self._get_signing_key(alg)
+        hdrs = headers.copy() if headers else {}
+        if self.config.typ:
+            hdrs.setdefault("typ", self.config.typ)
+        token = jwt.encode(payload, key, algorithm=alg, headers=hdrs if hdrs else None)
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        return token
+
+    def decode(self, token: str, verify: bool = True) -> Dict[str, Any]:
+        try:
+            header = jwt.get_unverified_header(token)
+        except jwt.PyJWTError as e:
+            raise JWTAuthError(str(e))
+        if self.config.typ:
+            typ = header.get("typ")
+            if typ and typ.lower() != self.config.typ.lower():
+                raise JWTAuthError("Invalid token type")
+        if not verify:
+            try:
+                return jwt.decode(
+                    token,
+                    algorithms=self.config.algorithms,
+                    options={
+                        "verify_signature": False,
+                        "verify_exp": False,
+                        "verify_nbf": False,
+                        "verify_iat": False,
+                        "verify_aud": False,
+                        "verify_iss": False,
+                    },
+                )
+            except jwt.PyJWTError as e:
+                raise JWTAuthError(str(e))
+        key = self._resolve_verification_key(header)
+        options = {
+            "require": self.config.required_claims,
+            "verify_aud": self.config.audience is not None,
+            "verify_iss": self.config.issuer is not None,
+        }
+        try:
+            return jwt.decode(
+                token,
+                key=key,
+                algorithms=self.config.algorithms,
+                issuer=self.config.issuer,
+                audience=self.config.audience,
+                leeway=self.config.leeway,
+                options=options,
+            )
+        except jwt.PyJWTError as e:
+            raise JWTAuthError(str(e))
+
+    def authenticate(
+        self,
+        token: str,
+        required_scopes: Optional[Iterable[str]] = None,
+        required_roles: Optional[Iterable[str]] = None,
+        custom_claims_checker: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        claims = self.decode(token, verify=True)
+        jti = claims.get("jti")
+        if self.revocation_store and self.revocation_store.is_revoked(jti):
+            raise TokenRevokedError("Token revoked")
+        if required_scopes:
+            if isinstance(required_scopes, str):
+                required_scopes = required_scopes.split()
+            token_scopes = self._normalize_scopes(claims.get("scope") or claims.get("scopes"))
+            if not set(required_scopes).issubset(token_scopes):
+                raise ScopeError("Missing required scopes")
+        if required_roles:
+            if isinstance(required_roles, str):
+                required_roles = required_roles.split()
+            token_roles = self._normalize_roles(claims.get("roles"))
+            if not set(required_roles).issubset(token_roles):
+                raise RoleError("Missing required roles")
+        if custom_claims_checker:
+            custom_claims_checker(claims)
+        return claims
+
+    def revoke(self, token: str) -> Optional[str]:
+        claims = self.decode(token, verify=False)
+        jti = claims.get("jti")
+        if self.revocation_store:
+            self.revocation_store.revoke(jti)
+        return jti
+
+    @staticmethod
+    def _normalize_scopes(scope_value: Any) -> set:
+        if not scope_value:
+            return set()
+        if isinstance(scope_value, str):
+            return set(scope_value.split())
+        if isinstance(scope_value, (list, tuple, set)):
+            return set(scope_value)
+        return {str(scope_value)}
+
+    @staticmethod
+    def _normalize_roles(role_value: Any) -> set:
+        if not role_value:
+            return set()
+        if isinstance(role_value, str):
+            if " " in role_value:
+                return set(role_value.split())
+            if "," in role_value:
+                return set([r for r in role_value.split(",") if r])
+            return {role_value}
+        if isinstance(role_value, (list, tuple, set)):
+            return set(role_value)
+        return {str(role_value)}
+
+
+def load_key(value: Optional[str]) -> Optional[Any]:
+    if value is None:
+        return None
+    path = value
+    if value.startswith("file:"):
+        path = value[5:]
+    if os.path.isfile(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            return data.decode("utf-8")
+        except Exception:
+            return data
+    return value
+
+
+def parse_json_claims(value: Optional[str]) -> Dict[str, Any]:
+    if not value:
+        return {}
+    if value.startswith("@") and os.path.isfile(value[1:]):
+        with open(value[1:], "r", encoding="utf-8") as f:
+            value = f.read()
+    return json.loads(value)
+
+
+def parse_list(values: Optional[List[str]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    if len(values) == 1:
+        v = values[0]
+        if v is None:
+            return None
+        if "," in v:
+            return [x for x in v.split(",") if x]
+        if " " in v:
+            return [x for x in v.split() if x]
+    return values
+
+
+def parse_audience(value: Optional[str]) -> Optional[Any]:
+    if value is None:
+        return None
+    if "," in value:
+        return [x for x in value.split(",") if x]
+    return value
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+    sub.required = True
+
+    enc = sub.add_parser("encode")
+    enc.add_argument("--sub", required=True)
+    enc.add_argument("--issuer")
+    enc.add_argument("--audience")
+    enc.add_argument("--alg", default="HS256")
+    enc.add_argument("--secret")
+    enc.add_argument("--private-key")
+    enc.add_argument("--expires-in", type=int, default=3600)
+    enc.add_argument("--nbf", type=int, default=0)
+    enc.add_argument("--roles", nargs="*")
+    enc.add_argument("--scopes", nargs="*")
+    enc.add_argument("--claims")
+    enc.add_argument("--kid")
+    enc.add_argument("--typ", default="JWT")
+
+    dec = sub.add_parser("decode")
+    dec.add_argument("--token")
+    dec.add_argument("--issuer")
+    dec.add_argument("--audience")
+    dec.add_argument("--alg", action="append")
+    dec.add_argument("--secret")
+    dec.add_argument("--public-key")
+    dec.add_argument("--jwks-url")
+    dec.add_argument("--leeway", type=int, default=0)
+    dec.add_argument("--required-scope", action="append")
+    dec.add_argument("--required-role", action="append")
+    dec.add_argument("--no-verify", action="store_true")
+    dec.add_argument("--typ", default="JWT")
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command == "encode":
+        cfg = JWTConfig(
+            issuer=args.issuer,
+            audience=parse_audience(args.audience),
+            algorithms=[args.alg],
+            typ=args.typ,
+        )
+        auth = JWTAuthenticator(
+            cfg,
+            secret=load_key(args.secret),
+            private_key=load_key(args.private_key),
+        )
+        roles = parse_list(args.roles)
+        scopes = parse_list(args.scopes)
+        claims = parse_json_claims(args.claims)
+        headers = {}
+        if args.kid:
+            headers["kid"] = args.kid
+        token = auth.encode(
+            subject=args.sub,
+            expires_in=args.expires_in,
+            not_before=args.nbf,
+            additional_claims=claims,
+            roles=roles,
+            scopes=scopes,
+            algorithm=args.alg,
+            headers=headers if headers else None,
+        )
+        sys.stdout.write(token)
+    elif args.command == "decode":
+        token = args.token or sys.stdin.read().strip()
+        if not token:
+            sys.exit(1)
+        algs = args.alg if args.alg else ["HS256"]
+        cfg = JWTConfig(
+            issuer=args.issuer,
+            audience=parse_audience(args.audience),
+            algorithms=algs,
+            leeway=args.leeway,
+            typ=args.typ,
+        )
+        auth = JWTAuthenticator(
+            cfg,
+            secret=load_key(args.secret),
+            public_key=load_key(args.public_key),
+            jwks_url=args.jwks_url,
+        )
+        if args.no_verify:
+            claims = auth.decode(token, verify=False)
+        else:
+            required_scopes = parse_list(args.required_scope)
+            required_roles = parse_list(args.required_role)
+            claims = auth.authenticate(token, required_scopes=required_scopes, required_roles=required_roles)
+        sys.stdout.write(json.dumps(claims, separators=(",", ":"), sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
