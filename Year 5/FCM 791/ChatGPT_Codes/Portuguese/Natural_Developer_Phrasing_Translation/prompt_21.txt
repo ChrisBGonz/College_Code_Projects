@@ -1,0 +1,119 @@
+import os
+import sys
+import json
+import jwt
+from jwt import PyJWKClient
+from typing import Iterable
+
+class JWTAuthenticator:
+    def __init__(self, jwks_url, audience=None, issuer=None, algorithms=None, leeway=0):
+        self.jwks_url = jwks_url
+        self.audience = audience
+        self.issuer = issuer
+        self.algorithms = algorithms or ["RS256", "ES256", "HS256"]
+        self.leeway = leeway
+        self.jwk_client = PyJWKClient(jwks_url)
+
+    def _get_signing_key(self, token):
+        return self.jwk_client.get_signing_key_from_jwt(token).key
+
+    def decode(self, token):
+        key = self._get_signing_key(token)
+        options = {"require": ["exp", "iat", "iss", "aud"], "verify_signature": True}
+        return jwt.decode(
+            token,
+            key,
+            algorithms=self.algorithms,
+            audience=self.audience,
+            issuer=self.issuer,
+            options=options,
+            leeway=self.leeway,
+        )
+
+    def _extract_scopes(self, claims):
+        scopes = set()
+        raw_scope = claims.get("scope") or claims.get("scp")
+        if isinstance(raw_scope, str):
+            scopes.update(filter(None, raw_scope.split()))
+        elif isinstance(raw_scope, (list, tuple, set)):
+            scopes.update(raw_scope)
+
+        permissions = claims.get("permissions")
+        if isinstance(permissions, dict):
+            for v in permissions.values():
+                if isinstance(v, (list, tuple, set)):
+                    scopes.update(v)
+                elif isinstance(v, str):
+                    scopes.add(v)
+        elif isinstance(permissions, (list, tuple, set)):
+            scopes.update(permissions)
+
+        roles = claims.get("realm_access", {}).get("roles") or claims.get("roles")
+        if isinstance(roles, (list, tuple, set)):
+            scopes.update(roles)
+
+        return scopes
+
+    def authorize(self, claims, required_scopes: Iterable[str]):
+        required = set(required_scopes or [])
+        if not required:
+            return True
+        available = self._extract_scopes(claims)
+        return required.issubset(available)
+
+    def authenticate(self, token, required_scopes=None):
+        claims = self.decode(token)
+        if not self.authorize(claims, required_scopes):
+            raise PermissionError("Insufficient permissions")
+        return claims
+
+def _load_required_scopes():
+    req = os.getenv("JWT_REQUIRED_SCOPES", "")
+    return [s for s in req.split() if s]
+
+def main():
+    token = sys.argv[1] if len(sys.argv) > 1 else os.getenv("JWT_TOKEN")
+    if not token:
+        sys.stderr.write("JWT_TOKEN not provided\n")
+        sys.exit(1)
+
+    jwks_url = os.getenv("JWKS_URL", "")
+    if not jwks_url:
+        sys.stderr.write("JWKS_URL not provided\n")
+        sys.exit(1)
+
+    audience = os.getenv("JWT_AUDIENCE")
+    issuer = os.getenv("JWT_ISSUER")
+    algorithms = os.getenv("JWT_ALGORITHMS")
+    if algorithms:
+        algorithms = [a.strip() for a in algorithms.split(",") if a.strip()]
+    else:
+        algorithms = None
+
+    leeway = int(os.getenv("JWT_LEEWAY", "0"))
+    required_scopes = _load_required_scopes()
+
+    auth = JWTAuthenticator(
+        jwks_url=jwks_url,
+        audience=audience,
+        issuer=issuer,
+        algorithms=algorithms,
+        leeway=leeway,
+    )
+
+    try:
+        claims = auth.authenticate(token, required_scopes=required_scopes)
+    except jwt.ExpiredSignatureError:
+        sys.stderr.write("Token expired\n")
+        sys.exit(2)
+    except jwt.InvalidTokenError as e:
+        sys.stderr.write(f"Invalid token: {e}\n")
+        sys.exit(3)
+    except PermissionError as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(4)
+
+    sys.stdout.write(json.dumps(claims, ensure_ascii=False, indent=2, sort_keys=True))
+
+if __name__ == "__main__":
+    main()
