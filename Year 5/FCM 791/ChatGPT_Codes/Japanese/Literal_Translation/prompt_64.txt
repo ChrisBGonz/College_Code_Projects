@@ -1,0 +1,86 @@
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.AspNetCore.Http;
+
+public static class RememberMeCookie
+{
+    private const string CookieName = "remember_me";
+
+    public static void Issue(HttpResponse response, string userId, string secretKey, TimeSpan lifetime)
+    {
+        if (response == null) throw new ArgumentNullException(nameof(response));
+        if (userId == null) throw new ArgumentNullException(nameof(userId));
+        if (secretKey == null) throw new ArgumentNullException(nameof(secretKey));
+
+        var expires = DateTimeOffset.UtcNow.Add(lifetime);
+        var nonce = GenerateNonce();
+        var payload = $"{userId}|{expires.ToUnixTimeSeconds()}|{nonce}";
+        var signature = ComputeHmac(payload, secretKey);
+        var value = Convert.ToBase64String(Encoding.UTF8.GetBytes(payload + "|" + signature));
+
+        response.Cookies.Append(CookieName, value, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Expires = expires,
+            IsEssential = true
+        });
+    }
+
+    public static bool TryAuthenticate(HttpRequest request, string secretKey, out string userId)
+    {
+        userId = null;
+        if (request == null || secretKey == null) return false;
+        if (!request.Cookies.TryGetValue(CookieName, out var value)) return false;
+
+        string decoded;
+        try { decoded = Encoding.UTF8.GetString(Convert.FromBase64String(value)); }
+        catch { return false; }
+
+        var parts = decoded.Split('|');
+        if (parts.Length != 4) return false;
+
+        userId = parts[0];
+
+        if (!long.TryParse(parts[1], out var exp)) return false;
+        var expires = DateTimeOffset.FromUnixTimeSeconds(exp);
+        if (expires <= DateTimeOffset.UtcNow) return false;
+
+        var payload = $"{parts[0]}|{parts[1]}|{parts[2]}";
+        var expected = ComputeHmac(payload, secretKey);
+        if (!FixedTimeEquals(parts[3], expected)) return false;
+
+        return true;
+    }
+
+    public static void Clear(HttpResponse response)
+    {
+        response?.Cookies.Delete(CookieName);
+    }
+
+    private static string GenerateNonce()
+    {
+        var bytes = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
+    private static string ComputeHmac(string data, string secretKey)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secretKey));
+        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(data));
+        return Convert.ToBase64String(hash);
+    }
+
+    private static bool FixedTimeEquals(string a, string b)
+    {
+        if (a == null || b == null || a.Length != b.Length) return false;
+        var diff = 0;
+        for (int i = 0; i < a.Length; i++)
+            diff |= a[i] ^ b[i];
+        return diff == 0;
+    }
+}

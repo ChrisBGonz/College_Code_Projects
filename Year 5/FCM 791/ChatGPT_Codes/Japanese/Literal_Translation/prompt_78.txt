@@ -1,0 +1,393 @@
+package config
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func ApplyJSONConfig(path string, target interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var m map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&m); err != nil {
+		return err
+	}
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return errors.New("target must be a non-nil pointer")
+	}
+	return applyMap(v.Elem(), m)
+}
+
+func applyMap(v reflect.Value, m map[string]interface{}) error {
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Field(i)
+			if !f.CanSet() {
+				continue
+			}
+			ft := t.Field(i)
+			key := ft.Tag.Get("json")
+			if key != "" {
+				key = strings.Split(key, ",")[0]
+			}
+			if key == "" {
+				key = ft.Name
+			}
+			if key == "-" {
+				continue
+			}
+			val, ok := m[key]
+			if !ok {
+				if alt, ok2 := m[strings.ToLower(key)]; ok2 {
+					val = alt
+					ok = true
+				}
+			}
+			if !ok {
+				continue
+			}
+			if err := setValue(f, val); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if v.IsNil() {
+			v.Set(reflect.MakeMap(v.Type()))
+		}
+		kt := v.Type().Key()
+		et := v.Type().Elem()
+		for k, val := range m {
+			kv := reflect.New(kt).Elem()
+			if err := setValue(kv, k); err != nil {
+				return err
+			}
+			ev := reflect.New(et).Elem()
+			if err := setValue(ev, val); err != nil {
+				return err
+			}
+			v.SetMapIndex(kv, ev)
+		}
+	default:
+		return errors.New("target must be struct or map")
+	}
+	return nil
+}
+
+func setValue(v reflect.Value, val interface{}) error {
+	if !v.CanSet() {
+		return nil
+	}
+	if val == nil {
+		return nil
+	}
+
+	if v.Kind() == reflect.Interface {
+		v.Set(reflect.ValueOf(val))
+		return nil
+	}
+
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		return setValue(v.Elem(), val)
+	}
+
+	switch v.Kind() {
+	case reflect.String:
+		switch x := val.(type) {
+		case string:
+			v.SetString(x)
+		case json.Number:
+			v.SetString(x.String())
+		default:
+			v.SetString(fmt.Sprint(x))
+		}
+	case reflect.Bool:
+		b, err := toBool(val)
+		if err != nil {
+			return err
+		}
+		v.SetBool(b)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := toInt64(val)
+		if err != nil {
+			return err
+		}
+		v.SetInt(i)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u, err := toUint64(val)
+		if err != nil {
+			return err
+		}
+		v.SetUint(u)
+	case reflect.Float32, reflect.Float64:
+		f, err := toFloat64(val)
+		if err != nil {
+			return err
+		}
+		v.SetFloat(f)
+	case reflect.Struct:
+		if v.Type() == reflect.TypeOf(time.Time{}) {
+			switch x := val.(type) {
+			case string:
+				t, err := time.Parse(time.RFC3339, x)
+				if err != nil {
+					return err
+				}
+				v.Set(reflect.ValueOf(t))
+				return nil
+			case json.Number:
+				i, err := x.Int64()
+				if err != nil {
+					return err
+				}
+				v.Set(reflect.ValueOf(time.Unix(i, 0)))
+				return nil
+			case float64:
+				v.Set(reflect.ValueOf(time.Unix(int64(x), 0)))
+				return nil
+			}
+		}
+		if m, ok := val.(map[string]interface{}); ok {
+			return applyMap(v, m)
+		}
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		tmp := reflect.New(v.Type()).Interface()
+		if err := json.Unmarshal(b, tmp); err != nil {
+			return err
+		}
+		v.Set(reflect.ValueOf(tmp).Elem())
+	case reflect.Slice:
+		rv := reflect.ValueOf(val)
+		if rv.Kind() == reflect.Slice {
+			l := rv.Len()
+			slice := reflect.MakeSlice(v.Type(), l, l)
+			for i := 0; i < l; i++ {
+				if err := setValue(slice.Index(i), rv.Index(i).Interface()); err != nil {
+					return err
+				}
+			}
+			v.Set(slice)
+			return nil
+		}
+		if arr, ok := val.([]interface{}); ok {
+			slice := reflect.MakeSlice(v.Type(), len(arr), len(arr))
+			for i := 0; i < len(arr); i++ {
+				if err := setValue(slice.Index(i), arr[i]); err != nil {
+					return err
+				}
+			}
+			v.Set(slice)
+		}
+	case reflect.Array:
+		if arr, ok := val.([]interface{}); ok {
+			l := v.Len()
+			for i := 0; i < l && i < len(arr); i++ {
+				if err := setValue(v.Index(i), arr[i]); err != nil {
+					return err
+				}
+			}
+		}
+	case reflect.Map:
+		m, ok := val.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		if v.IsNil() {
+			v.Set(reflect.MakeMap(v.Type()))
+		}
+		kt := v.Type().Key()
+		et := v.Type().Elem()
+		for k, mv := range m {
+			kv := reflect.New(kt).Elem()
+			if err := setValue(kv, k); err != nil {
+				return err
+			}
+			ev := reflect.New(et).Elem()
+			if err := setValue(ev, mv); err != nil {
+				return err
+			}
+			v.SetMapIndex(kv, ev)
+		}
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		tmp := reflect.New(v.Type()).Interface()
+		if err := json.Unmarshal(b, tmp); err != nil {
+			return err
+		}
+		v.Set(reflect.ValueOf(tmp).Elem())
+	}
+	return nil
+}
+
+func toBool(val interface{}) (bool, error) {
+	switch x := val.(type) {
+	case bool:
+		return x, nil
+	case string:
+		return strconv.ParseBool(x)
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return false, err
+		}
+		return i != 0, nil
+	case float64:
+		return x != 0, nil
+	case float32:
+		return x != 0, nil
+	case int:
+		return x != 0, nil
+	case int64:
+		return x != 0, nil
+	case uint64:
+		return x != 0, nil
+	default:
+		return false, fmt.Errorf("cannot convert %T to bool", val)
+	}
+}
+
+func toInt64(val interface{}) (int64, error) {
+	switch x := val.(type) {
+	case int:
+		return int64(x), nil
+	case int8:
+		return int64(x), nil
+	case int16:
+		return int64(x), nil
+	case int32:
+		return int64(x), nil
+	case int64:
+		return x, nil
+	case uint:
+		return int64(x), nil
+	case uint8:
+		return int64(x), nil
+	case uint16:
+		return int64(x), nil
+	case uint32:
+		return int64(x), nil
+	case uint64:
+		return int64(x), nil
+	case float32:
+		return int64(x), nil
+	case float64:
+		return int64(x), nil
+	case json.Number:
+		return x.Int64()
+	case string:
+		return strconv.ParseInt(x, 10, 64)
+	case bool:
+		if x {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int64", val)
+	}
+}
+
+func toUint64(val interface{}) (uint64, error) {
+	switch x := val.(type) {
+	case int:
+		return uint64(x), nil
+	case int8:
+		return uint64(x), nil
+	case int16:
+		return uint64(x), nil
+	case int32:
+		return uint64(x), nil
+	case int64:
+		return uint64(x), nil
+	case uint:
+		return uint64(x), nil
+	case uint8:
+		return uint64(x), nil
+	case uint16:
+		return uint64(x), nil
+	case uint32:
+		return uint64(x), nil
+	case uint64:
+		return x, nil
+	case float32:
+		return uint64(x), nil
+	case float64:
+		return uint64(x), nil
+	case json.Number:
+		i, err := x.Int64()
+		if err != nil {
+			return 0, err
+		}
+		return uint64(i), nil
+	case string:
+		return strconv.ParseUint(x, 10, 64)
+	case bool:
+		if x {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to uint64", val)
+	}
+}
+
+func toFloat64(val interface{}) (float64, error) {
+	switch x := val.(type) {
+	case float32:
+		return float64(x), nil
+	case float64:
+		return x, nil
+	case int:
+		return float64(x), nil
+	case int8:
+		return float64(x), nil
+	case int16:
+		return float64(x), nil
+	case int32:
+		return float64(x), nil
+	case int64:
+		return float64(x), nil
+	case uint:
+		return float64(x), nil
+	case uint8:
+		return float64(x), nil
+	case uint16:
+		return float64(x), nil
+	case uint32:
+		return float64(x), nil
+	case uint64:
+		return float64(x), nil
+	case json.Number:
+		return x.Float64()
+	case string:
+		return strconv.ParseFloat(x, 64)
+	case bool:
+		if x {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", val)
+	}
+}

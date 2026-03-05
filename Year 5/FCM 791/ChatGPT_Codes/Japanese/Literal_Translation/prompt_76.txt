@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import subprocess
+import time
+import shlex
+import fcntl
+
+def log(message):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+
+def run(cmd, check=True, capture_output=True, input_data=None, log_cmd=True, log_output=True):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = list(cmd)
+    if log_cmd:
+        log("Running: " + " ".join(shlex.quote(c) for c in cmd_list))
+    result = subprocess.run(
+        cmd_list,
+        text=True,
+        input=input_data,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None
+    )
+    if capture_output and log_output:
+        if result.stdout:
+            for line in result.stdout.splitlines():
+                log(line)
+        if result.stderr:
+            for line in result.stderr.splitlines():
+                log(line)
+    if check and result.returncode != 0:
+        raise RuntimeError(f"Command failed ({result.returncode})")
+    return result
+
+def env_list(name):
+    val = os.getenv(name)
+    if not val:
+        return []
+    return [v for v in (x.strip() for x in val.split(",")) if v]
+
+def env_bool(name, default=False):
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y", "on")
+
+def acquire_lock(path):
+    lock_file = open(path, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log("Another deployment is running.")
+        sys.exit(1)
+    return lock_file
+
+def docker_login(user, password, registry):
+    cmd = ["docker", "login"]
+    if registry:
+        cmd.append(registry)
+    if user:
+        cmd += ["-u", user]
+    if password:
+        cmd += ["--password-stdin"]
+        run(cmd, check=True, capture_output=False, input_data=password + "\n")
+    else:
+        run(cmd, check=True, capture_output=False)
+
+def container_exists(name):
+    result = run(["docker", "inspect", name], check=False, log_cmd=False, log_output=False)
+    return result.returncode == 0
+
+def get_container_image(name):
+    result = run(["docker", "inspect", "-f", "{{.Config.Image}}", name], check=False, log_cmd=False, log_output=False)
+    if result.returncode != 0:
+        return None
+    output = result.stdout.strip()
+    return output if output else None
+
+def stop_remove_container(name):
+    run(["docker", "stop", name], check=False, capture_output=False)
+    run(["docker", "rm", name], check=False, capture_output=False)
+
+def build_run_command(args, image):
+    cmd = ["docker", "run", "-d", "--name", args.container]
+    if args.restart:
+        cmd += ["--restart", args.restart]
+    for p in args.port:
+        cmd += ["-p", p]
+    for e in args.env:
+        cmd += ["-e", e]
+    for ef in args.env_file:
+        cmd += ["--env-file", ef]
+    for v in args.volume:
+        cmd += ["-v", v]
+    if args.network:
+        cmd += ["--network", args.network]
+    for l in args.label:
+        cmd += ["--label", l]
+    if args.user:
+        cmd += ["-u", args.user]
+    if args.workdir:
+        cmd += ["-w", args.workdir]
+    for h in args.add_host:
+        cmd += ["--add-host", h]
+    for d in args.device:
+        cmd += ["--device", d]
+    for arg in args.run_arg:
+        cmd += shlex.split(arg)
+    cmd.append(image)
+    if args.command:
+        cmd += [c for c in args.command if c != "--"]
+    return cmd
+
+def get_health_status(name):
+    result = run(
+        ["docker", "inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", name],
+        check=False,
+        log_cmd=False,
+        log_output=False
+    )
+    if result.returncode != 0:
+        return "unknown"
+    status = result.stdout.strip()
+    if not status:
+        return "unknown"
+    return status
+
+def wait_for_healthy(name, timeout, interval):
+    if timeout <= 0:
+        return True
+    end_time = time.time() + timeout
+    last_status = None
+    while time.time() < end_time:
+        status = get_health_status(name)
+        if status != last_status:
+            log(f"Health status: {status}")
+            last_status = status
+        if status in ("healthy", "none"):
+            return True
+        if status == "unhealthy":
+            return False
+        time.sleep(interval)
+    return False
+
+def docker_pull(image, retries, delay):
+    for attempt in range(1, retries + 1):
+        try:
+            run(["docker", "pull", image], capture_output=False)
+            return
+        except Exception as e:
+            log(f"Pull failed (attempt {attempt}/{retries}): {e}")
+            if attempt < retries:
+                time.sleep(delay)
+            else:
+                raise
+
+def main():
+    parser = argparse.ArgumentParser(description="CI/CD Docker deployment script")
+    parser.add_argument("--image", default=os.getenv("IMAGE"))
+    parser.add_argument("--container", default=os.getenv("CONTAINER"))
+    parser.add_argument("--port", action="append", default=[])
+    parser.add_argument("--env", action="append", default=[])
+    parser.add_argument("--env-file", action="append", default=[])
+    parser.add_argument("--volume", action="append", default=[])
+    parser.add_argument("--network", default=os.getenv("NETWORK"))
+    parser.add_argument("--restart", default=os.getenv("RESTART", "always"))
+    parser.add_argument("--label", action="append", default=[])
+    parser.add_argument("--user")
+    parser.add_argument("--workdir")
+    parser.add_argument("--add-host", action="append", default=[])
+    parser.add_argument("--device", action="append", default=[])
+    parser.add_argument("--run-arg", action="append", default=[])
+    parser.add_argument("--health-timeout", type=int, default=int(os.getenv("HEALTH_TIMEOUT", "60")))
+    parser.add_argument("--health-interval", type=int, default=int(os.getenv("HEALTH_INTERVAL", "3")))
+    parser.add_argument("--rollback", action="store_true")
+    parser.add_argument("--skip-healthcheck", action="store_true")
+    parser.add_argument("--login-user")
+    parser.add_argument("--login-password")
+    parser.add_argument("--login-registry")
+    parser.add_argument("--lock-file", default=os.getenv("DEPLOY_LOCK_FILE", "/tmp/deploy.lock"))
+    parser.add_argument("--no-lock", action="store_true")
+    parser.add_argument("--pull-retries", type=int, default=int(os.getenv("PULL_RETRIES", "3")))
+    parser.add_argument("--pull-delay", type=int, default=int(os.getenv("PULL_DELAY", "5")))
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    if not args.port:
+        args.port = env_list("PORTS")
+    if not args.env:
+        args.env = env_list("ENV_VARS")
+    if not args.volume:
+        args.volume = env_list("VOLUMES")
+    if not args.env_file:
+        args.env_file = env_list("ENV_FILES")
+    if not args.label:
+        args.label = env_list("LABELS")
+    if not args.add_host:
+        args.add_host = env_list("ADD_HOSTS")
+    if not args.device:
+        args.device = env_list("DEVICES")
+
+    if not args.image or not args.container:
+        parser.error("Both --image and --container are required (or set IMAGE/CONTAINER environment variables).")
+
+    if not args.rollback and env_bool("ROLLBACK"):
+        args.rollback = True
+    if not args.skip_healthcheck and env_bool("SKIP_HEALTHCHECK"):
+        args.skip_healthcheck = True
+
+    login_user = args.login_user or os.getenv("DOCKER_USERNAME") or os.getenv("DOCKER_USER")
+    login_password = args.login_password or os.getenv("DOCKER_PASSWORD") or os.getenv("DOCKER_TOKEN")
+    login_registry = args.login_registry or os.getenv("DOCKER_REGISTRY")
+
+    lock = None
+    if not args.no_lock and args.lock_file:
+        lock = acquire_lock(args.lock_file)
+
+    try:
+        if login_user or login_password or login_registry:
+            docker_login(login_user, login_password, login_registry)
+
+        old_image = None
+        if container_exists(args.container):
+            old_image = get_container_image(args.container)
+            if old_image:
+                log(f"Existing container image: {old_image}")
+
+        docker_pull(args.image, args.pull_retries, args.pull_delay)
+
+        if container_exists(args.container):
+            log("Stopping existing container")
+            stop_remove_container(args.container)
+
+        run(build_run_command(args, args.image), capture_output=False)
+
+        if not args.skip_healthcheck:
+            ok = wait_for_healthy(args.container, args.health_timeout, args.health_interval)
+            if not ok:
+                log("New container failed health check")
+                if args.rollback and old_image:
+                    log("Rolling back to previous image")
+                    stop_remove_container(args.container)
+                    run(build_run_command(args, old_image), capture_output=False)
+                    ok2 = wait_for_healthy(args.container, args.health_timeout, args.health_interval)
+                    if not ok2:
+                        log("Rollback failed")
+                        return 2
+                else:
+                    return 2
+
+        log("Deployment completed successfully")
+        return 0
+    except Exception as e:
+        log(f"Deployment error: {e}")
+        return 1
+    finally:
+        if lock:
+            lock.close()
+
+if __name__ == "__main__":
+    sys.exit(main())

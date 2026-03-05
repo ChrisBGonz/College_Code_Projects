@@ -1,0 +1,129 @@
+const STATES = Object.freeze({
+  CLOSED: "CLOSED",
+  OPEN: "OPEN",
+  HALF_OPEN: "HALF_OPEN"
+});
+
+class CircuitBreaker {
+  constructor(action, options = {}) {
+    if (typeof action !== "function") {
+      throw new Error("Action must be a function");
+    }
+    this.action = action;
+    this.failureThreshold = options.failureThreshold ?? 5;
+    this.successThreshold = options.successThreshold ?? 1;
+    this.timeout = options.timeout ?? 10000;
+    this.state = STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenLock = false;
+  }
+
+  execute(...args) {
+    if (this.state === STATES.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this.state = STATES.HALF_OPEN;
+        this.halfOpenLock = false;
+      } else {
+        return Promise.reject(this._error("Circuit breaker is open"));
+      }
+    }
+
+    if (this.state === STATES.HALF_OPEN) {
+      if (this.halfOpenLock) {
+        return Promise.reject(this._error("Circuit breaker is half-open"));
+      }
+      this.halfOpenLock = true;
+    }
+
+    return Promise.resolve()
+      .then(() => this.action(...args))
+      .then(result => {
+        this._onSuccess();
+        return result;
+      })
+      .catch(err => {
+        this._onFailure();
+        throw err;
+      });
+  }
+
+  _onSuccess() {
+    if (this.state === STATES.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else {
+      this.failureCount = 0;
+    }
+    this.halfOpenLock = false;
+  }
+
+  _onFailure() {
+    if (this.state === STATES.HALF_OPEN) {
+      this._open();
+    } else {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+    this.halfOpenLock = false;
+  }
+
+  _open() {
+    this.state = STATES.OPEN;
+    this.nextAttempt = Date.now() + this.timeout;
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  _close() {
+    this.state = STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+  }
+
+  reset() {
+    this._close();
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  _error(message) {
+    const e = new Error(message);
+    e.state = this.state;
+    return e;
+  }
+}
+
+function createCircuitBreaker(action, options) {
+  const breaker = new CircuitBreaker(action, options);
+  const wrapped = (...args) => breaker.execute(...args);
+  wrapped.breaker = breaker;
+  return wrapped;
+}
+
+const requestWithCircuitBreaker = createCircuitBreaker(
+  (input, init) => fetch(input, init),
+  { failureThreshold: 3, successThreshold: 2, timeout: 10000 }
+);
+
+if (typeof window !== "undefined") {
+  window.CircuitBreaker = CircuitBreaker;
+  window.createCircuitBreaker = createCircuitBreaker;
+  window.requestWithCircuitBreaker = requestWithCircuitBreaker;
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    CircuitBreaker,
+    createCircuitBreaker,
+    requestWithCircuitBreaker
+  };
+}
