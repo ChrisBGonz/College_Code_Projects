@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob dotglob
+
+URL="${1:-${TOOL_URL:-}}"
+TOOL_NAME="${2:-${TOOL_NAME:-securitytool}}"
+
+if [[ -z "$URL" ]]; then
+  echo "Usage: $0 <url> [tool_name]" >&2
+  exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+  echo "Please run as root" >&2
+  exit 1
+fi
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+FILENAME="$(basename "${URL%%\?*}")"
+if [[ -z "$FILENAME" || "$FILENAME" == "/" ]]; then
+  FILENAME="${TOOL_NAME}.pkg"
+fi
+FILE="$TMPDIR/$FILENAME"
+TYPE_HINT="$FILENAME"
+
+if command -v curl >/dev/null 2>&1; then
+  effective_url=$(curl -L --fail --retry 3 -sS -o "$FILE" -w "%{url_effective}" "$URL")
+  if [[ -n "${effective_url:-}" ]]; then
+    TYPE_HINT="$(basename "${effective_url%%\?*}")"
+  fi
+elif command -v wget >/dev/null 2>&1; then
+  wget -O "$FILE" "$URL"
+else
+  echo "curl or wget is required" >&2
+  exit 1
+fi
+
+if [[ ! -s "$FILE" ]]; then
+  echo "Download failed" >&2
+  exit 1
+fi
+
+install_deb() {
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y "$FILE"
+  elif command -v dpkg >/dev/null 2>&1; then
+    dpkg -i "$FILE"
+  else
+    echo "No Debian package manager found" >&2
+    exit 1
+  fi
+}
+
+install_rpm() {
+  if command -v dnf >/dev/null 2>&1; then
+    dnf install -y "$FILE"
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "$FILE"
+  elif command -v zypper >/dev/null 2>&1; then
+    zypper --non-interactive install "$FILE"
+  elif command -v rpm >/dev/null 2>&1; then
+    rpm -Uvh "$FILE"
+  else
+    echo "No RPM package manager found" >&2
+    exit 1
+  fi
+}
+
+install_binary() {
+  local src="$1"
+  local dest="/usr/local/bin/$TOOL_NAME"
+  install -m 0755 "$src" "$dest"
+}
+
+install_binary_gz() {
+  if ! command -v gunzip >/dev/null 2>&1; then
+    echo "gunzip is required to extract gzipped binary" >&2
+    exit 1
+  fi
+  local out="$TMPDIR/$TOOL_NAME"
+  gunzip -c "$FILE" > "$out"
+  install_binary "$out"
+}
+
+link_binaries() {
+  local dir="$1"
+  local linked=0
+  if [[ -d "$dir/bin" ]]; then
+    for exe in "$dir"/bin/*; do
+      if [[ -f "$exe" && -x "$exe" ]]; then
+        ln -sf "$exe" "/usr/local/bin/$(basename "$exe")"
+        linked=1
+      fi
+    done
+  fi
+  if [[ $linked -eq 0 ]]; then
+    for exe in "$dir"/*; do
+      if [[ -f "$exe" && -x "$exe" ]]; then
+        ln -sf "$exe" "/usr/local/bin/$(basename "$exe")"
+        linked=1
+      fi
+    done
+  fi
+}
+
+install_archive() {
+  local archive_type="$1"
+  local extract_dir="$TMPDIR/extract"
+  mkdir -p "$extract_dir"
+  if [[ "$archive_type" == "tar" ]]; then
+    if ! command -v tar >/dev/null 2>&1; then
+      echo "tar is required to extract archives" >&2
+      exit 1
+    fi
+    tar -xf "$FILE" -C "$extract_dir"
+  else
+    if ! command -v unzip >/dev/null 2>&1; then
+      echo "unzip is required to extract zip archives" >&2
+      exit 1
+    fi
+    unzip -q "$FILE" -d "$extract_dir"
+  fi
+
+  local root="$extract_dir"
+  local items=("$extract_dir"/*)
+  if [[ ${#items[@]} -eq 1 && -d "${items[0]}" ]]; then
+    root="${items[0]}"
+  fi
+
+  local install_dir="/opt/$TOOL_NAME"
+  rm -rf "$install_dir"
+  mkdir -p "$install_dir"
+  cp -a "$root"/. "$install_dir"/
+
+  if [[ -f "$install_dir/install.sh" ]]; then
+    bash "$install_dir/install.sh"
+  elif [[ -f "$install_dir/setup.sh" ]]; then
+    bash "$install_dir/setup.sh"
+  else
+    link_binaries "$install_dir"
+  fi
+}
+
+detect_type() {
+  local hint="${TYPE_HINT,,}"
+  local type="unknown"
+
+  case "$hint" in
+    *.deb) type="deb" ;;
+    *.rpm) type="rpm" ;;
+    *.tar.gz|*.tgz|*.tar.bz2|*.tar.xz|*.tar) type="tar" ;;
+    *.zip) type="zip" ;;
+    *.gz) type="gz" ;;
+  esac
+
+  if [[ "$type" == "gz" ]]; then
+    if tar -tzf "$FILE" >/dev/null 2>&1; then
+      type="tar"
+    else
+      type="binary_gz"
+    fi
+  fi
+
+  if [[ "$type" == "unknown" ]]; then
+    if tar -tf "$FILE" >/dev/null 2>&1; then
+      type="tar"
+    elif command -v unzip >/dev/null 2>&1 && unzip -t "$FILE" >/dev/null 2>&1; then
+      type="zip"
+    elif command -v file >/dev/null 2>&1; then
+      local mime
+      mime=$(file -b --mime-type "$FILE")
+      case "$mime" in
+        application/x-deb|application/vnd.debian.binary-package) type="deb" ;;
+        application/x-rpm) type="rpm" ;;
+        application/zip) type="zip" ;;
+        application/x-tar) type="tar" ;;
+        application/gzip)
+          if tar -tzf "$FILE" >/dev/null 2>&1; then
+            type="tar"
+          else
+            type="binary_gz"
+          fi
+          ;;
+        application/x-executable|application/x-pie-executable|application/octet-stream) type="binary" ;;
+      esac
+    fi
+  fi
+
+  echo "$type"
+}
+
+TYPE=$(detect_type)
+
+case "$TYPE" in
+  deb)
+    install_deb
+    ;;
+  rpm)
+    install_rpm
+    ;;
+  tar)
+    install_archive tar
+    ;;
+  zip)
+    install_archive zip
+    ;;
+  binary)
+    install_binary "$FILE"
+    ;;
+  binary_gz)
+    install_binary_gz
+    ;;
+  *)
+    echo "Unsupported or unknown package type" >&2
+    exit 1
+    ;;
+esac
+
+echo "$TOOL_NAME installation completed."

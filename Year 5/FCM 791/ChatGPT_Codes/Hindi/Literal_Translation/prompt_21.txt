@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import time
+from typing import Any, Dict, Optional, List
+
+import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import PyJWTError
+
+
+def read_text(path: str) -> str:
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def load_key(source: Optional[str]) -> Optional[str]:
+    if source is None:
+        return None
+    if isinstance(source, bytes):
+        return source.decode("utf-8")
+    if source.startswith("@"):
+        return read_text(source[1:])
+    if os.path.isfile(source):
+        return read_text(source)
+    return source
+
+
+def load_json_arg(value: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if value.startswith("@"):
+        path = value[1:]
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    if os.path.isfile(value):
+        with open(value, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(value)
+
+
+def parse_algorithms(value: Optional[str]) -> Optional[List[str]]:
+    if not value:
+        return None
+    if isinstance(value, list):
+        return value
+    return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def parse_audience(value: Optional[str]):
+    if value is None:
+        return None
+    try:
+        data = json.loads(value)
+        if isinstance(data, (list, str)):
+            return data
+    except Exception:
+        pass
+    if "," in value:
+        return [v.strip() for v in value.split(",") if v.strip()]
+    return value
+
+
+def load_token(value: str) -> str:
+    if value == "-":
+        return sys.stdin.read().strip()
+    if value.startswith("@"):
+        value = value[1:]
+    if os.path.isfile(value):
+        return read_text(value).strip()
+    return value
+
+
+def collect_required(values: Optional[List[str]]) -> Optional[List[str]]:
+    if not values:
+        return None
+    result: List[str] = []
+    for item in values:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            for part in item.split(","):
+                part = part.strip()
+                if part:
+                    result.append(part)
+        else:
+            result.append(str(item))
+    return result or None
+
+
+def extract_items(value: Any) -> set:
+    items = set()
+    if value is None:
+        return items
+    if isinstance(value, str):
+        for p in value.replace(",", " ").split():
+            if p:
+                items.add(p)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            if v is None:
+                continue
+            if isinstance(v, str):
+                items.add(v)
+            else:
+                items.add(str(v))
+    else:
+        items.add(str(value))
+    return items
+
+
+def validate_claims(claims: Dict[str, Any], required_scopes=None, required_roles=None):
+    if required_scopes:
+        scopes = extract_items(claims.get("scope") or claims.get("scopes"))
+        missing = [s for s in required_scopes if s not in scopes]
+        if missing:
+            raise ValueError("Missing required scopes: " + ", ".join(missing))
+    if required_roles:
+        roles = extract_items(claims.get("roles") or claims.get("role"))
+        missing = [r for r in required_roles if r not in roles]
+        if missing:
+            raise ValueError("Missing required roles: " + ", ".join(missing))
+
+
+def load_key_map(value: str) -> Dict[str, str]:
+    data = load_json_arg(value)
+    if not isinstance(data, dict):
+        raise ValueError("public-keys must be a JSON object")
+    result = {}
+    for kid, key in data.items():
+        result[kid] = load_key(key)
+    return result
+
+
+class KeyResolver:
+    def __init__(
+        self,
+        secret: Optional[str] = None,
+        public_key: Optional[str] = None,
+        public_keys: Optional[Dict[str, str]] = None,
+        jwks_url: Optional[str] = None,
+    ):
+        self.secret = secret
+        self.public_key = public_key
+        self.public_keys = public_keys or {}
+        self.jwks_url = jwks_url
+        self.jwks_client = PyJWKClient(jwks_url) if jwks_url else None
+
+    def resolve(self, token: str, header: Dict[str, Any]):
+        alg = header.get("alg")
+        if not alg:
+            raise ValueError("Missing 'alg' in token header")
+        if alg.lower() == "none":
+            raise ValueError("Algorithm 'none' is not allowed")
+        if alg.startswith("HS"):
+            if not self.secret:
+                raise ValueError("HMAC secret not configured")
+            return self.secret, alg
+        kid = header.get("kid")
+        if kid and kid in self.public_keys:
+            return self.public_keys[kid], alg
+        if self.public_key:
+            return self.public_key, alg
+        if self.jwks_client:
+            key = self.jwks_client.get_signing_key_from_jwt(token).key
+            return key, alg
+        raise ValueError("Public key not configured for asymmetric algorithm")
+
+
+class JWTAuthenticator:
+    def __init__(
+        self,
+        secret: Optional[str] = None,
+        public_key: Optional[str] = None,
+        public_keys: Optional[Dict[str, str]] = None,
+        jwks_url: Optional[str] = None,
+        algorithms: Optional[List[str]] = None,
+        issuer: Optional[str] = None,
+        audience: Any = None,
+        leeway: int = 0,
+    ):
+        self.resolver = KeyResolver(
+            secret=secret,
+            public_key=public_key,
+            public_keys=public_keys,
+            jwks_url=jwks_url,
+        )
+        self.algorithms = algorithms
+        self.issuer = issuer
+        self.audience = audience
+        self.leeway = leeway
+
+    def encode(
+        self,
+        payload: Dict[str, Any],
+        key: str,
+        algorithm: str = "HS256",
+        headers: Optional[Dict[str, Any]] = None,
+        expire_in: Optional[int] = None,
+        not_before: Optional[int] = None,
+        issued_at: bool = True,
+        issuer: Optional[str] = None,
+        audience: Any = None,
+        subject: Optional[str] = None,
+        jwt_id: Optional[str] = None,
+    ) -> str:
+        data = dict(payload)
+        now = int(time.time())
+        if issued_at and "iat" not in data:
+            data["iat"] = now
+        if expire_in is not None and "exp" not in data:
+            data["exp"] = now + expire_in
+        if not_before is not None and "nbf" not in data:
+            data["nbf"] = now + not_before
+        iss = issuer if issuer is not None else self.issuer
+        if iss and "iss" not in data:
+            data["iss"] = iss
+        aud = audience if audience is not None else self.audience
+        if aud and "aud" not in data:
+            data["aud"] = aud
+        if subject and "sub" not in data:
+            data["sub"] = subject
+        if jwt_id and "jti" not in data:
+            data["jti"] = jwt_id
+        token = jwt.encode(data, key, algorithm=algorithm, headers=headers)
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        return token
+
+    def decode(
+        self,
+        token: str,
+        verify: bool = True,
+        required_claims: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        if not verify:
+            return jwt.decode(
+                token,
+                options={
+                    "verify_signature": False,
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                    "verify_iat": False,
+                },
+            )
+        header = jwt.get_unverified_header(token)
+        key, alg = self.resolver.resolve(token, header)
+        if self.algorithms:
+            if alg not in self.algorithms:
+                raise ValueError("Algorithm not allowed: " + alg)
+            algs = self.algorithms
+        else:
+            algs = [alg]
+        options: Dict[str, Any] = {}
+        if self.audience is None:
+            options["verify_aud"] = False
+        if self.issuer is None:
+            options["verify_iss"] = False
+        if required_claims:
+            options["require"] = required_claims
+        return jwt.decode(
+            token,
+            key=key,
+            algorithms=algs,
+            issuer=self.issuer,
+            audience=self.audience,
+            leeway=self.leeway,
+            options=options,
+        )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    enc = sub.add_parser("encode")
+    enc.add_argument("--payload", required=True)
+    enc.add_argument("--alg", default="HS256")
+    enc.add_argument("--secret")
+    enc.add_argument("--private-key")
+    enc.add_argument("--kid")
+    enc.add_argument("--issuer")
+    enc.add_argument("--audience")
+    enc.add_argument("--subject")
+    enc.add_argument("--expire", type=int)
+    enc.add_argument("--nbf", type=int)
+    enc.add_argument("--jwt-id")
+    enc.add_argument("--no-iat", action="store_true")
+
+    dec = sub.add_parser("decode")
+    dec.add_argument("--token", required=True)
+    dec.add_argument("--secret")
+    dec.add_argument("--public-key")
+    dec.add_argument("--public-keys")
+    dec.add_argument("--jwks-url")
+    dec.add_argument("--algorithms")
+    dec.add_argument("--issuer")
+    dec.add_argument("--audience")
+    dec.add_argument("--leeway", type=int, default=0)
+    dec.add_argument("--require")
+    dec.add_argument("--require-scope", action="append")
+    dec.add_argument("--require-role", action="append")
+    dec.add_argument("--no-verify", action="store_true")
+
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.action == "encode":
+        try:
+            payload = load_json_arg(args.payload)
+        except Exception as e:
+            print("Invalid payload: " + str(e), file=sys.stderr)
+            sys.exit(1)
+        if not isinstance(payload, dict):
+            print("Payload must be a JSON object", file=sys.stderr)
+            sys.exit(1)
+        key_source = args.secret if args.secret is not None else args.private_key
+        key = load_key(key_source)
+        if not key:
+            print("Secret or private key required", file=sys.stderr)
+            sys.exit(1)
+        headers = {}
+        if args.kid:
+            headers["kid"] = args.kid
+        auth = JWTAuthenticator(issuer=args.issuer, audience=parse_audience(args.audience))
+        token = auth.encode(
+            payload=payload,
+            key=key,
+            algorithm=args.alg,
+            headers=headers or None,
+            expire_in=args.expire,
+            not_before=args.nbf,
+            issued_at=not args.no_iat,
+            issuer=args.issuer,
+            audience=parse_audience(args.audience),
+            subject=args.subject,
+            jwt_id=args.jwt_id,
+        )
+        sys.stdout.write(token)
+    elif args.action == "decode":
+        token = load_token(args.token)
+        secret = load_key(args.secret)
+        public_key = load_key(args.public_key)
+        try:
+            public_keys = load_key_map(args.public_keys) if args.public_keys else None
+        except Exception as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        algorithms = parse_algorithms(args.algorithms)
+        audience = parse_audience(args.audience)
+        required_claims = (
+            [c.strip() for c in args.require.split(",") if c.strip()]
+            if args.require
+            else None
+        )
+        required_scopes = collect_required(args.require_scope)
+        required_roles = collect_required(args.require_role)
+        auth = JWTAuthenticator(
+            secret=secret,
+            public_key=public_key,
+            public_keys=public_keys,
+            jwks_url=args.jwks_url,
+            algorithms=algorithms,
+            issuer=args.issuer,
+            audience=audience,
+            leeway=args.leeway,
+        )
+        try:
+            claims = auth.decode(
+                token, verify=not args.no_verify, required_claims=required_claims
+            )
+            validate_claims(
+                claims, required_scopes=required_scopes, required_roles=required_roles
+            )
+        except (PyJWTError, ValueError) as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        sys.stdout.write(json.dumps(claims, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import subprocess
+import shutil
+import shlex
+
+def find_project_root(start_path):
+    path = os.path.abspath(start_path)
+    if os.path.isfile(path):
+        path = os.path.dirname(path)
+    current = path
+    while True:
+        if os.path.isfile(os.path.join(current, "pom.xml")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+def find_maven_cmd(root):
+    for name in ("mvnw", "mvnw.cmd", "mvnw.bat"):
+        p = os.path.join(root, name)
+        if os.path.isfile(p):
+            return p
+    return shutil.which("mvn")
+
+def build_command(mvn_cmd, args):
+    cmd = [mvn_cmd] + args
+    if os.name == "nt" and mvn_cmd.lower().endswith((".cmd", ".bat")):
+        return ["cmd", "/c"] + cmd
+    if os.name != "nt" and os.path.basename(mvn_cmd) == "mvnw" and not os.access(mvn_cmd, os.X_OK):
+        return ["sh", mvn_cmd] + args
+    return cmd
+
+def join_cmd(cmd):
+    try:
+        return shlex.join(cmd)
+    except AttributeError:
+        return " ".join(shlex.quote(c) for c in cmd)
+
+def run(cmd, cwd, dry_run):
+    if dry_run:
+        sys.stdout.write(join_cmd(cmd) + "\n")
+        return
+    proc = subprocess.run(cmd, cwd=cwd)
+    if proc.returncode != 0:
+        sys.exit(proc.returncode)
+
+def main():
+    parser = argparse.ArgumentParser(description="Update all Maven dependencies to latest versions.")
+    parser.add_argument("path", nargs="?", default=".", help="Project directory or pom.xml path")
+    parser.add_argument("--allow-snapshots", action="store_true", help="Allow snapshot versions")
+    parser.add_argument("--no-parent", action="store_true", help="Skip parent update")
+    parser.add_argument("--no-plugins", action="store_true", help="Skip plugin version updates")
+    parser.add_argument("--no-properties", action="store_true", help="Skip updating version properties")
+    parser.add_argument("--backup", action="store_true", help="Generate backup POMs")
+    parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    args = parser.parse_args()
+
+    root = find_project_root(args.path)
+    if not root:
+        sys.stderr.write("pom.xml not found in the specified path or its parents.\n")
+        sys.exit(1)
+
+    mvn_cmd = find_maven_cmd(root)
+    if not mvn_cmd:
+        sys.stderr.write("Maven executable not found (mvn or mvnw).\n")
+        sys.exit(1)
+
+    common = []
+    if not args.backup:
+        common.append("-DgenerateBackupPoms=false")
+    common.append("-DallowSnapshots=" + ("true" if args.allow_snapshots else "false"))
+
+    commands = []
+
+    if not args.no_parent:
+        commands.append(["versions:update-parent"] + common)
+
+    goal = "versions:use-latest-versions" if args.allow_snapshots else "versions:use-latest-releases"
+    plugin_process = not args.no_plugins
+    commands.append([
+        goal,
+        "-DprocessDependencies=true",
+        "-DprocessDependencyManagement=true",
+        "-DprocessParent=true",
+        "-DprocessPlugins=" + ("true" if plugin_process else "false"),
+        "-DprocessPluginDependencies=" + ("true" if plugin_process else "false"),
+        "-DprocessPluginManagement=" + ("true" if plugin_process else "false"),
+    ] + common)
+
+    if not args.no_properties:
+        commands.append(["versions:update-properties"] + common)
+
+    for arglist in commands:
+        cmd = build_command(mvn_cmd, arglist)
+        run(cmd, cwd=root, dry_run=args.dry_run)
+
+if __name__ == "__main__":
+    main()
