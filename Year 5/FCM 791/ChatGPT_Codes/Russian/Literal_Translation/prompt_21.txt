@@ -1,0 +1,380 @@
+import argparse
+import sys
+import os
+import json
+import time
+
+import jwt
+from jwt import InvalidTokenError
+
+try:
+    from jwt import PyJWKClient
+except Exception:
+    PyJWKClient = None
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+from jwt.utils import base64url_decode
+
+
+class JWTAuthError(Exception):
+    pass
+
+
+def parse_list_values(values):
+    result = []
+    if not values:
+        return result
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, (list, tuple, set)):
+            result.extend(parse_list_values(list(v)))
+            continue
+        s = str(v)
+        s = s.replace(';', ' ').replace(',', ' ')
+        for part in s.split():
+            part = part.strip()
+            if part:
+                result.append(part)
+    return result
+
+
+def normalize_claim_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [v for v in value.replace(',', ' ').split() if v]
+    if isinstance(value, (list, tuple, set)):
+        res = []
+        for item in value:
+            res.extend(normalize_claim_list(item))
+        return res
+    return [str(value)]
+
+
+def extract_scopes(claims):
+    if 'scope' in claims:
+        return normalize_claim_list(claims['scope'])
+    if 'scp' in claims:
+        return normalize_claim_list(claims['scp'])
+    if 'scopes' in claims:
+        return normalize_claim_list(claims['scopes'])
+    return []
+
+
+def extract_roles(claims):
+    for key in ('roles', 'role', 'groups', 'group'):
+        if key in claims:
+            return normalize_claim_list(claims[key])
+    realm_access = claims.get('realm_access')
+    if isinstance(realm_access, dict) and 'roles' in realm_access:
+        return normalize_claim_list(realm_access.get('roles'))
+    resource_access = claims.get('resource_access')
+    if isinstance(resource_access, dict):
+        roles = []
+        for v in resource_access.values():
+            if isinstance(v, dict) and 'roles' in v:
+                roles.extend(normalize_claim_list(v.get('roles')))
+        if roles:
+            return roles
+    return []
+
+
+def load_token(args):
+    raw = None
+    if args.token:
+        raw = args.token
+    elif args.token_file:
+        with open(args.token_file, 'r', encoding='utf-8') as f:
+            raw = f.read()
+    elif args.stdin or not sys.stdin.isatty():
+        raw = sys.stdin.read()
+    if raw is None:
+        raise JWTAuthError("No token provided")
+    raw = raw.strip()
+    if raw.lower().startswith('bearer '):
+        raw = raw[7:].strip()
+    if not raw:
+        raise JWTAuthError("Empty token")
+    return raw
+
+
+def load_jwks(url, cache_file=None, cache_ttl=300, timeout=5):
+    if cache_file and os.path.exists(cache_file):
+        try:
+            age = time.time() - os.path.getmtime(cache_file)
+            if age < cache_ttl:
+                with open(cache_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and 'keys' in data:
+                    return data
+        except Exception:
+            pass
+    if requests is None:
+        raise JWTAuthError("requests library is required to fetch JWKS")
+    resp = requests.get(url, timeout=timeout)
+    if resp.status_code != 200:
+        raise JWTAuthError("Failed to fetch JWKS: HTTP %s" % resp.status_code)
+    try:
+        data = resp.json()
+    except Exception:
+        raise JWTAuthError("Invalid JWKS response")
+    if not isinstance(data, dict) or 'keys' not in data:
+        raise JWTAuthError("Invalid JWKS data")
+    if cache_file:
+        try:
+            tmp = cache_file + ".tmp"
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+            os.replace(tmp, cache_file)
+        except Exception:
+            pass
+    return data
+
+
+def select_jwk(jwks, kid):
+    keys = jwks.get('keys') or []
+    if not keys:
+        raise JWTAuthError("JWKS has no keys")
+    if kid:
+        for k in keys:
+            if k.get('kid') == kid:
+                return k
+        raise JWTAuthError("No matching JWK for kid")
+    if len(keys) == 1:
+        return keys[0]
+    for k in keys:
+        if k.get('use') == 'sig' or 'sig' in (k.get('key_ops') or []):
+            return k
+    return keys[0]
+
+
+def jwk_to_key(jwk, alg=None):
+    jwk_json = json.dumps(jwk)
+    if alg:
+        alg_obj = jwt.algorithms.get_default_algorithms().get(alg)
+        if alg_obj and hasattr(alg_obj, 'from_jwk'):
+            return alg_obj.from_jwk(jwk_json)
+    kty = jwk.get('kty')
+    if kty == 'RSA':
+        return jwt.algorithms.RSAAlgorithm.from_jwk(jwk_json)
+    if kty == 'EC':
+        return jwt.algorithms.ECAlgorithm.from_jwk(jwk_json)
+    if kty == 'OKP':
+        alg_obj = jwt.algorithms.get_default_algorithms().get('EdDSA')
+        if alg_obj and hasattr(alg_obj, 'from_jwk'):
+            return alg_obj.from_jwk(jwk_json)
+    if kty == 'oct':
+        k = jwk.get('k')
+        if not k:
+            raise JWTAuthError("Invalid oct JWK")
+        return base64url_decode(k)
+    try:
+        return jwt.algorithms.RSAAlgorithm.from_jwk(jwk_json)
+    except Exception:
+        raise JWTAuthError("Unsupported JWK type")
+
+
+def get_key_and_algs(token, args, header):
+    if args.jwks_url:
+        if header.get('alg') == 'none':
+            raise JWTAuthError("Unsecured JWT not allowed")
+        if args.alg and header.get('alg') and args.alg != header.get('alg'):
+            raise JWTAuthError("Algorithm mismatch")
+        if PyJWKClient:
+            try:
+                try:
+                    jwks_client = PyJWKClient(args.jwks_url, cache_keys=True)
+                except TypeError:
+                    jwks_client = PyJWKClient(args.jwks_url)
+                signing_key = jwks_client.get_signing_key_from_jwt(token)
+            except Exception as e:
+                raise JWTAuthError("Failed to obtain signing key: %s" % e)
+            alg = args.alg or getattr(signing_key, 'algorithm', None) or header.get('alg')
+            if not alg:
+                raise JWTAuthError("Unable to determine algorithm")
+            return signing_key.key, [alg]
+        else:
+            jwks = load_jwks(args.jwks_url, args.jwks_cache, args.jwks_ttl, args.timeout)
+            jwk = select_jwk(jwks, header.get('kid'))
+            alg = args.alg or header.get('alg')
+            if not alg:
+                raise JWTAuthError("Unable to determine algorithm")
+            key = jwk_to_key(jwk, alg)
+            return key, [alg]
+    if args.secret:
+        alg = args.alg or 'HS256'
+        return args.secret, [alg]
+    if args.public_key:
+        with open(args.public_key, 'r', encoding='utf-8') as f:
+            key = f.read()
+        if args.alg:
+            algs = [args.alg]
+        else:
+            algs = ['RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'ES512', 'EdDSA']
+        return key, algs
+    return None, None
+
+
+def validate_custom(claims, header, required_scopes, required_roles, azp, nonce, max_age, token_use, typ):
+    if required_scopes:
+        scopes = extract_scopes(claims)
+        missing = [s for s in required_scopes if s not in scopes]
+        if missing:
+            raise JWTAuthError("Missing scopes: " + ", ".join(missing))
+    if required_roles:
+        roles = extract_roles(claims)
+        missing = [r for r in required_roles if r not in roles]
+        if missing:
+            raise JWTAuthError("Missing roles: " + ", ".join(missing))
+    if azp:
+        if claims.get('azp') != azp:
+            raise JWTAuthError("Invalid azp")
+    if nonce:
+        if claims.get('nonce') != nonce:
+            raise JWTAuthError("Invalid nonce")
+    if max_age is not None:
+        auth_time = claims.get('auth_time')
+        if auth_time is None:
+            raise JWTAuthError("auth_time claim missing")
+        try:
+            auth_time = int(auth_time)
+        except Exception:
+            raise JWTAuthError("auth_time claim invalid")
+        if time.time() - auth_time > max_age:
+            raise JWTAuthError("auth_time exceeds max_age")
+    if token_use:
+        if claims.get('token_use') != token_use:
+            raise JWTAuthError("Invalid token_use")
+    if typ:
+        token_typ = None
+        if header:
+            token_typ = header.get('typ')
+        if not token_typ:
+            token_typ = claims.get('typ')
+        if not token_typ or str(token_typ).lower() != str(typ).lower():
+            raise JWTAuthError("Invalid typ")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser()
+    token_group = parser.add_mutually_exclusive_group(required=False)
+    token_group.add_argument('--token', help='JWT string')
+    token_group.add_argument('--token-file', help='File containing JWT')
+    token_group.add_argument('--stdin', action='store_true', help='Read token from stdin')
+    parser.add_argument('--jwks-url', help='JWKS endpoint URL')
+    parser.add_argument('--jwks-cache', help='Path to JWKS cache file')
+    parser.add_argument('--jwks-ttl', type=int, default=300, help='JWKS cache ttl in seconds')
+    parser.add_argument('--timeout', type=int, default=5, help='JWKS request timeout')
+    parser.add_argument('--secret', help='HMAC secret')
+    parser.add_argument('--public-key', help='Path to public key')
+    parser.add_argument('--alg', help='Expected algorithm')
+    parser.add_argument('--audience', action='append', help='Expected audience (repeatable)')
+    parser.add_argument('--issuer', help='Expected issuer')
+    parser.add_argument('--leeway', type=int, default=0, help='Leeway in seconds for time claims')
+    parser.add_argument('--require', action='append', help='Required claim (repeatable)')
+    parser.add_argument('--scope', action='append', help='Required scope (repeatable)')
+    parser.add_argument('--role', action='append', help='Required role (repeatable)')
+    parser.add_argument('--azp', help='Expected authorized party')
+    parser.add_argument('--nonce', help='Expected nonce')
+    parser.add_argument('--max-age', type=int, help='Maximum age of auth_time')
+    parser.add_argument('--token-use', help='Expected token_use claim')
+    parser.add_argument('--typ', help='Expected typ header/claim')
+    parser.add_argument('--no-verify', action='store_true', help='Skip signature verification')
+    parser.add_argument('--show-header', action='store_true', help='Include header in output')
+    parser.add_argument('--output', choices=['pretty', 'json'], default='pretty', help='Output format')
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        token = load_token(args)
+        try:
+            header = jwt.get_unverified_header(token)
+        except Exception as e:
+            raise JWTAuthError("Invalid token header: %s" % e)
+
+        required_claims = parse_list_values(args.require)
+        required_scopes = parse_list_values(args.scope)
+        required_roles = parse_list_values(args.role)
+
+        if not args.no_verify and not (args.jwks_url or args.secret or args.public_key):
+            raise JWTAuthError("Verification requires jwks-url, secret or public-key")
+
+        key = None
+        algs = None
+        if not args.no_verify:
+            key, algs = get_key_and_algs(token, args, header)
+        elif args.jwks_url or args.secret or args.public_key:
+            key, algs = get_key_and_algs(token, args, header)
+
+        if not args.no_verify and (not algs):
+            raise JWTAuthError("Algorithm is required for verification")
+
+        aud = args.audience
+        if aud is not None:
+            aud = parse_list_values(aud)
+            if not aud:
+                aud = None
+            elif len(aud) == 1:
+                aud = aud[0]
+
+        options = {}
+        if required_claims:
+            options['require'] = required_claims
+        if args.no_verify:
+            options['verify_signature'] = False
+
+        decode_kwargs = {'options': options}
+        if key is not None or not args.no_verify:
+            decode_kwargs['key'] = key if key is not None else ""
+        if algs:
+            decode_kwargs['algorithms'] = algs
+        if aud is not None:
+            decode_kwargs['audience'] = aud
+        if args.issuer:
+            decode_kwargs['issuer'] = args.issuer
+        if args.leeway:
+            decode_kwargs['leeway'] = args.leeway
+
+        try:
+            claims = jwt.decode(token, **decode_kwargs)
+        except InvalidTokenError as e:
+            raise JWTAuthError("Token validation failed: %s" % e)
+
+        validate_custom(
+            claims,
+            header,
+            required_scopes,
+            required_roles,
+            args.azp,
+            args.nonce,
+            args.max_age,
+            args.token_use,
+            args.typ,
+        )
+
+        if args.show_header:
+            output = {'header': header, 'claims': claims}
+        else:
+            output = claims
+        if args.output == 'json':
+            print(json.dumps(output, ensure_ascii=False, separators=(',', ':')))
+        else:
+            print(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True))
+    except JWTAuthError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print("Unexpected error: %s" % e, file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == '__main__':
+    main()

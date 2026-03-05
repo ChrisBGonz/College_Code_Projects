@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+set -euo pipefail
+shopt -s nullglob
+
+TOOL_URL="${1:-${SECURITY_TOOL_URL:-}}"
+if [[ -z "$TOOL_URL" ]]; then
+  echo "Usage: $0 <url>" >&2
+  exit 1
+fi
+
+if command -v curl >/dev/null 2>&1; then
+  DL_CMD="curl"
+elif command -v wget >/dev/null 2>&1; then
+  DL_CMD="wget"
+else
+  echo "curl or wget is required" >&2
+  exit 1
+fi
+
+SUDO=""
+if [[ $EUID -ne 0 ]]; then
+  SUDO="sudo"
+fi
+
+tmpdir="$(mktemp -d)"
+cleanup() { rm -rf "$tmpdir"; }
+trap cleanup EXIT
+
+fname="$(basename "${TOOL_URL%%\?*}")"
+if [[ -z "$fname" || "$fname" == "/" || "$fname" == "." ]]; then
+  fname="download"
+fi
+file="$tmpdir/$fname"
+
+if [[ "$DL_CMD" == "curl" ]]; then
+  curl -fL --retry 3 --connect-timeout 15 -o "$file" "$TOOL_URL"
+else
+  wget -qO "$file" "$TOOL_URL"
+fi
+
+if [[ ! -s "$file" ]]; then
+  echo "Download failed" >&2
+  exit 1
+fi
+
+ext=""
+case "$fname" in
+  *.tar.gz) ext="tar.gz" ;;
+  *.tgz) ext="tgz" ;;
+  *.tar.xz) ext="tar.xz" ;;
+  *.tar.bz2) ext="tar.bz2" ;;
+  *.zip) ext="zip" ;;
+  *.deb) ext="deb" ;;
+  *.rpm) ext="rpm" ;;
+  *.sh) ext="sh" ;;
+esac
+
+if [[ -z "$ext" ]]; then
+  if command -v file >/dev/null 2>&1; then
+    mime="$(file -b --mime-type "$file" 2>/dev/null || true)"
+    case "$mime" in
+      application/x-debian-package) ext="deb" ;;
+      application/x-rpm) ext="rpm" ;;
+      application/x-gzip) ext="tar.gz" ;;
+      application/x-xz) ext="tar.xz" ;;
+      application/x-bzip2) ext="tar.bz2" ;;
+      application/zip) ext="zip" ;;
+      text/x-shellscript) ext="sh" ;;
+      application/x-executable|application/octet-stream) ext="bin" ;;
+    esac
+  fi
+fi
+
+if [[ -z "$ext" ]]; then
+  ext="bin"
+fi
+
+name="$fname"
+for suf in ".tar.gz" ".tgz" ".tar.xz" ".tar.bz2" ".zip" ".deb" ".rpm" ".sh"; do
+  if [[ "$name" == *"$suf" ]]; then
+    name="${name%$suf}"
+    break
+  fi
+done
+if [[ -z "$name" ]]; then
+  name="security-tool"
+fi
+name="${name// /_}"
+
+$SUDO mkdir -p /usr/local/bin
+
+case "$ext" in
+  deb)
+    if ! $SUDO dpkg -i "$file"; then
+      if command -v apt-get >/dev/null 2>&1; then
+        $SUDO apt-get -f install -y
+      else
+        exit 1
+      fi
+    fi
+    ;;
+  rpm)
+    if command -v rpm >/dev/null 2>&1; then
+      $SUDO rpm -Uvh --nosignature "$file"
+    elif command -v dnf >/dev/null 2>&1; then
+      $SUDO dnf -y install "$file"
+    elif command -v yum >/dev/null 2>&1; then
+      $SUDO yum -y install "$file"
+    else
+      echo "No RPM installer found" >&2
+      exit 1
+    fi
+    ;;
+  sh)
+    chmod +x "$file"
+    $SUDO bash "$file"
+    ;;
+  tar.gz|tgz|tar.xz|tar.bz2|zip)
+    exdir="$tmpdir/extract"
+    mkdir -p "$exdir"
+    case "$ext" in
+      zip)
+        if ! command -v unzip >/dev/null 2>&1; then
+          echo "unzip is required" >&2
+          exit 1
+        fi
+        unzip -q "$file" -d "$exdir"
+        ;;
+      tar.gz|tgz) tar -xzf "$file" -C "$exdir" ;;
+      tar.xz) tar -xJf "$file" -C "$exdir" ;;
+      tar.bz2) tar -xjf "$file" -C "$exdir" ;;
+    esac
+
+    contents=("$exdir"/*)
+    if [[ ${#contents[@]} -eq 1 && -d "${contents[0]}" ]]; then
+      src="${contents[0]}"
+    else
+      src="$exdir"
+    fi
+
+    dest="/opt/$name"
+    $SUDO rm -rf "$dest"
+    $SUDO mkdir -p "$dest"
+    $SUDO cp -R "$src"/. "$dest"/
+
+    if [[ -d "$dest/bin" ]]; then
+      for f in "$dest/bin/"*; do
+        if [[ -f "$f" && -x "$f" ]]; then
+          $SUDO ln -sf "$f" "/usr/local/bin/$(basename "$f")"
+        fi
+      done
+    fi
+
+    while IFS= read -r -d '' f; do
+      $SUDO ln -sf "$f" "/usr/local/bin/$(basename "$f")"
+    done < <(find "$dest" -maxdepth 1 -type f -perm -111 -print0)
+
+    ;;
+  bin)
+    $SUDO install -m 0755 "$file" "/usr/local/bin/$name"
+    ;;
+  *)
+    echo "Unsupported package type: $ext" >&2
+    exit 1
+    ;;
+esac
