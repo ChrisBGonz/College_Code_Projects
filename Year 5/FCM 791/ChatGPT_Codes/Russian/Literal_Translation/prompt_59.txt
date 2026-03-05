@@ -1,0 +1,139 @@
+import os
+import json
+import uuid
+import urllib.parse
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class PaymentGatewayClient:
+    def __init__(self, endpoint=None, api_key=None, timeout=10):
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def create_payment(self, payload):
+        if not self.endpoint:
+            return {"status": "ok", "gateway_payment_id": "mock-" + uuid.uuid4().hex}
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(self.endpoint, data=data, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", "PaymentGatewayClient/1.0")
+        if self.api_key:
+            req.add_header("Authorization", "Bearer " + self.api_key)
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                resp_data = resp.read()
+                try:
+                    decoded = resp_data.decode("utf-8")
+                except Exception:
+                    decoded = None
+                try:
+                    return json.loads(decoded) if decoded else {"status": "ok"}
+                except Exception:
+                    return {"status": "ok", "raw": decoded}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+class PaymentRequestHandler(BaseHTTPRequestHandler):
+    gateway = PaymentGatewayClient(
+        os.environ.get("PAYMENT_GATEWAY_URL"),
+        os.environ.get("PAYMENT_GATEWAY_API_KEY"),
+        timeout=int(os.environ.get("PAYMENT_GATEWAY_TIMEOUT", "10")),
+    )
+
+    def log_message(self, format, *args):
+        return
+
+    def _read_body(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        if length > 0:
+            return self.rfile.read(length)
+        return b""
+
+    def _parse_body(self, body):
+        if not body:
+            return {}
+        ctype = self.headers.get("Content-Type", "")
+        if "application/json" in ctype:
+            try:
+                data = json.loads(body.decode("utf-8"))
+                if isinstance(data, dict):
+                    return data
+                return {}
+            except Exception:
+                return {}
+        if "application/x-www-form-urlencoded" in ctype:
+            try:
+                decoded = body.decode("utf-8")
+            except Exception:
+                decoded = ""
+            return {k: v for k, v in urllib.parse.parse_qs(decoded, keep_blank_values=True).items()}
+        return {}
+
+    def _flatten(self, params):
+        flat = {}
+        for k, v in params.items():
+            if isinstance(v, list):
+                if len(v) == 1:
+                    flat[k] = v[0]
+                else:
+                    flat[k] = v
+            else:
+                flat[k] = v
+        return flat
+
+    def _send_json(self, status, data):
+        payload = json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _handle_payment(self):
+        parsed = urllib.parse.urlparse(self.path)
+        query_params = self._flatten(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
+        body_params = self._flatten(self._parse_body(self._read_body()))
+        params = {}
+        params.update(query_params)
+        params.update(body_params)
+        success_url = params.get("success_url")
+        if not success_url:
+            self._send_json(400, {"error": "success_url is required"})
+            return
+        gateway_payload = dict(params)
+        gateway_result = self.gateway.create_payment(gateway_payload)
+        if isinstance(gateway_result, dict) and gateway_result.get("status") == "error":
+            self._send_json(502, {"error": "payment_gateway_error", "details": gateway_result.get("error")})
+            return
+        self.send_response(302)
+        self.send_header("Location", success_url)
+        self.end_headers()
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") == "/pay":
+            self._handle_payment()
+        else:
+            self._send_json(404, {"error": "not_found"})
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path.rstrip("/") == "/pay":
+            self._handle_payment()
+        else:
+            self._send_json(404, {"error": "not_found"})
+
+def run():
+    host = os.environ.get("HOST", "0.0.0.0")
+    port = int(os.environ.get("PORT", "8000"))
+    server = HTTPServer((host, port), PaymentRequestHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+if __name__ == "__main__":
+    run()

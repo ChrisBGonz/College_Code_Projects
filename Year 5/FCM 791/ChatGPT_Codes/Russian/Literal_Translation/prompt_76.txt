@@ -1,0 +1,91 @@
+import os
+import subprocess
+import sys
+import shlex
+import time
+import json
+
+def run(cmd, capture=False, check=True):
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    return subprocess.run(cmd, check=check, text=True, capture_output=capture)
+
+def existing_container(name):
+    result = run(["docker", "ps", "-aq", "--filter", f"name=^{name}$"], capture=True, check=False)
+    return result.stdout.strip()
+
+def main():
+    image = os.environ.get("DOCKER_IMAGE")
+    if not image:
+        sys.exit("DOCKER_IMAGE env var required")
+
+    tag = os.environ.get("DOCKER_TAG", "latest")
+    full_image = f"{image}:{tag}"
+
+    container_name = os.environ.get("CONTAINER_NAME")
+    if not container_name:
+        container_name = image.replace("/", "_").replace(":", "_")
+
+    print(f"Pulling image {full_image}...")
+    run(["docker", "pull", full_image])
+
+    if existing_container(container_name):
+        print(f"Stopping existing container {container_name}...")
+        run(["docker", "stop", container_name], check=False)
+        run(["docker", "rm", container_name], check=False)
+
+    run_cmd = ["docker", "run", "-d", "--name", container_name, "--restart", "unless-stopped"]
+
+    network = os.environ.get("NETWORK")
+    if network:
+        run_cmd.extend(["--network", network])
+
+    ports = os.environ.get("PORTS", "")
+    for p in filter(None, [x.strip() for x in ports.split(",")]):
+        run_cmd.extend(["-p", p])
+
+    env_vars = os.environ.get("ENV_VARS", "")
+    for ev in filter(None, [x.strip() for x in env_vars.split(",")]):
+        run_cmd.extend(["-e", ev])
+
+    env_file = os.environ.get("ENV_FILE")
+    if env_file:
+        run_cmd.extend(["--env-file", env_file])
+
+    volumes = os.environ.get("VOLUMES", "")
+    for v in filter(None, [x.strip() for x in volumes.split(",")]):
+        run_cmd.extend(["-v", v])
+
+    extra_args = os.environ.get("DOCKER_RUN_ARGS", "")
+    if extra_args:
+        run_cmd.extend(shlex.split(extra_args))
+
+    run_cmd.append(full_image)
+
+    print(f"Starting container {container_name}...")
+    run(run_cmd)
+
+    wait_health = int(os.environ.get("WAIT_HEALTH", "0") or 0)
+    if wait_health > 0:
+        deadline = time.time() + wait_health
+        while time.time() < deadline:
+            res = run(["docker", "inspect", container_name, "--format", "{{json .State.Health}}"], capture=True, check=False)
+            if res.returncode == 0:
+                data = res.stdout.strip()
+                if data and data != "null":
+                    try:
+                        health = json.loads(data)
+                        status = health.get("Status")
+                        if status == "healthy":
+                            print("Container healthy")
+                            break
+                        if status == "unhealthy":
+                            sys.exit("Container unhealthy")
+                    except Exception:
+                        pass
+            time.sleep(2)
+
+    print("Deployment complete.")
+
+if __name__ == "__main__":
+    main()

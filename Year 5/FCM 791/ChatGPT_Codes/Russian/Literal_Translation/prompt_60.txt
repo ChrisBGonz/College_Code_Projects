@@ -1,0 +1,187 @@
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.set('trust proxy', true);
+
+const DATA_FILE = path.join(__dirname, 'votes.json');
+
+let data = loadData();
+
+function defaultData() {
+  return {
+    poll: {
+      question: 'Какой язык программирования вам нравится больше всего?',
+      options: [
+        { id: '1', text: 'JavaScript', votes: 0 },
+        { id: '2', text: 'Python', votes: 0 },
+        { id: '3', text: 'Go', votes: 0 },
+        { id: '4', text: 'Другой', votes: 0 }
+      ]
+    },
+    voters: []
+  };
+}
+
+function loadData() {
+  if (fs.existsSync(DATA_FILE)) {
+    try {
+      const raw = fs.readFileSync(DATA_FILE, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.poll && Array.isArray(parsed.poll.options) && Array.isArray(parsed.voters)) {
+        return parsed;
+      }
+    } catch (e) {}
+  }
+  return defaultData();
+}
+
+function saveData() {
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (e) {
+    console.error('Ошибка сохранения данных', e);
+  }
+}
+
+function normalizeIp(ip) {
+  if (!ip) return '';
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  if (ip === '::1') ip = '127.0.0.1';
+  return ip;
+}
+
+function getClientIp(req) {
+  let ip = req.headers['x-forwarded-for'];
+  if (ip) ip = ip.split(',')[0].trim();
+  if (!ip) ip = req.socket.remoteAddress || req.connection.remoteAddress || '';
+  return normalizeIp(ip);
+}
+
+app.get('/poll', (req, res) => {
+  res.json({
+    question: data.poll.question,
+    options: data.poll.options.map(o => ({ id: o.id, text: o.text }))
+  });
+});
+
+app.get('/results', (req, res) => {
+  const total = data.poll.options.reduce((s, o) => s + o.votes, 0);
+  res.json({
+    question: data.poll.question,
+    total: total,
+    options: data.poll.options.map(o => ({ id: o.id, text: o.text, votes: o.votes }))
+  });
+});
+
+app.post('/vote', (req, res) => {
+  const ip = getClientIp(req);
+  if (!ip) {
+    return res.status(400).json({ error: 'Не удалось определить IP' });
+  }
+  if (data.voters.includes(ip)) {
+    return res.status(403).json({ error: 'Вы уже голосовали' });
+  }
+  const optionId = (req.body.option || req.body.id || '').toString();
+  const option = data.poll.options.find(o => o.id.toString() === optionId);
+  if (!option) {
+    return res.status(400).json({ error: 'Неверный вариант' });
+  }
+  option.votes += 1;
+  data.voters.push(ip);
+  saveData();
+  const total = data.poll.options.reduce((s, o) => s + o.votes, 0);
+  res.json({
+    success: true,
+    total: total,
+    options: data.poll.options.map(o => ({ id: o.id, text: o.text, votes: o.votes }))
+  });
+});
+
+app.get('/', (req, res) => {
+  res.type('html').send(`<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Голосование</title>
+<style>
+body { font-family: Arial, sans-serif; max-width: 600px; margin: 40px auto; }
+#message { margin-top: 10px; }
+</style>
+</head>
+<body>
+<h1 id="question"></h1>
+<form id="voteForm">
+<div id="options"></div>
+<button type="submit">Голосовать</button>
+</form>
+<div id="message"></div>
+<h2>Результаты</h2>
+<ul id="results"></ul>
+<script>
+async function fetchJSON(url, options){
+  const res = await fetch(url, options);
+  let data;
+  try { data = await res.json(); } catch(e) { data = {}; }
+  return {ok: res.ok, data: data};
+}
+function renderPoll(poll){
+  document.getElementById('question').textContent = poll.question;
+  const container = document.getElementById('options');
+  container.innerHTML = '';
+  poll.options.forEach(function(o){
+    const label = document.createElement('label');
+    label.style.display = 'block';
+    const input = document.createElement('input');
+    input.type = 'radio';
+    input.name = 'option';
+    input.value = o.id;
+    label.appendChild(input);
+    label.appendChild(document.createTextNode(' ' + o.text));
+    container.appendChild(label);
+  });
+}
+function renderResults(results){
+  const list = document.getElementById('results');
+  list.innerHTML = '';
+  results.options.forEach(function(o){
+    const li = document.createElement('li');
+    var percent = results.total ? ((o.votes / results.total) * 100).toFixed(1) : '0.0';
+    li.textContent = o.text + ': ' + o.votes + ' (' + percent + '%)';
+    list.appendChild(li);
+  });
+}
+async function load(){
+  const pollRes = await fetchJSON('/poll');
+  if(pollRes.ok) { renderPoll(pollRes.data); }
+  const resultRes = await fetchJSON('/results');
+  if(resultRes.ok) { renderResults(resultRes.data); }
+}
+document.getElementById('voteForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const selected = document.querySelector('input[name="option"]:checked');
+  const message = document.getElementById('message');
+  if(!selected){ message.textContent = 'Выберите вариант.'; return; }
+  const voteRes = await fetchJSON('/vote', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({option: selected.value})});
+  if(voteRes.ok){
+    message.textContent = 'Спасибо за ваш голос!';
+    renderResults(voteRes.data);
+  } else {
+    message.textContent = voteRes.data.error || 'Ошибка голосования.';
+    const resultRes = await fetchJSON('/results');
+    if(resultRes.ok) { renderResults(resultRes.data); }
+  }
+});
+load();
+</script>
+</body>
+</html>`);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log('Voting server running on port ' + PORT);
+});
