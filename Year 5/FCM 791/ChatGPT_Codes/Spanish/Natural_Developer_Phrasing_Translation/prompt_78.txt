@@ -1,0 +1,232 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"reflect"
+	"strings"
+)
+
+func ApplyConfig(filePath string, targets map[string]interface{}) error {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return err
+	}
+	var cfg map[string]map[string]interface{}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&cfg); err != nil {
+		return err
+	}
+	for name, fields := range cfg {
+		if target, ok := targets[name]; ok {
+			if err := applyFields(target, fields); err != nil {
+				return fmt.Errorf("object %s: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+func applyFields(target interface{}, fields map[string]interface{}) error {
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return errors.New("target must be non-nil pointer")
+	}
+	v = v.Elem()
+	if v.Kind() != reflect.Struct {
+		return errors.New("target must point to struct")
+	}
+	for key, val := range fields {
+		field, ok := findField(v, key)
+		if !ok {
+			continue
+		}
+		if err := setValue(field, val); err != nil {
+			return fmt.Errorf("field %s: %w", key, err)
+		}
+	}
+	return nil
+}
+
+func findField(v reflect.Value, key string) (reflect.Value, bool) {
+	t := v.Type()
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		if strings.EqualFold(f.Name, key) {
+			return v.Field(i), true
+		}
+		tag := f.Tag.Get("json")
+		if tag != "" && tag != "-" {
+			tag = strings.Split(tag, ",")[0]
+			if tag == key || strings.EqualFold(tag, key) {
+				return v.Field(i), true
+			}
+		}
+	}
+	return reflect.Value{}, false
+}
+
+func setValue(field reflect.Value, val interface{}) error {
+	if field.Kind() == reflect.Ptr {
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		return setValue(field.Elem(), val)
+	}
+	switch field.Kind() {
+	case reflect.Interface:
+		v := reflect.ValueOf(val)
+		if v.IsValid() {
+			field.Set(v)
+			return nil
+		}
+		return errors.New("invalid value")
+	case reflect.String:
+		if v, ok := val.(string); ok {
+			field.SetString(v)
+			return nil
+		}
+		return fmt.Errorf("expected string")
+	case reflect.Bool:
+		if v, ok := val.(bool); ok {
+			field.SetBool(v)
+			return nil
+		}
+		return fmt.Errorf("expected bool")
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := val.(type) {
+		case json.Number:
+			i, err := v.Int64()
+			if err != nil {
+				return err
+			}
+			field.SetInt(i)
+			return nil
+		case float64:
+			field.SetInt(int64(v))
+			return nil
+		case int:
+			field.SetInt(int64(v))
+			return nil
+		case float32:
+			field.SetInt(int64(v))
+			return nil
+		default:
+			return fmt.Errorf("expected number")
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		switch v := val.(type) {
+		case json.Number:
+			i, err := v.Int64()
+			if err != nil {
+				return err
+			}
+			if i < 0 {
+				return fmt.Errorf("negative number")
+			}
+			field.SetUint(uint64(i))
+			return nil
+		case float64:
+			if v < 0 {
+				return fmt.Errorf("negative number")
+			}
+			field.SetUint(uint64(v))
+			return nil
+		case int:
+			if v < 0 {
+				return fmt.Errorf("negative number")
+			}
+			field.SetUint(uint64(v))
+			return nil
+		case float32:
+			if v < 0 {
+				return fmt.Errorf("negative number")
+			}
+			field.SetUint(uint64(v))
+			return nil
+		default:
+			return fmt.Errorf("expected number")
+		}
+	case reflect.Float32, reflect.Float64:
+		switch v := val.(type) {
+		case json.Number:
+			f, err := v.Float64()
+			if err != nil {
+				return err
+			}
+			field.SetFloat(f)
+			return nil
+		case float64:
+			field.SetFloat(v)
+			return nil
+		case int:
+			field.SetFloat(float64(v))
+			return nil
+		case float32:
+			field.SetFloat(float64(v))
+			return nil
+		default:
+			return fmt.Errorf("expected number")
+		}
+	case reflect.Slice, reflect.Map, reflect.Struct:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return err
+		}
+		temp := reflect.New(field.Type()).Interface()
+		if err := json.Unmarshal(b, temp); err != nil {
+			return err
+		}
+		field.Set(reflect.ValueOf(temp).Elem())
+		return nil
+	default:
+		v := reflect.ValueOf(val)
+		if v.IsValid() && v.Type().ConvertibleTo(field.Type()) {
+			field.Set(v.Convert(field.Type()))
+			return nil
+		}
+		return fmt.Errorf("unsupported type")
+	}
+}
+
+type App struct {
+	Name    string            `json:"name"`
+	Port    int               `json:"port"`
+	Debug   bool              `json:"debug"`
+	Tags    []string          `json:"tags"`
+	Options map[string]string `json:"options"`
+}
+
+type Service struct {
+	URL     string `json:"url"`
+	Retries int    `json:"retries"`
+}
+
+func main() {
+	app := &App{
+		Name:  "default",
+		Port:  8080,
+		Debug: false,
+	}
+	svc := &Service{
+		URL:     "http://localhost",
+		Retries: 3,
+	}
+	targets := map[string]interface{}{
+		"app":     app,
+		"service": svc,
+	}
+	if err := ApplyConfig("config.json", targets); err != nil {
+		fmt.Println("error:", err)
+		return
+	}
+	fmt.Printf("App: %+v\n", app)
+	fmt.Printf("Service: %+v\n", svc)
+}

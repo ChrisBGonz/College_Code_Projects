@@ -1,0 +1,136 @@
+const CircuitState = Object.freeze({ CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' });
+
+class CircuitOpenError extends Error {
+  constructor(message = 'Circuit breaker is open') {
+    super(message);
+    this.name = 'CircuitOpenError';
+  }
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = Number.isFinite(options.failureThreshold) ? options.failureThreshold : 5;
+    this.successThreshold = Number.isFinite(options.successThreshold) ? options.successThreshold : 2;
+    this.timeout = Number.isFinite(options.timeout) ? options.timeout : 10000;
+    this.retryLimit = Number.isFinite(options.retryLimit) ? options.retryLimit : 0;
+    this.retryDelay = options.retryDelay !== undefined ? options.retryDelay : 0;
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInProgress = false;
+    this.onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : null;
+  }
+
+  _setState(state) {
+    if (this.state !== state) {
+      this.state = state;
+      if (this.onStateChange) this.onStateChange(state);
+    }
+  }
+
+  _open() {
+    this._setState(CircuitState.OPEN);
+    this.nextAttempt = Date.now() + this.timeout;
+    this.successCount = 0;
+    this.halfOpenInProgress = false;
+  }
+
+  _halfOpen() {
+    this._setState(CircuitState.HALF_OPEN);
+    this.successCount = 0;
+    this.halfOpenInProgress = false;
+  }
+
+  _close() {
+    this._setState(CircuitState.CLOSED);
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenInProgress = false;
+  }
+
+  _canAttempt() {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._halfOpen();
+        return true;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  async _retry(action, retries, delay) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await action();
+      } catch (err) {
+        if (attempt >= retries) throw err;
+        attempt++;
+        const waitTime = typeof delay === 'function' ? delay(attempt, err) : delay;
+        if (waitTime > 0) await sleep(waitTime);
+      }
+    }
+  }
+
+  async fire(action, options = {}) {
+    if (typeof action !== 'function') return Promise.reject(new Error('Action must be a function'));
+    if (!this._canAttempt()) return Promise.reject(new CircuitOpenError());
+    if (this.state === CircuitState.HALF_OPEN) {
+      if (this.halfOpenInProgress) return Promise.reject(new CircuitOpenError('Circuit breaker is half-open'));
+      this.halfOpenInProgress = true;
+    }
+    try {
+      const retries = Number.isFinite(options.retries) ? options.retries : this.retryLimit;
+      const retryDelay = options.retryDelay !== undefined ? options.retryDelay : this.retryDelay;
+      const result = await this._retry(action, retries, retryDelay);
+      this._onSuccess();
+      return result;
+    } catch (err) {
+      this._onFailure();
+      throw err;
+    } finally {
+      this.halfOpenInProgress = false;
+    }
+  }
+
+  _onSuccess() {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) this._close();
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this._open();
+    } else {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) this._open();
+    }
+  }
+
+  wrap(fn, options = {}) {
+    return (...args) => this.fire(() => fn(...args), options);
+  }
+
+  request(url, options = {}, circuitOptions = {}) {
+    return this.fire(() => fetch(url, options).then(res => {
+      if (!res.ok) {
+        const err = new Error('HTTP ' + res.status);
+        err.response = res;
+        throw err;
+      }
+      return res;
+    }), circuitOptions);
+  }
+
+  getState() {
+    return this.state;
+  }
+}

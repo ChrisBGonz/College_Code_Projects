@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import hashlib
+import base64
+import re
+import fnmatch
+
+def normalize_b64(s):
+    s = ''.join(s.strip().split())
+    padding = '=' * (-len(s) % 4)
+    return s + padding
+
+def decode_hash(s, encoding):
+    s = s.strip()
+    if encoding == 'hex':
+        if len(s) % 2 == 1:
+            s = '0' + s
+        return bytes.fromhex(s)
+    elif encoding == 'base64':
+        return base64.b64decode(normalize_b64(s), validate=False)
+    elif encoding == 'base64url':
+        s = s.replace('-', '+').replace('_', '/')
+        return base64.b64decode(normalize_b64(s), validate=False)
+    else:
+        try:
+            return bytes.fromhex(s)
+        except Exception:
+            return base64.b64decode(normalize_b64(s), validate=False)
+
+def encode_hash(b, encoding):
+    if encoding == 'hex':
+        return b.hex()
+    elif encoding == 'base64':
+        return base64.b64encode(b).decode('ascii')
+    elif encoding == 'base64url':
+        return base64.urlsafe_b64encode(b).decode('ascii').rstrip('=')
+    else:
+        return b.hex()
+
+def looks_like_hash(s):
+    if len(s) < 16:
+        return False
+    if re.fullmatch(r'[0-9a-fA-F]+', s):
+        return True
+    if re.fullmatch(r'[A-Za-z0-9+/=]+', s):
+        return True
+    return False
+
+def clean_path(p):
+    p = p.strip()
+    if (p.startswith('"') and p.endswith('"')) or (p.startswith("'") and p.endswith("'")):
+        p = p[1:-1]
+    if p.startswith('./') or p.startswith('.\\'):
+        p = p[2:]
+    return p
+
+def norm_rel(p):
+    p = clean_path(p)
+    p = p.replace('\\', '/')
+    p = os.path.normpath(p).replace('\\', '/')
+    if p == '.':
+        return ''
+    return p.lstrip('./')
+
+def split_ignores(text):
+    parts = re.split(r'[,\s]+', text.strip())
+    return [p for p in parts if p]
+
+def extract_header_info(line):
+    l = line.strip()
+    if l.startswith('//'):
+        l = l[2:].strip()
+    elif l.startswith('#') or l.startswith(';'):
+        l = l[1:].strip()
+    info = {}
+    ignores = []
+    m = re.search(r'\bignore[s]?\s*[:=]\s*(.+)$', l, re.I)
+    if m:
+        ignores.extend(split_ignores(m.group(1)))
+    pairs = re.findall(r'(\b[a-zA-Z][\w-]*\b)\s*[:=]\s*([^\s,;]+)', l)
+    for k, v in pairs:
+        kl = k.lower()
+        if kl in ('ignore', 'ignores', 'exclude', 'excludes'):
+            ignores.extend(split_ignores(v))
+        else:
+            info[kl] = v
+    if not any(k in info for k in ('algo', 'algorithm', 'hash', 'digest')):
+        m = re.search(r'\b(md5|sha1|sha224|sha256|sha384|sha512|blake2b|blake2s|sha3_224|sha3_256|sha3_384|sha3_512)\b', l, re.I)
+        if m:
+            info['algorithm'] = m.group(1)
+    if not any(k in info for k in ('encoding', 'enc', 'format')):
+        m = re.search(r'\b(hex|base64|b64|base64url|b64url)\b', l, re.I)
+        if m:
+            info['encoding'] = m.group(1)
+    return info, ignores
+
+def parse_manifest_line(line):
+    l = line.strip()
+    m = re.match(r'^([A-Za-z0-9_-]+)\s*\(\s*(.+?)\s*\)\s*=\s*([A-Za-z0-9+/=]+)\s*$', l)
+    if m:
+        algo = m.group(1).lower()
+        path = m.group(2)
+        hash_str = m.group(3)
+        return path, hash_str, algo
+    m = re.match(r'^([A-Za-z0-9+/=]+)\s*[:|,]\s*(.+)$', l)
+    if m and looks_like_hash(m.group(1)):
+        return m.group(2), m.group(1), None
+    parts = l.split()
+    if len(parts) >= 2:
+        first = parts[0]
+        last = parts[-1]
+        if looks_like_hash(first):
+            hash_str = first
+            rest = l[len(first):].strip()
+            if rest.startswith('*'):
+                rest = rest[1:]
+            path = rest.strip()
+            return path, hash_str, None
+        if looks_like_hash(last):
+            hash_str = last
+            path = ' '.join(parts[:-1])
+            return path, hash_str, None
+    raise ValueError("Línea de manifest inválida: " + line)
+
+def parse_manifest(path):
+    entries = {}
+    header = {}
+    ignores = []
+    algo_hint = None
+    with open(path, 'r', encoding='utf-8', errors='replace') as f:
+        for raw in f:
+            line = raw.rstrip('\n')
+            if not line.strip():
+                continue
+            stripped = line.strip()
+            if stripped.startswith(('#', ';', '//')):
+                info, ign = extract_header_info(line)
+                for k, v in info.items():
+                    if v:
+                        header[k] = v
+                ignores.extend(ign)
+                continue
+            if re.match(r'^\s*(algorithm|algo|encoding|enc|format|ignore|exclude)\s*[:=]', stripped, re.I):
+                info, ign = extract_header_info(stripped)
+                for k, v in info.items():
+                    if v:
+                        header[k] = v
+                ignores.extend(ign)
+                continue
+            path_entry, hash_str, algo_line = parse_manifest_line(line)
+            if algo_line and not algo_hint:
+                algo_hint = algo_line
+            entries[norm_rel(path_entry)] = hash_str.strip()
+    return header, entries, ignores, algo_hint
+
+def infer_from_hash(h):
+    if re.fullmatch(r'[0-9a-fA-F]+', h):
+        enc = 'hex'
+        digest_len = len(h) // 2
+    else:
+        try:
+            dec = base64.b64decode(normalize_b64(h), validate=True)
+            enc = 'base64'
+            digest_len = len(dec)
+        except Exception:
+            return None, None
+    algo_map = {16: 'md5', 20: 'sha1', 28: 'sha224', 32: 'sha256', 48: 'sha384', 64: 'sha512'}
+    algo = algo_map.get(digest_len)
+    return algo, enc
+
+def normalize_algo(a):
+    if not a:
+        return a
+    a = a.strip().lower()
+    a = re.sub(r'[^a-z0-9_]', '', a)
+    if a.startswith('sha3') and '_' not in a and len(a) > 4:
+        a = 'sha3_' + a[4:]
+    return a
+
+def normalize_enc(e):
+    if not e:
+        return e
+    e = e.strip().lower()
+    if e in ('hexadecimal',):
+        return 'hex'
+    if e in ('b64',):
+        return 'base64'
+    if e in ('base64url', 'b64url', 'urlsafe', 'url'):
+        return 'base64url'
+    return e
+
+def resolve_algo_encoding(entries, header, algo_hint, cli_algo, cli_enc):
+    algo = cli_algo
+    enc = cli_enc
+    if not algo:
+        for k in ('algorithm', 'algo', 'hash', 'digest'):
+            if k in header:
+                algo = header[k]
+                break
+    if not enc:
+        for k in ('encoding', 'enc', 'format'):
+            if k in header:
+                enc = header[k]
+                break
+    if not algo and algo_hint:
+        algo = algo_hint
+    algo = normalize_algo(algo)
+    enc = normalize_enc(enc)
+    first_hash = next(iter(entries.values()), None)
+    if not enc and first_hash:
+        ia, ie = infer_from_hash(first_hash)
+        if ie:
+            enc = ie
+        if not algo and ia:
+            algo = ia
+    if not algo and first_hash and enc:
+        try:
+            digest_len = len(decode_hash(first_hash, enc))
+            algo_map = {16: 'md5', 20: 'sha1', 28: 'sha224', 32: 'sha256', 48: 'sha384', 64: 'sha512'}
+            algo = algo_map.get(digest_len)
+        except Exception:
+            pass
+    if not enc:
+        enc = 'hex'
+    if not algo:
+        if not entries:
+            algo = 'sha256'
+        else:
+            raise ValueError("No se pudo determinar el algoritmo de hash.")
+    try:
+        hashlib.new(algo)
+    except Exception:
+        raise ValueError("Algoritmo no soportado: " + algo)
+    return algo, enc
+
+def is_ignored(rel_path, ignore_patterns):
+    rel_path = rel_path.replace('\\', '/')
+    for pat in ignore_patterns:
+        if not pat:
+            continue
+        p = pat.replace('\\', '/')
+        if p.endswith('/'):
+            if rel_path.startswith(p.rstrip('/')):
+                return True
+        if fnmatch.fnmatch(rel_path, p):
+            return True
+    return False
+
+def list_project_files(root, ignore_patterns):
+    files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root)
+        if rel_dir == '.':
+            rel_dir = ''
+        rel_dir_norm = norm_rel(rel_dir) if rel_dir else ''
+        new_dirnames = []
+        for d in dirnames:
+            rel = d if not rel_dir_norm else rel_dir_norm + '/' + d
+            rel = norm_rel(rel)
+            if is_ignored(rel + '/', ignore_patterns) or is_ignored(rel, ignore_patterns):
+                continue
+            new_dirnames.append(d)
+        dirnames[:] = new_dirnames
+        for fname in filenames:
+            rel = fname if not rel_dir_norm else rel_dir_norm + '/' + fname
+            rel = norm_rel(rel)
+            if is_ignored(rel, ignore_patterns):
+                continue
+            files.append(rel)
+    return files
+
+def compute_file_digest(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(8192), b''):
+            h.update(chunk)
+    return h.digest()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('manifest', help='archivo manifest')
+    parser.add_argument('--algo', '--algorithm', dest='algo', help='algoritmo de hash')
+    parser.add_argument('--encoding', '--enc', dest='encoding', help='encoding: hex|base64|base64url')
+    parser.add_argument('--root', help='directorio raíz del proyecto')
+    parser.add_argument('--ignore', action='append', default=[], help='patrón glob a ignorar (puede repetirse)')
+    parser.add_argument('--quiet', action='store_true', help='no mostrar detalles')
+    args = parser.parse_args()
+
+    manifest_path = os.path.abspath(args.manifest)
+    if not os.path.isfile(manifest_path):
+        print("Manifest no encontrado: " + manifest_path, file=sys.stderr)
+        sys.exit(2)
+    root = os.path.abspath(args.root) if args.root else os.path.dirname(manifest_path)
+
+    header, entries, ignores_from_manifest, algo_hint = parse_manifest(manifest_path)
+
+    ignore_patterns = []
+    ignore_patterns.extend(ignores_from_manifest)
+    ignore_patterns.extend(args.ignore or [])
+    rel_manifest = norm_rel(os.path.relpath(manifest_path, root))
+    if rel_manifest:
+        ignore_patterns.append(rel_manifest)
+    ignore_patterns = list(dict.fromkeys(ignore_patterns))
+
+    try:
+        algo, enc = resolve_algo_encoding(entries, header, algo_hint, args.algo, args.encoding)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    missing = []
+    mismatches = []
+
+    for rel_path, expected_hash in entries.items():
+        if not rel_path:
+            continue
+        file_path = os.path.join(root, *rel_path.split('/'))
+        if not os.path.isfile(file_path):
+            missing.append(rel_path)
+            continue
+        try:
+            expected_bytes = decode_hash(expected_hash, enc)
+        except Exception:
+            mismatches.append((rel_path, expected_hash, None, 'hash inválido'))
+            continue
+        actual_bytes = compute_file_digest(file_path, algo)
+        if actual_bytes != expected_bytes:
+            actual_encoded = encode_hash(actual_bytes, enc)
+            mismatches.append((rel_path, expected_hash, actual_encoded, None))
+
+    all_files = set(list_project_files(root, ignore_patterns))
+    manifest_files = set(entries.keys())
+    extras = sorted(f for f in all_files if f not in manifest_files)
+
+    missing = sorted(missing)
+    mismatches = sorted(mismatches, key=lambda x: x[0])
+
+    if not args.quiet:
+        for path in missing:
+            print(f"FALTANTE: {path}")
+        for path, expected, actual, err in mismatches:
+            if err:
+                print(f"HASH INVALIDO: {path} ({err})")
+            else:
+                print(f"DIFERENTE: {path}")
+                print(f"  esperado: {expected}")
+                if actual is not None:
+                    print(f"  actual:   {actual}")
+        for path in extras:
+            print(f"SOBRANTE: {path}")
+        total = len(entries)
+        print(f"Resumen: {total} en manifest, {len(missing)} faltantes, {len(mismatches)} mismatches, {len(extras)} sobrantes.")
+
+    if missing or mismatches or extras:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()
