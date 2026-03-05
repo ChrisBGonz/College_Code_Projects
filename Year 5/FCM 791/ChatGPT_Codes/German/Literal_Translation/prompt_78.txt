@@ -1,0 +1,572 @@
+package config
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+)
+
+func ApplyJSONConfig(path string, target interface{}) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	var cfg map[string]interface{}
+	if err := dec.Decode(&cfg); err != nil {
+		return err
+	}
+	return applyConfigMap(cfg, target)
+}
+
+func applyConfigMap(cfg map[string]interface{}, target interface{}) error {
+	if target == nil {
+		return errors.New("target is nil")
+	}
+	v := reflect.ValueOf(target)
+	if v.Kind() != reflect.Ptr || v.IsNil() {
+		return errors.New("target must be a non-nil pointer")
+	}
+	return setStructFields(v.Elem(), cfg)
+}
+
+func setStructFields(v reflect.Value, cfg map[string]interface{}) error {
+	if !v.IsValid() {
+		return errors.New("invalid target")
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for key, val := range cfg {
+			idx, _, ok := findField(t, key)
+			if !ok {
+				continue
+			}
+			field := v.Field(idx)
+			if !field.CanSet() {
+				continue
+			}
+			if err := setValue(field, val); err != nil {
+				return err
+			}
+		}
+		return nil
+	case reflect.Map:
+		return setMapFields(v, cfg)
+	default:
+		return errors.New("target must be struct or map")
+	}
+}
+
+func findField(t reflect.Type, key string) (int, reflect.StructField, bool) {
+	keyLower := strings.ToLower(key)
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tag := f.Tag.Get("json")
+		if tag != "" && tag != "-" {
+			name := strings.Split(tag, ",")[0]
+			if name == key {
+				return i, f, true
+			}
+		}
+		if strings.ToLower(f.Name) == keyLower {
+			return i, f, true
+		}
+	}
+	return -1, reflect.StructField{}, false
+}
+
+func setMapFields(m reflect.Value, cfg map[string]interface{}) error {
+	if m.Kind() != reflect.Map {
+		return errors.New("target is not a map")
+	}
+	if m.Type().Key().Kind() != reflect.String {
+		return errors.New("map key type must be string")
+	}
+	if m.IsNil() {
+		m.Set(reflect.MakeMap(m.Type()))
+	}
+	for k, v := range cfg {
+		keyVal := reflect.ValueOf(k).Convert(m.Type().Key())
+		elem := reflect.New(m.Type().Elem()).Elem()
+		if err := setValue(elem, v); err != nil {
+			return err
+		}
+		m.SetMapIndex(keyVal, elem)
+	}
+	return nil
+}
+
+func setValue(field reflect.Value, val interface{}) error {
+	if !field.CanSet() {
+		return nil
+	}
+	if val == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+
+	if field.Kind() == reflect.Ptr {
+		if field.IsNil() {
+			field.Set(reflect.New(field.Type().Elem()))
+		}
+		return setValue(field.Elem(), val)
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		switch v := val.(type) {
+		case string:
+			field.SetString(v)
+		case []byte:
+			field.SetString(string(v))
+		case json.Number:
+			field.SetString(v.String())
+		default:
+			field.SetString(fmt.Sprintf("%v", v))
+		}
+		return nil
+	case reflect.Bool:
+		b, err := toBool(val)
+		if err != nil {
+			return err
+		}
+		field.SetBool(b)
+		return nil
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		i, err := toInt64(val)
+		if err != nil {
+			return err
+		}
+		field.SetInt(i)
+		return nil
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		u, err := toUint64(val)
+		if err != nil {
+			return err
+		}
+		field.SetUint(u)
+		return nil
+	case reflect.Float32, reflect.Float64:
+		f, err := toFloat64(val)
+		if err != nil {
+			return err
+		}
+		field.SetFloat(f)
+		return nil
+	case reflect.Struct:
+		if m, ok := val.(map[string]interface{}); ok {
+			return setStructFields(field, m)
+		}
+		rv := reflect.ValueOf(val)
+		if rv.IsValid() && rv.Type().AssignableTo(field.Type()) {
+			field.Set(rv)
+		} else if rv.IsValid() && rv.Type().ConvertibleTo(field.Type()) {
+			field.Set(rv.Convert(field.Type()))
+		}
+		return nil
+	case reflect.Slice:
+		return setSlice(field, val)
+	case reflect.Array:
+		return setArray(field, val)
+	case reflect.Map:
+		return setMap(field, val)
+	case reflect.Interface:
+		field.Set(reflect.ValueOf(val))
+		return nil
+	default:
+		rv := reflect.ValueOf(val)
+		if rv.IsValid() && rv.Type().AssignableTo(field.Type()) {
+			field.Set(rv)
+			return nil
+		}
+		if rv.IsValid() && rv.Type().ConvertibleTo(field.Type()) {
+			field.Set(rv.Convert(field.Type()))
+			return nil
+		}
+	}
+	return nil
+}
+
+func setSlice(field reflect.Value, val interface{}) error {
+	if val == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+	arr, ok := val.([]interface{})
+	if !ok {
+		rv := reflect.ValueOf(val)
+		if rv.IsValid() && rv.Kind() == reflect.Slice {
+			slice := reflect.MakeSlice(field.Type(), 0, rv.Len())
+			for i := 0; i < rv.Len(); i++ {
+				elem := reflect.New(field.Type().Elem()).Elem()
+				if err := setValue(elem, rv.Index(i).Interface()); err != nil {
+					return err
+				}
+				slice = reflect.Append(slice, elem)
+			}
+			field.Set(slice)
+			return nil
+		}
+		return fmt.Errorf("cannot convert %T to slice", val)
+	}
+	slice := reflect.MakeSlice(field.Type(), 0, len(arr))
+	for _, item := range arr {
+		elem := reflect.New(field.Type().Elem()).Elem()
+		if err := setValue(elem, item); err != nil {
+			return err
+		}
+		slice = reflect.Append(slice, elem)
+	}
+	field.Set(slice)
+	return nil
+}
+
+func setArray(field reflect.Value, val interface{}) error {
+	if val == nil {
+		return nil
+	}
+	arr, ok := val.([]interface{})
+	if ok {
+		for i := 0; i < field.Len() && i < len(arr); i++ {
+			if err := setValue(field.Index(i), arr[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	rv := reflect.ValueOf(val)
+	if rv.IsValid() && (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array) {
+		for i := 0; i < field.Len() && i < rv.Len(); i++ {
+			if err := setValue(field.Index(i), rv.Index(i).Interface()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func setMap(field reflect.Value, val interface{}) error {
+	if val == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+	if field.Type().Key().Kind() == reflect.String {
+		if m, ok := val.(map[string]interface{}); ok {
+			if field.IsNil() {
+				field.Set(reflect.MakeMap(field.Type()))
+			}
+			for k, v := range m {
+				keyVal := reflect.ValueOf(k).Convert(field.Type().Key())
+				elem := reflect.New(field.Type().Elem()).Elem()
+				if err := setValue(elem, v); err != nil {
+					return err
+				}
+				field.SetMapIndex(keyVal, elem)
+			}
+			return nil
+		}
+	}
+	rv := reflect.ValueOf(val)
+	if rv.IsValid() && rv.Kind() == reflect.Map {
+		if field.IsNil() {
+			field.Set(reflect.MakeMap(field.Type()))
+		}
+		iter := rv.MapRange()
+		for iter.Next() {
+			keyVal, err := convertKey(field.Type().Key(), iter.Key().Interface())
+			if err != nil {
+				return err
+			}
+			elem := reflect.New(field.Type().Elem()).Elem()
+			if err := setValue(elem, iter.Value().Interface()); err != nil {
+				return err
+			}
+			field.SetMapIndex(keyVal, elem)
+		}
+		return nil
+	}
+	return fmt.Errorf("cannot convert %T to map", val)
+}
+
+func convertKey(t reflect.Type, key interface{}) (reflect.Value, error) {
+	if key == nil {
+		return reflect.Zero(t), errors.New("nil key")
+	}
+	rv := reflect.ValueOf(key)
+	if rv.Type().AssignableTo(t) {
+		return rv, nil
+	}
+	if rv.Type().ConvertibleTo(t) {
+		return rv.Convert(t), nil
+	}
+	if s, ok := key.(string); ok {
+		switch t.Kind() {
+		case reflect.String:
+			return reflect.ValueOf(s).Convert(t), nil
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			i, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			v := reflect.New(t).Elem()
+			v.SetInt(i)
+			return v, nil
+		case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+			u, err := strconv.ParseUint(s, 10, 64)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			v := reflect.New(t).Elem()
+			v.SetUint(u)
+			return v, nil
+		case reflect.Bool:
+			b, err := strconv.ParseBool(s)
+			if err != nil {
+				return reflect.Value{}, err
+			}
+			v := reflect.New(t).Elem()
+			v.SetBool(b)
+			return v, nil
+		}
+	}
+	return reflect.Value{}, fmt.Errorf("cannot convert key %v to %v", key, t)
+}
+
+func toBool(v interface{}) (bool, error) {
+	switch n := v.(type) {
+	case bool:
+		return n, nil
+	case string:
+		if n == "" {
+			return false, nil
+		}
+		return strconv.ParseBool(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i != 0, nil
+		}
+		f, err := n.Float64()
+		if err != nil {
+			return false, err
+		}
+		return f != 0, nil
+	default:
+		if i, err := toInt64(v); err == nil {
+			return i != 0, nil
+		}
+		if f, err := toFloat64(v); err == nil {
+			return f != 0, nil
+		}
+		return false, fmt.Errorf("cannot convert %T to bool", v)
+	}
+}
+
+func toInt64(v interface{}) (int64, error) {
+	switch n := v.(type) {
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i, nil
+		}
+		f, err := n.Float64()
+		if err != nil {
+			return 0, err
+		}
+		return int64(f), nil
+	case float64:
+		return int64(n), nil
+	case float32:
+		return int64(n), nil
+	case int:
+		return int64(n), nil
+	case int8:
+		return int64(n), nil
+	case int16:
+		return int64(n), nil
+	case int32:
+		return int64(n), nil
+	case int64:
+		return n, nil
+	case uint:
+		return int64(n), nil
+	case uint8:
+		return int64(n), nil
+	case uint16:
+		return int64(n), nil
+	case uint32:
+		return int64(n), nil
+	case uint64:
+		if n > math.MaxInt64 {
+			return 0, fmt.Errorf("overflow converting %d to int64", n)
+		}
+		return int64(n), nil
+	case string:
+		if n == "" {
+			return 0, nil
+		}
+		if i, err := strconv.ParseInt(n, 10, 64); err == nil {
+			return i, nil
+		}
+		f, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			return 0, err
+		}
+		return int64(f), nil
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			return toInt64(rv.Elem().Interface())
+		}
+		return 0, fmt.Errorf("cannot convert %T to int64", v)
+	}
+}
+
+func toUint64(v interface{}) (uint64, error) {
+	switch n := v.(type) {
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			if i < 0 {
+				return 0, fmt.Errorf("negative value")
+			}
+			return uint64(i), nil
+		}
+		f, err := n.Float64()
+		if err != nil {
+			return 0, err
+		}
+		if f < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(f), nil
+	case float64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case float32:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int8:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int16:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int32:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case int64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(n), nil
+	case uint:
+		return uint64(n), nil
+	case uint8:
+		return uint64(n), nil
+	case uint16:
+		return uint64(n), nil
+	case uint32:
+		return uint64(n), nil
+	case uint64:
+		return n, nil
+	case string:
+		if n == "" {
+			return 0, nil
+		}
+		if u, err := strconv.ParseUint(n, 10, 64); err == nil {
+			return u, nil
+		}
+		f, err := strconv.ParseFloat(n, 64)
+		if err != nil {
+			return 0, err
+		}
+		if f < 0 {
+			return 0, fmt.Errorf("negative value")
+		}
+		return uint64(f), nil
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			return toUint64(rv.Elem().Interface())
+		}
+		return 0, fmt.Errorf("cannot convert %T to uint64", v)
+	}
+}
+
+func toFloat64(v interface{}) (float64, error) {
+	switch n := v.(type) {
+	case json.Number:
+		return n.Float64()
+	case float64:
+		return n, nil
+	case float32:
+		return float64(n), nil
+	case int:
+		return float64(n), nil
+	case int8:
+		return float64(n), nil
+	case int16:
+		return float64(n), nil
+	case int32:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	case uint:
+		return float64(n), nil
+	case uint8:
+		return float64(n), nil
+	case uint16:
+		return float64(n), nil
+	case uint32:
+		return float64(n), nil
+	case uint64:
+		return float64(n), nil
+	case string:
+		if n == "" {
+			return 0, nil
+		}
+		return strconv.ParseFloat(n, 64)
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	default:
+		rv := reflect.ValueOf(v)
+		if rv.IsValid() && rv.Kind() == reflect.Ptr && !rv.IsNil() {
+			return toFloat64(rv.Elem().Interface())
+		}
+		return 0, fmt.Errorf("cannot convert %T to float64", v)
+	}
+}

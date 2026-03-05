@@ -1,0 +1,205 @@
+'use strict';
+
+const cookieEncryption = require('cookie-encryption');
+
+function normalizeOptions(opts) {
+  if (!opts) return {};
+  if (typeof opts === 'string' || Buffer.isBuffer(opts) || Array.isArray(opts)) return { secret: opts };
+  return opts;
+}
+
+function createEncryptor(secret, options) {
+  let enc;
+  if (typeof cookieEncryption === 'function') {
+    try {
+      if (cookieEncryption.length <= 1) {
+        enc = cookieEncryption(options && Object.keys(options).length ? options : secret);
+      } else {
+        enc = cookieEncryption(secret, options);
+      }
+    } catch (e) {}
+  }
+  if (enc && typeof enc.encrypt === 'function' && typeof enc.decrypt === 'function') return enc;
+  if (cookieEncryption && typeof cookieEncryption.encrypt === 'function' && typeof cookieEncryption.decrypt === 'function') {
+    return {
+      encrypt: function(val) { return cookieEncryption.encrypt(val, secret, options); },
+      decrypt: function(val) { return cookieEncryption.decrypt(val, secret, options); }
+    };
+  }
+  if (cookieEncryption && typeof cookieEncryption.CookieEncryption === 'function') {
+    try {
+      enc = new cookieEncryption.CookieEncryption(options && Object.keys(options).length ? options : secret);
+    } catch (e) {}
+    if (enc && typeof enc.encrypt === 'function' && typeof enc.decrypt === 'function') return enc;
+  }
+  throw new Error('cookie-encryption module does not expose encrypt/decrypt');
+}
+
+function parseCookies(header) {
+  const result = {};
+  if (!header) return result;
+  const pairs = header.split(/; */);
+  for (let i = 0; i < pairs.length; i++) {
+    const pair = pairs[i];
+    if (!pair) continue;
+    const idx = pair.indexOf('=');
+    if (idx < 0) continue;
+    const key = pair.substr(0, idx).trim();
+    if (!key) continue;
+    let val = pair.substr(idx + 1).trim();
+    if (val[0] === '"' && val[val.length - 1] === '"') val = val.slice(1, -1);
+    try { val = decodeURIComponent(val); } catch (e) {}
+    result[key] = val;
+  }
+  return result;
+}
+
+function encodeValue(value) {
+  if (value === undefined) return '';
+  if (typeof value === 'string') return value;
+  try { return 'j:' + JSON.stringify(value); } catch (e) { return String(value); }
+}
+
+function decodeValue(value) {
+  if (typeof value !== 'string') return value;
+  if (value.substr(0, 2) === 'j:') {
+    try { return JSON.parse(value.slice(2)); } catch (e) { return value; }
+  }
+  return value;
+}
+
+function decryptValue(value, encryptor) {
+  if (value == null) return value;
+  const str = typeof value === 'string' ? value : String(value);
+  let decrypted;
+  try { decrypted = encryptor.decrypt(str); } catch (e) { return undefined; }
+  if (decrypted === undefined || decrypted === null) return undefined;
+  if (Buffer.isBuffer(decrypted)) decrypted = decrypted.toString('utf8');
+  return decodeValue(decrypted);
+}
+
+function isEncrypted(value, encryptor) {
+  if (value == null) return false;
+  try {
+    const res = encryptor.decrypt(value);
+    return res !== undefined && res !== null;
+  } catch (e) {
+    return false;
+  }
+}
+
+function encryptValue(value, encryptor) {
+  if (typeof value === 'string') {
+    if (isEncrypted(value, encryptor)) return value;
+    return encryptor.encrypt(value);
+  }
+  const encoded = encodeValue(value);
+  return encryptor.encrypt(encoded);
+}
+
+function maybeDecode(value) {
+  if (typeof value !== 'string') return { value: value, encoded: false };
+  let decoded = value;
+  let encoded = false;
+  try {
+    const tmp = decodeURIComponent(value);
+    if (tmp !== value) {
+      decoded = tmp;
+      encoded = true;
+    }
+  } catch (e) {
+    decoded = value;
+    encoded = false;
+  }
+  return { value: decoded, encoded: encoded };
+}
+
+function encryptCookieString(cookieStr, encryptor) {
+  if (typeof cookieStr !== 'string') return cookieStr;
+  const parts = cookieStr.split(';');
+  const nameValue = parts.shift();
+  if (!nameValue) return cookieStr;
+  const idx = nameValue.indexOf('=');
+  if (idx < 0) return cookieStr;
+  const name = nameValue.substr(0, idx).trim();
+  let val = nameValue.substr(idx + 1).trim();
+  let quoted = false;
+  if (val.startsWith('"') && val.endsWith('"')) {
+    quoted = true;
+    val = val.slice(1, -1);
+  }
+  const info = maybeDecode(val);
+  let rawVal = info.value;
+  if (!isEncrypted(rawVal, encryptor)) {
+    rawVal = encryptor.encrypt(rawVal);
+  }
+  if (info.encoded) rawVal = encodeURIComponent(rawVal);
+  if (quoted) rawVal = '"' + rawVal + '"';
+  return name + '=' + rawVal + (parts.length ? ';' + parts.join(';') : '');
+}
+
+function encryptSetCookieHeader(header, encryptor) {
+  if (header == null) return header;
+  if (Array.isArray(header)) return header.map(function(h) { return encryptCookieString(h, encryptor); });
+  return encryptCookieString(header, encryptor);
+}
+
+function patchResponse(res, encryptor) {
+  if (res._encryptedCookiesPatched) return;
+  res._encryptedCookiesPatched = true;
+  if (typeof res.cookie === 'function') {
+    const origCookie = res.cookie.bind(res);
+    res.cookie = function(name, value, options) {
+      const enc = encryptValue(value, encryptor);
+      return origCookie(name, enc, options);
+    };
+  }
+  if (typeof res.setHeader === 'function') {
+    const origSetHeader = res.setHeader.bind(res);
+    res.setHeader = function(field, value) {
+      if (typeof field === 'string' && field.toLowerCase() === 'set-cookie') {
+        value = encryptSetCookieHeader(value, encryptor);
+      }
+      return origSetHeader(field, value);
+    };
+  }
+  if (typeof res.writeHead === 'function') {
+    const origWriteHead = res.writeHead;
+    res.writeHead = function(statusCode, reasonPhrase, headers) {
+      let hdrs = headers;
+      let reason = reasonPhrase;
+      if (typeof reasonPhrase === 'object' && reasonPhrase !== null) {
+        hdrs = reasonPhrase;
+        reason = undefined;
+      }
+      if (hdrs && (hdrs['Set-Cookie'] || hdrs['set-cookie'])) {
+        const key = hdrs['Set-Cookie'] ? 'Set-Cookie' : 'set-cookie';
+        hdrs[key] = encryptSetCookieHeader(hdrs[key], encryptor);
+      }
+      if (reason !== undefined) return origWriteHead.call(this, statusCode, reason, hdrs);
+      if (hdrs !== undefined) return origWriteHead.call(this, statusCode, hdrs);
+      return origWriteHead.call(this, statusCode);
+    };
+  }
+}
+
+function encryptedCookieMiddleware(opts) {
+  const options = normalizeOptions(opts);
+  const secret = options.secret || options.key || options.keys;
+  if (!secret) throw new Error('Cookie encryption secret is required');
+  const encryptor = createEncryptor(secret, options);
+  return function(req, res, next) {
+    const cookies = parseCookies(req.headers && req.headers.cookie);
+    const decrypted = {};
+    Object.keys(cookies).forEach(function(name) {
+      const val = cookies[name];
+      const dec = decryptValue(val, encryptor);
+      if (dec !== undefined) decrypted[name] = dec;
+    });
+    req.cookies = decrypted;
+    patchResponse(res, encryptor);
+    next();
+  };
+}
+
+module.exports = encryptedCookieMiddleware;

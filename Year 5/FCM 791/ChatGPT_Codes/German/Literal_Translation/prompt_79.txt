@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import sys
+import os
+import hashlib
+import re
+
+HASH_LEN_ALGO = {32: 'md5', 40: 'sha1', 56: 'sha224', 64: 'sha256', 96: 'sha384', 128: 'sha512'}
+HASH_TOKEN_RE = re.compile(r'^([A-Za-z0-9_-]+)[:=]([0-9a-fA-F]{32}|[0-9a-fA-F]{40}|[0-9a-fA-F]{56}|[0-9a-fA-F]{64}|[0-9a-fA-F]{96}|[0-9a-fA-F]{128})$')
+
+def normalize_algo(name):
+    if not name:
+        return None
+    name = name.strip().lower().replace('-', '').replace('_', '')
+    alias = {
+        'md5': 'md5',
+        'sha1': 'sha1',
+        'sha224': 'sha224',
+        'sha256': 'sha256',
+        'sha384': 'sha384',
+        'sha512': 'sha512',
+        'blake2b': 'blake2b',
+        'blake2s': 'blake2s',
+        'ripemd160': 'ripemd160'
+    }
+    return alias.get(name, name)
+
+def looks_like_hash(token):
+    token = token.strip()
+    if not token:
+        return False
+    if HASH_TOKEN_RE.match(token):
+        return True
+    t = token
+    if t.lower().startswith('0x'):
+        t = t[2:]
+    if len(t) not in HASH_LEN_ALGO:
+        return False
+    try:
+        int(t, 16)
+        return True
+    except ValueError:
+        return False
+
+def parse_hash_token(token):
+    token = token.strip()
+    algo = None
+    h = token
+    m = HASH_TOKEN_RE.match(token)
+    if m:
+        algo = m.group(1)
+        h = m.group(2)
+    else:
+        if ':' in token:
+            prefix, rest = token.split(':', 1)
+            if rest and all(c in '0123456789abcdefABCDEF' for c in rest):
+                algo = prefix
+                h = rest
+        elif '=' in token:
+            prefix, rest = token.split('=', 1)
+            if rest and all(c in '0123456789abcdefABCDEF' for c in rest):
+                algo = prefix
+                h = rest
+    if h.lower().startswith('0x') and all(c in '0123456789abcdefABCDEF' for c in h[2:]):
+        h = h[2:]
+    return h, algo
+
+def parse_manifest_line(line):
+    if line and line[0] == '\ufeff':
+        line = line[1:]
+    line = line.strip()
+    if not line:
+        return None
+    if line.startswith('#') or line.startswith(';'):
+        return None
+    tokens = line.split()
+    if len(tokens) < 2:
+        return None
+    if looks_like_hash(tokens[0]):
+        hash_token = tokens[0]
+        path = ' '.join(tokens[1:])
+    elif looks_like_hash(tokens[-1]):
+        hash_token = tokens[-1]
+        path = ' '.join(tokens[:-1])
+    else:
+        hash_token = tokens[0]
+        path = ' '.join(tokens[1:])
+    path = path.strip()
+    if path.startswith('*'):
+        path = path.lstrip('*').strip()
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+        path = path[1:-1]
+    h, algo = parse_hash_token(hash_token)
+    return h.lower(), algo, path
+
+def get_algo(hexhash, algo_hint=None):
+    if algo_hint:
+        algo = normalize_algo(algo_hint)
+        try:
+            hashlib.new(algo)
+            return algo
+        except Exception:
+            pass
+    l = len(hexhash)
+    if l in HASH_LEN_ALGO:
+        algo = HASH_LEN_ALGO[l]
+        try:
+            hashlib.new(algo)
+            return algo
+        except Exception:
+            pass
+    return None
+
+def compute_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    if len(sys.argv) < 2:
+        sys.stderr.write("Usage: %s manifest [base_dir]\n" % os.path.basename(sys.argv[0]))
+        return 2
+    manifest = sys.argv[1]
+    base_dir = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(manifest))
+    total = ok = fail = missing = unknown = errors = 0
+    try:
+        with open(manifest, 'r', encoding='utf-8', errors='ignore') as f:
+            for line_num, line in enumerate(f, 1):
+                parsed = parse_manifest_line(line)
+                if not parsed:
+                    continue
+                expected_hash, algo_hint, rel_path = parsed
+                total += 1
+                path = rel_path
+                if not os.path.isabs(path):
+                    path = os.path.join(base_dir, path)
+                if not os.path.exists(path):
+                    print("MISSING %s" % rel_path)
+                    missing += 1
+                    continue
+                algo = get_algo(expected_hash, algo_hint)
+                if not algo:
+                    print("UNKNOWN_ALGO %s" % rel_path)
+                    unknown += 1
+                    continue
+                try:
+                    actual_hash = compute_hash(path, algo)
+                except Exception:
+                    print("ERROR %s" % rel_path)
+                    errors += 1
+                    continue
+                if actual_hash.lower() == expected_hash.lower():
+                    print("OK %s" % rel_path)
+                    ok += 1
+                else:
+                    print("FAIL %s" % rel_path)
+                    fail += 1
+    except FileNotFoundError:
+        sys.stderr.write("Manifest file not found: %s\n" % manifest)
+        return 2
+    except Exception as e:
+        sys.stderr.write("Error reading manifest: %s\n" % e)
+        return 2
+    if fail or missing or unknown or errors:
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

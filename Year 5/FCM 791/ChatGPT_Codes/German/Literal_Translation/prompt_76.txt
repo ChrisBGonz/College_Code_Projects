@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import shlex
+import time
+import logging
+import json
+import urllib.request
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(asctime)s %(levelname)s %(message)s")
+
+def run(cmd, input=None, check=True, capture=False):
+    if isinstance(cmd, str):
+        cmd = shlex.split(cmd)
+    log_cmd = " ".join(shlex.quote(c) for c in cmd)
+    logging.info("Running: %s", log_cmd)
+    kwargs = {"text": True}
+    if input is not None:
+        kwargs["input"] = input
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    result = subprocess.run(cmd, **kwargs)
+    if check and result.returncode != 0:
+        stdout = result.stdout.strip() if result.stdout else ""
+        stderr = result.stderr.strip() if result.stderr else ""
+        raise RuntimeError(f"Command failed ({result.returncode}): {log_cmd}\n{stdout}\n{stderr}")
+    return result
+
+def parse_csv(value):
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+def default_container_name(image):
+    name = image.split("/")[-1]
+    if ":" in name:
+        name = name.split(":")[0]
+    name = name.replace("_", "-")
+    return name
+
+def docker_login(registry, user, password):
+    if not user or not password:
+        return
+    cmd = ["docker", "login"]
+    if registry:
+        cmd.append(registry)
+    cmd += ["-u", user, "--password-stdin"]
+    run(cmd, input=password + "\n")
+
+def pull_image(image):
+    run(["docker", "pull", image])
+
+def container_exists(name):
+    res = run(["docker", "ps", "-a", "--filter", f"name=^{name}$", "--format", "{{.ID}}"], capture=True, check=False)
+    return bool(res.stdout.strip())
+
+def remove_container(name):
+    run(["docker", "rm", "-f", name])
+
+def parse_env_vars():
+    envs = []
+    for item in parse_csv(os.getenv("ENV_VARS", "")):
+        if "=" in item:
+            envs.append(item)
+        else:
+            logging.warning("Invalid ENV_VARS entry: %s", item)
+    json_env = os.getenv("ENV_VARS_JSON")
+    if json_env:
+        try:
+            data = json.loads(json_env)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    envs.append(f"{k}={v}")
+        except json.JSONDecodeError:
+            logging.warning("Invalid ENV_VARS_JSON")
+    return envs
+
+def build_run_args(image, name):
+    args = ["docker", "run", "-d", "--name", name]
+    restart = os.getenv("RESTART_POLICY", "unless-stopped")
+    if restart:
+        args += ["--restart", restart]
+    network = os.getenv("NETWORK")
+    if network:
+        args += ["--network", network]
+    for label in parse_csv(os.getenv("LABELS", "")):
+        args += ["--label", label]
+    for port in parse_csv(os.getenv("PORTS", "")):
+        args += ["-p", port]
+    for volume in parse_csv(os.getenv("VOLUMES", "")):
+        args += ["-v", volume]
+    for env_file in parse_csv(os.getenv("ENV_FILES", "")):
+        args += ["--env-file", env_file]
+    for env_var in parse_env_vars():
+        args += ["-e", env_var]
+    extra = os.getenv("EXTRA_RUN_ARGS", "")
+    if extra:
+        args += shlex.split(extra)
+    args.append(image)
+    cmd = os.getenv("CONTAINER_CMD", "")
+    if cmd:
+        args += shlex.split(cmd)
+    return args
+
+def get_container_health(name):
+    res = run(
+        ["docker", "inspect", "--format", "{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}", name],
+        capture=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        return None
+    return res.stdout.strip()
+
+def wait_for_container(name, timeout):
+    start = time.time()
+    last = None
+    while time.time() - start < timeout:
+        status = get_container_health(name)
+        if status in ("healthy", "running"):
+            return True
+        if status in ("exited", "dead", "removing"):
+            logging.error("Container state: %s", status)
+            return False
+        if status and status != last:
+            logging.info("Container state: %s", status)
+            last = status
+        time.sleep(2)
+    return False
+
+def wait_for_http(url, timeout):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    return False
+
+def execute_hook(env_var):
+    cmd = os.getenv(env_var)
+    if not cmd:
+        return
+    run(cmd)
+
+def main():
+    image = os.getenv("IMAGE")
+    if not image:
+        logging.error("IMAGE environment variable is required")
+        return 1
+    name = os.getenv("CONTAINER_NAME") or default_container_name(image)
+
+    execute_hook("PRE_DEPLOY_CMD")
+
+    registry = os.getenv("REGISTRY")
+    user = os.getenv("REGISTRY_USER") or os.getenv("DOCKER_USER")
+    password = os.getenv("REGISTRY_PASS") or os.getenv("DOCKER_PASS")
+    if user and password:
+        docker_login(registry, user, password)
+
+    pull_image(image)
+
+    if container_exists(name):
+        logging.info("Removing existing container: %s", name)
+        remove_container(name)
+
+    args = build_run_args(image, name)
+    res = run(args, capture=True)
+    container_id = res.stdout.strip()
+    logging.info("Started container: %s", container_id)
+
+    timeout = int(os.getenv("HEALTHCHECK_TIMEOUT", "60"))
+    health_url = os.getenv("HEALTHCHECK_URL")
+    wait_health = os.getenv("WAIT_FOR_HEALTH", "").lower() in ("1", "true", "yes", "on")
+    if health_url:
+        ok = wait_for_http(health_url, timeout)
+    elif wait_health:
+        ok = wait_for_container(name, timeout)
+    else:
+        ok = True
+
+    if not ok:
+        logging.error("Deployment failed health check")
+        return 1
+
+    execute_hook("POST_DEPLOY_CMD")
+    logging.info("Deployment completed successfully")
+    return 0
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        logging.error(str(e))
+        sys.exit(1)

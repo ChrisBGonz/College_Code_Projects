@@ -1,0 +1,113 @@
+import argparse
+import socket
+import struct
+import sys
+
+def xor_bytes(data, key):
+    if not key:
+        return data
+    klen = len(key)
+    return bytes(b ^ key[i % klen] for i, b in enumerate(data))
+
+def recvall(sock, n):
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError("Socket closed")
+        data += chunk
+    return data
+
+def send_length(sock, data, key):
+    enc = xor_bytes(data, key)
+    sock.sendall(struct.pack("!I", len(enc)) + enc)
+
+def recv_length(sock, key):
+    hdr = recvall(sock, 4)
+    length = struct.unpack("!I", hdr)[0]
+    enc = recvall(sock, length)
+    return xor_bytes(enc, key)
+
+def send_line(sock, data, key):
+    enc = xor_bytes(data, key)
+    sock.sendall(enc + b"\n")
+
+def recv_line(sock, key):
+    buf = bytearray()
+    while True:
+        ch = sock.recv(1)
+        if not ch:
+            raise ConnectionError("Socket closed")
+        if ch == b"\n":
+            break
+        buf.extend(ch)
+    return xor_bytes(bytes(buf), key)
+
+def parse_key(s):
+    if s.startswith("hex:"):
+        return bytes.fromhex(s[4:])
+    if s.startswith("0x"):
+        try:
+            return bytes.fromhex(s[2:])
+        except ValueError:
+            pass
+    return s.encode()
+
+def output_bytes(data):
+    sys.stdout.buffer.write(data)
+    if data and not data.endswith(b"\n"):
+        sys.stdout.buffer.write(b"\n")
+    sys.stdout.buffer.flush()
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("host")
+    parser.add_argument("port", type=int)
+    parser.add_argument("-k", "--key", required=True)
+    parser.add_argument("-m", "--message")
+    parser.add_argument("--hex-message", action="store_true")
+    parser.add_argument("--mode", choices=["length", "line"], default="length")
+    parser.add_argument("--timeout", type=float, default=10.0)
+    parser.add_argument("--no-response", action="store_true")
+    args = parser.parse_args()
+
+    key = parse_key(args.key)
+
+    msg = None
+    if args.message is not None:
+        msg = bytes.fromhex(args.message) if args.hex_message else args.message.encode()
+
+    sock = socket.create_connection((args.host, args.port), timeout=args.timeout)
+
+    send_fn = send_length if args.mode == "length" else send_line
+    recv_fn = recv_length if args.mode == "length" else recv_line
+
+    try:
+        if msg is not None:
+            send_fn(sock, msg, key)
+            if not args.no_response:
+                resp = recv_fn(sock, key)
+                output_bytes(resp)
+        else:
+            while True:
+                try:
+                    line = input("> ")
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not line:
+                    continue
+                if line.lower() in ("exit", "quit"):
+                    break
+                send_fn(sock, line.encode(), key)
+                if args.no_response:
+                    continue
+                try:
+                    resp = recv_fn(sock, key)
+                except ConnectionError:
+                    break
+                output_bytes(resp)
+    finally:
+        sock.close()
+
+if __name__ == "__main__":
+    main()

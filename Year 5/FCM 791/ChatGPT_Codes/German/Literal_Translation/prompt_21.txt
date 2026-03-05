@@ -1,0 +1,182 @@
+import argparse
+import json
+import time
+import uuid
+import sys
+import urllib.request
+
+import jwt
+from jwt import InvalidTokenError
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import serialization
+
+def load_jwks_from_url(url):
+    with urllib.request.urlopen(url) as response:
+        return json.load(response)
+
+def load_jwks_from_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def generate_demo_keys(kid="demo-key"):
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption()
+    )
+    public_key = private_key.public_key()
+    jwk = json.loads(jwt.algorithms.RSAAlgorithm.to_jwk(public_key))
+    jwk["kid"] = kid
+    jwk["use"] = "sig"
+    jwk["alg"] = "RS256"
+    jwks = {"keys": [jwk]}
+    return private_pem, jwks
+
+def create_token(private_key, issuer, audience, subject, scopes=None, roles=None, ttl=3600, kid="demo-key"):
+    now = int(time.time())
+    payload = {
+        "iss": issuer,
+        "aud": audience,
+        "sub": subject,
+        "iat": now,
+        "nbf": now - 5,
+        "exp": now + ttl,
+        "jti": uuid.uuid4().hex,
+        "scope": " ".join(scopes or []),
+        "roles": roles or []
+    }
+    headers = {"kid": kid, "typ": "JWT"}
+    token = jwt.encode(payload, private_key, algorithm="RS256", headers=headers)
+    return token
+
+class JWTAuthenticator:
+    def __init__(self, issuer, audience, jwks, allowed_algs=None, leeway=30):
+        self.issuer = issuer
+        self.audience = audience
+        self.jwks = jwks or {"keys": []}
+        self.allowed_algs = allowed_algs or ["RS256"]
+        self.leeway = leeway
+        self._key_cache = {}
+        self._kid_map = {k.get("kid"): k for k in self.jwks.get("keys", []) if k.get("kid")}
+
+    def _normalize_to_set(self, value):
+        if value is None:
+            return set()
+        if isinstance(value, str):
+            return set(value.split())
+        if isinstance(value, (list, tuple, set)):
+            return set(value)
+        return set()
+
+    def _get_scopes(self, payload):
+        return self._normalize_to_set(payload.get("scope") or payload.get("scp") or payload.get("scopes"))
+
+    def _get_roles(self, payload):
+        return self._normalize_to_set(payload.get("roles") or payload.get("role"))
+
+    def _get_key(self, kid):
+        if not kid:
+            if len(self._kid_map) == 1:
+                kid = next(iter(self._kid_map))
+            else:
+                raise InvalidTokenError("Token header missing 'kid'")
+        if kid in self._key_cache:
+            return self._key_cache[kid]
+        jwk = self._kid_map.get(kid)
+        if not jwk:
+            raise InvalidTokenError("Unknown key id")
+        kty = jwk.get("kty")
+        if kty == "RSA":
+            key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
+        elif kty == "EC":
+            key = jwt.algorithms.ECAlgorithm.from_jwk(json.dumps(jwk))
+        elif kty == "oct":
+            key = jwt.utils.base64url_decode(jwk.get("k", ""))
+        else:
+            raise InvalidTokenError("Unsupported key type")
+        self._key_cache[kid] = key
+        return key
+
+    def _validate_scopes(self, payload, required_scopes):
+        if required_scopes:
+            scopes = self._get_scopes(payload)
+            missing = [s for s in required_scopes if s not in scopes]
+            if missing:
+                raise InvalidTokenError("Missing scope(s): " + ", ".join(missing))
+
+    def _validate_roles(self, payload, required_roles):
+        if required_roles:
+            roles = self._get_roles(payload)
+            missing = [r for r in required_roles if r not in roles]
+            if missing:
+                raise InvalidTokenError("Missing role(s): " + ", ".join(missing))
+
+    def authenticate(self, token, required_scopes=None, required_roles=None):
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg")
+        if alg not in self.allowed_algs:
+            raise InvalidTokenError("Disallowed algorithm")
+        key = self._get_key(header.get("kid"))
+        options = {"require": ["exp", "iat", "iss", "aud", "sub"]}
+        payload = jwt.decode(
+            token,
+            key=key,
+            algorithms=self.allowed_algs,
+            audience=self.audience,
+            issuer=self.issuer,
+            leeway=self.leeway,
+            options=options
+        )
+        self._validate_scopes(payload, required_scopes)
+        self._validate_roles(payload, required_roles)
+        return payload
+
+    def decode(self, token, verify_signature=False):
+        if not verify_signature:
+            return jwt.decode(token, options={"verify_signature": False})
+        return self.authenticate(token)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token", help="JWT to verify")
+    parser.add_argument("--jwks", help="Path to JWKS file")
+    parser.add_argument("--jwks-url", help="URL to JWKS endpoint")
+    parser.add_argument("--issuer", default="https://issuer.example")
+    parser.add_argument("--audience", default="example-audience")
+    parser.add_argument("--scope", action="append", help="Required scope (repeatable)")
+    parser.add_argument("--role", action="append", help="Required role (repeatable)")
+    parser.add_argument("--decode-only", action="store_true", help="Decode without signature verification")
+    args = parser.parse_args()
+
+    if args.token:
+        if args.jwks_url:
+            jwks = load_jwks_from_url(args.jwks_url)
+        elif args.jwks:
+            jwks = load_jwks_from_file(args.jwks)
+        else:
+            sys.stderr.write("JWKS source required\n")
+            sys.exit(1)
+        auth = JWTAuthenticator(args.issuer, args.audience, jwks)
+        try:
+            if args.decode_only:
+                payload = auth.decode(args.token, verify_signature=False)
+            else:
+                payload = auth.authenticate(args.token, required_scopes=args.scope, required_roles=args.role)
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        except InvalidTokenError as e:
+            sys.stderr.write("Invalid token: " + str(e) + "\n")
+            sys.exit(1)
+    else:
+        private_key, jwks = generate_demo_keys()
+        scopes = args.scope or ["read", "write"]
+        roles = args.role or ["user", "admin"]
+        token = create_token(private_key, args.issuer, args.audience, "user123", scopes=scopes, roles=roles)
+        auth = JWTAuthenticator(args.issuer, args.audience, jwks)
+        payload = auth.authenticate(token, required_scopes=scopes, required_roles=roles)
+        print(token)
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        print(json.dumps(auth.decode(token, verify_signature=False), indent=2, sort_keys=True))
+
+if __name__ == "__main__":
+    main()
