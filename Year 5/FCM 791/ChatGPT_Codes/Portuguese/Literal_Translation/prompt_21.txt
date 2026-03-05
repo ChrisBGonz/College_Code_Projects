@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+import os
+import sys
+import time
+import json
+import argparse
+import urllib.request
+from typing import Any, Dict, Optional, List
+
+from jose import jwt, jwe
+
+class JWKSClient:
+    def __init__(self, url: str, cache_ttl: int = 300, timeout: int = 5):
+        self.url = url
+        self.cache_ttl = cache_ttl
+        self.timeout = timeout
+        self._keys: Dict[str, Dict[str, Any]] = {}
+        self._last_fetch = 0.0
+
+    def _fetch(self) -> None:
+        try:
+            req = urllib.request.Request(self.url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = resp.read()
+        except Exception as e:
+            raise ConnectionError("Falha ao obter JWKS: " + str(e))
+        try:
+            jwks = json.loads(data.decode("utf-8"))
+        except Exception as e:
+            raise ValueError("JWKS inválido: " + str(e))
+        keys: Dict[str, Dict[str, Any]] = {}
+        for k in jwks.get("keys", []):
+            kid = k.get("kid")
+            if kid:
+                keys[kid] = k
+        self._keys = keys
+        self._last_fetch = time.time()
+
+    def get_key(self, kid: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not self._keys or (time.time() - self._last_fetch) > self.cache_ttl or (kid and kid not in self._keys):
+            self._fetch()
+        if kid and kid in self._keys:
+            return self._keys[kid]
+        if len(self._keys) == 1:
+            return next(iter(self._keys.values()))
+        return None
+
+class JWTAuthenticator:
+    def __init__(self,
+                 audience: Optional[str] = None,
+                 issuer: Optional[str] = None,
+                 algorithms: Optional[List[str]] = None,
+                 jwks_url: Optional[str] = None,
+                 secret: Optional[str] = None,
+                 jwe_key: Optional[str] = None,
+                 leeway: int = 0,
+                 required_claims: Optional[List[str]] = None,
+                 cache_ttl: int = 300):
+        self.audience = audience
+        self.issuer = issuer
+        self.algorithms = algorithms or ["RS256", "HS256"]
+        self.secret = secret
+        self.jwe_key = jwe_key
+        self.leeway = leeway
+        self.required_claims = required_claims or []
+        self.jwks_client = JWKSClient(jwks_url, cache_ttl=cache_ttl) if jwks_url else None
+
+    def _resolve_key(self, token: str) -> Any:
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg")
+        if not alg:
+            raise ValueError("Algoritmo ausente no header")
+        if alg.lower() == "none":
+            raise ValueError("Algoritmo 'none' não é permitido")
+        if alg.startswith("HS"):
+            if not self.secret:
+                raise ValueError("Segredo HMAC não fornecido")
+            return self.secret
+        kid = header.get("kid")
+        if self.jwks_client:
+            key = self.jwks_client.get_key(kid)
+            if not key:
+                raise ValueError("Chave pública não encontrada no JWKS")
+            return key
+        if self.secret:
+            return self.secret
+        raise ValueError("Nenhuma chave disponível para verificação")
+
+    def _decrypt_if_jwe(self, token: str) -> str:
+        if token.count(".") == 4:
+            if not self.jwe_key:
+                raise ValueError("Token JWE detectado e chave não fornecida")
+            try:
+                decrypted = jwe.decrypt(token, self.jwe_key)
+            except Exception as e:
+                raise ValueError("Falha ao decriptar JWE: " + str(e))
+            if isinstance(decrypted, bytes):
+                decrypted = decrypted.decode("utf-8")
+            return decrypted
+        return token
+
+    def _expand_nested_claims(self, data: Any, depth: int) -> Any:
+        if isinstance(data, dict):
+            return {k: self._expand_nested_claims(v, depth) for k, v in data.items()}
+        if isinstance(data, list):
+            return [self._expand_nested_claims(v, depth) for v in data]
+        if depth > 0 and isinstance(data, str) and data.count(".") == 2:
+            try:
+                nested_claims = jwt.get_unverified_claims(data)
+                return {
+                    "_jwt": data,
+                    "claims": self._expand_nested_claims(nested_claims, depth - 1)
+                }
+            except Exception:
+                return data
+        return data
+
+    def decode(self, token: str, verify: bool = True, expand_nested: bool = True, max_depth: int = 2) -> Dict[str, Any]:
+        if isinstance(token, bytes):
+            token = token.decode("utf-8")
+        token = self._decrypt_if_jwe(token)
+        if verify:
+            key = self._resolve_key(token)
+            options = {
+                "verify_aud": self.audience is not None,
+                "verify_iss": self.issuer is not None,
+                "verify_signature": True
+            }
+            if self.required_claims:
+                options["require"] = self.required_claims
+            claims = jwt.decode(
+                token,
+                key,
+                algorithms=self.algorithms,
+                audience=self.audience,
+                issuer=self.issuer,
+                options=options,
+                leeway=self.leeway
+            )
+        else:
+            claims = jwt.get_unverified_claims(token)
+        if expand_nested:
+            claims = self._expand_nested_claims(claims, max_depth)
+        return claims
+
+    def _normalize_scopes(self, claims: Dict[str, Any]) -> set:
+        scope = claims.get("scope") or claims.get("scp") or claims.get("scopes")
+        if scope is None:
+            return set()
+        if isinstance(scope, str):
+            return set([s for s in scope.replace(",", " ").split() if s])
+        if isinstance(scope, list):
+            return set([str(s) for s in scope if s])
+        return set()
+
+    def authenticate(self, token: str, required_scopes: Optional[List[str]] = None,
+                     expand_nested: bool = True, max_depth: int = 2) -> Dict[str, Any]:
+        claims = self.decode(token, verify=True, expand_nested=expand_nested, max_depth=max_depth)
+        if required_scopes:
+            token_scopes = self._normalize_scopes(claims)
+            missing = [s for s in required_scopes if s not in token_scopes]
+            if missing:
+                raise PermissionError("Escopos ausentes: " + ", ".join(missing))
+        return claims
+
+def extract_token(value: str) -> str:
+    if not value:
+        return value
+    value = value.strip()
+    if value.lower().startswith("bearer "):
+        return value.split(None, 1)[1].strip()
+    return value
+
+def parse_list(value: Optional[str]) -> Optional[List[str]]:
+    if value is None:
+        return None
+    parts = [p for p in value.replace(",", " ").split() if p]
+    return parts if parts else None
+
+def load_token(args: argparse.Namespace) -> str:
+    token = args.token or os.environ.get("JWT_TOKEN")
+    if not token:
+        data = sys.stdin.read().strip()
+        if data:
+            token = data
+    if not token:
+        raise SystemExit("Token não informado")
+    return extract_token(token)
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token")
+    parser.add_argument("--audience")
+    parser.add_argument("--issuer")
+    parser.add_argument("--jwks-url")
+    parser.add_argument("--secret")
+    parser.add_argument("--jwe-key")
+    parser.add_argument("--algorithms")
+    parser.add_argument("--scopes")
+    parser.add_argument("--required-claims")
+    parser.add_argument("--leeway", type=int, default=0)
+    parser.add_argument("--cache-ttl", type=int, default=300)
+    parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--no-expand", action="store_true")
+    parser.add_argument("--max-depth", type=int, default=2)
+    args = parser.parse_args()
+
+    token = load_token(args)
+    audience = args.audience or os.environ.get("JWT_AUD")
+    issuer = args.issuer or os.environ.get("JWT_ISS")
+    jwks_url = args.jwks_url or os.environ.get("JWKS_URL")
+    secret = args.secret or os.environ.get("JWT_SECRET")
+    jwe_key = args.jwe_key or os.environ.get("JWE_KEY")
+    algorithms = parse_list(args.algorithms or os.environ.get("JWT_ALGORITHMS"))
+    required_scopes = parse_list(args.scopes or os.environ.get("JWT_SCOPES"))
+    required_claims = parse_list(args.required_claims or os.environ.get("JWT_REQUIRED_CLAIMS"))
+
+    auth = JWTAuthenticator(
+        audience=audience,
+        issuer=issuer,
+        algorithms=algorithms,
+        jwks_url=jwks_url,
+        secret=secret,
+        jwe_key=jwe_key,
+        leeway=args.leeway,
+        required_claims=required_claims,
+        cache_ttl=args.cache_ttl
+    )
+
+    try:
+        if args.no_verify:
+            claims = auth.decode(token, verify=False, expand_nested=not args.no_expand, max_depth=args.max_depth)
+        else:
+            claims = auth.authenticate(token, required_scopes=required_scopes,
+                                       expand_nested=not args.no_expand, max_depth=args.max_depth)
+        json.dump(claims, sys.stdout, indent=2, sort_keys=True, ensure_ascii=False)
+        sys.stdout.write("\n")
+    except Exception as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
