@@ -1,0 +1,210 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  echo "Usage: $0 <url> [tool-name]" >&2
+  exit 1
+}
+
+URL=""
+TOOL_NAME=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -u|--url)
+      [[ $# -lt 2 ]] && usage
+      URL=$2
+      shift 2
+      ;;
+    -n|--name)
+      [[ $# -lt 2 ]] && usage
+      TOOL_NAME=$2
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      if [[ -z "$URL" ]]; then
+        URL=$1
+      elif [[ -z "$TOOL_NAME" ]]; then
+        TOOL_NAME=$1
+      else
+        echo "Unexpected argument: $1" >&2
+        usage
+      fi
+      shift
+      ;;
+  esac
+done
+
+[[ -z "$URL" ]] && usage
+
+INSTALL_DIR=${INSTALL_DIR:-/usr/local/bin}
+
+if ! command -v curl >/dev/null 2>&1; then
+  echo "curl is required" >&2
+  exit 1
+fi
+
+SUDO=""
+if [[ $EUID -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    SUDO="sudo"
+  else
+    echo "Root privileges required." >&2
+    exit 1
+  fi
+fi
+
+if [[ ! -d "$INSTALL_DIR" ]]; then
+  $SUDO mkdir -p "$INSTALL_DIR"
+fi
+
+tmp=$(mktemp -d)
+cleanup() { rm -rf "$tmp"; }
+trap cleanup EXIT
+
+archive="$tmp/download"
+final_url=$(curl -fL -sS -o "$archive" -w '%{url_effective}' "$URL")
+if [[ -z "$final_url" ]]; then
+  final_url="$URL"
+fi
+
+filename=$(basename "${final_url%%\?*}")
+filename=${filename%%\#*}
+if [[ -z "$filename" || "$filename" == "/" ]]; then
+  filename="download"
+fi
+
+detect_type() {
+  local file=$1
+  local name=$2
+  case "$name" in
+    *.tar.gz|*.tgz) echo "targz"; return;;
+    *.tar.bz2|*.tbz2) echo "tarbz2"; return;;
+    *.tar.xz|*.txz) echo "tarxz"; return;;
+    *.tar) echo "tar"; return;;
+    *.zip) echo "zip"; return;;
+    *.deb) echo "deb"; return;;
+    *.rpm) echo "rpm"; return;;
+  esac
+  if command -v file >/dev/null 2>&1; then
+    local mime
+    mime=$(file -b --mime-type "$file" 2>/dev/null || true)
+    case "$mime" in
+      application/zip) echo "zip"; return;;
+      application/x-gzip|application/gzip) echo "targz"; return;;
+      application/x-bzip2) echo "tarbz2"; return;;
+      application/x-xz) echo "tarxz"; return;;
+      application/x-tar) echo "tar"; return;;
+      application/vnd.debian.binary-package) echo "deb"; return;;
+      application/x-rpm) echo "rpm"; return;;
+    esac
+  fi
+  if command -v tar >/dev/null 2>&1; then
+    if tar -tf "$file" >/dev/null 2>&1; then
+      echo "tar"
+      return
+    fi
+  fi
+  echo "binary"
+}
+
+install_from_dir() {
+  local dir=$1
+  local target_name=$2
+
+  local nullglob_state
+  nullglob_state=$(shopt -p nullglob)
+  shopt -s nullglob
+  local entries=("$dir"/*)
+  eval "$nullglob_state"
+
+  if [[ ${#entries[@]} -eq 1 && -d "${entries[0]}" ]]; then
+    dir="${entries[0]}"
+  fi
+
+  if [[ -z "$target_name" ]]; then
+    target_name=$(basename "$dir")
+    target_name=${target_name%%-*}
+  fi
+
+  if [[ -f "$dir/install.sh" ]]; then
+    $SUDO bash "$dir/install.sh"
+    return
+  fi
+
+  if [[ -f "$dir/Makefile" ]]; then
+    (cd "$dir" && make && $SUDO make install)
+    return
+  fi
+
+  local bin=""
+  if [[ -n "$target_name" ]]; then
+    bin=$(find "$dir" -maxdepth 2 -type f -name "$target_name" -perm -u+x 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -z "$bin" ]]; then
+    bin=$(find "$dir" -maxdepth 2 -type f -perm -u+x 2>/dev/null | head -n1 || true)
+  fi
+
+  if [[ -z "$bin" ]]; then
+    echo "No executable found to install." >&2
+    exit 1
+  fi
+
+  $SUDO install -m 755 "$bin" "$INSTALL_DIR/$(basename "$bin")"
+}
+
+type=$(detect_type "$archive" "$filename")
+
+case "$type" in
+  deb)
+    if ! command -v dpkg >/dev/null 2>&1; then
+      echo "dpkg not found." >&2
+      exit 1
+    fi
+    $SUDO dpkg -i "$archive"
+    ;;
+  rpm)
+    if ! command -v rpm >/dev/null 2>&1; then
+      echo "rpm not found." >&2
+      exit 1
+    fi
+    $SUDO rpm -Uvh "$archive"
+    ;;
+  zip)
+    if ! command -v unzip >/dev/null 2>&1; then
+      echo "unzip not found." >&2
+      exit 1
+    fi
+    mkdir -p "$tmp/extract"
+    unzip -q "$archive" -d "$tmp/extract"
+    install_from_dir "$tmp/extract" "$TOOL_NAME"
+    ;;
+  tar|targz|tarbz2|tarxz)
+    if ! command -v tar >/dev/null 2>&1; then
+      echo "tar not found." >&2
+      exit 1
+    fi
+    mkdir -p "$tmp/extract"
+    tar -xf "$archive" -C "$tmp/extract"
+    install_from_dir "$tmp/extract" "$TOOL_NAME"
+    ;;
+  binary)
+    if [[ -z "$TOOL_NAME" ]]; then
+      TOOL_NAME=$(basename "$filename")
+      TOOL_NAME=${TOOL_NAME%%.*}
+    fi
+    chmod +x "$archive"
+    $SUDO install -m 755 "$archive" "$INSTALL_DIR/$TOOL_NAME"
+    ;;
+  *)
+    echo "Unknown file type." >&2
+    exit 1
+    ;;
+esac

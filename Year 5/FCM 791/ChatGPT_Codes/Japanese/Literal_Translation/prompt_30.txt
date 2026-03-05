@@ -1,0 +1,108 @@
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <setjmp.h>
+#include <jpeglib.h>
+
+struct my_error_mgr {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void my_error_exit(j_common_ptr cinfo) {
+    my_error_mgr* myerr = (my_error_mgr*)cinfo->err;
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+bool process_jpeg(const char* input_path, const char* output_path, int quality = 90) {
+    FILE* infile = std::fopen(input_path, "rb");
+    if (!infile) return false;
+
+    jpeg_decompress_struct cinfo;
+    my_error_mgr jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(infile);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, infile);
+    jpeg_read_header(&cinfo, TRUE);
+    cinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&cinfo);
+
+    size_t width = cinfo.output_width;
+    size_t height = cinfo.output_height;
+    size_t row_stride = width * cinfo.output_components;
+
+    std::vector<unsigned char> rgb(width * height * cinfo.output_components);
+    JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+
+    size_t row = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, buffer, 1);
+        std::memcpy(&rgb[row * row_stride], buffer[0], row_stride);
+        row++;
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    std::fclose(infile);
+
+    std::vector<unsigned char> gray(width * height);
+    for (size_t i = 0; i < width * height; ++i) {
+        unsigned char r = rgb[3 * i];
+        unsigned char g = rgb[3 * i + 1];
+        unsigned char b = rgb[3 * i + 2];
+        gray[i] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+    }
+
+    FILE* outfile = std::fopen(output_path, "wb");
+    if (!outfile) return false;
+
+    jpeg_compress_struct cinfo_out;
+    my_error_mgr jerr_out;
+    cinfo_out.err = jpeg_std_error(&jerr_out.pub);
+    jerr_out.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr_out.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo_out);
+        std::fclose(outfile);
+        return false;
+    }
+
+    jpeg_create_compress(&cinfo_out);
+    jpeg_stdio_dest(&cinfo_out, outfile);
+
+    cinfo_out.image_width = static_cast<JDIMENSION>(width);
+    cinfo_out.image_height = static_cast<JDIMENSION>(height);
+    cinfo_out.input_components = 1;
+    cinfo_out.in_color_space = JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo_out);
+    jpeg_set_quality(&cinfo_out, quality, TRUE);
+    jpeg_start_compress(&cinfo_out, TRUE);
+
+    JSAMPROW row_pointer[1];
+    while (cinfo_out.next_scanline < cinfo_out.image_height) {
+        row_pointer[0] = &gray[cinfo_out.next_scanline * width];
+        jpeg_write_scanlines(&cinfo_out, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo_out);
+    jpeg_destroy_compress(&cinfo_out);
+    std::fclose(outfile);
+
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) return 1;
+    return process_jpeg(argv[1], argv[2]) ? 0 : 1;
+}

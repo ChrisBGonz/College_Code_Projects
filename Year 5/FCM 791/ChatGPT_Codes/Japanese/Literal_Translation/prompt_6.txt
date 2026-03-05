@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+import argparse
+import sqlite3
+import os
+import sys
+import getpass
+import hashlib
+import secrets
+import datetime
+import json
+import base64
+from urllib.parse import parse_qs
+from wsgiref.simple_server import make_server
+
+DEFAULT_DB = os.environ.get("SAAS_DB", "saas.db")
+PWD_ITERATIONS = 150000
+DB_PATH = DEFAULT_DB
+
+def utc_now():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+def connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+def init_db():
+    conn = connect()
+    conn.executescript("""
+    CREATE TABLE IF NOT EXISTS companies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        company_id INTEGER NOT NULL,
+        is_admin INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS annual_reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_id INTEGER NOT NULL,
+        year INTEGER NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+        UNIQUE(company_id, year)
+    );
+    """)
+    conn.commit()
+    conn.close()
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PWD_ITERATIONS)
+    return f"{salt}${dk.hex()}"
+
+def verify_password(password, stored):
+    if "$" not in stored:
+        return False
+    salt, hashed = stored.split("$", 1)
+    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PWD_ITERATIONS)
+    return secrets.compare_digest(dk.hex(), hashed)
+
+def company_exists(company_id):
+    conn = connect()
+    try:
+        cur = conn.execute("SELECT 1 FROM companies WHERE id=?", (company_id,))
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+def add_company(name):
+    conn = connect()
+    try:
+        cur = conn.execute("INSERT INTO companies (name, created_at) VALUES (?,?)", (name, utc_now()))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+def get_company(company_id):
+    conn = connect()
+    try:
+        cur = conn.execute("SELECT * FROM companies WHERE id=?", (company_id,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+def get_user(username):
+    conn = connect()
+    try:
+        cur = conn.execute("SELECT * FROM users WHERE username=?", (username,))
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+def add_user(username, password, company_id, is_admin=False):
+    if not company_exists(company_id):
+        raise ValueError("Company not found")
+    conn = connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, company_id, is_admin, created_at) VALUES (?,?,?,?,?)",
+            (username, hash_password(password), company_id, int(is_admin), utc_now())
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+def authenticate_user(username, password):
+    user = get_user(username)
+    if user is None:
+        return None
+    if verify_password(password, user["password_hash"]):
+        return user
+    return None
+
+def add_report(company_id, year, content, update=False):
+    if not company_exists(company_id):
+        raise ValueError("Company not found")
+    conn = connect()
+    try:
+        cur = conn.execute("SELECT id FROM annual_reports WHERE company_id=? AND year=?", (company_id, year))
+        row = cur.fetchone()
+        if row:
+            if not update:
+                raise ValueError("Report for this year already exists")
+            conn.execute("UPDATE annual_reports SET content=?, created_at=? WHERE id=?", (content, utc_now(), row["id"]))
+            report_id = row["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO annual_reports (company_id, year, content, created_at) VALUES (?,?,?,?)",
+                (company_id, year, content, utc_now())
+            )
+            report_id = cur.lastrowid
+        conn.commit()
+        return report_id
+    finally:
+        conn.close()
+
+def get_report(company_id, year=None):
+    conn = connect()
+    try:
+        if year is None:
+            cur = conn.execute(
+                "SELECT * FROM annual_reports WHERE company_id=? ORDER BY year DESC LIMIT 1",
+                (company_id,)
+            )
+        else:
+            cur = conn.execute(
+                "SELECT * FROM annual_reports WHERE company_id=? AND year=?",
+                (company_id, year)
+            )
+        return cur.fetchone()
+    finally:
+        conn.close()
+
+def list_companies():
+    conn = connect()
+    try:
+        return conn.execute("SELECT id, name, created_at FROM companies ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+def list_users(company_id=None):
+    conn = connect()
+    try:
+        if company_id is None:
+            return conn.execute(
+                "SELECT id, username, company_id, is_admin, created_at FROM users ORDER BY id"
+            ).fetchall()
+        return conn.execute(
+            "SELECT id, username, company_id, is_admin, created_at FROM users WHERE company_id=? ORDER BY id",
+            (company_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+def list_reports(company_id=None):
+    conn = connect()
+    try:
+        if company_id is None:
+            return conn.execute(
+                "SELECT id, company_id, year, created_at FROM annual_reports ORDER BY company_id, year"
+            ).fetchall()
+        return conn.execute(
+            "SELECT id, company_id, year, created_at FROM annual_reports WHERE company_id=? ORDER BY year",
+            (company_id,)
+        ).fetchall()
+    finally:
+        conn.close()
+
+def read_password(pw_arg, prompt="Password: "):
+    if pw_arg:
+        return pw_arg
+    return getpass.getpass(prompt)
+
+def read_content(content_arg, file_arg):
+    if content_arg is not None:
+        return content_arg
+    if file_arg:
+        with open(file_arg, "r", encoding="utf-8") as f:
+            return f.read()
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise ValueError("Content is required")
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+def parse_basic_auth(environ):
+    auth = environ.get("HTTP_AUTHORIZATION")
+    if not auth or not auth.startswith("Basic "):
+        return None
+    try:
+        encoded = auth.split(" ", 1)[1]
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        username, password = decoded.split(":", 1)
+        return username, password
+    except Exception:
+        return None
+
+def respond(start_response, status, body, headers=None):
+    if headers is None:
+        headers = []
+    if isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = body
+    headers = headers + [("Content-Length", str(len(body_bytes)))]
+    start_response(status, headers)
+    return [body_bytes]
+
+def wsgi_app(environ, start_response):
+    path = environ.get("PATH_INFO", "/")
+    method = environ.get("REQUEST_METHOD", "GET").upper()
+    if path == "/report" and method == "GET":
+        auth = parse_basic_auth(environ)
+        if auth is None:
+            start_response("401 Unauthorized", [("WWW-Authenticate", 'Basic realm="AnnualReport"')])
+            return [b""]
+        username, password = auth
+        user = authenticate_user(username, password)
+        if user is None:
+            return respond(start_response, "403 Forbidden", "Forbidden", [("Content-Type", "text/plain; charset=utf-8")])
+        params = parse_qs(environ.get("QUERY_STRING", ""))
+        company_id = params.get("company_id", [None])[0]
+        if company_id is None:
+            return respond(start_response, "400 Bad Request", "company_id is required", [("Content-Type", "text/plain; charset=utf-8")])
+        try:
+            company_id_int = int(company_id)
+        except ValueError:
+            return respond(start_response, "400 Bad Request", "invalid company_id", [("Content-Type", "text/plain; charset=utf-8")])
+        if user["company_id"] != company_id_int and not user["is_admin"]:
+            return respond(start_response, "403 Forbidden", "access denied", [("Content-Type", "text/plain; charset=utf-8")])
+        year_param = params.get("year", [None])[0]
+        year = None
+        if year_param:
+            try:
+                year = int(year_param)
+            except ValueError:
+                return respond(start_response, "400 Bad Request", "invalid year", [("Content-Type", "text/plain; charset=utf-8")])
+        report = get_report(company_id_int, year)
+        if report is None:
+            return respond(start_response, "404 Not Found", "report not found", [("Content-Type", "text/plain; charset=utf-8")])
+        data = {"company_id": company_id_int, "year": report["year"], "content": report["content"]}
+        body = json.dumps(data, ensure_ascii=False)
+        return respond(start_response, "200 OK", body, [("Content-Type", "application/json; charset=utf-8")])
+    elif path == "/health":
+        return respond(start_response, "200 OK", "OK", [("Content-Type", "text/plain; charset=utf-8")])
+    else:
+        return respond(start_response, "404 Not Found", "Not Found", [("Content-Type", "text/plain; charset=utf-8")])
+
+def serve(host, port):
+    init_db()
+    with make_server(host, port, wsgi_app) as httpd:
+        print(f"Serving on {host}:{port}")
+        httpd.serve_forever()
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Multi-tenant SaaS Annual Report Manager")
+    parser.add_argument("--db", dest="db_path", default=DEFAULT_DB)
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("init-db")
+    p = sub.add_parser("add-company")
+    p.add_argument("name")
+    p = sub.add_parser("add-user")
+    p.add_argument("username")
+    p.add_argument("--password")
+    p.add_argument("--company-id", type=int, required=True)
+    p.add_argument("--admin", action="store_true")
+    p = sub.add_parser("add-report")
+    p.add_argument("--company-id", type=int, required=True)
+    p.add_argument("--year", type=int, required=True)
+    p.add_argument("--content")
+    p.add_argument("--file")
+    p.add_argument("--update", action="store_true")
+    p = sub.add_parser("view-report")
+    p.add_argument("--username", required=True)
+    p.add_argument("--password")
+    p.add_argument("--company-id", type=int, required=True)
+    p.add_argument("--year", type=int)
+    p.add_argument("--output")
+    sub.add_parser("list-companies")
+    p = sub.add_parser("list-users")
+    p.add_argument("--company-id", type=int)
+    p = sub.add_parser("list-reports")
+    p.add_argument("--company-id", type=int)
+    p = sub.add_parser("serve")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8000)
+    return parser
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not args.command:
+        parser.print_help()
+        return 1
+    global DB_PATH
+    DB_PATH = args.db_path
+    if args.command == "init-db":
+        init_db()
+        return 0
+    if args.command == "serve":
+        serve(args.host, args.port)
+        return 0
+    init_db()
+    try:
+        if args.command == "add-company":
+            cid = add_company(args.name)
+            print(cid)
+        elif args.command == "add-user":
+            password = read_password(args.password)
+            uid = add_user(args.username, password, args.company_id, args.admin)
+            print(uid)
+        elif args.command == "add-report":
+            content = read_content(args.content, args.file)
+            rid = add_report(args.company_id, args.year, content, args.update)
+            print(rid)
+        elif args.command == "view-report":
+            password = read_password(args.password)
+            user = authenticate_user(args.username, password)
+            if user is None:
+                eprint("Authentication failed")
+                return 1
+            if user["company_id"] != args.company_id and not user["is_admin"]:
+                eprint("Access denied")
+                return 1
+            report = get_report(args.company_id, args.year)
+            if report is None:
+                eprint("Report not found")
+                return 1
+            content = report["content"]
+            if args.output:
+                with open(args.output, "w", encoding="utf-8") as f:
+                    f.write(content)
+            else:
+                sys.stdout.write(content)
+                if not content.endswith("\n"):
+                    sys.stdout.write("\n")
+        elif args.command == "list-companies":
+            rows = list_companies()
+            for r in rows:
+                print(f"{r['id']}\t{r['name']}\t{r['created_at']}")
+        elif args.command == "list-users":
+            rows = list_users(args.company_id)
+            for r in rows:
+                print(f"{r['id']}\t{r['username']}\t{r['company_id']}\t{r['is_admin']}\t{r['created_at']}")
+        elif args.command == "list-reports":
+            rows = list_reports(args.company_id)
+            for r in rows:
+                print(f"{r['id']}\t{r['company_id']}\t{r['year']}\t{r['created_at']}")
+        else:
+            eprint("Unknown command")
+            return 1
+    except sqlite3.IntegrityError as e:
+        eprint("Database error:", e)
+        return 1
+    except Exception as e:
+        eprint(str(e))
+        return 1
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())

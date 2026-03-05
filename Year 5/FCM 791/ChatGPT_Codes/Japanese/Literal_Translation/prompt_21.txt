@@ -1,0 +1,307 @@
+import argparse
+import base64
+import json
+import sys
+import time
+import threading
+import requests
+import jwt
+from jwt import InvalidTokenError
+from jwt.algorithms import RSAAlgorithm, ECAlgorithm
+try:
+    from jwt.algorithms import OKPAlgorithm
+except ImportError:
+    OKPAlgorithm = None
+
+HMAC_ALGS = {"HS256", "HS384", "HS512"}
+
+def b64url_decode(data):
+    if isinstance(data, bytes):
+        data = data.decode("utf-8")
+    data = data.strip()
+    if data == "":
+        return b""
+    padding = (-len(data)) % 4
+    if padding:
+        data += "=" * padding
+    return base64.urlsafe_b64decode(data.encode("utf-8"))
+
+def parse_max_age(cache_control):
+    if not cache_control:
+        return None
+    for part in cache_control.split(","):
+        part = part.strip()
+        if part.lower().startswith("max-age"):
+            try:
+                return int(part.split("=", 1)[1])
+            except Exception:
+                return None
+    return None
+
+def parse_headers(items):
+    headers = {}
+    for item in items:
+        if ":" not in item:
+            raise ValueError("Invalid header format: %s" % item)
+        key, value = item.split(":", 1)
+        headers[key.strip()] = value.strip()
+    return headers
+
+def load_token(token_arg):
+    if token_arg == "-":
+        return sys.stdin.read().strip()
+    if token_arg.startswith("@"):
+        path = token_arg[1:]
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return token_arg
+
+def normalize_list(values):
+    if not values:
+        return None
+    if len(values) == 1 and isinstance(values[0], str) and "," in values[0]:
+        return [v.strip() for v in values[0].split(",") if v.strip()]
+    return values
+
+class JWKCache:
+    def __init__(self, jwks_url, cache_ttl=300, timeout=10, headers=None, session=None):
+        self.jwks_url = jwks_url
+        self.cache_ttl = cache_ttl
+        self.timeout = timeout
+        self.headers = headers or {}
+        self.session = session or requests.Session()
+        self.jwks = None
+        self.expires_at = 0
+        self.lock = threading.Lock()
+
+    def _fetch(self):
+        resp = self.session.get(self.jwks_url, headers=self.headers, timeout=self.timeout)
+        resp.raise_for_status()
+        data = resp.json()
+        keys = data.get("keys")
+        if not isinstance(keys, list):
+            raise ValueError("Invalid JWKS response")
+        self.jwks = keys
+        max_age = parse_max_age(resp.headers.get("Cache-Control"))
+        ttl = max_age if max_age is not None else self.cache_ttl
+        self.expires_at = time.time() + ttl
+
+    def _select_key(self, keys, kid=None, alg=None):
+        if kid:
+            for k in keys:
+                if k.get("kid") == kid:
+                    return k
+        if alg:
+            for k in keys:
+                if k.get("alg") == alg:
+                    return k
+        if len(keys) == 1:
+            return keys[0]
+        return None
+
+    def get_jwk(self, kid=None, alg=None):
+        with self.lock:
+            if self.jwks is None or time.time() >= self.expires_at:
+                self._fetch()
+            jwk = self._select_key(self.jwks, kid, alg)
+            if jwk is None:
+                self._fetch()
+                jwk = self._select_key(self.jwks, kid, alg)
+            if jwk is None:
+                raise KeyError("No matching JWK")
+            return jwk
+
+def jwk_to_key(jwk):
+    kty = jwk.get("kty")
+    if kty == "RSA":
+        return RSAAlgorithm.from_jwk(json.dumps(jwk))
+    if kty == "EC":
+        return ECAlgorithm.from_jwk(json.dumps(jwk))
+    if kty == "OKP":
+        if OKPAlgorithm is None:
+            raise RuntimeError("OKP keys not supported by this PyJWT version")
+        return OKPAlgorithm.from_jwk(json.dumps(jwk))
+    if kty == "oct":
+        k = jwk.get("k")
+        if not k:
+            raise ValueError("Missing 'k' for oct key")
+        return b64url_decode(k)
+    raise ValueError("Unsupported key type: %s" % kty)
+
+class JWTAuthenticator:
+    def __init__(self, jwks_url=None, secret=None, algorithms=None, audience=None, issuer=None, leeway=0, require=None, allowed_crit=None, cache_ttl=300, timeout=10, jwks_headers=None, verify_exp=True, verify_nbf=True, verify_iat=True):
+        self.jwks_url = jwks_url
+        self.secret = secret
+        self.algorithms = algorithms
+        self.audience = audience
+        self.issuer = issuer
+        self.leeway = leeway
+        self.require = require
+        self.allowed_crit = set(allowed_crit or [])
+        self.verify_exp = verify_exp
+        self.verify_nbf = verify_nbf
+        self.verify_iat = verify_iat
+        self.jwks_cache = None
+        if jwks_url:
+            self.jwks_cache = JWKCache(jwks_url, cache_ttl=cache_ttl, timeout=timeout, headers=jwks_headers or {})
+
+    def _validate_header(self, header):
+        alg = header.get("alg")
+        if not alg or str(alg).lower() == "none":
+            raise InvalidTokenError("Unacceptable algorithm")
+        crit = header.get("crit")
+        if crit:
+            if not isinstance(crit, list):
+                raise InvalidTokenError("crit header must be a list")
+            for item in crit:
+                if item not in self.allowed_crit:
+                    raise InvalidTokenError("Unsupported critical header: %s" % item)
+            if "b64" in crit and header.get("b64") is False:
+                raise InvalidTokenError("Unencoded payloads are not supported")
+
+    def _get_key(self, header, alg):
+        kid = header.get("kid")
+        if alg in HMAC_ALGS:
+            if self.secret is not None:
+                return self.secret
+            if self.jwks_cache:
+                jwk = self.jwks_cache.get_jwk(kid=kid, alg=alg)
+                return jwk_to_key(jwk)
+        else:
+            if self.jwks_cache:
+                jwk = self.jwks_cache.get_jwk(kid=kid, alg=alg)
+                return jwk_to_key(jwk)
+            if self.secret is not None:
+                return self.secret
+        raise InvalidTokenError("No key source available for algorithm %s" % alg)
+
+    def decode(self, token, verify=True):
+        header = jwt.get_unverified_header(token)
+        self._validate_header(header)
+        if not verify:
+            options = {"verify_signature": False, "verify_exp": False, "verify_nbf": False, "verify_iat": False}
+            payload = jwt.decode(token, key=None, algorithms=None, options=options)
+            return header, payload
+        alg = header.get("alg")
+        algorithms = self.algorithms or [alg]
+        if alg not in algorithms:
+            raise InvalidTokenError("Algorithm not allowed")
+        key = self._get_key(header, alg)
+        options = {
+            "verify_signature": True,
+            "verify_exp": self.verify_exp,
+            "verify_nbf": self.verify_nbf,
+            "verify_iat": self.verify_iat
+        }
+        if self.require:
+            options["require"] = self.require
+        payload = jwt.decode(token, key=key, algorithms=algorithms, audience=self.audience, issuer=self.issuer, leeway=self.leeway, options=options)
+        return header, payload
+
+def dump_json(obj, pretty=False):
+    if pretty:
+        return json.dumps(obj, indent=2, ensure_ascii=False, sort_keys=True)
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False, sort_keys=True)
+
+def main():
+    parser = argparse.ArgumentParser(description="JWT authentication and decoding utility")
+    parser.add_argument("token", help="JWT string, '-' for stdin, or '@file'")
+    parser.add_argument("--jwks-url", help="JWKS endpoint URL")
+    parser.add_argument("--secret", help="Shared secret for HMAC")
+    parser.add_argument("--secret-file", help="Path to file containing shared secret")
+    parser.add_argument("--secret-base64", action="store_true", help="Decode secret as base64url")
+    parser.add_argument("--algorithms", nargs="+", help="Allowed algorithms (comma separated or multiple)")
+    parser.add_argument("--audience", help="Expected audience (comma separated for multiple)")
+    parser.add_argument("--issuer", help="Expected issuer")
+    parser.add_argument("--leeway", type=int, default=0, help="Clock skew in seconds")
+    parser.add_argument("--require", nargs="*", help="Required claims")
+    parser.add_argument("--no-verify", action="store_true", help="Disable signature and claim verification")
+    parser.add_argument("--skip-exp", action="store_true", help="Skip exp verification")
+    parser.add_argument("--skip-nbf", action="store_true", help="Skip nbf verification")
+    parser.add_argument("--skip-iat", action="store_true", help="Skip iat verification")
+    parser.add_argument("--cache-ttl", type=int, default=300, help="JWKS cache TTL in seconds")
+    parser.add_argument("--timeout", type=int, default=10, help="HTTP timeout for JWKS fetch")
+    parser.add_argument("--jwks-header", action="append", default=[], help="Extra header for JWKS request (Key:Value)")
+    parser.add_argument("--allowed-crit", nargs="*", default=[], help="Allowed critical headers")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output")
+    parser.add_argument("--header-only", action="store_true", help="Output only header")
+    parser.add_argument("--payload-only", action="store_true", help="Output only payload")
+    args = parser.parse_args()
+
+    if args.header_only and args.payload_only:
+        print("Cannot use --header-only and --payload-only together", file=sys.stderr)
+        sys.exit(2)
+
+    token = load_token(args.token)
+    algorithms = normalize_list(args.algorithms)
+    require = normalize_list(args.require)
+    allowed_crit = normalize_list(args.allowed_crit) or []
+
+    audience = args.audience
+    if audience and "," in audience:
+        audience = [a.strip() for a in audience.split(",") if a.strip()]
+
+    secret = None
+    if args.secret is not None:
+        secret = args.secret
+    elif args.secret_file:
+        with open(args.secret_file, "rb") as f:
+            data = f.read().strip()
+            try:
+                secret = data.decode("utf-8")
+            except Exception:
+                secret = data
+
+    if secret is not None and args.secret_base64:
+        if isinstance(secret, bytes):
+            secret = secret.decode("utf-8")
+        secret = b64url_decode(secret)
+
+    try:
+        jwks_headers = parse_headers(args.jwks_header)
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        auth = JWTAuthenticator(
+            jwks_url=args.jwks_url,
+            secret=secret,
+            algorithms=algorithms,
+            audience=audience,
+            issuer=args.issuer,
+            leeway=args.leeway,
+            require=require,
+            allowed_crit=allowed_crit,
+            cache_ttl=args.cache_ttl,
+            timeout=args.timeout,
+            jwks_headers=jwks_headers,
+            verify_exp=not args.skip_exp,
+            verify_nbf=not args.skip_nbf,
+            verify_iat=not args.skip_iat
+        )
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        header, payload = auth.decode(token, verify=not args.no_verify)
+    except InvalidTokenError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
+    if args.header_only:
+        output = header
+    elif args.payload_only:
+        output = payload
+    else:
+        output = {"header": header, "payload": payload}
+
+    sys.stdout.write(dump_json(output, pretty=args.pretty))
+    sys.stdout.write("\n")
+
+if __name__ == "__main__":
+    main()
