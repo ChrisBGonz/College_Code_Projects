@@ -1,0 +1,544 @@
+import argparse
+import base64
+import json
+import os
+import sys
+import time
+
+import jwt
+from jwt import algorithms
+from jwt import exceptions as jwt_exceptions
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.backends import default_backend
+    from cryptography import x509
+except Exception:
+    serialization = None
+    default_backend = None
+    x509 = None
+
+class JWTAuthError(Exception):
+    pass
+
+class JWKSKeyNotFound(JWTAuthError):
+    pass
+
+class JWTClaimError(JWTAuthError):
+    pass
+
+def b64url_decode(data):
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    data = data.strip()
+    rem = len(data) % 4
+    if rem:
+        data += b"=" * (4 - rem)
+    return base64.urlsafe_b64decode(data)
+
+def load_text(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+def normalize_token(token):
+    if token is None:
+        return None
+    token = token.strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+def decode_secret(secret):
+    if secret is None:
+        return None
+    if isinstance(secret, bytes):
+        return secret
+    s = secret.strip()
+    try:
+        return base64.b64decode(s, validate=True)
+    except Exception:
+        try:
+            return b64url_decode(s)
+        except Exception:
+            return secret
+
+def load_public_key(data):
+    if data is None:
+        return None
+    if isinstance(data, bytes):
+        return data
+    if serialization and "BEGIN" in data:
+        try:
+            return serialization.load_pem_public_key(data.encode("utf-8"), backend=default_backend())
+        except Exception:
+            return data
+    return data
+
+def key_from_x5c(x5c_list):
+    if not x5c_list or x509 is None:
+        return None
+    try:
+        cert_der = base64.b64decode(x5c_list[0])
+        cert = x509.load_der_x509_certificate(cert_der)
+        return cert.public_key()
+    except Exception:
+        return None
+
+def jwk_to_key(jwk, alg=None):
+    if not isinstance(jwk, dict):
+        raise JWKSKeyNotFound("Invalid JWK")
+    if "x5c" in jwk:
+        key = key_from_x5c(jwk.get("x5c"))
+        if key is not None:
+            return key
+    kty = jwk.get("kty")
+    jwk_json = json.dumps(jwk)
+    if kty == "RSA":
+        return algorithms.RSAAlgorithm.from_jwk(jwk_json)
+    if kty == "EC":
+        return algorithms.ECAlgorithm.from_jwk(jwk_json)
+    if kty == "oct":
+        k = jwk.get("k")
+        if k is None:
+            raise JWKSKeyNotFound("Missing symmetric key")
+        return b64url_decode(k)
+    if kty == "OKP":
+        okp = getattr(algorithms, "OKPAlgorithm", None)
+        if okp:
+            return okp.from_jwk(jwk_json)
+    if alg:
+        try:
+            alg_obj = jwt.get_algorithm_by_name(alg)
+            if hasattr(alg_obj, "from_jwk"):
+                return alg_obj.from_jwk(jwk_json)
+        except Exception:
+            pass
+    raise JWKSKeyNotFound("Unsupported key type")
+
+class JWKSCache:
+    def __init__(self, url, cache_file=None, ttl=3600, session=None, timeout=5):
+        self.url = url
+        self.cache_file = cache_file
+        self.ttl = ttl
+        self.session = session or (requests.Session() if requests else None)
+        self.timeout = timeout
+        self._jwks = None
+        self._fetched_at = 0
+
+    def _load_cache(self):
+        if not self.cache_file:
+            return
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "jwks" in data and "fetched_at" in data:
+                self._jwks = data.get("jwks")
+                self._fetched_at = float(data.get("fetched_at") or 0)
+        except Exception:
+            pass
+
+    def _save_cache(self):
+        if not self.cache_file:
+            return
+        dirpath = os.path.dirname(self.cache_file)
+        if dirpath:
+            try:
+                os.makedirs(dirpath, exist_ok=True)
+            except Exception:
+                pass
+        try:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
+                json.dump({"jwks": self._jwks, "fetched_at": self._fetched_at}, f)
+        except Exception:
+            pass
+
+    def _cache_valid(self):
+        if self._jwks is None:
+            return False
+        if self.ttl is None:
+            return True
+        return (time.time() - self._fetched_at) < self.ttl
+
+    def get_jwks(self, force=False):
+        if self._jwks is None:
+            self._load_cache()
+        if not force and self._cache_valid():
+            return self._jwks
+        if not self.session:
+            raise JWKSKeyNotFound("requests library is required for JWKS retrieval")
+        resp = self.session.get(self.url, timeout=self.timeout, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        jwks = resp.json()
+        if not isinstance(jwks, dict) or "keys" not in jwks:
+            raise JWKSKeyNotFound("Invalid JWKS")
+        self._jwks = jwks
+        self._fetched_at = time.time()
+        self._save_cache()
+        return jwks
+
+    def _select_key(self, keys, kid=None, alg=None):
+        candidates = []
+        for k in keys:
+            if kid and k.get("kid") != kid:
+                continue
+            if k.get("use") and k.get("use") != "sig":
+                continue
+            if alg and k.get("alg") and k.get("alg") != alg:
+                continue
+            candidates.append(k)
+        if not candidates:
+            return None
+        if len(candidates) == 1:
+            return candidates[0]
+        if alg:
+            for k in candidates:
+                if k.get("alg") == alg:
+                    return k
+        return candidates[0]
+
+    def get_key(self, kid=None, alg=None):
+        jwks = self.get_jwks()
+        key_data = self._select_key(jwks.get("keys", []), kid, alg)
+        if key_data is None and kid:
+            jwks = self.get_jwks(force=True)
+            key_data = self._select_key(jwks.get("keys", []), kid, alg)
+        if key_data is None:
+            raise JWKSKeyNotFound("Signing key not found")
+        return jwk_to_key(key_data, alg)
+
+class JWTAuthenticator:
+    def __init__(
+        self,
+        secret=None,
+        public_key=None,
+        jwks_url=None,
+        algorithms=None,
+        audience=None,
+        issuer=None,
+        leeway=0,
+        required_claims=None,
+        max_age=None,
+        required_scopes=None,
+        subject=None,
+        revoked_jti=None,
+        expected_typ=None,
+        cache_file=None,
+        cache_ttl=3600,
+        timeout=5,
+    ):
+        self.secret = secret
+        self.public_key = public_key
+        self.algorithms = algorithms
+        self.audience = audience
+        self.issuer = issuer
+        self.leeway = leeway or 0
+        self.required_claims = required_claims or []
+        self.max_age = max_age
+        self.required_scopes = required_scopes or []
+        self.subject = subject
+        self.revoked_jti = set(revoked_jti) if revoked_jti else set()
+        self.expected_typ = expected_typ
+        self.jwks_client = JWKSCache(jwks_url, cache_file, cache_ttl, timeout=timeout) if jwks_url else None
+
+    def _get_key(self, header):
+        alg = header.get("alg")
+        if not alg:
+            raise JWTAuthError("Missing algorithm")
+        if alg.lower() == "none":
+            raise JWTAuthError("Unsecured JWT is not allowed")
+        if self.expected_typ:
+            typ = header.get("typ")
+            if not typ or str(typ).lower() != str(self.expected_typ).lower():
+                raise JWTAuthError("Invalid token type")
+        if alg.startswith("HS"):
+            if self.secret is not None:
+                return self.secret
+            if self.jwks_client:
+                return self.jwks_client.get_key(header.get("kid"), alg)
+            raise JWTAuthError("HMAC secret not configured")
+        else:
+            if self.public_key is not None:
+                return self.public_key
+            if self.jwks_client:
+                return self.jwks_client.get_key(header.get("kid"), alg)
+            raise JWTAuthError("Public key not configured")
+
+    def _validate_custom(self, payload):
+        now = time.time()
+        if self.max_age is not None:
+            iat = payload.get("iat")
+            if iat is None:
+                raise JWTClaimError("iat claim required for max_age validation")
+            try:
+                iat_val = int(iat)
+            except Exception:
+                raise JWTClaimError("iat claim must be an integer")
+            if now - iat_val > self.max_age + self.leeway:
+                raise JWTClaimError("Token is too old")
+        if self.subject is not None:
+            if payload.get("sub") != self.subject:
+                raise JWTClaimError("Subject does not match")
+        if self.required_scopes:
+            scope_claim = payload.get("scope") or payload.get("scp") or payload.get("scopes")
+            if isinstance(scope_claim, str):
+                actual_scopes = set(scope_claim.split())
+            elif isinstance(scope_claim, (list, tuple, set)):
+                actual_scopes = set(map(str, scope_claim))
+            elif scope_claim is None:
+                actual_scopes = set()
+            else:
+                actual_scopes = {str(scope_claim)}
+            missing = [s for s in self.required_scopes if s not in actual_scopes]
+            if missing:
+                raise JWTClaimError("Missing required scopes: " + ",".join(missing))
+        if self.revoked_jti:
+            jti = payload.get("jti")
+            if jti and jti in self.revoked_jti:
+                raise JWTClaimError("Token has been revoked")
+
+    def authenticate(self, token):
+        token = normalize_token(token)
+        if not token:
+            raise JWTAuthError("Token is empty")
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg")
+        if self.algorithms and alg not in self.algorithms:
+            raise JWTAuthError("Algorithm not allowed")
+        algorithms_list = self.algorithms or [alg]
+        key = self._get_key(header)
+        options = {
+            "verify_signature": True,
+            "verify_exp": True,
+            "verify_iat": True,
+            "verify_nbf": True,
+            "verify_aud": bool(self.audience),
+            "verify_iss": bool(self.issuer),
+            "require": self.required_claims,
+        }
+        try:
+            payload = jwt.decode(
+                token,
+                key,
+                algorithms=algorithms_list,
+                audience=self.audience,
+                issuer=self.issuer,
+                leeway=self.leeway,
+                options=options,
+            )
+        except jwt_exceptions.PyJWTError as e:
+            raise JWTAuthError(str(e))
+        self._validate_custom(payload)
+        return header, payload
+
+def decode_unverified(token):
+    token = normalize_token(token)
+    header = jwt.get_unverified_header(token)
+    payload = jwt.decode(token, options={"verify_signature": False})
+    return header, payload
+
+def parse_list(value):
+    if not value:
+        return []
+    if isinstance(value, (list, tuple)):
+        items = []
+        for v in value:
+            if v is None:
+                continue
+            if isinstance(v, str):
+                items.extend([p.strip() for p in v.split(",") if p.strip()])
+            else:
+                items.append(str(v))
+        return items
+    if isinstance(value, str):
+        return [p.strip() for p in value.split(",") if p.strip()]
+    return [str(value)]
+
+def parse_audience(values):
+    if not values:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    result = []
+    for v in values:
+        if v is None:
+            continue
+        v = str(v).strip()
+        if not v:
+            continue
+        if v.startswith("["):
+            try:
+                arr = json.loads(v)
+                if isinstance(arr, list):
+                    result.extend([str(x) for x in arr])
+                    continue
+            except Exception:
+                pass
+        for part in v.split(","):
+            part = part.strip()
+            if part:
+                result.append(part)
+    if not result:
+        return None
+    if len(result) == 1:
+        return result[0]
+    return result
+
+def parse_required_claims(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(v) for v in value if v]
+    if isinstance(value, str):
+        v = value.strip()
+        if not v:
+            return []
+        if v.startswith("["):
+            try:
+                arr = json.loads(v)
+                if isinstance(arr, list):
+                    return [str(x) for x in arr]
+            except Exception:
+                pass
+        return [p.strip() for p in v.split(",") if p.strip()]
+    return [str(value)]
+
+def read_token_from_args(args):
+    token = None
+    if args.token:
+        token = args.token
+    elif args.token_file:
+        token = load_text(args.token_file)
+    else:
+        if not sys.stdin.isatty():
+            token = sys.stdin.read()
+    return normalize_token(token)
+
+def read_secret_from_args(args):
+    secret = None
+    if args.secret:
+        secret = args.secret
+    elif args.secret_file:
+        secret = load_text(args.secret_file)
+    if secret and args.secret_base64:
+        secret = decode_secret(secret)
+    return secret
+
+def read_public_key_from_args(args):
+    data = None
+    if args.public_key:
+        data = args.public_key
+    elif args.public_key_file:
+        data = load_text(args.public_key_file)
+    if data is None:
+        return None
+    return load_public_key(data)
+
+def load_revoked_jti(path):
+    if not path:
+        return set()
+    data = load_text(path)
+    if not data:
+        return set()
+    try:
+        obj = json.loads(data)
+        if isinstance(obj, list):
+            return set(str(x) for x in obj)
+    except Exception:
+        pass
+    return set(line.strip() for line in data.splitlines() if line.strip())
+
+def json_output(obj, pretty=False):
+    return json.dumps(obj, ensure_ascii=False, indent=2 if pretty else None, sort_keys=pretty, default=str)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--token")
+    parser.add_argument("--token-file")
+    parser.add_argument("--secret")
+    parser.add_argument("--secret-file")
+    parser.add_argument("--secret-base64", action="store_true")
+    parser.add_argument("--public-key")
+    parser.add_argument("--public-key-file")
+    parser.add_argument("--jwks-url")
+    parser.add_argument("--audience", action="append")
+    parser.add_argument("--issuer")
+    parser.add_argument("--algorithms")
+    parser.add_argument("--leeway", type=int, default=0)
+    parser.add_argument("--required-claims", default="exp")
+    parser.add_argument("--max-age", type=int)
+    parser.add_argument("--required-scope", action="append")
+    parser.add_argument("--subject")
+    parser.add_argument("--revoked-jti-file")
+    parser.add_argument("--expected-typ")
+    parser.add_argument("--cache-file")
+    parser.add_argument("--cache-ttl", type=int, default=3600)
+    parser.add_argument("--timeout", type=int, default=5)
+    parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--include-unverified", action="store_true")
+    args = parser.parse_args()
+
+    token = read_token_from_args(args)
+    if not token:
+        print(json_output({"valid": False, "error": "TokenError", "message": "Token not provided"}, args.pretty))
+        sys.exit(2)
+
+    if args.no_verify:
+        try:
+            header, payload = decode_unverified(token)
+            result = {"valid": None, "verified": False, "header": header, "payload": payload}
+            print(json_output(result, args.pretty))
+            return
+        except Exception as e:
+            print(json_output({"valid": False, "error": type(e).__name__, "message": str(e)}, args.pretty))
+            sys.exit(1)
+
+    secret = read_secret_from_args(args)
+    public_key = read_public_key_from_args(args)
+    algorithms_list = parse_list(args.algorithms) if args.algorithms else None
+    audience = parse_audience(args.audience)
+    required_claims = parse_required_claims(args.required_claims)
+    required_scopes = parse_list(args.required_scope)
+    revoked_jti = load_revoked_jti(args.revoked_jti_file)
+
+    authenticator = JWTAuthenticator(
+        secret=secret,
+        public_key=public_key,
+        jwks_url=args.jwks_url,
+        algorithms=algorithms_list,
+        audience=audience,
+        issuer=args.issuer,
+        leeway=args.leeway,
+        required_claims=required_claims,
+        max_age=args.max_age,
+        required_scopes=required_scopes,
+        subject=args.subject,
+        revoked_jti=revoked_jti,
+        expected_typ=args.expected_typ,
+        cache_file=args.cache_file,
+        cache_ttl=args.cache_ttl,
+        timeout=args.timeout,
+    )
+    try:
+        header, payload = authenticator.authenticate(token)
+        result = {"valid": True, "header": header, "payload": payload}
+        print(json_output(result, args.pretty))
+    except Exception as e:
+        error_obj = {"valid": False, "error": type(e).__name__, "message": str(e)}
+        if args.include_unverified:
+            try:
+                header, payload = decode_unverified(token)
+                error_obj["header"] = header
+                error_obj["payload"] = payload
+            except Exception:
+                pass
+        print(json_output(error_obj, args.pretty))
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

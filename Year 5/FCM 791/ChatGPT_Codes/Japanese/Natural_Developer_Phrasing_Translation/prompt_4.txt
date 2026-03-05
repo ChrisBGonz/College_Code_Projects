@@ -1,0 +1,147 @@
+using System;
+using System.Threading.Tasks;
+
+namespace AdminApp
+{
+    public enum DeleteMode
+    {
+        Logical,
+        Physical
+    }
+
+    public class UserDeletionService
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly IAuthorizationService _authorizationService;
+        private readonly IConfirmationService _confirmationService;
+        private readonly IAuditLogger _auditLogger;
+
+        public UserDeletionService(IUserRepository userRepository, IAuthorizationService authorizationService, IConfirmationService confirmationService, IAuditLogger auditLogger)
+        {
+            _userRepository = userRepository ?? throw new ArgumentNullException(nameof(userRepository));
+            _authorizationService = authorizationService ?? throw new ArgumentNullException(nameof(authorizationService));
+            _confirmationService = confirmationService ?? throw new ArgumentNullException(nameof(confirmationService));
+            _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
+        }
+
+        public async Task<bool> DeleteUserAsync(Guid adminUserId, Guid targetUserId, DeleteMode mode = DeleteMode.Logical)
+        {
+            try
+            {
+                if (!await _authorizationService.IsAdminAsync(adminUserId))
+                {
+                    _auditLogger.Write(new AuditLogEntry
+                    {
+                        Timestamp = DateTime.UtcNow,
+                        ActorId = adminUserId,
+                        TargetId = targetUserId,
+                        Action = "UserDeleteDenied",
+                        Detail = "管理者権限がありません。"
+                    });
+                    return false;
+                }
+
+                var targetUser = await _userRepository.GetByIdAsync(targetUserId);
+                if (targetUser == null)
+                {
+                    _auditLogger.Write(new AuditLogEntry
+                    {
+                        Timestamp = DateTime.UtcNow,
+                        ActorId = adminUserId,
+                        TargetId = targetUserId,
+                        Action = "UserDeleteNotFound",
+                        Detail = "対象ユーザーが存在しません。"
+                    });
+                    return false;
+                }
+
+                var message = $"ユーザー「{targetUser.UserName}」を削除しますか？";
+                if (!_confirmationService.Confirm(message, "削除確認"))
+                {
+                    _auditLogger.Write(new AuditLogEntry
+                    {
+                        Timestamp = DateTime.UtcNow,
+                        ActorId = adminUserId,
+                        TargetId = targetUserId,
+                        Action = "UserDeleteCancelled",
+                        Detail = "削除はキャンセルされました。"
+                    });
+                    return false;
+                }
+
+                if (mode == DeleteMode.Physical)
+                {
+                    await _userRepository.DeleteAsync(targetUserId);
+                }
+                else
+                {
+                    targetUser.IsDeleted = true;
+                    targetUser.DeletedAt = DateTime.UtcNow;
+                    await _userRepository.UpdateAsync(targetUser);
+                }
+
+                _auditLogger.Write(new AuditLogEntry
+                {
+                    Timestamp = DateTime.UtcNow,
+                    ActorId = adminUserId,
+                    TargetId = targetUserId,
+                    Action = "UserDeleteSuccess",
+                    Detail = mode == DeleteMode.Physical ? "物理削除" : "論理削除"
+                });
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _auditLogger.Write(new AuditLogEntry
+                {
+                    Timestamp = DateTime.UtcNow,
+                    ActorId = adminUserId,
+                    TargetId = targetUserId,
+                    Action = "UserDeleteError",
+                    Detail = ex.ToString()
+                });
+                throw;
+            }
+        }
+    }
+
+    public interface IUserRepository
+    {
+        Task<User> GetByIdAsync(Guid userId);
+        Task UpdateAsync(User user);
+        Task DeleteAsync(Guid userId);
+    }
+
+    public interface IAuthorizationService
+    {
+        Task<bool> IsAdminAsync(Guid userId);
+    }
+
+    public interface IConfirmationService
+    {
+        bool Confirm(string message, string title);
+    }
+
+    public interface IAuditLogger
+    {
+        void Write(AuditLogEntry entry);
+    }
+
+    public class AuditLogEntry
+    {
+        public DateTime Timestamp { get; set; }
+        public Guid ActorId { get; set; }
+        public Guid TargetId { get; set; }
+        public string Action { get; set; }
+        public string Detail { get; set; }
+    }
+
+    public class User
+    {
+        public Guid Id { get; set; }
+        public string UserName { get; set; }
+        public bool IsDeleted { get; set; }
+        public DateTime? DeletedAt { get; set; }
+    }
+}

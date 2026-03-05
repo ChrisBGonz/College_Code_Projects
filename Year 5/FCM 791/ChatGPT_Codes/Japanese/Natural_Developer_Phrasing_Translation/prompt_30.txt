@@ -1,0 +1,143 @@
+/*
+Build (g++):
+g++ -std=c++17 main.cpp -ljpeg -o jpeg_gray
+
+CMakeLists.txt:
+cmake_minimum_required(VERSION 3.10)
+project(jpeg_gray)
+add_executable(jpeg_gray main.cpp)
+target_link_libraries(jpeg_gray jpeg)
+*/
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <iostream>
+#include <jpeglib.h>
+#include <setjmp.h>
+
+struct JPEGErrorManager {
+    jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+    char message[JMSG_LENGTH_MAX];
+};
+
+static void JPEGErrorExit(j_common_ptr cinfo) {
+    JPEGErrorManager* err = reinterpret_cast<JPEGErrorManager*>(cinfo->err);
+    (*cinfo->err->format_message)(cinfo, err->message);
+    longjmp(err->setjmp_buffer, 1);
+}
+
+bool ConvertToGrayscaleJPEG(const std::string& inputPath, const std::string& outputPath, int quality) {
+    FILE* infile = std::fopen(inputPath.c_str(), "rb");
+    if (!infile) {
+        std::cerr << "Failed to open input file: " << inputPath << std::endl;
+        return false;
+    }
+
+    jpeg_decompress_struct dinfo;
+    JPEGErrorManager jderr;
+    dinfo.err = jpeg_std_error(&jderr.pub);
+    jderr.pub.error_exit = JPEGErrorExit;
+
+    if (setjmp(jderr.setjmp_buffer)) {
+        std::cerr << "JPEG decode error: " << jderr.message << std::endl;
+        jpeg_destroy_decompress(&dinfo);
+        std::fclose(infile);
+        return false;
+    }
+
+    jpeg_create_decompress(&dinfo);
+    jpeg_stdio_src(&dinfo, infile);
+    jpeg_read_header(&dinfo, TRUE);
+    dinfo.out_color_space = JCS_RGB;
+    jpeg_start_decompress(&dinfo);
+
+    int width = static_cast<int>(dinfo.output_width);
+    int height = static_cast<int>(dinfo.output_height);
+    int channels = dinfo.output_components;
+
+    std::vector<unsigned char> gray(static_cast<size_t>(width) * height);
+    std::vector<unsigned char> row(static_cast<size_t>(width) * channels);
+
+    while (dinfo.output_scanline < dinfo.output_height) {
+        JSAMPROW rowptr = row.data();
+        jpeg_read_scanlines(&dinfo, &rowptr, 1);
+        size_t y = dinfo.output_scanline - 1;
+        for (int x = 0; x < width; ++x) {
+            unsigned char r = 0, g = 0, b = 0;
+            if (channels == 1) {
+                r = g = b = row[x];
+            } else if (channels >= 3) {
+                r = row[x * channels + 0];
+                g = row[x * channels + 1];
+                b = row[x * channels + 2];
+            }
+            int gv = static_cast<int>(0.299 * r + 0.587 * g + 0.114 * b + 0.5);
+            gray[y * static_cast<size_t>(width) + static_cast<size_t>(x)] = static_cast<unsigned char>(gv);
+        }
+    }
+
+    jpeg_finish_decompress(&dinfo);
+    jpeg_destroy_decompress(&dinfo);
+    std::fclose(infile);
+
+    FILE* outfile = std::fopen(outputPath.c_str(), "wb");
+    if (!outfile) {
+        std::cerr << "Failed to open output file: " << outputPath << std::endl;
+        return false;
+    }
+
+    jpeg_compress_struct cinfo;
+    JPEGErrorManager jcerr;
+    cinfo.err = jpeg_std_error(&jcerr.pub);
+    jcerr.pub.error_exit = JPEGErrorExit;
+
+    if (setjmp(jcerr.setjmp_buffer)) {
+        std::cerr << "JPEG encode error: " << jcerr.message << std::endl;
+        jpeg_destroy_compress(&cinfo);
+        std::fclose(outfile);
+        return false;
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = width;
+    cinfo.image_height = height;
+    cinfo.input_components = 1;
+    cinfo.in_color_space = JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW rowptr = &gray[cinfo.next_scanline * static_cast<size_t>(width)];
+        jpeg_write_scanlines(&cinfo, &rowptr, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    std::fclose(outfile);
+
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " input.jpg output.jpg [quality]" << std::endl;
+        return 1;
+    }
+    int quality = 90;
+    if (argc >= 4) {
+        quality = std::atoi(argv[3]);
+        if (quality < 1) quality = 1;
+        if (quality > 100) quality = 100;
+    }
+    if (!ConvertToGrayscaleJPEG(argv[1], argv[2], quality)) {
+        return 1;
+    }
+    return 0;
+}

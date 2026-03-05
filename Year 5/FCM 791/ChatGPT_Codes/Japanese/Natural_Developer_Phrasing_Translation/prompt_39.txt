@@ -1,0 +1,99 @@
+import socket
+import struct
+import argparse
+import sys
+import threading
+
+def xor_data(data, key):
+    if not key:
+        raise ValueError("Key must not be empty")
+    key_len = len(key)
+    return bytes(b ^ key[i % key_len] for i, b in enumerate(data))
+
+def recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+def send_message(sock, data, key):
+    enc = xor_data(data, key)
+    sock.sendall(struct.pack("!I", len(enc)) + enc)
+
+def recv_message(sock, key):
+    raw_len = recv_exact(sock, 4)
+    if raw_len is None:
+        return None
+    length = struct.unpack("!I", raw_len)[0]
+    enc = recv_exact(sock, length)
+    if enc is None:
+        return None
+    return xor_data(enc, key)
+
+def handle_client(conn, addr, key):
+    with conn:
+        while True:
+            msg = recv_message(conn, key)
+            if msg is None:
+                break
+            text = msg.decode('utf-8', errors='ignore')
+            print(f"[{addr[0]}:{addr[1]}] {text}")
+            response = f"ACK: {text}".encode('utf-8')
+            send_message(conn, response, key)
+
+def run_server(host, port, key):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        s.listen(5)
+        print(f"Listening on {host}:{port}")
+        while True:
+            conn, addr = s.accept()
+            threading.Thread(target=handle_client, args=(conn, addr, key), daemon=True).start()
+
+def run_client(host, port, key, message):
+    try:
+        sock = socket.create_connection((host, port))
+    except OSError as e:
+        sys.stderr.write(f"Connection failed: {e}\n")
+        return
+    with sock:
+        if message is not None:
+            send_message(sock, message.encode('utf-8'), key)
+            resp = recv_message(sock, key)
+            if resp is not None:
+                sys.stdout.write(resp.decode('utf-8', errors='ignore') + "\n")
+        else:
+            for line in sys.stdin:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+                if line.lower() in ("quit", "exit"):
+                    break
+                send_message(sock, line.encode('utf-8'), key)
+                resp = recv_message(sock, key)
+                if resp is None:
+                    break
+                sys.stdout.write(resp.decode('utf-8', errors='ignore') + "\n")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["client", "server"], default="client")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=9000)
+    parser.add_argument("--key", default="legacykey")
+    parser.add_argument("--message")
+    args = parser.parse_args()
+
+    key_bytes = args.key.encode('utf-8')
+
+    if args.mode == "server":
+        run_server(args.host, args.port, key_bytes)
+    else:
+        run_client(args.host, args.port, key_bytes, args.message)
+
+if __name__ == "__main__":
+    main()
