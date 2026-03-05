@@ -1,0 +1,230 @@
+const STATES = { CLOSED: 'CLOSED', OPEN: 'OPEN', HALF_OPEN: 'HALF_OPEN' };
+
+function defaultIsFailure(response) {
+  if (!response || typeof response.status !== 'number') return true;
+  return response.status >= 500;
+}
+
+function defaultAdapter(input, init = {}, timeoutMs = 0) {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  if (init.signal) {
+    if (init.signal.aborted) {
+      controller.abort();
+    } else {
+      init.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+  }
+  const timeout = typeof init.timeout === 'number' ? init.timeout : timeoutMs;
+  let timer;
+  if (timeout > 0) {
+    timer = setTimeout(() => controller.abort(), timeout);
+  }
+  const finalInit = Object.assign({}, init, { signal });
+  return fetch(input, finalInit)
+    .then(response => {
+      if (timer) clearTimeout(timer);
+      return response;
+    })
+    .catch(error => {
+      if (timer) clearTimeout(timer);
+      if (error && error.name === 'AbortError') {
+        const timeoutError = new Error('Request timed out after ' + timeout + 'ms');
+        timeoutError.code = 'ETIMEDOUT';
+        timeoutError.isTimeout = true;
+        throw timeoutError;
+      }
+      throw error;
+    });
+}
+
+class CircuitBreakerOpenError extends Error {
+  constructor(nextAttempt, reason) {
+    super('Circuit breaker is open');
+    this.name = 'CircuitBreakerOpenError';
+    this.code = 'ECIRCUITOPEN';
+    this.nextAttempt = nextAttempt;
+    this.reason = reason || 'open';
+  }
+}
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = typeof options.failureThreshold === 'number' ? options.failureThreshold : 5;
+    this.successThreshold = typeof options.successThreshold === 'number' ? options.successThreshold : 1;
+    this.cooldown = typeof options.cooldown === 'number' ? options.cooldown : 10000;
+    this.requestTimeout = typeof options.requestTimeout === 'number' ? options.requestTimeout : 8000;
+    this.halfOpenMaxRequests = typeof options.halfOpenMaxRequests === 'number' ? options.halfOpenMaxRequests : 1;
+    this.adapter = options.adapter || defaultAdapter;
+    this.isFailure = options.isFailure || defaultIsFailure;
+    this.fallback = options.fallback;
+    this.state = STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInFlight = 0;
+  }
+
+  fire(input, init = {}) {
+    return this._call(input, init);
+  }
+
+  async _call(input, init) {
+    if (this.state === STATES.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._toHalfOpen();
+      } else {
+        return this._handleOpen(input, init, 'cooldown');
+      }
+    }
+    let halfOpenUsed = false;
+    if (this.state === STATES.HALF_OPEN) {
+      if (this.halfOpenInFlight >= this.halfOpenMaxRequests) {
+        return this._handleOpen(input, init, 'half-open-limit');
+      }
+      this.halfOpenInFlight++;
+      halfOpenUsed = true;
+    }
+    try {
+      const response = await this.adapter(input, init, this.requestTimeout);
+      if (this.isFailure(response)) {
+        const err = new Error('Request failed with status ' + response.status);
+        err.response = response;
+        throw err;
+      }
+      this._onSuccess();
+      return response;
+    } catch (error) {
+      this._onFailure(error);
+      if (this.fallback) {
+        return await this.fallback(error, { input, init, state: this.state });
+      }
+      throw error;
+    } finally {
+      if (halfOpenUsed) {
+        this.halfOpenInFlight = Math.max(0, this.halfOpenInFlight - 1);
+      }
+    }
+  }
+
+  _handleOpen(input, init, reason) {
+    const err = new CircuitBreakerOpenError(this.nextAttempt, reason);
+    err.state = this.state;
+    if (this.fallback) {
+      return Promise.resolve(this.fallback(err, { input, init, state: this.state }));
+    }
+    return Promise.reject(err);
+  }
+
+  _toOpen() {
+    this.state = STATES.OPEN;
+    this.nextAttempt = Date.now() + this.cooldown;
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  _toHalfOpen() {
+    this.state = STATES.HALF_OPEN;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenInFlight = 0;
+  }
+
+  _toClosed() {
+    this.state = STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  _onSuccess() {
+    if (this.state === STATES.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._toClosed();
+      }
+    } else if (this.state === STATES.CLOSED) {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === STATES.HALF_OPEN) {
+      this._toOpen();
+    } else if (this.state === STATES.CLOSED) {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._toOpen();
+      }
+    }
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      nextAttempt: this.nextAttempt,
+      halfOpenInFlight: this.halfOpenInFlight
+    };
+  }
+
+  reset() {
+    this._toClosed();
+  }
+}
+
+const API_BASE = 'https://api.example.com';
+
+const apiBreaker = new CircuitBreaker({
+  failureThreshold: 3,
+  successThreshold: 1,
+  cooldown: 5000,
+  requestTimeout: 4000,
+  halfOpenMaxRequests: 1,
+  fallback: (err) => {
+    if (err.code === 'ECIRCUITOPEN') {
+      return {
+        fallback: true,
+        data: null,
+        error: 'Service unavailable',
+        state: err.state,
+        nextAttempt: err.nextAttempt
+      };
+    }
+    throw err;
+  }
+});
+
+async function apiRequest(path, options = {}) {
+  const res = await apiBreaker.fire(API_BASE + path, options);
+  if (res && res.fallback) return res;
+  if (!res.ok) {
+    const text = await res.text();
+    const error = new Error('API error ' + res.status);
+    error.status = res.status;
+    error.body = text;
+    throw error;
+  }
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('application/json')) return res.json();
+  return res.text();
+}
+
+const apiClient = {
+  get(path, options) {
+    return apiRequest(path, Object.assign({ method: 'GET' }, options || {}));
+  },
+  post(path, body, options) {
+    const opts = options || {};
+    const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+    return apiRequest(path, Object.assign({}, opts, { method: 'POST', headers, body: JSON.stringify(body) }));
+  }
+};
+
+apiClient.get('/users')
+  .then(data => console.log('users', data))
+  .catch(err => console.error('api error', err));

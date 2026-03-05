@@ -1,0 +1,116 @@
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.set('trust proxy', true);
+app.use(express.json());
+
+const polls = new Map();
+
+function randomId() {
+  if (crypto.randomUUID) return crypto.randomUUID();
+  return crypto.randomBytes(16).toString('hex');
+}
+
+function getClientIp(req) {
+  let ip = '';
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    ip = forwarded.split(',')[0].trim();
+  }
+  if (!ip) {
+    ip = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : '';
+  }
+  if (ip.startsWith('::ffff:')) ip = ip.slice(7);
+  return ip;
+}
+
+function serializePoll(poll) {
+  return {
+    id: poll.id,
+    question: poll.question,
+    options: poll.options.map(o => ({
+      id: o.id,
+      text: o.text,
+      count: o.count
+    })),
+    totalVotes: poll.votesByIp.size
+  };
+}
+
+app.post('/polls', (req, res) => {
+  const { question, options } = req.body || {};
+  if (typeof question !== 'string' || !question.trim()) {
+    return res.status(400).json({ error: 'question required' });
+  }
+  if (!Array.isArray(options) || options.length < 2 || options.some(o => typeof o !== 'string' || !o.trim())) {
+    return res.status(400).json({ error: 'options must be array of at least 2 strings' });
+  }
+  const poll = {
+    id: randomId(),
+    question: question.trim(),
+    options: options.map(text => ({ id: randomId(), text: text.trim(), count: 0 })),
+    votesByIp: new Map()
+  };
+  polls.set(poll.id, poll);
+  res.status(201).json({
+    id: poll.id,
+    question: poll.question,
+    options: poll.options.map(o => ({ id: o.id, text: o.text }))
+  });
+});
+
+app.get('/polls', (req, res) => {
+  const list = Array.from(polls.values()).map(serializePoll);
+  res.json(list);
+});
+
+app.get('/polls/:id', (req, res) => {
+  const poll = polls.get(req.params.id);
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+  res.json(serializePoll(poll));
+});
+
+app.post('/polls/:id/vote', (req, res) => {
+  const poll = polls.get(req.params.id);
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+
+  const ip = getClientIp(req);
+  if (!ip) return res.status(400).json({ error: 'unable to determine ip' });
+
+  if (poll.votesByIp.has(ip)) {
+    return res.status(429).json({ error: 'duplicate vote' });
+  }
+
+  const { optionId } = req.body || {};
+  if (typeof optionId !== 'string') {
+    return res.status(400).json({ error: 'optionId required' });
+  }
+  const option = poll.options.find(o => o.id === optionId);
+  if (!option) return res.status(400).json({ error: 'invalid option' });
+
+  option.count += 1;
+  poll.votesByIp.set(ip, optionId);
+
+  res.json({
+    success: true,
+    pollId: poll.id,
+    optionId: option.id,
+    counts: poll.options.map(o => ({ id: o.id, count: o.count })),
+    totalVotes: poll.votesByIp.size
+  });
+});
+
+app.get('/polls/:id/results', (req, res) => {
+  const poll = polls.get(req.params.id);
+  if (!poll) return res.status(404).json({ error: 'poll not found' });
+  res.json(serializePoll(poll));
+});
+
+app.use((req, res) => res.status(404).json({ error: 'not found' }));
+
+app.listen(PORT, () => {
+  console.log(`Voting server running on port ${PORT}`);
+});

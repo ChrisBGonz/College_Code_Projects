@@ -1,0 +1,187 @@
+'use strict';
+
+const getRawBody = require('raw-body');
+const Busboy = require('busboy');
+const qs = require('querystring');
+const { Readable } = require('stream');
+const contentType = require('content-type');
+
+function bufferToStream(buffer) {
+  const stream = new Readable();
+  stream._read = () => {};
+  stream.push(buffer);
+  stream.push(null);
+  return stream;
+}
+
+function parseMultipart(buffer, headers) {
+  return new Promise((resolve, reject) => {
+    const fields = {};
+    const files = [];
+    const busboy = new Busboy({ headers });
+
+    const addField = (name, val) => {
+      if (Object.prototype.hasOwnProperty.call(fields, name)) {
+        if (Array.isArray(fields[name])) fields[name].push(val);
+        else fields[name] = [fields[name], val];
+      } else {
+        fields[name] = val;
+      }
+    };
+
+    busboy.on('field', (name, val) => {
+      addField(name, val);
+    });
+
+    busboy.on('file', (name, file, filename, encoding, mimetype) => {
+      let info = {};
+      if (filename && typeof filename === 'object') {
+        info = filename;
+        filename = info.filename;
+        encoding = info.encoding;
+        mimetype = info.mimeType || info.mimetype;
+      }
+      const chunks = [];
+      let size = 0;
+      file.on('data', data => {
+        chunks.push(data);
+        size += data.length;
+      });
+      file.on('end', () => {
+        const buf = Buffer.concat(chunks, size);
+        files.push({
+          fieldname: name,
+          filename: filename || info.filename || null,
+          encoding: encoding || info.encoding || null,
+          mimetype: mimetype || info.mimeType || info.mimetype || null,
+          size: buf.length,
+          buffer: buf,
+          base64: buf.toString('base64')
+        });
+      });
+    });
+
+    busboy.on('error', reject);
+    busboy.on('finish', () => resolve({ fields, files }));
+
+    bufferToStream(buffer).pipe(busboy);
+  });
+}
+
+function createRequestLogger(options = {}) {
+  const limit = options.limit || '100mb';
+  const logger = options.logger || (entry => console.log(entry));
+
+  return function requestLogger(req, res, next) {
+    (async () => {
+      let rawBody = req.rawBody;
+      if (rawBody && !Buffer.isBuffer(rawBody)) {
+        if (typeof rawBody === 'string') rawBody = Buffer.from(rawBody);
+        else {
+          try {
+            rawBody = Buffer.from(JSON.stringify(rawBody));
+          } catch (e) {
+            rawBody = Buffer.alloc(0);
+          }
+        }
+      }
+
+      if (!rawBody) {
+        if (req.readable === false || req.readableEnded || req.complete) {
+          if (req.body !== undefined) {
+            if (Buffer.isBuffer(req.body)) rawBody = req.body;
+            else if (typeof req.body === 'string') rawBody = Buffer.from(req.body);
+            else {
+              try {
+                rawBody = Buffer.from(JSON.stringify(req.body));
+              } catch (e) {
+                rawBody = Buffer.alloc(0);
+              }
+            }
+          } else {
+            rawBody = Buffer.alloc(0);
+          }
+        } else {
+          rawBody = await getRawBody(req, {
+            length: req.headers['content-length'],
+            limit,
+            encoding: false
+          });
+        }
+      }
+
+      req.rawBody = rawBody;
+
+      const contentTypeHeader = (req.headers['content-type'] || '').toLowerCase();
+      let charset = 'utf8';
+      try {
+        const parsedCT = contentType.parse(contentTypeHeader);
+        if (parsedCT && parsedCT.parameters && parsedCT.parameters.charset) {
+          charset = parsedCT.parameters.charset.toLowerCase();
+        }
+      } catch (e) {}
+
+      let parsedBody = null;
+
+      if (rawBody && rawBody.length > 0) {
+        if (contentTypeHeader.includes('application/json')) {
+          try {
+            parsedBody = JSON.parse(rawBody.toString(charset));
+          } catch (err) {
+            parsedBody = { _error: err.message, _raw: rawBody.toString(charset) };
+          }
+        } else if (contentTypeHeader.includes('application/x-www-form-urlencoded')) {
+          parsedBody = qs.parse(rawBody.toString(charset));
+        } else if (contentTypeHeader.includes('multipart/form-data')) {
+          parsedBody = await parseMultipart(rawBody, req.headers);
+        } else {
+          parsedBody = rawBody.toString(charset);
+        }
+      }
+
+      if (contentTypeHeader.includes('multipart/form-data')) {
+        req.body = parsedBody ? parsedBody.fields : {};
+        req.files = parsedBody ? parsedBody.files : [];
+      } else {
+        req.body = parsedBody;
+      }
+      req._body = true;
+      req.parsedBody = parsedBody;
+
+      let logParsedBody = parsedBody;
+      if (parsedBody && parsedBody.files && Array.isArray(parsedBody.files)) {
+        logParsedBody = {
+          fields: parsedBody.fields,
+          files: parsedBody.files.map(f => ({
+            fieldname: f.fieldname,
+            filename: f.filename,
+            encoding: f.encoding,
+            mimetype: f.mimetype,
+            size: f.size,
+            base64: f.base64
+          }))
+        };
+      }
+
+      const logEntry = {
+        timestamp: new Date().toISOString(),
+        method: req.method,
+        url: req.originalUrl || req.url,
+        headers: req.headers,
+        body: {
+          raw: {
+            length: rawBody ? rawBody.length : 0,
+            charset,
+            text: rawBody ? rawBody.toString(charset) : '',
+            base64: rawBody ? rawBody.toString('base64') : ''
+          },
+          parsed: logParsedBody
+        }
+      };
+
+      logger(JSON.stringify(logEntry));
+    })().then(() => next()).catch(next);
+  };
+}
+
+module.exports = createRequestLogger;

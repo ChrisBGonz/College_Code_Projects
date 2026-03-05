@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+import os
+import time
+import json
+import argparse
+import glob
+import gzip
+import shutil
+import datetime
+import re
+
+TIMESTAMP_FORMAT = "%Y%m%d_%H%M%S"
+
+
+def load_state(path):
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        return {k: float(v) for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+def save_state(path, state):
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def resolve_paths(patterns):
+    result = []
+    for p in patterns:
+        p = os.path.expandvars(os.path.expanduser(p))
+        matches = glob.glob(p, recursive=True)
+        if matches:
+            result.extend(matches)
+        else:
+            result.append(p)
+    uniq = []
+    seen = set()
+    for p in result:
+        ap = os.path.abspath(p)
+        if ap not in seen:
+            seen.add(ap)
+            uniq.append(ap)
+    return uniq
+
+
+def list_rotated_files(log_path):
+    directory = os.path.dirname(log_path) or "."
+    base = os.path.basename(log_path)
+    pattern = re.compile(re.escape(base) + r"\.(\d{8}_\d{6})(?:\.\d+)?(?:\.gz)?$")
+    files = []
+    try:
+        for fname in os.listdir(directory):
+            m = pattern.match(fname)
+            if m:
+                ts = m.group(1)
+                try:
+                    t = datetime.datetime.strptime(ts, TIMESTAMP_FORMAT).timestamp()
+                except Exception:
+                    try:
+                        t = os.path.getmtime(os.path.join(directory, fname))
+                    except Exception:
+                        t = 0
+                files.append((t, os.path.join(directory, fname)))
+    except FileNotFoundError:
+        pass
+    return sorted(files, key=lambda x: x[0], reverse=True)
+
+
+def enforce_retention(log_path, max_backups):
+    if max_backups is None or max_backups < 0:
+        return
+    files = list_rotated_files(log_path)
+    for i, (_, f) in enumerate(files):
+        if i >= max_backups:
+            try:
+                os.remove(f)
+            except Exception:
+                pass
+
+
+def rotate_file(path, compress, max_backups, copytruncate=False):
+    if not os.path.isfile(path):
+        return False
+    timestamp = datetime.datetime.now().strftime(TIMESTAMP_FORMAT)
+    dest = f"{path}.{timestamp}"
+    if os.path.exists(dest) or (compress and os.path.exists(dest + ".gz")):
+        idx = 1
+        while True:
+            candidate = f"{dest}.{idx}"
+            if not os.path.exists(candidate) and not (compress and os.path.exists(candidate + ".gz")):
+                dest = candidate
+                break
+            idx += 1
+    rotated = False
+    if copytruncate:
+        try:
+            shutil.copy2(path, dest)
+            with open(path, "w") as f:
+                pass
+            rotated = True
+        except Exception:
+            rotated = False
+    else:
+        try:
+            st = os.stat(path)
+        except Exception:
+            st = None
+        try:
+            os.rename(path, dest)
+            rotated = True
+            if st:
+                fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, st.st_mode & 0o777)
+                os.close(fd)
+                try:
+                    os.chmod(path, st.st_mode & 0o777)
+                except Exception:
+                    pass
+                try:
+                    os.chown(path, st.st_uid, st.st_gid)
+                except Exception:
+                    pass
+            else:
+                with open(path, "a") as f:
+                    pass
+        except Exception:
+            try:
+                shutil.copy2(path, dest)
+                with open(path, "w") as f:
+                    pass
+                rotated = True
+            except Exception:
+                rotated = False
+    if not rotated:
+        return False
+    if compress:
+        gz_path = dest + ".gz"
+        try:
+            with open(dest, "rb") as f_in, gzip.open(gz_path, "wb") as f_out:
+                shutil.copyfileobj(f_in, f_out)
+            os.remove(dest)
+            dest = gz_path
+        except Exception:
+            pass
+    enforce_retention(path, max_backups)
+    return True
+
+
+def process(paths, state, interval, compress, max_backups, copytruncate):
+    now = time.time()
+    for path in paths:
+        if not os.path.exists(path) or os.path.isdir(path):
+            continue
+        last = state.get(path)
+        if last is None:
+            try:
+                last = os.path.getmtime(path)
+            except Exception:
+                continue
+            state[path] = last
+        if now - last >= interval:
+            if rotate_file(path, compress, max_backups, copytruncate):
+                state[path] = now
+        else:
+            enforce_retention(path, max_backups)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("logfiles", nargs="+", help="Logdateien oder Glob-Pattern")
+    parser.add_argument("--interval-hours", type=float, default=24.0, help="Rotationsintervall in Stunden")
+    parser.add_argument("--max-backups", type=int, default=7, help="Maximale Anzahl aufzubewahrender Backups (-1 = unbegrenzt)")
+    parser.add_argument("--compress", action="store_true", help="Rotierte Logs gzip-komprimieren")
+    parser.add_argument("--state-file", default="~/.logrotate_state.json", help="Pfad zur Statusdatei")
+    parser.add_argument("--loop", action="store_true", help="Dauerhaft laufen und regelmäßig prüfen")
+    parser.add_argument("--check-interval", type=int, default=60, help="Sekunden zwischen Prüfungen im Loop-Modus")
+    parser.add_argument("--copytruncate", action="store_true", help="Datei kopieren und truncaten statt umbenennen")
+    args = parser.parse_args()
+
+    state_file = os.path.expandvars(os.path.expanduser(args.state_file))
+    state = load_state(state_file)
+    interval = args.interval_hours * 3600
+
+    def run_once():
+        paths = resolve_paths(args.logfiles)
+        process(paths, state, interval, args.compress, args.max_backups, args.copytruncate)
+        save_state(state_file, state)
+
+    if args.loop:
+        try:
+            while True:
+                run_once()
+                time.sleep(args.check_interval)
+        except KeyboardInterrupt:
+            save_state(state_file, state)
+    else:
+        run_once()
+
+
+if __name__ == "__main__":
+    main()

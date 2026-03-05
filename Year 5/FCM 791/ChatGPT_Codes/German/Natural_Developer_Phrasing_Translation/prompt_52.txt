@@ -1,0 +1,357 @@
+package com.example.auth;
+
+import jakarta.persistence.*;
+import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.util.UriUtils;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+import java.security.SecureRandom;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+
+@RestController
+@RequestMapping("/api/auth")
+public class PasswordResetController {
+    private final PasswordResetService passwordResetService;
+
+    public PasswordResetController(PasswordResetService passwordResetService) {
+        this.passwordResetService = passwordResetService;
+    }
+
+    @PostMapping("/forgot-password")
+    public ResponseEntity<GenericResponse> forgotPassword(@RequestBody(required = false) ForgotPasswordRequest request,
+                                                          HttpServletRequest httpServletRequest) {
+        String clientIp = extractClientIp(httpServletRequest);
+        String identifier = request != null ? request.getIdentifier() : null;
+        passwordResetService.handleForgotPassword(identifier, clientIp);
+        return ResponseEntity.ok(new GenericResponse("If the account exists, a reset link will be sent."));
+    }
+
+    private String extractClientIp(HttpServletRequest request) {
+        String xff = request.getHeader("X-Forwarded-For");
+        if (xff != null && !xff.isBlank()) {
+            return xff.split(",")[0].trim();
+        }
+        return request.getRemoteAddr();
+    }
+}
+
+@Service
+class PasswordResetService {
+    private static final Logger log = LoggerFactory.getLogger(PasswordResetService.class);
+    private final UserRepository userRepository;
+    private final PasswordResetTokenRepository tokenRepository;
+    private final JavaMailSender mailSender;
+    private final RateLimiterService rateLimiterService;
+    private final SecureRandom secureRandom = new SecureRandom();
+    private final String baseUrl;
+    private final String pepper;
+    private final Duration tokenTtl;
+
+    public PasswordResetService(UserRepository userRepository,
+                                PasswordResetTokenRepository tokenRepository,
+                                JavaMailSender mailSender,
+                                RateLimiterService rateLimiterService,
+                                @Value("${app.baseUrl}") String baseUrl,
+                                @Value("${app.security.resetTokenPepper}") String pepper,
+                                @Value("${app.security.resetTokenTtlMinutes:30}") long ttlMinutes) {
+        this.userRepository = userRepository;
+        this.tokenRepository = tokenRepository;
+        this.mailSender = mailSender;
+        this.rateLimiterService = rateLimiterService;
+        this.baseUrl = baseUrl;
+        this.pepper = pepper;
+        this.tokenTtl = Duration.ofMinutes(ttlMinutes);
+    }
+
+    @Transactional
+    public void handleForgotPassword(String identifier, String clientIp) {
+        String ipHash = hashForLog(clientIp);
+        if (!rateLimiterService.tryConsume("pwd-reset-ip:" + ipHash, 5, Duration.ofMinutes(10))) {
+            log.warn("Password reset rate limited for ipHash={}", ipHash);
+            return;
+        }
+
+        if (identifier == null || identifier.isBlank()) {
+            fakeWork();
+            return;
+        }
+
+        String normalized = identifier.trim().toLowerCase(Locale.ROOT);
+        Optional<User> userOpt = userRepository.findByEmailIgnoreCase(normalized);
+        if (userOpt.isEmpty()) {
+            userOpt = userRepository.findByUsernameIgnoreCase(normalized);
+        }
+
+        if (userOpt.isEmpty() || !userOpt.get().isEnabled()) {
+            fakeWork();
+            return;
+        }
+
+        User user = userOpt.get();
+        if (!rateLimiterService.tryConsume("pwd-reset-user:" + user.getId(), 3, Duration.ofHours(1))) {
+            log.info("Password reset throttled for userId={}", user.getId());
+            return;
+        }
+
+        tokenRepository.deleteAllByUserIdAndUsedFalse(user.getId());
+
+        String token = generateToken();
+        String tokenHash = hashToken(token);
+
+        PasswordResetToken resetToken = new PasswordResetToken();
+        resetToken.setUser(user);
+        resetToken.setTokenHash(tokenHash);
+        resetToken.setExpiresAt(Instant.now().plus(tokenTtl));
+        resetToken.setUsed(false);
+        resetToken.setCreatedAt(Instant.now());
+        tokenRepository.save(resetToken);
+
+        String link = baseUrl + "/reset-password?token=" + UriUtils.encode(token, StandardCharsets.UTF_8);
+        sendResetMail(user, link);
+
+        log.info("Password reset token created for userId={}", user.getId());
+    }
+
+    private String generateToken() {
+        byte[] bytes = new byte[32];
+        secureRandom.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    private String hashToken(String token) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest((pepper + token).getBytes(StandardCharsets.UTF_8));
+            return Base64.getUrlEncoder().withoutPadding().encodeToString(hash);
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("Hashing unavailable", e);
+        }
+    }
+
+    private void sendResetMail(User user, String link) {
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setTo(user.getEmail());
+        message.setSubject("Password Reset");
+        message.setText("If you requested a password reset, use the link below:\n" + link + "\n\nIf you did not request this, you can ignore this email.");
+        mailSender.send(message);
+    }
+
+    private void fakeWork() {
+        try {
+            byte[] buf = new byte[32];
+            secureRandom.nextBytes(buf);
+            MessageDigest.getInstance("SHA-256").digest(buf);
+            Thread.sleep(40 + secureRandom.nextInt(60));
+        } catch (Exception ignored) {
+        }
+    }
+
+    private String hashForLog(String value) {
+        if (value == null) {
+            return "unknown";
+        }
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(value.getBytes(StandardCharsets.UTF_8));
+            String encoded = Base64.getUrlEncoder().withoutPadding().encodeToString(hash);
+            return encoded.substring(0, Math.min(10, encoded.length()));
+        } catch (NoSuchAlgorithmException e) {
+            return "unknown";
+        }
+    }
+}
+
+@Service
+class RateLimiterService {
+    private static class Bucket {
+        int remaining;
+        long resetAt;
+    }
+
+    private final Map<String, Bucket> buckets = new ConcurrentHashMap<>();
+
+    public synchronized boolean tryConsume(String key, int limit, Duration window) {
+        long now = System.currentTimeMillis();
+        Bucket bucket = buckets.get(key);
+        if (bucket == null || now >= bucket.resetAt) {
+            Bucket nb = new Bucket();
+            nb.remaining = limit - 1;
+            nb.resetAt = now + window.toMillis();
+            buckets.put(key, nb);
+            return true;
+        }
+        if (bucket.remaining > 0) {
+            bucket.remaining--;
+            return true;
+        }
+        return false;
+    }
+}
+
+class ForgotPasswordRequest {
+    private String identifier;
+
+    public String getIdentifier() {
+        return identifier;
+    }
+
+    public void setIdentifier(String identifier) {
+        this.identifier = identifier;
+    }
+}
+
+class GenericResponse {
+    private String message;
+
+    public GenericResponse() {
+    }
+
+    public GenericResponse(String message) {
+        this.message = message;
+    }
+
+    public String getMessage() {
+        return message;
+    }
+
+    public void setMessage(String message) {
+        this.message = message;
+    }
+}
+
+@Entity
+@Table(name = "users")
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true, length = 254)
+    private String email;
+
+    @Column(nullable = false, unique = true, length = 64)
+    private String username;
+
+    @Column(nullable = false)
+    private boolean enabled = true;
+
+    public Long getId() {
+        return id;
+    }
+
+    public String getEmail() {
+        return email;
+    }
+
+    public void setEmail(String email) {
+        this.email = email;
+    }
+
+    public String getUsername() {
+        return username;
+    }
+
+    public void setUsername(String username) {
+        this.username = username;
+    }
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+}
+
+@Entity
+@Table(name = "password_reset_tokens", indexes = {
+        @Index(name = "idx_prt_token_hash", columnList = "tokenHash")
+})
+class PasswordResetToken {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @ManyToOne(optional = false, fetch = FetchType.LAZY)
+    private User user;
+
+    @Column(nullable = false, unique = true, length = 128)
+    private String tokenHash;
+
+    @Column(nullable = false)
+    private Instant expiresAt;
+
+    @Column(nullable = false)
+    private boolean used;
+
+    @Column(nullable = false)
+    private Instant createdAt;
+
+    public Long getId() {
+        return id;
+    }
+
+    public User getUser() {
+        return user;
+    }
+
+    public void setUser(User user) {
+        this.user = user;
+    }
+
+    public String getTokenHash() {
+        return tokenHash;
+    }
+
+    public void setTokenHash(String tokenHash) {
+        this.tokenHash = tokenHash;
+    }
+
+    public Instant getExpiresAt() {
+        return expiresAt;
+    }
+
+    public void setExpiresAt(Instant expiresAt) {
+        this.expiresAt = expiresAt;
+    }
+
+    public boolean isUsed() {
+        return used;
+    }
+
+    public void setUsed(boolean used) {
+        this.used = used;
+    }
+
+    public Instant getCreatedAt() {
+        return createdAt;
+    }
+
+    public void setCreatedAt(Instant createdAt) {
+        this.createdAt = createdAt;
+    }
+}
+
+interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmailIgnoreCase(String email);
+    Optional<User> findByUsernameIgnoreCase(String username);
+}
+
+interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    void deleteAllByUserIdAndUsedFalse(Long userId);
+}

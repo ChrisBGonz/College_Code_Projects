@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import shlex
+import argparse
+
+def eprint(*args):
+    print(*args, file=sys.stderr)
+
+def run(cmd, input=None, check=True, capture=False):
+    if isinstance(cmd, str):
+        cmd_list = shlex.split(cmd)
+    else:
+        cmd_list = cmd
+    result = subprocess.run(
+        cmd_list,
+        input=input,
+        text=True,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None
+    )
+    if check and result.returncode != 0:
+        if capture:
+            if result.stdout:
+                eprint(result.stdout)
+            if result.stderr:
+                eprint(result.stderr)
+        sys.exit(result.returncode)
+    return result
+
+def parse_list(s):
+    if not s:
+        return []
+    parts = []
+    for chunk in s.replace('\n', ',').replace(';', ',').split(','):
+        item = chunk.strip()
+        if item:
+            parts.append(item)
+    return parts
+
+def build_image_ref(registry, image, tag):
+    image_ref = image
+    if registry:
+        registry = registry.rstrip('/')
+        if not image_ref.startswith(registry + '/'):
+            image_ref = registry + '/' + image_ref
+    last_slash = image_ref.rfind('/')
+    if '@' in image_ref and image_ref.rfind('@') > last_slash:
+        return image_ref
+    if tag:
+        last_colon = image_ref.rfind(':')
+        if last_colon <= last_slash:
+            image_ref = image_ref + ':' + tag
+    return image_ref
+
+def docker_login(registry, user, password):
+    if user and password:
+        cmd = ['docker', 'login']
+        if registry:
+            cmd.append(registry)
+        cmd += ['-u', user, '--password-stdin']
+        run(cmd, input=password + '\n')
+    elif user or password:
+        eprint('Registry credentials incomplete')
+        sys.exit(1)
+
+def get_existing_container_id(name):
+    res = run(['docker', 'ps', '-aq', '-f', f'name=^{name}$'], capture=True, check=False)
+    return res.stdout.strip()
+
+def stop_remove_container(name):
+    cid = get_existing_container_id(name)
+    if cid:
+        run(['docker', 'stop', cid], check=False)
+        run(['docker', 'rm', cid], check=False)
+
+def deploy_container(image_ref, name, ports, envs, volumes, network, env_file, restart, command, extra_args):
+    cmd = ['docker', 'run', '-d', '--name', name]
+    if restart:
+        cmd += ['--restart', restart]
+    if env_file:
+        cmd += ['--env-file', env_file]
+    for p in ports:
+        cmd += ['-p', p]
+    for v in volumes:
+        cmd += ['-v', v]
+    for e in envs:
+        cmd += ['-e', e]
+    if network:
+        cmd += ['--network', network]
+    if extra_args:
+        cmd += extra_args
+    cmd.append(image_ref)
+    if command:
+        cmd += shlex.split(command)
+    run(cmd)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--registry', default=os.getenv('REGISTRY_URL', ''))
+    parser.add_argument('--image', default=os.getenv('IMAGE_NAME', ''))
+    parser.add_argument('--tag', default=os.getenv('IMAGE_TAG', 'latest'))
+    parser.add_argument('--container', default=os.getenv('CONTAINER_NAME', ''))
+    parser.add_argument('--ports', default=os.getenv('PORTS', ''))
+    parser.add_argument('--env', default=os.getenv('ENV_VARS', ''))
+    parser.add_argument('--volumes', default=os.getenv('VOLUMES', ''))
+    parser.add_argument('--network', default=os.getenv('NETWORK', ''))
+    parser.add_argument('--env-file', dest='env_file', default=os.getenv('ENV_FILE', ''))
+    parser.add_argument('--restart', default=os.getenv('RESTART_POLICY', 'unless-stopped'))
+    parser.add_argument('--username', default=os.getenv('REGISTRY_USER', ''))
+    parser.add_argument('--password', default=os.getenv('REGISTRY_PASSWORD', ''))
+    parser.add_argument('--password-file', default=os.getenv('REGISTRY_PASSWORD_FILE', ''))
+    parser.add_argument('--pull-only', action='store_true')
+    parser.add_argument('--command', default=os.getenv('CONTAINER_COMMAND', ''))
+    parser.add_argument('--extra-args', default=os.getenv('DOCKER_RUN_ARGS', ''))
+    parser.add_argument('--prod', default=os.getenv('DEPLOY_ENV', 'prod'))
+    parser.add_argument('--force', action='store_true')
+    args = parser.parse_args()
+
+    if not args.image:
+        eprint('IMAGE_NAME is required')
+        sys.exit(1)
+
+    deploy_env = (args.prod or '').lower()
+    if deploy_env not in ('prod', 'production') and not args.force:
+        eprint('Deployment environment is not production; use --force to override')
+        sys.exit(1)
+
+    password = args.password
+    if not password and args.password_file:
+        try:
+            with open(args.password_file, 'r', encoding='utf-8') as f:
+                password = f.read().strip()
+        except FileNotFoundError:
+            eprint('Password file not found')
+            sys.exit(1)
+
+    image_ref = build_image_ref(args.registry, args.image, args.tag)
+
+    docker_login(args.registry, args.username, password)
+
+    run(['docker', 'pull', image_ref])
+
+    if args.pull_only:
+        return
+
+    container_name = args.container or args.image.split('/')[-1].split(':')[0]
+    stop_remove_container(container_name)
+
+    ports = parse_list(args.ports)
+    volumes = parse_list(args.volumes)
+    envs = parse_list(args.env)
+    extra_args = shlex.split(args.extra_args) if args.extra_args else []
+
+    deploy_container(
+        image_ref,
+        container_name,
+        ports,
+        envs,
+        volumes,
+        args.network,
+        args.env_file,
+        args.restart,
+        args.command,
+        extra_args
+    )
+
+if __name__ == '__main__':
+    main()
