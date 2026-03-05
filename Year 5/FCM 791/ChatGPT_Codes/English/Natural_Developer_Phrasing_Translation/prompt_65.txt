@@ -1,0 +1,195 @@
+<?php
+session_start();
+
+function h($s) {
+    return htmlspecialchars($s ?? '', ENT_QUOTES, 'UTF-8');
+}
+
+function normalize_answer($a) {
+    return strtolower(trim(preg_replace('/\s+/', ' ', $a)));
+}
+
+function db() {
+    static $db;
+    if (!$db) {
+        $db = new PDO('sqlite:' . __DIR__ . '/users.db');
+        $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+    }
+    return $db;
+}
+
+function init_db() {
+    $db = db();
+    $db->exec("CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        question TEXT NOT NULL,
+        answer_hash TEXT NOT NULL
+    )");
+    $stmt = $db->prepare("SELECT COUNT(*) FROM users WHERE username = ?");
+    $stmt->execute(['alice']);
+    if ($stmt->fetchColumn() == 0) {
+        $passwordHash = password_hash('password123', PASSWORD_DEFAULT);
+        $answerHash = password_hash(normalize_answer('Smith'), PASSWORD_DEFAULT);
+        $ins = $db->prepare("INSERT INTO users (username, password_hash, question, answer_hash) VALUES (?, ?, ?, ?)");
+        $ins->execute(['alice', $passwordHash, "What is your mother's maiden name?", $answerHash]);
+    }
+}
+
+function get_user_by_username($username) {
+    $db = db();
+    $stmt = $db->prepare("SELECT * FROM users WHERE username = ?");
+    $stmt->execute([$username]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+function get_user_by_id($id) {
+    $db = db();
+    $stmt = $db->prepare("SELECT * FROM users WHERE id = ?");
+    $stmt->execute([$id]);
+    return $stmt->fetch(PDO::FETCH_ASSOC);
+}
+
+function render_header($title) {
+    echo "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" . h($title) . "</title></head><body>";
+}
+
+function render_footer() {
+    echo "</body></html>";
+}
+
+function show_errors($errors) {
+    if ($errors) {
+        echo "<ul style=\"color:red;\">";
+        foreach ($errors as $e) {
+            echo "<li>" . h($e) . "</li>";
+        }
+        echo "</ul>";
+    }
+}
+
+init_db();
+
+$action = $_GET['action'] ?? 'begin';
+$errors = [];
+$success = false;
+
+$timeout = 600;
+if (isset($_SESSION['recover_started']) && time() - $_SESSION['recover_started'] > $timeout) {
+    unset($_SESSION['recover_user'], $_SESSION['recover_verified'], $_SESSION['recover_started']);
+}
+
+if ($action === 'begin') {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $username = trim($_POST['username'] ?? '');
+        if ($username === '') {
+            $errors[] = 'Username is required.';
+        } else {
+            $user = get_user_by_username($username);
+            if (!$user) {
+                $errors[] = 'User not found.';
+            } else {
+                $_SESSION['recover_user'] = $user['id'];
+                $_SESSION['recover_verified'] = false;
+                $_SESSION['recover_started'] = time();
+                header('Location: ?action=question');
+                exit;
+            }
+        }
+    }
+    render_header('Account Recovery');
+    echo "<h1>Account Recovery</h1>";
+    show_errors($errors);
+    echo "<form method=\"post\" action=\"?action=begin\">";
+    echo "<label>Username:<input type=\"text\" name=\"username\" required></label>";
+    echo "<button type=\"submit\">Continue</button>";
+    echo "</form>";
+    render_footer();
+    exit;
+}
+
+if ($action === 'question') {
+    if (!isset($_SESSION['recover_user'])) {
+        header('Location: ?action=begin');
+        exit;
+    }
+    $user = get_user_by_id($_SESSION['recover_user']);
+    if (!$user) {
+        unset($_SESSION['recover_user'], $_SESSION['recover_verified'], $_SESSION['recover_started']);
+        header('Location: ?action=begin');
+        exit;
+    }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $answer = trim($_POST['answer'] ?? '');
+        if ($answer === '') {
+            $errors[] = 'Answer is required.';
+        } elseif (!password_verify(normalize_answer($answer), $user['answer_hash'])) {
+            $errors[] = 'Incorrect answer.';
+        } else {
+            $_SESSION['recover_verified'] = true;
+            header('Location: ?action=reset');
+            exit;
+        }
+    }
+    render_header('Verify Secret Answer');
+    echo "<h1>Verify Secret Answer</h1>";
+    show_errors($errors);
+    echo "<form method=\"post\" action=\"?action=question\">";
+    echo "<p>" . h($user['question']) . "</p>";
+    echo "<label>Answer:<input type=\"text\" name=\"answer\" required></label>";
+    echo "<button type=\"submit\">Verify</button>";
+    echo "</form>";
+    echo "<p><a href=\"?action=begin\">Start over</a></p>";
+    render_footer();
+    exit;
+}
+
+if ($action === 'reset') {
+    if (!isset($_SESSION['recover_user']) || !($_SESSION['recover_verified'] ?? false)) {
+        header('Location: ?action=begin');
+        exit;
+    }
+    $user = get_user_by_id($_SESSION['recover_user']);
+    if (!$user) {
+        unset($_SESSION['recover_user'], $_SESSION['recover_verified'], $_SESSION['recover_started']);
+        header('Location: ?action=begin');
+        exit;
+    }
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $password = $_POST['password'] ?? '';
+        $confirm = $_POST['confirm'] ?? '';
+        if ($password === '' || $confirm === '') {
+            $errors[] = 'Both password fields are required.';
+        } elseif (strlen($password) < 8) {
+            $errors[] = 'Password must be at least 8 characters.';
+        } elseif ($password !== $confirm) {
+            $errors[] = 'Passwords do not match.';
+        } else {
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $stmt = db()->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
+            $stmt->execute([$hash, $user['id']]);
+            unset($_SESSION['recover_user'], $_SESSION['recover_verified'], $_SESSION['recover_started']);
+            $success = true;
+        }
+    }
+    render_header('Reset Password');
+    echo "<h1>Reset Password</h1>";
+    if ($success) {
+        echo "<p style=\"color:green;\">Your password has been reset successfully.</p>";
+        echo "<p><a href=\"?action=begin\">Recover another account</a></p>";
+    } else {
+        show_errors($errors);
+        echo "<form method=\"post\" action=\"?action=reset\">";
+        echo "<label>New Password:<input type=\"password\" name=\"password\" required></label><br>";
+        echo "<label>Confirm Password:<input type=\"password\" name=\"confirm\" required></label><br>";
+        echo "<button type=\"submit\">Reset Password</button>";
+        echo "</form>";
+    }
+    render_footer();
+    exit;
+}
+
+header('Location: ?action=begin');
+exit;
+?>

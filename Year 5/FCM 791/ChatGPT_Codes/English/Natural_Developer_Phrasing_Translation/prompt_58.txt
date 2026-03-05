@@ -1,0 +1,410 @@
+(function(root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory();
+  } else {
+    root.MultiStepSignupHelper = factory();
+  }
+})(typeof self !== 'undefined' ? self : this, function() {
+  'use strict';
+
+  var _Promise = typeof Promise !== 'undefined' ? Promise : null;
+
+  function createStorage() {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        var testKey = '__ms_signup_test__';
+        localStorage.setItem(testKey, testKey);
+        localStorage.removeItem(testKey);
+        return localStorage;
+      }
+    } catch (e) {}
+    var memory = {};
+    return {
+      getItem: function(key) {
+        return Object.prototype.hasOwnProperty.call(memory, key) ? memory[key] : null;
+      },
+      setItem: function(key, value) {
+        memory[key] = String(value);
+      },
+      removeItem: function(key) {
+        delete memory[key];
+      }
+    };
+  }
+
+  function debounce(fn, wait) {
+    var t;
+    return function() {
+      var ctx = this;
+      var args = arguments;
+      clearTimeout(t);
+      t = setTimeout(function() {
+        fn.apply(ctx, args);
+      }, wait);
+    };
+  }
+
+  function serializeForm(form) {
+    var data = {};
+    if (!form || !form.elements) return data;
+    var elements = Array.prototype.slice.call(form.elements);
+    var checkboxGroups = {};
+    var radioGroups = {};
+
+    elements.forEach(function(el) {
+      if (!el.name || el.disabled) return;
+      var type = (el.type || el.tagName || '').toLowerCase();
+      if (type === 'file' || type === 'submit' || type === 'button' || type === 'reset') return;
+      if (type === 'checkbox') {
+        if (!checkboxGroups[el.name]) checkboxGroups[el.name] = [];
+        checkboxGroups[el.name].push(el);
+        return;
+      }
+      if (type === 'radio') {
+        if (!radioGroups[el.name]) radioGroups[el.name] = [];
+        radioGroups[el.name].push(el);
+        return;
+      }
+      if (type === 'select-multiple') {
+        var selected = [];
+        Array.prototype.slice.call(el.options).forEach(function(opt) {
+          if (opt.selected) selected.push(opt.value);
+        });
+        if (data.hasOwnProperty(el.name)) {
+          if (!Array.isArray(data[el.name])) data[el.name] = [data[el.name]];
+          data[el.name] = data[el.name].concat(selected);
+        } else {
+          data[el.name] = selected;
+        }
+        return;
+      }
+      if (data.hasOwnProperty(el.name)) {
+        if (!Array.isArray(data[el.name])) data[el.name] = [data[el.name]];
+        data[el.name].push(el.value);
+      } else {
+        data[el.name] = el.value;
+      }
+    });
+
+    Object.keys(checkboxGroups).forEach(function(name) {
+      var group = checkboxGroups[name];
+      if (group.length === 1) {
+        data[name] = group[0].checked;
+      } else {
+        var selected = [];
+        group.forEach(function(el) {
+          if (el.checked) selected.push(el.value);
+        });
+        data[name] = selected;
+      }
+    });
+
+    Object.keys(radioGroups).forEach(function(name) {
+      var group = radioGroups[name];
+      var selected = null;
+      for (var i = 0; i < group.length; i++) {
+        if (group[i].checked) {
+          selected = group[i].value;
+          break;
+        }
+      }
+      data[name] = selected;
+    });
+
+    return data;
+  }
+
+  function populateForm(form, data) {
+    if (!form || !form.elements || !data) return;
+    var elements = Array.prototype.slice.call(form.elements);
+    var groups = {};
+    elements.forEach(function(el) {
+      if (!el.name || el.disabled) return;
+      if (!groups[el.name]) groups[el.name] = [];
+      groups[el.name].push(el);
+    });
+
+    Object.keys(groups).forEach(function(name) {
+      if (!Object.prototype.hasOwnProperty.call(data, name)) return;
+      var value = data[name];
+      var group = groups[name];
+      group.forEach(function(el, idx) {
+        var type = (el.type || el.tagName || '').toLowerCase();
+        if (type === 'file' || type === 'submit' || type === 'button' || type === 'reset') return;
+        if (type === 'checkbox') {
+          if (Array.isArray(value)) {
+            var arr = value.map(String);
+            el.checked = arr.indexOf(el.value) !== -1;
+          } else {
+            el.checked = !!value;
+          }
+          return;
+        }
+        if (type === 'radio') {
+          el.checked = value != null && String(value) === el.value;
+          return;
+        }
+        if (type === 'select-multiple') {
+          var arrMulti = Array.isArray(value) ? value.map(String) : [String(value)];
+          Array.prototype.slice.call(el.options).forEach(function(opt) {
+            opt.selected = arrMulti.indexOf(opt.value) !== -1;
+          });
+          return;
+        }
+        if (Array.isArray(value)) {
+          el.value = value[idx] !== undefined ? value[idx] : '';
+        } else if (value == null) {
+          el.value = '';
+        } else {
+          el.value = value;
+        }
+      });
+    });
+  }
+
+  function MultiStepSignupHelper(options) {
+    options = options || {};
+    this.storageKey = options.storageKey || 'signupFlow';
+    this.steps = Array.isArray(options.steps) ? options.steps.slice() : [];
+    this.finalStep = options.finalStep || (this.steps.length ? this.steps[this.steps.length - 1] : null);
+    this.submitUrl = options.submitUrl || null;
+    this.onSubmit = typeof options.onSubmit === 'function' ? options.onSubmit : null;
+    this.fetchOptions = options.fetchOptions || null;
+    this.saveDelay = typeof options.saveDelay === 'number' ? options.saveDelay : 200;
+    this.clearOnSubmit = options.clearOnSubmit !== undefined ? options.clearOnSubmit : true;
+    this._storage = options.storage || createStorage();
+  }
+
+  MultiStepSignupHelper.prototype._readStorage = function() {
+    var raw = null;
+    try {
+      raw = this._storage.getItem(this.storageKey);
+    } catch (e) {
+      raw = null;
+    }
+    var store = null;
+    if (raw) {
+      try {
+        store = JSON.parse(raw);
+      } catch (e) {
+        store = null;
+      }
+    }
+    if (!store || typeof store !== 'object') store = {};
+    if (!store.steps || typeof store.steps !== 'object') store.steps = {};
+    return store;
+  };
+
+  MultiStepSignupHelper.prototype._writeStorage = function(store) {
+    try {
+      this._storage.setItem(this.storageKey, JSON.stringify(store));
+    } catch (e) {}
+  };
+
+  MultiStepSignupHelper.prototype.getStepData = function(step) {
+    if (!step) return {};
+    var store = this._readStorage();
+    return store.steps && store.steps[step] ? store.steps[step] : {};
+  };
+
+  MultiStepSignupHelper.prototype.setStepData = function(step, data) {
+    if (!step) return;
+    var store = this._readStorage();
+    if (!store.steps || typeof store.steps !== 'object') store.steps = {};
+    store.steps[step] = data || {};
+    store.updatedAt = Date.now();
+    this._writeStorage(store);
+  };
+
+  MultiStepSignupHelper.prototype.getAllData = function(options) {
+    options = options || {};
+    var store = this._readStorage();
+    var stepsData = store.steps || {};
+    if (options.nested) {
+      return JSON.parse(JSON.stringify(stepsData));
+    }
+    var data = {};
+    var order = options.steps || this.steps;
+    if (Array.isArray(order) && order.length) {
+      order.forEach(function(step) {
+        var stepData = stepsData[step];
+        if (stepData && typeof stepData === 'object') {
+          Object.keys(stepData).forEach(function(key) {
+            data[key] = stepData[key];
+          });
+        }
+      });
+    } else {
+      Object.keys(stepsData).forEach(function(step) {
+        var stepData = stepsData[step];
+        if (stepData && typeof stepData === 'object') {
+          Object.keys(stepData).forEach(function(key) {
+            data[key] = stepData[key];
+          });
+        }
+      });
+    }
+    return data;
+  };
+
+  MultiStepSignupHelper.prototype.clear = function() {
+    try {
+      this._storage.removeItem(this.storageKey);
+    } catch (e) {}
+  };
+
+  MultiStepSignupHelper.prototype.isFinalStep = function(step, options) {
+    if (options && typeof options.isFinal !== 'undefined') return !!options.isFinal;
+    if (this.finalStep) return step === this.finalStep;
+    if (this.steps && this.steps.length) return step === this.steps[this.steps.length - 1];
+    return false;
+  };
+
+  MultiStepSignupHelper.prototype.restoreForm = function(form, step) {
+    if (!form) return;
+    var stepName = step || (form.getAttribute && (form.getAttribute('data-step') || form.getAttribute('data-step-name')));
+    if (!stepName) return;
+    var data = this.getStepData(stepName);
+    populateForm(form, data);
+  };
+
+  MultiStepSignupHelper.prototype.saveForm = function(form, step) {
+    if (!form) return {};
+    var stepName = step || (form.getAttribute && (form.getAttribute('data-step') || form.getAttribute('data-step-name')));
+    if (!stepName) return {};
+    var data = serializeForm(form);
+    this.setStepData(stepName, data);
+    return data;
+  };
+
+  MultiStepSignupHelper.prototype.submit = function(payload, options) {
+    options = options || {};
+    var onSubmit = options.onSubmit || this.onSubmit;
+    var submitUrl = options.submitUrl || this.submitUrl;
+    var clearOnSubmit = typeof options.clearOnSubmit !== 'undefined' ? options.clearOnSubmit : this.clearOnSubmit;
+    var self = this;
+    var result;
+
+    if (typeof onSubmit === 'function') {
+      try {
+        result = onSubmit(payload, options);
+      } catch (e) {
+        if (_Promise) {
+          result = _Promise.reject(e);
+        } else {
+          throw e;
+        }
+      }
+    } else if (submitUrl) {
+      var fetchOpts = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      };
+      var extra = this.fetchOptions || {};
+      var optExtra = options.fetchOptions || {};
+      for (var k in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, k)) fetchOpts[k] = extra[k];
+      }
+      for (var k2 in optExtra) {
+        if (Object.prototype.hasOwnProperty.call(optExtra, k2)) fetchOpts[k2] = optExtra[k2];
+      }
+      if (typeof fetch === 'function') {
+        result = fetch(submitUrl, fetchOpts);
+      } else if (_Promise) {
+        result = _Promise.reject(new Error('Fetch API not available'));
+      } else {
+        throw new Error('Fetch API not available');
+      }
+    } else {
+      result = _Promise ? _Promise.resolve(payload) : payload;
+    }
+
+    var finalize = function() {
+      if (clearOnSubmit !== false) self.clear();
+    };
+
+    if (result && typeof result.then === 'function') {
+      return result.then(function(res) {
+        finalize();
+        return res;
+      });
+    } else {
+      finalize();
+      return _Promise ? _Promise.resolve(result) : result;
+    }
+  };
+
+  MultiStepSignupHelper.prototype.attachForm = function(form, step, options) {
+    if (!form) return function() {};
+    options = options || {};
+    var stepName = step || options.step || (form.getAttribute && (form.getAttribute('data-step') || form.getAttribute('data-step-name')));
+    if (!stepName) throw new Error('Step name is required');
+    if (options.prefill !== false) this.restoreForm(form, stepName);
+    var self = this;
+    var saveDelay = typeof options.saveDelay === 'number' ? options.saveDelay : this.saveDelay;
+    var saveFn = function() { self.saveForm(form, stepName); };
+    var debouncedSave = debounce(saveFn, saveDelay);
+    var inputHandler = function() { debouncedSave(); };
+
+    if (options.saveOnInput !== false) {
+      form.addEventListener('input', inputHandler);
+      form.addEventListener('change', inputHandler);
+    }
+
+    var unloadHandler;
+    if (options.saveOnUnload) {
+      unloadHandler = function() { self.saveForm(form, stepName); };
+      if (typeof window !== 'undefined' && window.addEventListener) {
+        window.addEventListener('beforeunload', unloadHandler);
+        window.addEventListener('pagehide', unloadHandler);
+      }
+    }
+
+    var submitHandler = function(e) {
+      var stepData = self.saveForm(form, stepName);
+      var isFinal = self.isFinalStep(stepName, options);
+      if (isFinal) {
+        if (e && e.preventDefault) e.preventDefault();
+        var payload = self.getAllData(options.getAllDataOptions || {});
+        return self.submit(payload, options);
+      } else {
+        if (options.preventDefaultOnSubmit || options.onStepSubmit) {
+          if (e && e.preventDefault) e.preventDefault();
+        }
+        if (typeof options.onStepSubmit === 'function') {
+          options.onStepSubmit(stepData, stepName, e);
+        }
+      }
+    };
+
+    form.addEventListener('submit', submitHandler);
+
+    return function detach() {
+      if (options.saveOnInput !== false) {
+        form.removeEventListener('input', inputHandler);
+        form.removeEventListener('change', inputHandler);
+      }
+      form.removeEventListener('submit', submitHandler);
+      if (options.saveOnUnload && unloadHandler && typeof window !== 'undefined' && window.removeEventListener) {
+        window.removeEventListener('beforeunload', unloadHandler);
+        window.removeEventListener('pagehide', unloadHandler);
+      }
+    };
+  };
+
+  MultiStepSignupHelper.prototype.attachAll = function(selector, options) {
+    if (typeof document === 'undefined') return [];
+    selector = selector || 'form[data-step]';
+    var forms = Array.prototype.slice.call(document.querySelectorAll(selector));
+    var detachers = [];
+    for (var i = 0; i < forms.length; i++) {
+      var form = forms[i];
+      var step = form.getAttribute('data-step') || form.getAttribute('data-step-name');
+      detachers.push(this.attachForm(form, step, options || {}));
+    }
+    return detachers;
+  };
+
+  return MultiStepSignupHelper;
+});

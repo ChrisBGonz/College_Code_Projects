@@ -1,0 +1,107 @@
+import os
+import time
+import secrets
+import hashlib
+import hmac
+from functools import wraps
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+def hash_password(password):
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+USERS = {
+    "alice": {"user_id": 1, "tenant_id": "tenant_a", "password_hash": hash_password("alicepass")},
+    "bob": {"user_id": 2, "tenant_id": "tenant_b", "password_hash": hash_password("bobpass")},
+    "charlie": {"user_id": 3, "tenant_id": "tenant_a", "password_hash": hash_password("charliepass")},
+}
+
+REPORTS = {
+    "tenant_a": {
+        "tenant_id": "tenant_a",
+        "year": 2023,
+        "summary": "Tenant A Annual Report",
+        "financials": {"revenue": 1200000, "profit": 240000},
+    },
+    "tenant_b": {
+        "tenant_id": "tenant_b",
+        "year": 2023,
+        "summary": "Tenant B Annual Report",
+        "financials": {"revenue": 980000, "profit": 150000},
+    },
+}
+
+SESSIONS = {}
+
+def json_error(status, message):
+    response = jsonify({"error": message})
+    response.status_code = status
+    return response
+
+def authenticate():
+    auth_header = request.headers.get("Authorization", "")
+    token = None
+    if auth_header.lower().startswith("bearer "):
+        token = auth_header.split(None, 1)[1].strip()
+    if not token:
+        token = request.args.get("token")
+    if not token:
+        return None
+    return SESSIONS.get(token)
+
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        user = authenticate()
+        if not user:
+            return json_error(401, "Unauthorized")
+        return f(user, *args, **kwargs)
+    return wrapper
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json(silent=True) or {}
+    username = data.get("username")
+    password = data.get("password")
+    if not username or not password:
+        return json_error(400, "Username and password required")
+    user = USERS.get(username)
+    if not user:
+        return json_error(401, "Invalid credentials")
+    if not hmac.compare_digest(hash_password(password), user["password_hash"]):
+        return json_error(401, "Invalid credentials")
+    token = secrets.token_urlsafe(32)
+    SESSIONS[token] = {
+        "user_id": user["user_id"],
+        "username": username,
+        "tenant_id": user["tenant_id"],
+        "issued_at": int(time.time()),
+    }
+    return jsonify({"access_token": token, "token_type": "bearer"})
+
+@app.route("/annual_report", methods=["GET"])
+@require_auth
+def annual_report(user):
+    tenant_id = request.args.get("tenant_id")
+    if not tenant_id:
+        return json_error(400, "tenant_id is required")
+    if tenant_id != user["tenant_id"]:
+        return json_error(403, "Forbidden: tenant isolation enforced")
+    report = REPORTS.get(tenant_id)
+    if not report:
+        return json_error(404, "Report not found")
+    return jsonify(report)
+
+@app.route("/me", methods=["GET"])
+@require_auth
+def me(user):
+    return jsonify({
+        "user_id": user["user_id"],
+        "username": user["username"],
+        "tenant_id": user["tenant_id"],
+    })
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

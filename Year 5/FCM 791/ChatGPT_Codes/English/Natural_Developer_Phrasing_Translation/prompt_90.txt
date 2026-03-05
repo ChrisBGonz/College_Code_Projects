@@ -1,0 +1,137 @@
+import os
+import glob
+import time
+import logging
+import argparse
+from logging.handlers import TimedRotatingFileHandler
+
+def cleanup_logs(log_dir, base_filename, retention_days=7, max_total_size_bytes=0):
+    if not log_dir:
+        log_dir = "."
+    base_path = os.path.abspath(os.path.join(log_dir, base_filename))
+    pattern = base_path + "*"
+    file_infos = []
+    for path in glob.glob(pattern):
+        if not os.path.isfile(path):
+            continue
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        file_infos.append({
+            "path": path,
+            "mtime": st.st_mtime,
+            "size": st.st_size,
+            "is_base": os.path.abspath(path) == base_path
+        })
+
+    if retention_days and retention_days > 0:
+        cutoff = time.time() - retention_days * 86400
+        for info in list(file_infos):
+            if info["is_base"]:
+                continue
+            if info["mtime"] < cutoff:
+                try:
+                    os.remove(info["path"])
+                except OSError:
+                    pass
+        new_infos = []
+        for info in file_infos:
+            if os.path.isfile(info["path"]):
+                try:
+                    st = os.stat(info["path"])
+                except OSError:
+                    continue
+                info["mtime"] = st.st_mtime
+                info["size"] = st.st_size
+                new_infos.append(info)
+        file_infos = new_infos
+
+    if max_total_size_bytes and max_total_size_bytes > 0:
+        total = sum(info["size"] for info in file_infos)
+        if total > max_total_size_bytes:
+            for info in sorted(file_infos, key=lambda x: x["mtime"]):
+                if total <= max_total_size_bytes:
+                    break
+                if info["is_base"]:
+                    continue
+                try:
+                    os.remove(info["path"])
+                except OSError:
+                    pass
+                total -= info["size"]
+
+class DailyRotatingFileHandler(TimedRotatingFileHandler):
+    def __init__(self, filename, retention_days=7, max_total_size_bytes=0, **kwargs):
+        self.retention_days = retention_days
+        self.max_total_size_bytes = max_total_size_bytes
+        super().__init__(filename, when="midnight", interval=1, backupCount=0, **kwargs)
+        self.suffix = "%Y-%m-%d"
+        self._cleanup()
+
+    def doRollover(self):
+        super().doRollover()
+        self._cleanup()
+
+    def _cleanup(self):
+        cleanup_logs(
+            os.path.dirname(self.baseFilename),
+            os.path.basename(self.baseFilename),
+            self.retention_days,
+            self.max_total_size_bytes
+        )
+
+def setup_logger(name="app", log_dir="logs", log_file="app.log",
+                 retention_days=7, max_total_size_mb=100, level=logging.INFO):
+    os.makedirs(log_dir, exist_ok=True)
+    max_total_size_bytes = int(max_total_size_mb * 1024 * 1024) if max_total_size_mb else 0
+    handler = DailyRotatingFileHandler(
+        os.path.join(log_dir, log_file),
+        retention_days=retention_days,
+        max_total_size_bytes=max_total_size_bytes,
+        encoding="utf-8"
+    )
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    handler.setFormatter(formatter)
+    logger = logging.getLogger(name)
+    logger.setLevel(level)
+    logger.propagate = False
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+    logger.addHandler(handler)
+    return logger
+
+def main():
+    parser = argparse.ArgumentParser(description="Daily log rotation with cleanup.")
+    parser.add_argument("--log-dir", default="logs")
+    parser.add_argument("--log-file", default="app.log")
+    parser.add_argument("--retention-days", type=int, default=7)
+    parser.add_argument("--max-total-size-mb", type=int, default=100)
+    parser.add_argument("--level", default="INFO")
+    parser.add_argument("--message", default="Log rotation initialized.")
+    parser.add_argument("--demo", action="store_true")
+    parser.add_argument("--interval", type=float, default=5.0)
+    args = parser.parse_args()
+
+    level = getattr(logging, args.level.upper(), logging.INFO)
+    logger = setup_logger(
+        log_dir=args.log_dir,
+        log_file=args.log_file,
+        retention_days=args.retention_days,
+        max_total_size_mb=args.max_total_size_mb,
+        level=level
+    )
+    logger.info(args.message)
+
+    if args.demo:
+        i = 0
+        try:
+            while True:
+                logger.info("demo log %d", i)
+                i += 1
+                time.sleep(args.interval)
+        except KeyboardInterrupt:
+            pass
+
+if __name__ == "__main__":
+    main()

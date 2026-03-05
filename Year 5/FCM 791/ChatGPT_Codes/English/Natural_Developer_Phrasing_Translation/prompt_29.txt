@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+import os
+import sys
+import subprocess
+import json
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+import re
+from collections import namedtuple
+
+DepKey = namedtuple('DepKey', ['groupId', 'artifactId', 'type', 'classifier'])
+PROP_RE = re.compile(r'^\$\{([^}]+)\}$')
+RESERVED_PROPS = {
+    'project.version', 'pom.version', 'project.parent.version',
+    'project.groupId', 'pom.groupId', 'project.artifactId', 'pom.artifactId',
+    'revision', 'sha1', 'changelist'
+}
+
+def get_namespace(tag):
+    if tag.startswith('{'):
+        return tag[1:].split('}', 1)[0]
+    return ''
+
+def ns_tag(ns, tag):
+    return f'{{{ns}}}{tag}' if ns else tag
+
+def local_name(tag):
+    return tag.split('}', 1)[1] if tag.startswith('{') else tag
+
+def get_child_text(elem, tag, ns):
+    if elem is None:
+        return None
+    child = elem.find(ns_tag(ns, tag))
+    if child is not None and child.text:
+        return child.text.strip()
+    return None
+
+def indent(elem, level=0):
+    i = "\n" + level * "  "
+    if len(elem):
+        if not elem.text or not elem.text.strip():
+            elem.text = i + "  "
+        for child in elem:
+            indent(child, level + 1)
+            if not child.tail or not child.tail.strip():
+                child.tail = i + "  "
+        if not elem[-1].tail or not elem[-1].tail.strip():
+            elem[-1].tail = i
+    else:
+        if level and (not elem.tail or not elem.tail.strip()):
+            elem.tail = i
+
+class Pom:
+    def __init__(self, path):
+        self.path = path
+        self.tree = ET.parse(path)
+        self.root = self.tree.getroot()
+        self.ns = get_namespace(self.root.tag)
+        if self.ns:
+            ET.register_namespace('', self.ns)
+        self.props_elem = self.root.find(ns_tag(self.ns, 'properties'))
+        self.prop_elems = {}
+        if self.props_elem is not None:
+            for child in list(self.props_elem):
+                self.prop_elems[local_name(child.tag)] = child
+        self.builtin_props = self._compute_builtin_props()
+
+    def _compute_builtin_props(self):
+        parent = self.root.find(ns_tag(self.ns, 'parent'))
+        parent_group = get_child_text(parent, 'groupId', self.ns) if parent is not None else None
+        parent_version = get_child_text(parent, 'version', self.ns) if parent is not None else None
+        groupId = get_child_text(self.root, 'groupId', self.ns) or parent_group
+        artifactId = get_child_text(self.root, 'artifactId', self.ns)
+        version = get_child_text(self.root, 'version', self.ns) or parent_version
+        props = {}
+        if groupId:
+            props['project.groupId'] = groupId
+            props['pom.groupId'] = groupId
+        if artifactId:
+            props['project.artifactId'] = artifactId
+            props['pom.artifactId'] = artifactId
+        if version:
+            props['project.version'] = version
+            props['pom.version'] = version
+        if parent_version:
+            props['project.parent.version'] = parent_version
+        return props
+
+    def resolve(self, text):
+        if text is None:
+            return None
+        t = text.strip()
+        m = PROP_RE.match(t)
+        if m:
+            name = m.group(1)
+            if name in self.prop_elems and self.prop_elems[name].text:
+                return self.prop_elems[name].text.strip()
+            if name in self.builtin_props and self.builtin_props[name]:
+                return self.builtin_props[name]
+        return t
+
+    def set_property(self, name, value):
+        if self.props_elem is None:
+            self.props_elem = ET.SubElement(self.root, ns_tag(self.ns, 'properties'))
+        if name in self.prop_elems:
+            self.prop_elems[name].text = value
+        else:
+            elem = ET.SubElement(self.props_elem, ns_tag(self.ns, name))
+            elem.text = value
+            self.prop_elems[name] = elem
+
+def discover_poms(root_pom):
+    poms = []
+    seen = set()
+    def recurse(pom_path):
+        abs_pom = os.path.abspath(pom_path)
+        if abs_pom in seen or not os.path.isfile(abs_pom):
+            return
+        seen.add(abs_pom)
+        poms.append(abs_pom)
+        try:
+            tree = ET.parse(abs_pom)
+        except Exception:
+            return
+        root = tree.getroot()
+        ns = get_namespace(root.tag)
+        modules_elem = root.find(ns_tag(ns, 'modules'))
+        if modules_elem is None:
+            return
+        for module in modules_elem.findall(ns_tag(ns, 'module')):
+            if module.text:
+                mod_text = module.text.strip()
+                if not mod_text:
+                    continue
+                mod_path = os.path.join(os.path.dirname(abs_pom), mod_text)
+                if os.path.isdir(mod_path):
+                    mod_pom = os.path.join(mod_path, 'pom.xml')
+                else:
+                    mod_pom = mod_path if mod_path.endswith('.xml') else os.path.join(mod_path, 'pom.xml')
+                recurse(mod_pom)
+    recurse(root_pom)
+    return poms
+
+def gather_declared(pom_objs):
+    declared_keys = set()
+    declared_ga = set()
+    for pom in pom_objs:
+        for dep in pom.root.findall('.//' + ns_tag(pom.ns, 'dependency')):
+            g_raw = get_child_text(dep, 'groupId', pom.ns)
+            a_raw = get_child_text(dep, 'artifactId', pom.ns)
+            if not g_raw or not a_raw:
+                continue
+            g = pom.resolve(g_raw)
+            a = pom.resolve(a_raw)
+            if not g or not a or '${' in g or '${' in a:
+                continue
+            t = get_child_text(dep, 'type', pom.ns) or 'jar'
+            c = get_child_text(dep, 'classifier', pom.ns)
+            key = DepKey(g, a, t, c if c else None)
+            declared_keys.add(key)
+            declared_ga.add((g, a))
+    return declared_keys, declared_ga
+
+def maven_cmd():
+    candidates = ['./mvnw', 'mvnw', './mvnw.cmd', 'mvnw.cmd']
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return 'mvn'
+
+def get_resolved_dependencies():
+    cmd = [
+        maven_cmd(), '-B', '-q', '-DskipTests',
+        'dependency:list', '-DexcludeTransitive=false',
+        '-DincludeScope=test', '-DoutputAbsoluteArtifactFilename=false'
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        sys.exit(proc.returncode)
+    resolved_keys = set()
+    resolved_ga = set()
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith('[INFO]'):
+            continue
+        s = line[6:].strip()
+        if not s or s.startswith('---') or s.startswith('The following') or s.startswith('None'):
+            continue
+        if ' (optional)' in s:
+            s = s.replace(' (optional)', '')
+        if s.count(':') < 4:
+            continue
+        parts = s.split(':')
+        if len(parts) < 5:
+            continue
+        groupId = parts[0].strip()
+        artifactId = parts[1].strip()
+        if len(parts) == 5:
+            type_ = parts[2].strip()
+            classifier = None
+        else:
+            type_ = parts[2].strip()
+            classifier = parts[3].strip()
+            if classifier == '':
+                classifier = None
+        if not groupId or not artifactId:
+            continue
+        key = DepKey(groupId, artifactId, type_ if type_ else 'jar', classifier if classifier else None)
+        resolved_keys.add(key)
+        resolved_ga.add((groupId, artifactId))
+    return resolved_keys, resolved_ga
+
+def fetch_latest_version(groupId, artifactId, cache):
+    key = (groupId, artifactId)
+    if key in cache:
+        return cache[key]
+    params = {'q': f'g:"{groupId}"+AND+a:"{artifactId}"', 'rows': '1', 'wt': 'json'}
+    url = 'https://search.maven.org/solrsearch/select?' + urllib.parse.urlencode(params)
+    latest = None
+    try:
+        req = urllib.request.Request(url, headers={'User-Agent': 'maven-dep-bumper'})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            docs = data.get('response', {}).get('docs', [])
+            if docs:
+                doc = docs[0]
+                latest = doc.get('latestVersion') or doc.get('v') or doc.get('version')
+    except Exception:
+        latest = None
+    cache[key] = latest
+    return latest
+
+def get_latest_versions(all_ga):
+    cache = {}
+    latest_versions = {}
+    for g, a in sorted(all_ga):
+        latest_versions[(g, a)] = fetch_latest_version(g, a, cache)
+    return latest_versions
+
+def update_dependencies(pom_objs, latest_versions, property_map):
+    for pom in pom_objs:
+        for dep in pom.root.findall('.//' + ns_tag(pom.ns, 'dependency')):
+            g_raw = get_child_text(dep, 'groupId', pom.ns)
+            a_raw = get_child_text(dep, 'artifactId', pom.ns)
+            if not g_raw or not a_raw:
+                continue
+            g = pom.resolve(g_raw)
+            a = pom.resolve(a_raw)
+            if not g or not a or '${' in g or '${' in a:
+                continue
+            latest = latest_versions.get((g, a))
+            if not latest:
+                continue
+            ver_elem = dep.find(ns_tag(pom.ns, 'version'))
+            if ver_elem is not None and ver_elem.text and ver_elem.text.strip():
+                ver_text = ver_elem.text.strip()
+                m = PROP_RE.match(ver_text)
+                if m:
+                    prop_name = m.group(1)
+                    if prop_name in RESERVED_PROPS or prop_name.startswith('project.') or prop_name.startswith('pom.'):
+                        continue
+                    if prop_name in property_map:
+                        for p, e in property_map[prop_name]:
+                            e.text = latest
+                    else:
+                        pom.set_property(prop_name, latest)
+                        property_map.setdefault(prop_name, []).append((pom, pom.prop_elems[prop_name]))
+                else:
+                    ver_elem.text = latest
+            else:
+                if ver_elem is None:
+                    ver_elem = ET.SubElement(dep, ns_tag(pom.ns, 'version'))
+                ver_elem.text = latest
+
+def add_dependency_management(pom, keys, latest_versions):
+    if not keys:
+        return
+    dm = pom.root.find(ns_tag(pom.ns, 'dependencyManagement'))
+    if dm is None:
+        dm = ET.SubElement(pom.root, ns_tag(pom.ns, 'dependencyManagement'))
+    deps_elem = dm.find(ns_tag(pom.ns, 'dependencies'))
+    if deps_elem is None:
+        deps_elem = ET.SubElement(dm, ns_tag(pom.ns, 'dependencies'))
+    existing = set()
+    for dep in deps_elem.findall(ns_tag(pom.ns, 'dependency')):
+        g = get_child_text(dep, 'groupId', pom.ns)
+        a = get_child_text(dep, 'artifactId', pom.ns)
+        if not g or not a:
+            continue
+        t = get_child_text(dep, 'type', pom.ns) or 'jar'
+        c = get_child_text(dep, 'classifier', pom.ns)
+        existing.add(DepKey(g, a, t, c if c else None))
+    for key in sorted(keys, key=lambda k: (k.groupId, k.artifactId, k.type or '', k.classifier or '')):
+        if key in existing:
+            continue
+        latest = latest_versions.get((key.groupId, key.artifactId))
+        if not latest:
+            continue
+        dep_el = ET.SubElement(deps_elem, ns_tag(pom.ns, 'dependency'))
+        ET.SubElement(dep_el, ns_tag(pom.ns, 'groupId')).text = key.groupId
+        ET.SubElement(dep_el, ns_tag(pom.ns, 'artifactId')).text = key.artifactId
+        if key.type and key.type != 'jar':
+            ET.SubElement(dep_el, ns_tag(pom.ns, 'type')).text = key.type
+        if key.classifier:
+            ET.SubElement(dep_el, ns_tag(pom.ns, 'classifier')).text = key.classifier
+        ET.SubElement(dep_el, ns_tag(pom.ns, 'version')).text = latest
+        existing.add(key)
+
+def main():
+    root_pom = os.path.join(os.getcwd(), 'pom.xml')
+    if not os.path.isfile(root_pom):
+        sys.stderr.write('pom.xml not found\n')
+        sys.exit(1)
+
+    pom_paths = discover_poms(root_pom)
+    pom_objs = [Pom(p) for p in pom_paths]
+    root_abs = os.path.abspath(root_pom)
+    root_pom_obj = None
+    for pom in pom_objs:
+        if os.path.abspath(pom.path) == root_abs:
+            root_pom_obj = pom
+            break
+    if root_pom_obj is None:
+        root_pom_obj = pom_objs[0]
+
+    property_map = {}
+    for pom in pom_objs:
+        for name, elem in pom.prop_elems.items():
+            property_map.setdefault(name, []).append((pom, elem))
+
+    declared_keys, declared_ga = gather_declared(pom_objs)
+    resolved_keys, resolved_ga = get_resolved_dependencies()
+
+    all_ga = declared_ga | resolved_ga
+    latest_versions = get_latest_versions(all_ga)
+
+    update_dependencies(pom_objs, latest_versions, property_map)
+
+    transitive_keys = resolved_keys - declared_keys
+    add_dependency_management(root_pom_obj, transitive_keys, latest_versions)
+
+    for pom in pom_objs:
+        indent(pom.root)
+        pom.tree.write(pom.path, encoding='utf-8', xml_declaration=True)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,113 @@
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+def parse_manifest(path):
+    entries = []
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line[0] == '\ufeff':
+                line = line.lstrip('\ufeff')
+            if not line or line.startswith('#'):
+                continue
+            m = re.match(r'^[A-Za-z0-9_-]+\s+\((.+?)\)\s*=\s*([A-Fa-f0-9]+)$', line)
+            if m:
+                entries.append((m.group(2), m.group(1)))
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                if re.fullmatch(r'[A-Fa-f0-9]{8,}', parts[0]):
+                    hash_val = parts[0]
+                    file_part = line[len(parts[0]):].strip()
+                    if file_part.startswith('*'):
+                        file_part = file_part[1:].lstrip()
+                    entries.append((hash_val, file_part))
+                    continue
+                if re.fullmatch(r'[A-Fa-f0-9]{8,}', parts[-1]):
+                    hash_val = parts[-1]
+                    file_part = line[:line.rfind(parts[-1])].strip()
+                    entries.append((hash_val, file_part))
+                    continue
+            if ':' in line:
+                left, right = line.rsplit(':', 1)
+                if re.fullmatch(r'[A-Fa-f0-9]{8,}', right.strip()):
+                    entries.append((right.strip(), left.strip()))
+                    continue
+                if re.fullmatch(r'[A-Fa-f0-9]{8,}', left.strip()):
+                    entries.append((left.strip(), right.strip()))
+                    continue
+    return entries
+
+def compute_hash(path, algo):
+    h = hashlib.new(algo)
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('manifest', help='Path to manifest file')
+    p.add_argument('-a', '--algo', default='sha256', help='Hash algorithm')
+    p.add_argument('-b', '--base', default=None, help='Base directory for file paths (default: manifest directory)')
+    p.add_argument('-q', '--quiet', action='store_true', help='Only output missing/mismatched files')
+    args = p.parse_args()
+
+    try:
+        hashlib.new(args.algo)
+    except Exception:
+        sys.stderr.write(f'Unsupported hash algorithm: {args.algo}\n')
+        sys.exit(2)
+
+    manifest_path = os.path.abspath(args.manifest)
+    base_dir = os.path.abspath(args.base) if args.base else os.path.dirname(manifest_path)
+
+    entries = parse_manifest(manifest_path)
+
+    missing = []
+    mismatches = []
+    errors = []
+
+    for expected, rel_path in entries:
+        file_path = rel_path
+        if not os.path.isabs(file_path):
+            file_path = os.path.join(base_dir, file_path)
+        if not os.path.exists(file_path) or not os.path.isfile(file_path):
+            missing.append(rel_path)
+            if not args.quiet:
+                print(f'MISSING {rel_path}')
+            continue
+        try:
+            actual = compute_hash(file_path, args.algo)
+        except Exception as e:
+            errors.append((rel_path, str(e)))
+            if not args.quiet:
+                print(f'ERROR {rel_path} {e}')
+            continue
+        if actual.lower() != expected.lower():
+            mismatches.append((rel_path, expected, actual))
+            if not args.quiet:
+                print(f'MISMATCH {rel_path}\n  expected: {expected}\n  actual:   {actual}')
+        else:
+            if not args.quiet:
+                print(f'OK {rel_path}')
+
+    if args.quiet:
+        for rel_path in missing:
+            print(f'MISSING {rel_path}')
+        for rel_path, expected, actual in mismatches:
+            print(f'MISMATCH {rel_path} expected {expected} actual {actual}')
+        for rel_path, err in errors:
+            print(f'ERROR {rel_path} {err}')
+
+    if missing or mismatches or errors:
+        sys.exit(1)
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()

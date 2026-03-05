@@ -1,0 +1,309 @@
+import os
+import tempfile
+import shutil
+import pathlib
+from urllib.parse import urlparse
+
+class PDFRenderError(Exception):
+    pass
+
+class SafeDict(dict):
+    def __missing__(self, key):
+        return ''
+
+def _load_template(template):
+    base_url = None
+    if hasattr(template, 'read'):
+        data = template.read()
+        if isinstance(data, bytes):
+            data = data.decode('utf-8', errors='ignore')
+        return data, None
+    if isinstance(template, (str, os.PathLike)):
+        path = os.fspath(template)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                data = f.read()
+            base_url = os.path.dirname(os.path.abspath(path))
+            return data, base_url
+    if isinstance(template, bytes):
+        return template.decode('utf-8', errors='ignore'), None
+    if template is None:
+        return '', None
+    return str(template), None
+
+def _render_template(html, context):
+    if not context:
+        return html
+    if not isinstance(context, dict):
+        try:
+            context = dict(context)
+        except Exception:
+            context = getattr(context, '__dict__', {})
+    try:
+        from jinja2 import Environment, BaseLoader, select_autoescape
+    except ImportError:
+        try:
+            return html.format_map(SafeDict(context))
+        except Exception:
+            return html
+    env = Environment(loader=BaseLoader(), autoescape=select_autoescape(['html', 'xml']))
+    tmpl = env.from_string(html)
+    return tmpl.render(**context)
+
+def _normalize_css(css):
+    if not css:
+        return []
+    if isinstance(css, (str, bytes, os.PathLike)):
+        return [css]
+    try:
+        return list(css)
+    except Exception:
+        return [css]
+
+def _prepare_assets(assets, base_url):
+    temp_dirs = []
+    if assets:
+        if isinstance(assets, dict):
+            tmp = tempfile.mkdtemp(prefix='pdf_assets_')
+            temp_dirs.append(tmp)
+            for rel, content in assets.items():
+                if rel is None:
+                    continue
+                rel_path = str(rel).lstrip('/\\')
+                file_path = os.path.join(tmp, rel_path)
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                data = None
+                if hasattr(content, 'read'):
+                    data = content.read()
+                else:
+                    data = content
+                if isinstance(data, str):
+                    data = data.encode('utf-8')
+                elif data is None:
+                    data = b''
+                elif not isinstance(data, bytes):
+                    data = str(data).encode('utf-8')
+                with open(file_path, 'wb') as f:
+                    f.write(data)
+            if base_url is None:
+                base_url = tmp
+        elif isinstance(assets, (str, os.PathLike)) and os.path.isdir(assets):
+            if base_url is None:
+                base_url = os.fspath(assets)
+        elif isinstance(assets, (list, tuple, set)):
+            tmp = tempfile.mkdtemp(prefix='pdf_assets_')
+            temp_dirs.append(tmp)
+            for path in assets:
+                if not path:
+                    continue
+                try:
+                    src = os.fspath(path)
+                except Exception:
+                    continue
+                if os.path.isfile(src):
+                    dest = os.path.join(tmp, os.path.basename(src))
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copy2(src, dest)
+            if base_url is None:
+                base_url = tmp
+    return base_url, temp_dirs
+
+def _to_base_href(base_url):
+    if not base_url:
+        return None
+    if isinstance(base_url, os.PathLike):
+        base_url = os.fspath(base_url)
+    base_url = str(base_url)
+    parsed = urlparse(base_url)
+    if parsed.scheme in ('http', 'https', 'file'):
+        href = base_url
+    else:
+        try:
+            href = pathlib.Path(base_url).resolve().as_uri()
+        except Exception:
+            href = base_url
+    if not href.endswith('/'):
+        href += '/'
+    return href
+
+def _inject_base_tag(html, base_url):
+    if not base_url:
+        return html
+    lower = html.lower()
+    if '<base' in lower:
+        return html
+    tag = '<base href="{}">'.format(base_url)
+    head_idx = lower.find('<head')
+    if head_idx != -1:
+        end = lower.find('>', head_idx)
+        if end != -1:
+            return html[:end + 1] + tag + html[end + 1:]
+    return tag + html
+
+class PDFRenderer:
+    def __init__(self, backend='weasyprint', backend_options=None):
+        self.backend = backend or 'weasyprint'
+        self.backend_options = backend_options or {}
+        self._validate_backend()
+
+    def _validate_backend(self):
+        if self.backend in ('weasyprint', 'weasy'):
+            try:
+                import weasyprint
+            except ImportError as e:
+                raise PDFRenderError('WeasyPrint is not installed') from e
+        elif self.backend in ('pdfkit', 'wkhtmltopdf'):
+            try:
+                import pdfkit
+            except ImportError as e:
+                raise PDFRenderError('pdfkit is not installed') from e
+        else:
+            raise PDFRenderError('Unknown backend: {}'.format(self.backend))
+
+    def render(self, template, context=None, output_path=None, return_bytes=None, base_url=None, css=None, assets=None, backend_options=None):
+        html, template_base = _load_template(template)
+        if base_url is None:
+            base_url = template_base
+        base_url, asset_dirs = _prepare_assets(assets, base_url)
+        html = _render_template(html, context)
+        css_list = _normalize_css(css)
+        if return_bytes is None:
+            return_bytes = output_path is None
+        if output_path:
+            output_path = os.fspath(output_path)
+            out_dir = os.path.dirname(os.path.abspath(output_path))
+            if out_dir and not os.path.exists(out_dir):
+                os.makedirs(out_dir, exist_ok=True)
+        opts = {}
+        for src in (self.backend_options, backend_options):
+            if src:
+                if not isinstance(src, dict):
+                    try:
+                        src = dict(src)
+                    except Exception:
+                        src = {}
+                opts.update(src)
+        try:
+            if self.backend in ('weasyprint', 'weasy'):
+                result = self._render_weasyprint(html, output_path, base_url, css_list, opts, return_bytes)
+            elif self.backend in ('pdfkit', 'wkhtmltopdf'):
+                result = self._render_pdfkit(html, output_path, base_url, css_list, opts, return_bytes)
+            else:
+                raise PDFRenderError('Unknown backend: {}'.format(self.backend))
+            return result
+        except Exception as e:
+            if isinstance(e, PDFRenderError):
+                raise
+            raise PDFRenderError(str(e)) from e
+        finally:
+            for d in asset_dirs:
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+
+    def _render_weasyprint(self, html, output_path, base_url, css_list, options, return_bytes):
+        from weasyprint import HTML, CSS
+        html_kwargs = options.get('html') or {}
+        css_kwargs = options.get('css') or {}
+        pdf_kwargs = options.get('pdf') or {}
+        if not isinstance(html_kwargs, dict):
+            try:
+                html_kwargs = dict(html_kwargs)
+            except Exception:
+                html_kwargs = {}
+        if not isinstance(css_kwargs, dict):
+            try:
+                css_kwargs = dict(css_kwargs)
+            except Exception:
+                css_kwargs = {}
+        if not isinstance(pdf_kwargs, dict):
+            try:
+                pdf_kwargs = dict(pdf_kwargs)
+            except Exception:
+                pdf_kwargs = {}
+        if base_url is not None and 'base_url' not in html_kwargs:
+            html_kwargs['base_url'] = base_url
+        html_obj = HTML(string=html, **html_kwargs)
+        stylesheets = []
+        for item in css_list:
+            if item is None:
+                continue
+            if isinstance(item, bytes):
+                try:
+                    item = item.decode('utf-8')
+                except Exception:
+                    item = item.decode('utf-8', errors='ignore')
+            if isinstance(item, (str, os.PathLike)) and os.path.exists(os.fspath(item)):
+                stylesheets.append(CSS(filename=os.fspath(item), **css_kwargs))
+            else:
+                stylesheets.append(CSS(string=str(item), **css_kwargs))
+        if output_path and not return_bytes:
+            html_obj.write_pdf(target=output_path, stylesheets=stylesheets or None, **pdf_kwargs)
+            return output_path
+        pdf_bytes = html_obj.write_pdf(stylesheets=stylesheets or None, **pdf_kwargs)
+        if output_path:
+            with open(output_path, 'wb') as f:
+                f.write(pdf_bytes)
+        return pdf_bytes
+
+    def _render_pdfkit(self, html, output_path, base_url, css_list, options, return_bytes):
+        import pdfkit
+        cfg = options.get('configuration')
+        if cfg is None and options.get('wkhtmltopdf'):
+            cfg = pdfkit.configuration(wkhtmltopdf=options.get('wkhtmltopdf'))
+        pdfkit_options = options.get('options') or {}
+        if not isinstance(pdfkit_options, dict):
+            try:
+                pdfkit_options = dict(pdfkit_options)
+            except Exception:
+                pdfkit_options = {}
+        if base_url:
+            href = _to_base_href(base_url)
+            if href:
+                html = _inject_base_tag(html, href)
+            parsed = urlparse(str(base_url))
+            if parsed.scheme in ('', 'file'):
+                if 'enable-local-file-access' not in pdfkit_options:
+                    pdfkit_options['enable-local-file-access'] = None
+        css_files = []
+        temp_files = []
+        for c in css_list:
+            if c is None:
+                continue
+            if isinstance(c, bytes):
+                try:
+                    c = c.decode('utf-8')
+                except Exception:
+                    pass
+            path = None
+            if isinstance(c, (str, os.PathLike)) and os.path.exists(os.fspath(c)):
+                path = os.fspath(c)
+            else:
+                fd, path = tempfile.mkstemp(prefix='pdf_css_', suffix='.css')
+                with os.fdopen(fd, 'wb') as f:
+                    if isinstance(c, bytes):
+                        f.write(c)
+                    else:
+                        f.write(str(c).encode('utf-8'))
+                temp_files.append(path)
+            css_files.append(path)
+        try:
+            if output_path and not return_bytes:
+                pdfkit.from_string(html, output_path, options=pdfkit_options or None, css=css_files or None, configuration=cfg)
+                return output_path
+            pdf_bytes = pdfkit.from_string(html, False, options=pdfkit_options or None, css=css_files or None, configuration=cfg)
+            if output_path:
+                with open(output_path, 'wb') as f:
+                    f.write(pdf_bytes)
+            return pdf_bytes
+        finally:
+            for p in temp_files:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+def render_pdf(template, context=None, output_path=None, backend='weasyprint', base_url=None, css=None, assets=None, return_bytes=None, backend_options=None):
+    renderer = PDFRenderer(backend=backend)
+    return renderer.render(template, context=context, output_path=output_path, return_bytes=return_bytes, base_url=base_url, css=css, assets=assets, backend_options=backend_options)

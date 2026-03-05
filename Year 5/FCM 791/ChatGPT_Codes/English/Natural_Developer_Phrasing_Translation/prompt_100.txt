@@ -1,0 +1,201 @@
+const CircuitState = {
+  CLOSED: 'CLOSED',
+  OPEN: 'OPEN',
+  HALF_OPEN: 'HALF_OPEN'
+};
+
+const isNumber = v => typeof v === 'number' && !isNaN(v);
+
+class CircuitBreaker {
+  constructor(action, options = {}) {
+    if (typeof action !== 'function') {
+      throw new TypeError('action must be a function');
+    }
+    this.action = action;
+    this.failureThreshold = isNumber(options.failureThreshold) ? options.failureThreshold : 5;
+    if (this.failureThreshold < 1) this.failureThreshold = 1;
+    this.successThreshold = isNumber(options.successThreshold) ? options.successThreshold : 1;
+    if (this.successThreshold < 1) this.successThreshold = 1;
+    this.timeout = isNumber(options.timeout) ? options.timeout : 10000;
+    if (this.timeout < 0) this.timeout = 0;
+    this.halfOpenMaxCalls = isNumber(options.halfOpenMaxCalls) ? options.halfOpenMaxCalls : this.successThreshold;
+    if (this.halfOpenMaxCalls < 1) this.halfOpenMaxCalls = 1;
+    this.probe = typeof options.probe === 'function' ? options.probe : (typeof options.healthCheck === 'function' ? options.healthCheck : null);
+    this.probeArgs = Array.isArray(options.probeArgs) ? options.probeArgs : null;
+    this.probeInterval = isNumber(options.probeInterval) ? options.probeInterval : this.timeout;
+    if (this.probeInterval < 0) this.probeInterval = 0;
+
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenCalls = 0;
+    this.nextAttempt = 0;
+    this._probeTimer = null;
+    this._listeners = new Set();
+    this._lastArgs = [];
+  }
+
+  onStateChange(fn) {
+    if (typeof fn === 'function') {
+      this._listeners.add(fn);
+      return () => this._listeners.delete(fn);
+    }
+    return () => {};
+  }
+
+  _emit(state) {
+    this._listeners.forEach(fn => {
+      try { fn(state); } catch (e) {}
+    });
+  }
+
+  _transition(state) {
+    if (this.state !== state) {
+      this.state = state;
+      this._emit(state);
+    }
+  }
+
+  call(...args) {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._halfOpen();
+      } else {
+        return Promise.reject(this._error('CircuitBreakerOpen'));
+      }
+    }
+
+    if (this.state === CircuitState.HALF_OPEN) {
+      if (this.halfOpenCalls >= this.halfOpenMaxCalls) {
+        return Promise.reject(this._error('CircuitBreakerHalfOpen'));
+      }
+      this.halfOpenCalls++;
+    }
+
+    this._lastArgs = args;
+    return this._execute(this.action, args);
+  }
+
+  fire(...args) {
+    return this.call(...args);
+  }
+
+  _execute(fn, args) {
+    let result;
+    try {
+      result = fn(...args);
+    } catch (err) {
+      return this._handleFailure(err);
+    }
+    return Promise.resolve(result).then(
+      res => this._handleSuccess(res),
+      err => this._handleFailure(err)
+    );
+  }
+
+  _handleSuccess(res) {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else {
+      this.failureCount = 0;
+    }
+    return res;
+  }
+
+  _handleFailure(err) {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this._open();
+    } else {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+    return Promise.reject(err);
+  }
+
+  _open() {
+    this._transition(CircuitState.OPEN);
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenCalls = 0;
+    this.nextAttempt = Date.now() + this.timeout;
+    this._startProbe();
+  }
+
+  _halfOpen() {
+    this._transition(CircuitState.HALF_OPEN);
+    this.successCount = 0;
+    this.halfOpenCalls = 0;
+    this._stopProbe();
+  }
+
+  _close() {
+    this._transition(CircuitState.CLOSED);
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.halfOpenCalls = 0;
+    this._stopProbe();
+  }
+
+  _startProbe() {
+    if (this._probeTimer || this.probeInterval <= 0) return;
+    this._probeTimer = setInterval(() => {
+      if (this.state !== CircuitState.OPEN) return;
+      if (Date.now() < this.nextAttempt) return;
+      const fn = this.probe || this.action;
+      const args = this.probeArgs !== null ? this.probeArgs : this._lastArgs;
+      this._halfOpen();
+      this.halfOpenCalls++;
+      this._execute(fn, Array.isArray(args) ? args : []).catch(() => {});
+    }, this.probeInterval);
+  }
+
+  _stopProbe() {
+    if (this._probeTimer) {
+      clearInterval(this._probeTimer);
+      this._probeTimer = null;
+    }
+  }
+
+  _error(code) {
+    const err = new Error(code);
+    err.code = code;
+    err.state = this.state;
+    return err;
+  }
+
+  isOpen() {
+    return this.state === CircuitState.OPEN;
+  }
+
+  isClosed() {
+    return this.state === CircuitState.CLOSED;
+  }
+
+  isHalfOpen() {
+    return this.state === CircuitState.HALF_OPEN;
+  }
+
+  open() {
+    this._open();
+  }
+
+  close() {
+    this._close();
+  }
+
+  reset() {
+    this._close();
+  }
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { CircuitBreaker, CircuitState };
+} else if (typeof window !== 'undefined') {
+  window.CircuitBreaker = CircuitBreaker;
+  window.CircuitState = CircuitState;
+}

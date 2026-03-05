@@ -1,0 +1,125 @@
+import socket
+import sys
+import argparse
+from itertools import cycle
+
+def xor_bytes(data: bytes, key: bytes) -> bytes:
+    if not key:
+        return data
+    return bytes(b ^ k for b, k in zip(data, cycle(key)))
+
+class LegacyClient:
+    def __init__(self, host, port, key, timeout=5.0, encoding='utf-8'):
+        self.host = host
+        self.port = port
+        if isinstance(key, (bytes, bytearray, memoryview)):
+            self.key = bytes(key)
+        else:
+            self.key = str(key).encode(encoding)
+        self.timeout = timeout
+        self.encoding = encoding
+        self.sock = None
+
+    def connect(self):
+        if self.sock:
+            return self
+        self.sock = socket.create_connection((self.host, self.port), self.timeout)
+        self.sock.settimeout(self.timeout)
+        return self
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.sock.close()
+            self.sock = None
+
+    def __enter__(self):
+        return self.connect()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+    def _encode(self, data):
+        if isinstance(data, str):
+            data = data.encode(self.encoding)
+        else:
+            data = bytes(data)
+        return xor_bytes(data, self.key)
+
+    def _decode(self, data):
+        return xor_bytes(data, self.key)
+
+    def send(self, data):
+        if not self.sock:
+            self.connect()
+        payload = self._encode(data)
+        self.sock.sendall(payload)
+
+    def recv(self, size=4096):
+        if not self.sock:
+            self.connect()
+        data = self.sock.recv(size)
+        if not data:
+            return b''
+        return self._decode(data)
+
+    def recv_exact(self, size):
+        if not self.sock:
+            self.connect()
+        buf = bytearray()
+        while len(buf) < size:
+            chunk = self.sock.recv(size - len(buf))
+            if not chunk:
+                break
+            buf.extend(chunk)
+        if not buf:
+            return b''
+        return self._decode(bytes(buf))
+
+    def request(self, data, size=4096):
+        self.send(data)
+        return self.recv(size)
+
+def main():
+    parser = argparse.ArgumentParser(description='Legacy XOR TCP client')
+    parser.add_argument('host')
+    parser.add_argument('port', type=int)
+    parser.add_argument('key')
+    parser.add_argument('-m', '--message', help='message to send; if omitted, read from stdin')
+    parser.add_argument('-s', '--size', type=int, default=4096, help='bytes to read for response')
+    parser.add_argument('-t', '--timeout', type=float, default=5.0)
+    parser.add_argument('--hex', action='store_true', help='interpret message as hex bytes')
+    parser.add_argument('--no-response', action='store_true', help='do not wait for response')
+    args = parser.parse_args()
+
+    def parse_message(msg):
+        if msg is None:
+            return None
+        if args.hex:
+            return bytes.fromhex(msg.strip())
+        return msg
+
+    with LegacyClient(args.host, args.port, args.key, timeout=args.timeout) as client:
+        if args.message is not None:
+            client.send(parse_message(args.message))
+            if not args.no_response and args.size > 0:
+                resp = client.recv(args.size)
+                if resp:
+                    sys.stdout.buffer.write(resp)
+                    sys.stdout.flush()
+        else:
+            for line in sys.stdin.buffer:
+                if not line:
+                    break
+                client.send(line)
+                if not args.no_response and args.size > 0:
+                    resp = client.recv(args.size)
+                    if resp:
+                        sys.stdout.buffer.write(resp)
+                        sys.stdout.flush()
+
+if __name__ == '__main__':
+    main()

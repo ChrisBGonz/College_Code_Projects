@@ -1,0 +1,124 @@
+import json
+import time
+import argparse
+import sys
+from typing import Any, Dict, Optional, List
+from urllib.request import urlopen, Request
+import jwt
+
+class JWKSClient:
+    def __init__(self, jwks_url: str, cache_ttl: int = 300):
+        self.jwks_url = jwks_url
+        self.cache_ttl = cache_ttl
+        self.last_fetch = 0.0
+        self.keys: Dict[str, Dict[str, Any]] = {}
+
+    def _needs_refresh(self) -> bool:
+        return not self.keys or (time.time() - self.last_fetch) > self.cache_ttl
+
+    def _fetch_jwks(self) -> Dict[str, Any]:
+        req = Request(self.jwks_url, headers={"Accept": "application/json"})
+        with urlopen(req, timeout=10) as resp:
+            data = resp.read()
+        return json.loads(data.decode("utf-8"))
+
+    def refresh(self) -> None:
+        data = self._fetch_jwks()
+        keys = data.get("keys", [])
+        new_keys: Dict[str, Dict[str, Any]] = {}
+        for k in keys:
+            kid = k.get("kid")
+            if kid:
+                new_keys[kid] = k
+        self.keys = new_keys
+        self.last_fetch = time.time()
+
+    def get_jwk(self, kid: str) -> Optional[Dict[str, Any]]:
+        if self._needs_refresh() or kid not in self.keys:
+            self.refresh()
+        return self.keys.get(kid)
+
+    def get_all_jwks(self) -> List[Dict[str, Any]]:
+        if self._needs_refresh():
+            self.refresh()
+        return list(self.keys.values())
+
+    def get_signing_key(self, kid: str, alg: str):
+        jwk = self.get_jwk(kid)
+        if not jwk:
+            raise KeyError(f"Key with kid {kid} not found")
+        if jwk.get("alg") and jwk.get("alg") != alg:
+            raise ValueError(f"Algorithm mismatch: header {alg} vs jwk {jwk.get('alg')}")
+        return jwk_to_public_key(jwk, alg)
+
+def jwk_to_public_key(jwk: Dict[str, Any], alg: str):
+    algs = jwt.algorithms.get_default_algorithms()
+    if alg not in algs:
+        raise ValueError(f"Unsupported algorithm: {alg}")
+    return algs[alg].from_jwk(json.dumps(jwk))
+
+class JWTAuthenticator:
+    def __init__(self, jwks_url: str, issuer: str, audience: str, cache_ttl: int = 300, leeway: int = 0):
+        self.issuer = issuer
+        self.audience = audience
+        self.leeway = leeway
+        self.jwks_client = JWKSClient(jwks_url, cache_ttl)
+
+    def _select_key(self, token: str):
+        header = jwt.get_unverified_header(token)
+        alg = header.get("alg")
+        kid = header.get("kid")
+        if not alg:
+            raise ValueError("Token header missing alg")
+        if kid:
+            key = self.jwks_client.get_signing_key(kid, alg)
+            return key, alg
+        jwks = self.jwks_client.get_all_jwks()
+        if len(jwks) == 1:
+            key = jwk_to_public_key(jwks[0], alg)
+            return key, alg
+        raise ValueError("Token header missing kid and multiple JWKS keys present")
+
+    def decode(self, token: str) -> Dict[str, Any]:
+        key, alg = self._select_key(token)
+        options = {
+            "require": ["exp", "iss", "aud", "nbf"],
+            "verify_signature": True,
+            "verify_exp": True,
+            "verify_iss": True,
+            "verify_aud": True,
+            "verify_nbf": True,
+        }
+        payload = jwt.decode(
+            token,
+            key=key,
+            algorithms=[alg],
+            issuer=self.issuer,
+            audience=self.audience,
+            options=options,
+            leeway=self.leeway,
+        )
+        return payload
+
+    def verify(self, token: str) -> Dict[str, Any]:
+        return self.decode(token)
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("token", help="JWT to verify")
+    parser.add_argument("--jwks-url", required=True)
+    parser.add_argument("--issuer", required=True)
+    parser.add_argument("--audience", required=True)
+    parser.add_argument("--cache-ttl", type=int, default=300)
+    parser.add_argument("--leeway", type=int, default=0)
+    args = parser.parse_args()
+    auth = JWTAuthenticator(args.jwks_url, args.issuer, args.audience, args.cache_ttl, args.leeway)
+    try:
+        payload = auth.decode(args.token)
+    except Exception as e:
+        sys.stderr.write(str(e) + "\n")
+        sys.exit(1)
+    sys.stdout.write(json.dumps(payload, separators=(",", ":"), sort_keys=True))
+
+if __name__ == "__main__":
+    main()

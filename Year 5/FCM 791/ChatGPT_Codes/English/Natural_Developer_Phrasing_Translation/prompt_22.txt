@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+umask 022
+
+TOOL_NAME="${TOOL_NAME:-securitytool}"
+BIN_NAME="${BIN_NAME:-$TOOL_NAME}"
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+ASSET_PATTERN="${ASSET_PATTERN:-linux_amd64}"
+LOG_FILE="${LOG_FILE:-/tmp/${TOOL_NAME}-install.log}"
+
+usage(){ echo "Usage: $0 <release_url> [asset_pattern]" >&2; }
+
+RELEASE_API_URL="${RELEASE_API_URL:-}"
+if [[ $# -ge 1 ]]; then RELEASE_API_URL="$1"; fi
+if [[ -z "$RELEASE_API_URL" ]]; then usage; exit 1; fi
+if [[ $# -ge 2 ]]; then ASSET_PATTERN="$2"; fi
+
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/${TOOL_NAME}-install.log"
+
+log(){ printf '%s %s\n' "$(date +'%Y-%m-%dT%H:%M:%S%z')" "$*" | tee -a "$LOG_FILE" >&2; }
+die(){ log "ERROR: $*"; exit 1; }
+need_cmd(){ command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+need_cmd curl
+need_cmd grep
+need_cmd cut
+need_cmd awk
+need_cmd mktemp
+
+WORK_DIR="$(mktemp -d)"
+cleanup(){ rm -rf "$WORK_DIR"; }
+trap cleanup EXIT
+
+CURL_OPTS=(-fsSL --retry 3 --retry-delay 2)
+
+SHA256_CMD=()
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD=(sha256sum)
+elif command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD=(shasum -a 256)
+fi
+
+select_asset(){
+    local pattern="$1" info="$2" url
+    url=$(grep -aE '"browser_download_url"' "$info" | cut -d '"' -f4 | grep -E "$pattern" | grep -Evi 'sha256|checksum|sig|asc' | head -n1 || true)
+    if [[ -z "$url" ]]; then
+        url=$(grep -aE '"browser_download_url"' "$info" | cut -d '"' -f4 | grep -Evi 'sha256|checksum|sig|asc' | head -n1 || true)
+    fi
+    echo "$url"
+}
+
+find_checksum(){
+    local info="$1" asset="$2" base url
+    base=$(basename "${asset%%\?*}")
+    url=$(grep -aE '"browser_download_url"' "$info" | cut -d '"' -f4 | grep -F "${base}.sha256" | head -n1 || true)
+    if [[ -z "$url" ]]; then
+        url=$(grep -aE '"browser_download_url"' "$info" | cut -d '"' -f4 | grep -F "${base}.sha256sum" | head -n1 || true)
+    fi
+    if [[ -z "$url" ]]; then
+        url=$(grep -aE '"browser_download_url"' "$info" | cut -d '"' -f4 | grep -E 'sha256|checksum' | head -n1 || true)
+    fi
+    echo "$url"
+}
+
+verify_checksum(){
+    local file="$1" checksum_file="$2"
+    if [[ ${#SHA256_CMD[@]} -eq 0 ]]; then
+        log "SHA256 tool not found; skipping verification"
+        return 0
+    fi
+    if ! grep -aqE '[a-fA-F0-9]{64}' "$checksum_file"; then
+        log "Checksum file does not contain SHA256 hash; skipping verification"
+        return 0
+    fi
+    local fname line tmp expected actual
+    fname=$(basename "$file")
+    if grep -aFq "$fname" "$checksum_file"; then
+        line=$(grep -aF "$fname" "$checksum_file" | head -n1)
+        tmp="$WORK_DIR/verify.sha256"
+        echo "$line" > "$tmp"
+        (cd "$(dirname "$file")" && "${SHA256_CMD[@]}" -c "$tmp") >>"$LOG_FILE" 2>&1 || die "Checksum verification failed"
+    else
+        expected=$(grep -aEo '[a-fA-F0-9]{64}' "$checksum_file" | head -n1)
+        actual=$("${SHA256_CMD[@]}" "$file" | awk '{print $1}')
+        [[ "$expected" == "$actual" ]] || die "Checksum verification failed"
+    fi
+    log "Checksum verification passed"
+}
+
+use_sudo=0
+if [[ $EUID -ne 0 ]]; then
+    if [[ -d "$INSTALL_DIR" ]]; then
+        [[ -w "$INSTALL_DIR" ]] || use_sudo=1
+    else
+        parent=$(dirname "$INSTALL_DIR")
+        [[ -w "$parent" ]] || use_sudo=1
+    fi
+fi
+if [[ $use_sudo -eq 1 ]]; then
+    command -v sudo >/dev/null 2>&1 || die "sudo required but not found"
+    if ! sudo -n true >/dev/null 2>&1; then
+        die "sudo privileges required but not available (passwordless sudo needed)"
+    fi
+fi
+
+run_cmd(){
+    if [[ $use_sudo -eq 1 ]]; then
+        sudo -n "$@" >>"$LOG_FILE" 2>&1
+    else
+        "$@" >>"$LOG_FILE" 2>&1
+    fi
+}
+
+ensure_install_dir(){
+    if [[ ! -d "$INSTALL_DIR" ]]; then
+        run_cmd mkdir -p "$INSTALL_DIR" || die "Failed to create $INSTALL_DIR"
+    fi
+}
+
+install_binary(){
+    local src="$1" dest="$INSTALL_DIR/$BIN_NAME"
+    ensure_install_dir
+    if command -v install >/dev/null 2>&1; then
+        run_cmd install -m 0755 "$src" "$dest" || die "Failed to install binary"
+    else
+        run_cmd cp "$src" "$dest" || die "Failed to copy binary"
+        run_cmd chmod 0755 "$dest" || die "Failed to set permissions"
+    fi
+    log "Installed $dest"
+}
+
+find_binary(){
+    local dir="$1" name="$2" path=""
+    if [[ -f "$dir/$name" ]]; then
+        path="$dir/$name"
+    else
+        path=$(find "$dir" -type f -name "$name" -perm -111 2>/dev/null | head -n1 || true)
+    fi
+    if [[ -z "$path" ]]; then
+        path=$(find "$dir" -type f -perm -111 2>/dev/null | head -n1 || true)
+    fi
+    echo "$path"
+}
+
+log "Fetching release metadata from $RELEASE_API_URL"
+release_info="$WORK_DIR/release_info"
+if ! curl "${CURL_OPTS[@]}" -o "$release_info" "$RELEASE_API_URL"; then
+    die "Failed to fetch release metadata"
+fi
+
+asset_url=""
+asset_file=""
+if grep -aq '"browser_download_url"' "$release_info"; then
+    asset_url=$(select_asset "$ASSET_PATTERN" "$release_info")
+    [[ -n "$asset_url" ]] || die "No matching asset found"
+    asset_name=$(basename "${asset_url%%\?*}")
+    asset_file="$WORK_DIR/$asset_name"
+    log "Downloading asset $asset_url"
+    if ! curl "${CURL_OPTS[@]}" -o "$asset_file" "$asset_url"; then
+        die "Failed to download asset"
+    fi
+    checksum_url=$(find_checksum "$release_info" "$asset_url")
+    if [[ -n "$checksum_url" ]]; then
+        checksum_file="$WORK_DIR/$(basename "${checksum_url%%\?*}")"
+        log "Downloading checksum $checksum_url"
+        if curl "${CURL_OPTS[@]}" -o "$checksum_file" "$checksum_url"; then
+            verify_checksum "$asset_file" "$checksum_file"
+        else
+            log "Failed to download checksum; skipping verification"
+        fi
+    else
+        log "No checksum asset found; skipping verification"
+    fi
+else
+    asset_url="$RELEASE_API_URL"
+    asset_name=$(basename "${asset_url%%\?*}")
+    asset_file="$WORK_DIR/$asset_name"
+    mv "$release_info" "$asset_file"
+    log "Using direct download $asset_url"
+fi
+
+case "$asset_file" in
+    *.deb)
+        need_cmd dpkg
+        log "Installing deb package"
+        run_cmd dpkg -i "$asset_file" || die "dpkg install failed"
+        log "Installation complete"
+        exit 0
+        ;;
+    *.rpm)
+        need_cmd rpm
+        log "Installing rpm package"
+        run_cmd rpm -Uvh "$asset_file" || die "rpm install failed"
+        log "Installation complete"
+        exit 0
+        ;;
+esac
+
+extract_dir="$WORK_DIR/extract"
+mkdir -p "$extract_dir"
+
+extracted=0
+case "$asset_file" in
+    *.tar.gz|*.tgz)
+        need_cmd tar
+        log "Extracting tar.gz archive"
+        tar -xzf "$asset_file" -C "$extract_dir"
+        extracted=1
+        ;;
+    *.tar.xz|*.txz)
+        need_cmd tar
+        log "Extracting tar.xz archive"
+        tar -xJf "$asset_file" -C "$extract_dir"
+        extracted=1
+        ;;
+    *.tar.bz2|*.tbz2)
+        need_cmd tar
+        log "Extracting tar.bz2 archive"
+        tar -xjf "$asset_file" -C "$extract_dir"
+        extracted=1
+        ;;
+    *.tar)
+        need_cmd tar
+        log "Extracting tar archive"
+        tar -xf "$asset_file" -C "$extract_dir"
+        extracted=1
+        ;;
+    *.zip)
+        need_cmd unzip
+        log "Extracting zip archive"
+        unzip -q "$asset_file" -d "$extract_dir"
+        extracted=1
+        ;;
+esac
+
+if [[ $extracted -eq 1 ]]; then
+    src_bin=$(find_binary "$extract_dir" "$BIN_NAME")
+    [[ -n "$src_bin" ]] || die "Failed to locate executable in archive"
+else
+    src_bin="$asset_file"
+fi
+
+chmod +x "$src_bin" 2>/dev/null || true
+install_binary "$src_bin"
+log "Installation completed successfully"
+exit 0

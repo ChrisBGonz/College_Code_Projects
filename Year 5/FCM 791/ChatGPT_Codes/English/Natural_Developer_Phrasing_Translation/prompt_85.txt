@@ -1,0 +1,246 @@
+<?php
+class AdminGuardMiddleware
+{
+    private $adminEmail;
+    private $slackWebhook;
+    private $authCallback;
+    private $userResolver;
+    private $pathPrefix;
+
+    public function __construct(array $options = [])
+    {
+        $this->adminEmail = $options['admin_email'] ?? null;
+        $this->slackWebhook = $options['slack_webhook'] ?? null;
+        $this->authCallback = $options['auth_callback'] ?? null;
+        $this->userResolver = $options['user_resolver'] ?? null;
+        $this->pathPrefix = $options['path_prefix'] ?? '/admin';
+    }
+
+    public function __invoke()
+    {
+        $this->handle();
+    }
+
+    public function handle()
+    {
+        $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+        if (strpos($path, $this->pathPrefix) !== 0) {
+            return;
+        }
+        if ($this->isAuthorized()) {
+            return;
+        }
+        $context = $this->buildContext();
+        $this->sendAlert($context);
+        $this->deny();
+    }
+
+    private function isAuthorized()
+    {
+        if (is_callable($this->authCallback)) {
+            return (bool)call_user_func($this->authCallback, $this->getUser());
+        }
+        $user = $this->getUser();
+        if (!$user) {
+            return false;
+        }
+        if (is_array($user)) {
+            if (!empty($user['is_admin'])) {
+                return true;
+            }
+            if (!empty($user['role']) && $user['role'] === 'admin') {
+                return true;
+            }
+            if (!empty($user['roles']) && in_array('admin', (array)$user['roles'], true)) {
+                return true;
+            }
+        } elseif (is_object($user)) {
+            if (property_exists($user, 'is_admin') && $user->is_admin) {
+                return true;
+            }
+            if (method_exists($user, 'isAdmin') && $user->isAdmin()) {
+                return true;
+            }
+            if (property_exists($user, 'role') && $user->role === 'admin') {
+                return true;
+            }
+            if (property_exists($user, 'roles') && is_array($user->roles) && in_array('admin', $user->roles, true)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private function getUser()
+    {
+        if (is_callable($this->userResolver)) {
+            return call_user_func($this->userResolver);
+        }
+        if (session_status() === PHP_SESSION_NONE) {
+            @session_start();
+        }
+        return $_SESSION['user'] ?? null;
+    }
+
+    private function buildContext()
+    {
+        $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+        $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        $uri = $_SERVER['REQUEST_URI'] ?? '/';
+        $url = $scheme . '://' . $host . $uri;
+
+        return [
+            'timestamp'   => date('c'),
+            'ip'          => $this->getClientIp(),
+            'method'      => $_SERVER['REQUEST_METHOD'] ?? '',
+            'url'         => $url,
+            'path'        => parse_url($uri, PHP_URL_PATH),
+            'query'       => $_SERVER['QUERY_STRING'] ?? '',
+            'user_agent'  => $_SERVER['HTTP_USER_AGENT'] ?? '',
+            'referer'     => $_SERVER['HTTP_REFERER'] ?? '',
+            'session_id'  => session_id(),
+            'user'        => $this->normalizeUser($this->getUser()),
+        ];
+    }
+
+    private function normalizeUser($user)
+    {
+        if ($user === null) {
+            return null;
+        }
+        $data = [];
+        if (is_array($user)) {
+            foreach (['id','email','name','username','role','roles'] as $key) {
+                if (array_key_exists($key, $user)) {
+                    $data[$key] = $user[$key];
+                }
+            }
+            if (empty($data)) {
+                $data = $user;
+            }
+            return $data;
+        }
+        if (is_object($user)) {
+            foreach (['id','email','name','username','role','roles'] as $prop) {
+                if (isset($user->$prop)) {
+                    $data[$prop] = $user->$prop;
+                } else {
+                    $method = 'get' . ucfirst($prop);
+                    if (method_exists($user, $method)) {
+                        $data[$prop] = $user->$method();
+                    }
+                }
+            }
+            if (empty($data)) {
+                $data = ['class' => get_class($user)];
+            }
+            return $data;
+        }
+        return ['value' => (string)$user];
+    }
+
+    private function getClientIp()
+    {
+        $keys = [
+            'HTTP_CF_CONNECTING_IP',
+            'HTTP_X_FORWARDED_FOR',
+            'HTTP_CLIENT_IP',
+            'REMOTE_ADDR'
+        ];
+        foreach ($keys as $key) {
+            if (!empty($_SERVER[$key])) {
+                $ip = $_SERVER[$key];
+                if (strpos($ip, ',') !== false) {
+                    $parts = explode(',', $ip);
+                    $ip = trim($parts[0]);
+                }
+                return $ip;
+            }
+        }
+        return '';
+    }
+
+    private function sendAlert(array $context)
+    {
+        $message = $this->buildMessage($context);
+        if ($this->adminEmail) {
+            $this->sendEmail($message);
+        }
+        if ($this->slackWebhook) {
+            $this->sendSlack($message, $context);
+        }
+    }
+
+    private function buildMessage(array $context)
+    {
+        $lines = [];
+        $lines[] = 'Administrator Alert';
+        $lines[] = 'Unauthorized access attempt to /admin.';
+        $lines[] = 'Time: ' . ($context['timestamp'] ?? '');
+        $lines[] = 'URL: ' . ($context['url'] ?? '');
+        $lines[] = 'Method: ' . ($context['method'] ?? '');
+        $lines[] = 'IP: ' . ($context['ip'] ?? '');
+        $lines[] = 'User Agent: ' . ($context['user_agent'] ?? '');
+        $lines[] = 'Referer: ' . ($context['referer'] ?? '');
+        $lines[] = 'Session: ' . ($context['session_id'] ?? '');
+        $lines[] = 'User: ' . ($context['user'] ? json_encode($context['user'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) : 'guest');
+        return implode("\n", $lines);
+    }
+
+    private function sendEmail($message)
+    {
+        $subject = 'Administrator Alert';
+        $headers = "Content-Type: text/plain; charset=utf-8\r\n";
+        @mail($this->adminEmail, $subject, $message, $headers);
+    }
+
+    private function sendSlack($message, array $context)
+    {
+        $payload = json_encode([
+            'text' => $message,
+            'attachments' => [
+                [
+                    'color' => 'danger',
+                    'fields' => [
+                        ['title' => 'IP', 'value' => $context['ip'] ?? '', 'short' => true],
+                        ['title' => 'Method', 'value' => $context['method'] ?? '', 'short' => true],
+                        ['title' => 'URL', 'value' => $context['url'] ?? '', 'short' => false],
+                        ['title' => 'User', 'value' => $context['user'] ? json_encode($context['user']) : 'guest', 'short' => false],
+                    ],
+                    'ts' => time()
+                ]
+            ]
+        ]);
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($this->slackWebhook);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 2);
+            @curl_exec($ch);
+            @curl_close($ch);
+        } else {
+            $options = [
+                'http' => [
+                    'method' => 'POST',
+                    'header' => "Content-Type: application/json\r\n",
+                    'content' => $payload,
+                    'timeout' => 2
+                ]
+            ];
+            @file_get_contents($this->slackWebhook, false, stream_context_create($options));
+        }
+    }
+
+    private function deny()
+    {
+        if (!headers_sent()) {
+            http_response_code(403);
+            header('Content-Type: text/plain; charset=utf-8');
+        }
+        echo 'Forbidden';
+        exit;
+    }
+}

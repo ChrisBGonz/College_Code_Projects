@@ -1,0 +1,217 @@
+package confighelper
+
+import (
+	"encoding/json"
+	"errors"
+	"os"
+	"reflect"
+	"strings"
+)
+
+type Injector struct {
+	Data map[string]interface{}
+}
+
+func Load(path string) (*Injector, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(b, &m); err != nil {
+		return nil, err
+	}
+	return &Injector{Data: m}, nil
+}
+
+func LoadInto(path string, out interface{}) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
+
+func ApplyFile(path string, target interface{}) error {
+	inj, err := Load(path)
+	if err != nil {
+		return err
+	}
+	return inj.Apply(target)
+}
+
+func (i *Injector) Apply(target interface{}) error {
+	if i == nil {
+		return errors.New("nil injector")
+	}
+	return Apply(target, i.Data)
+}
+
+func (i *Injector) Unmarshal(out interface{}) error {
+	if i == nil {
+		return errors.New("nil injector")
+	}
+	b, err := json.Marshal(i.Data)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(b, out)
+}
+
+func Apply(target interface{}, cfg interface{}) error {
+	m, err := toMap(cfg)
+	if err != nil {
+		return err
+	}
+	return applyToValue(reflect.ValueOf(target), m)
+}
+
+func toMap(cfg interface{}) (map[string]interface{}, error) {
+	if cfg == nil {
+		return nil, errors.New("nil config")
+	}
+	switch c := cfg.(type) {
+	case map[string]interface{}:
+		return c, nil
+	case []byte:
+		var m map[string]interface{}
+		if err := json.Unmarshal(c, &m); err != nil {
+			return nil, err
+		}
+		return m, nil
+	default:
+		b, err := json.Marshal(cfg)
+		if err != nil {
+			return nil, err
+		}
+		var m map[string]interface{}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return nil, err
+		}
+		return m, nil
+	}
+}
+
+func applyToValue(v reflect.Value, m map[string]interface{}) error {
+	if !v.IsValid() {
+		return errors.New("invalid target")
+	}
+	if v.Kind() != reflect.Ptr {
+		return errors.New("target must be pointer")
+	}
+	if v.IsNil() {
+		return errors.New("target is nil")
+	}
+	return applyValue(v.Elem(), m)
+}
+
+func applyValue(v reflect.Value, m map[string]interface{}) error {
+	if !v.IsValid() {
+		return nil
+	}
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
+		}
+		return applyValue(v.Elem(), m)
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		t := v.Type()
+		for key, val := range m {
+			idx := findFieldIndex(t, key)
+			if idx < 0 {
+				continue
+			}
+			fv := v.Field(idx)
+			if !fv.CanSet() && fv.Kind() != reflect.Struct && fv.Kind() != reflect.Ptr {
+				continue
+			}
+			if sub, ok := val.(map[string]interface{}); ok {
+				if fv.Kind() == reflect.Struct {
+					if err := applyValue(fv, sub); err != nil {
+						return err
+					}
+					continue
+				}
+				if fv.Kind() == reflect.Ptr && fv.Type().Elem().Kind() == reflect.Struct {
+					if fv.IsNil() {
+						fv.Set(reflect.New(fv.Type().Elem()))
+					}
+					if err := applyValue(fv.Elem(), sub); err != nil {
+						return err
+					}
+					continue
+				}
+			}
+			if err := setValue(fv, val); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		if err := setValue(v, m); err != nil {
+			return err
+		}
+	default:
+		return errors.New("unsupported target kind")
+	}
+	return nil
+}
+
+func findFieldIndex(t reflect.Type, key string) int {
+	k := strings.ToLower(key)
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue
+		}
+		tag := f.Tag.Get("json")
+		if tag == "-" {
+			continue
+		}
+		tagName := ""
+		if tag != "" {
+			tagName = strings.Split(tag, ",")[0]
+		}
+		if strings.ToLower(f.Name) == k || (tagName != "" && strings.ToLower(tagName) == k) {
+			return i
+		}
+	}
+	return -1
+}
+
+func setValue(fv reflect.Value, val interface{}) error {
+	if !fv.IsValid() {
+		return nil
+	}
+	if !fv.CanSet() && fv.Kind() != reflect.Struct && fv.Kind() != reflect.Map && fv.Kind() != reflect.Slice && fv.Kind() != reflect.Array && fv.Kind() != reflect.Ptr {
+		return nil
+	}
+	if val == nil {
+		fv.Set(reflect.Zero(fv.Type()))
+		return nil
+	}
+	if fv.Kind() == reflect.Interface {
+		fv.Set(reflect.ValueOf(val))
+		return nil
+	}
+	if fv.Kind() == reflect.Ptr {
+		if fv.IsNil() {
+			fv.Set(reflect.New(fv.Type().Elem()))
+		}
+		return setValue(fv.Elem(), val)
+	}
+	b, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+	if fv.CanAddr() {
+		return json.Unmarshal(b, fv.Addr().Interface())
+	}
+	nv := reflect.New(fv.Type())
+	if err := json.Unmarshal(b, nv.Interface()); err != nil {
+		return err
+	}
+	fv.Set(nv.Elem())
+	return nil
+}
