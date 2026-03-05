@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import sys
+import os
+import hashlib
+import string
+
+ALGO_SET = {a.lower() for a in hashlib.algorithms_available}
+LENGTH_ALG = {
+    32: "md5",
+    40: "sha1",
+    56: "sha224",
+    64: "sha256",
+    96: "sha384",
+    128: "sha512",
+}
+
+def resolve_alg(name):
+    n = name.lower()
+    if n in ALGO_SET:
+        return n
+    n2 = n.replace("-", "")
+    if n2 in ALGO_SET:
+        return n2
+    n2 = n.replace("-", "_")
+    if n2 in ALGO_SET:
+        return n2
+    return None
+
+def is_hex(s):
+    for c in s:
+        if c not in string.hexdigits:
+            return False
+    return True
+
+def detect_algo_from_hash(h):
+    return LENGTH_ALG.get(len(h))
+
+def parse_hash_token(token):
+    if ":" in token:
+        alg_part, hash_part = token.split(":", 1)
+        alg = resolve_alg(alg_part)
+        if alg:
+            return alg, hash_part, True
+    if is_hex(token):
+        alg = detect_algo_from_hash(token)
+        return alg, token, True
+    return None, None, False
+
+def parse_line(line):
+    line = line.strip()
+    if not line:
+        return None
+    line = line.lstrip()
+    if line.startswith("#") or line.startswith(";"):
+        return None
+    tokens = line.split()
+    if len(tokens) < 2:
+        return None
+    first = tokens[0]
+    alg, hash_val, is_hash_first = parse_hash_token(first)
+    if is_hash_first:
+        path = line[len(first):].lstrip()
+    else:
+        last = tokens[-1]
+        alg, hash_val, is_hash_last = parse_hash_token(last)
+        if not is_hash_last:
+            return None
+        idx = line.rfind(last)
+        path = line[:idx].rstrip()
+    if path.startswith("*"):
+        path = path[1:]
+    if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+        path = path[1:-1]
+    return alg, hash_val, path
+
+def hash_file(path, algo):
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: {} <manifest>".format(os.path.basename(sys.argv[0])), file=sys.stderr)
+        return 2
+    manifest_path = sys.argv[1]
+    if not os.path.isfile(manifest_path):
+        print("Manifest not found: {}".format(manifest_path), file=sys.stderr)
+        return 2
+    base_dir = os.path.dirname(os.path.abspath(manifest_path))
+    total = ok = missing = mismatch = unknown = errors = 0
+    with open(manifest_path, "r", encoding="utf-8-sig", errors="replace") as f:
+        for line in f:
+            parsed = parse_line(line)
+            if not parsed:
+                continue
+            total += 1
+            alg, expected, relpath = parsed
+            if alg is None:
+                print("UNKNOWN_ALGORITHM {}".format(relpath))
+                unknown += 1
+                errors += 1
+                continue
+            file_path = relpath
+            if not os.path.isabs(file_path):
+                file_path = os.path.join(base_dir, relpath)
+            if not os.path.exists(file_path):
+                print("MISSING {}".format(relpath))
+                missing += 1
+                errors += 1
+                continue
+            if not os.path.isfile(file_path):
+                print("NOT_A_FILE {}".format(relpath))
+                errors += 1
+                continue
+            try:
+                actual = hash_file(file_path, alg)
+            except Exception as e:
+                print("ERROR {} {}".format(relpath, e))
+                errors += 1
+                continue
+            if actual.lower() != expected.lower():
+                print("MISMATCH {}".format(relpath))
+                print("EXPECTED {}".format(expected.lower()))
+                print("ACTUAL   {}".format(actual.lower()))
+                mismatch += 1
+                errors += 1
+            else:
+                ok += 1
+    print("TOTAL {} OK {} MISSING {} MISMATCH {} UNKNOWN {}".format(total, ok, missing, mismatch, unknown))
+    return 1 if errors else 0
+
+if __name__ == "__main__":
+    sys.exit(main())

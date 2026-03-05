@@ -1,0 +1,184 @@
+const STATE = { CLOSED: 'closed', OPEN: 'open', HALF_OPEN: 'half-open' };
+
+class CircuitBreakerOpenError extends Error {
+  constructor(message, state) {
+    super(message || 'Circuit is open');
+    this.name = 'CircuitBreakerOpenError';
+    this.state = state || STATE.OPEN;
+  }
+}
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = typeof options.failureThreshold === 'number' ? options.failureThreshold : 5;
+    this.successThreshold = typeof options.successThreshold === 'number' ? options.successThreshold : 1;
+    this.timeout = typeof options.timeout === 'number' ? options.timeout : 10000;
+    this.cooldownTime = typeof options.cooldownTime === 'number' ? options.cooldownTime : 10000;
+    this.maxRetries = typeof options.maxRetries === 'number' ? options.maxRetries : 0;
+    this.retryDelay = options.retryDelay != null ? options.retryDelay : 0;
+    this.state = STATE.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInProgress = false;
+    this.onStateChange = typeof options.onStateChange === 'function' ? options.onStateChange : null;
+  }
+
+  getState() {
+    return this.state;
+  }
+
+  async execute(action, options = {}) {
+    if (typeof action !== 'function') {
+      throw new TypeError('Action must be a function');
+    }
+    if (!this._canRequest()) {
+      const msg = this.state === STATE.HALF_OPEN ? 'Circuit is half-open' : 'Circuit is open';
+      return Promise.reject(new CircuitBreakerOpenError(msg, this.state));
+    }
+    const isHalfOpen = this.state === STATE.HALF_OPEN;
+    if (isHalfOpen) {
+      this.halfOpenInProgress = true;
+    }
+    const timeout = typeof options.timeout === 'number' ? options.timeout : this.timeout;
+    const retries = typeof options.retries === 'number' ? options.retries : this.maxRetries;
+    const retryDelay = options.retryDelay != null ? options.retryDelay : this.retryDelay;
+    try {
+      const result = await this._retry(action, retries, retryDelay, timeout);
+      this._onSuccess();
+      return result;
+    } catch (err) {
+      this._onFailure();
+      throw err;
+    } finally {
+      if (isHalfOpen) {
+        this.halfOpenInProgress = false;
+      }
+    }
+  }
+
+  _canRequest() {
+    if (this.state === STATE.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._halfOpen();
+        return !this.halfOpenInProgress;
+      }
+      return false;
+    }
+    if (this.state === STATE.HALF_OPEN && this.halfOpenInProgress) {
+      return false;
+    }
+    return true;
+  }
+
+  async _retry(action, retries, retryDelay, timeout) {
+    let attempt = 0;
+    while (true) {
+      try {
+        return await this._executeWithTimeout(action, timeout);
+      } catch (err) {
+        if (attempt >= retries) throw err;
+        attempt++;
+        const delay = typeof retryDelay === 'function' ? retryDelay(attempt, err) : retryDelay;
+        if (delay > 0) {
+          await this._sleep(delay);
+        }
+      }
+    }
+  }
+
+  _executeWithTimeout(action, timeout) {
+    if (timeout <= 0 || !isFinite(timeout)) {
+      return Promise.resolve().then(action);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('Timeout'));
+      }, timeout);
+      Promise.resolve()
+        .then(action)
+        .then(result => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch(err => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    });
+  }
+
+  _onSuccess() {
+    if (this.state === STATE.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else if (this.state === STATE.CLOSED) {
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure() {
+    if (this.state === STATE.HALF_OPEN) {
+      this._open();
+    } else if (this.state === STATE.CLOSED) {
+      this.failureCount++;
+      if (this.failureCount >= this.failureThreshold) {
+        this._open();
+      }
+    }
+  }
+
+  _open() {
+    if (this.state !== STATE.OPEN) {
+      this.state = STATE.OPEN;
+      this.nextAttempt = Date.now() + this.cooldownTime;
+      this.failureCount = 0;
+      this.successCount = 0;
+      this._notify();
+    } else {
+      this.nextAttempt = Date.now() + this.cooldownTime;
+    }
+  }
+
+  _halfOpen() {
+    if (this.state !== STATE.HALF_OPEN) {
+      this.state = STATE.HALF_OPEN;
+      this.failureCount = 0;
+      this.successCount = 0;
+      this.halfOpenInProgress = false;
+      this._notify();
+    }
+  }
+
+  _close() {
+    if (this.state !== STATE.CLOSED) {
+      this.state = STATE.CLOSED;
+      this.failureCount = 0;
+      this.successCount = 0;
+      this.nextAttempt = 0;
+      this.halfOpenInProgress = false;
+      this._notify();
+    }
+  }
+
+  reset() {
+    this._close();
+  }
+
+  _notify() {
+    if (this.onStateChange) {
+      try {
+        this.onStateChange(this.state);
+      } catch (e) {}
+    }
+  }
+
+  _sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+}
+
+export { CircuitBreaker, CircuitBreakerOpenError, STATE };
+export default CircuitBreaker;

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import sys
+import subprocess
+import shlex
+import time
+import urllib.request
+import re
+
+def run(cmd, input=None, capture=False, check=True, log=True):
+    if log:
+        print("+", " ".join(shlex.quote(c) for c in cmd), flush=True)
+    kwargs = {"text": True}
+    if capture:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    result = subprocess.run(cmd, input=input, **kwargs)
+    if check and result.returncode != 0:
+        if result.stdout:
+            sys.stdout.write(result.stdout)
+        if result.stderr:
+            sys.stderr.write(result.stderr)
+        raise subprocess.CalledProcessError(result.returncode, cmd, result.stdout, result.stderr)
+    return result
+
+def docker_login():
+    user = os.getenv("DOCKER_USERNAME")
+    pwd = os.getenv("DOCKER_PASSWORD")
+    registry = os.getenv("DOCKER_REGISTRY")
+    if user and pwd:
+        cmd = ["docker", "login"]
+        if registry:
+            cmd.append(registry)
+        cmd += ["-u", user, "--password-stdin"]
+        run(cmd, input=pwd, log=True)
+
+def default_container_name(image):
+    name = image.split("/")[-1]
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    if ":" in name:
+        name = name.split(":", 1)[0]
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "-", name)
+    if not name:
+        name = "app"
+    return name
+
+def list_from_env(var):
+    val = os.getenv(var)
+    if not val:
+        return []
+    return [v for v in val.split(",") if v]
+
+def container_exists(name):
+    pattern = "^" + re.escape(name) + "$"
+    res = run(["docker", "ps", "-a", "-q", "-f", f"name={pattern}"], capture=True, log=False)
+    return bool(res.stdout.strip())
+
+def remove_container(name):
+    if container_exists(name):
+        run(["docker", "rm", "-f", name])
+
+def wait_for_health(url, timeout=60, interval=5):
+    end = time.time() + timeout
+    last_err = None
+    while time.time() < end:
+        try:
+            with urllib.request.urlopen(url, timeout=interval) as resp:
+                status = getattr(resp, "status", resp.getcode())
+                if 200 <= status < 400:
+                    return True
+        except Exception as e:
+            last_err = e
+        time.sleep(interval)
+    if last_err:
+        print(f"Health check failed: {last_err}", file=sys.stderr)
+    else:
+        print("Health check failed", file=sys.stderr)
+    return False
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image", help="Docker image")
+    parser.add_argument("--container", help="Container name")
+    parser.add_argument("--port", action="append", default=[], help="Port mapping HOST:CONTAINER")
+    parser.add_argument("--env", action="append", default=[], help="Environment variable KEY=VALUE or KEY")
+    parser.add_argument("--env-file", help="Environment file")
+    parser.add_argument("--volume", action="append", default=[], help="Volume mapping HOST:CONTAINER")
+    parser.add_argument("--network", help="Docker network")
+    parser.add_argument("--restart", help="Restart policy")
+    parser.add_argument("--no-pull", action="store_true", help="Skip docker pull")
+    parser.add_argument("--extra-arg", action="append", default=[], help="Extra docker run option")
+    parser.add_argument("--healthcheck-url", help="Health check URL")
+    parser.add_argument("--healthcheck-timeout", type=int, help="Health check timeout in seconds")
+    parser.add_argument("--healthcheck-interval", type=int, help="Health check interval in seconds")
+    parser.add_argument("command", nargs=argparse.REMAINDER, help="Command to run in container")
+    args = parser.parse_args()
+
+    image = args.image or os.getenv("DOCKER_IMAGE")
+    if not image:
+        print("Docker image not specified", file=sys.stderr)
+        sys.exit(1)
+
+    container = args.container or os.getenv("CONTAINER_NAME") or default_container_name(image)
+
+    ports = list_from_env("PORTS") + args.port
+    envs = list_from_env("ENV_VARS") + args.env
+    volumes = list_from_env("VOLUMES") + args.volume
+    network = args.network or os.getenv("DOCKER_NETWORK")
+    restart = args.restart or os.getenv("RESTART_POLICY") or "unless-stopped"
+    env_file = args.env_file or os.getenv("ENV_FILE")
+
+    extra_args = []
+    extra_env = os.getenv("EXTRA_DOCKER_RUN_ARGS")
+    if extra_env:
+        extra_args += shlex.split(extra_env)
+    extra_args += args.extra_arg
+
+    health_url = args.healthcheck_url or os.getenv("HEALTHCHECK_URL")
+    health_timeout = args.healthcheck_timeout or int(os.getenv("HEALTHCHECK_TIMEOUT", "60"))
+    health_interval = args.healthcheck_interval or int(os.getenv("HEALTHCHECK_INTERVAL", "5"))
+
+    try:
+        docker_login()
+
+        skip_pull = args.no_pull or os.getenv("NO_PULL", "").lower() in ("1", "true", "yes")
+        if not skip_pull:
+            run(["docker", "pull", image])
+
+        remove_container(container)
+
+        cmd = ["docker", "run", "-d", "--name", container, "--restart", restart]
+        for p in ports:
+            cmd += ["-p", p]
+        for e in envs:
+            cmd += ["-e", e]
+        if env_file:
+            cmd += ["--env-file", env_file]
+        for v in volumes:
+            cmd += ["-v", v]
+        if network:
+            cmd += ["--network", network]
+        if extra_args:
+            cmd += extra_args
+        cmd.append(image)
+        if args.command:
+            cmd += args.command
+
+        res = run(cmd, capture=True)
+        container_id = res.stdout.strip()
+        if container_id:
+            print(container_id)
+
+        if health_url:
+            ok = wait_for_health(health_url, timeout=health_timeout, interval=health_interval)
+            if not ok:
+                remove_container(container)
+                sys.exit(1)
+
+    except subprocess.CalledProcessError as e:
+        sys.exit(e.returncode)
+
+if __name__ == "__main__":
+    main()
