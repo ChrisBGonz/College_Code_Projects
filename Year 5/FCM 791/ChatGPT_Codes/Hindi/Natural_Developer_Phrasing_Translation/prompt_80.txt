@@ -1,0 +1,157 @@
+from flask import Flask, request, render_template_string, redirect, url_for, flash, session, jsonify, abort
+import yaml
+import uuid
+import json
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'replace-this-with-a-secret-key'
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024
+
+PROFILES = {}
+
+UPLOAD_FORM = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>YAML Profile Setup</title>
+</head>
+<body>
+<h1>YAML Profile Setup</h1>
+<p>Upload a YAML configuration file to initialize your profile.</p>
+{% with messages = get_flashed_messages() %}
+{% if messages %}
+<ul style="color:red;">
+{% for m in messages %}
+<li>{{ m }}</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endwith %}
+<form method="post" enctype="multipart/form-data" action="{{ url_for('upload') }}">
+<input type="file" name="file" accept=".yml,.yaml" required>
+<button type="submit">Upload</button>
+</form>
+{% if profile_id %}
+<p>Last profile: <a href="{{ url_for('profile', profile_id=profile_id) }}">{{ profile_id }}</a></p>
+{% endif %}
+</body>
+</html>
+"""
+
+PROFILE_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Profile</title>
+</head>
+<body>
+<h1>Profile Initialized</h1>
+<p>Profile ID: {{ profile_id }}</p>
+<pre>{{ profile_json }}</pre>
+<p><a href="{{ url_for('index') }}">Upload another</a></p>
+</body>
+</html>
+"""
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ('yml', 'yaml')
+
+def initialize_profile(config):
+    if config is None:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError('YAML must be a mapping of keys to values')
+    user_block = config.get('user') if isinstance(config.get('user'), dict) else {}
+    def pick(*keys):
+        for k in keys:
+            if k in config and config[k] is not None:
+                return config[k]
+            if k in user_block and user_block[k] is not None:
+                return user_block[k]
+        return None
+    profile = {}
+    username = pick('username', 'user_name', 'name')
+    if not username:
+        username = f"user_{uuid.uuid4().hex[:8]}"
+    profile['username'] = str(username)
+    for field in ['full_name', 'email', 'bio', 'age', 'location', 'website']:
+        value = pick(field)
+        if value is not None:
+            profile[field] = value
+    preferences = pick('preferences', 'prefs')
+    if preferences is None:
+        preferences = {}
+    if not isinstance(preferences, dict):
+        preferences = {'value': preferences}
+    profile['preferences'] = preferences
+    settings = pick('settings')
+    if settings is not None:
+        if isinstance(settings, dict):
+            profile['settings'] = settings
+        else:
+            profile['settings'] = {'value': settings}
+    reserved = {'user', 'username', 'user_name', 'name', 'full_name', 'email', 'bio', 'age', 'location', 'website', 'preferences', 'prefs', 'settings'}
+    extras = {}
+    for k, v in config.items():
+        if k in reserved:
+            continue
+        extras[k] = v
+    if extras:
+        profile['extra'] = extras
+    return profile
+
+@app.route('/', methods=['GET'])
+def index():
+    profile_id = session.get('profile_id')
+    return render_template_string(UPLOAD_FORM, profile_id=profile_id)
+
+@app.route('/upload', methods=['POST'])
+def upload():
+    if 'file' not in request.files:
+        flash('No file provided')
+        return redirect(url_for('index'))
+    file = request.files['file']
+    if file.filename == '':
+        flash('No selected file')
+        return redirect(url_for('index'))
+    if not allowed_file(file.filename):
+        flash('Only YAML files are allowed')
+        return redirect(url_for('index'))
+    try:
+        data = yaml.safe_load(file.stream)
+    except Exception:
+        flash('Invalid YAML file')
+        return redirect(url_for('index'))
+    try:
+        profile = initialize_profile(data)
+    except Exception as e:
+        flash(str(e))
+        return redirect(url_for('index'))
+    profile_id = str(uuid.uuid4())
+    PROFILES[profile_id] = profile
+    session['profile_id'] = profile_id
+    return redirect(url_for('profile', profile_id=profile_id))
+
+@app.route('/profile/<profile_id>')
+def profile(profile_id):
+    profile = PROFILES.get(profile_id)
+    if profile is None:
+        abort(404)
+    profile_json = json.dumps(profile, ensure_ascii=False, indent=2)
+    return render_template_string(PROFILE_TEMPLATE, profile_id=profile_id, profile_json=profile_json)
+
+@app.route('/api/profile/<profile_id>')
+def profile_api(profile_id):
+    profile = PROFILES.get(profile_id)
+    if profile is None:
+        return jsonify({'error': 'not found'}), 404
+    return jsonify(profile)
+
+@app.route('/profiles')
+def list_profiles():
+    return jsonify({'profiles': list(PROFILES.keys())})
+
+if __name__ == '__main__':
+    app.run(debug=True)

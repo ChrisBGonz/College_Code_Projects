@@ -1,0 +1,125 @@
+const CircuitState = { CLOSED: "CLOSED", OPEN: "OPEN", HALF_OPEN: "HALF_OPEN" };
+
+class CircuitBreaker {
+  constructor(action, options = {}) {
+    if (typeof action !== "function") throw new Error("action must be a function");
+    this.action = action;
+    this.failureThreshold = options.failureThreshold !== undefined ? options.failureThreshold : 5;
+    this.successThreshold = options.successThreshold !== undefined ? options.successThreshold : 1;
+    this.timeout = options.timeout !== undefined ? options.timeout : 10000;
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.nextAttempt = 0;
+    this.halfOpenInProgress = false;
+    this.onStateChange = typeof options.onStateChange === "function" ? options.onStateChange : null;
+  }
+
+  async fire(...args) {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() >= this.nextAttempt) {
+        this._transitionTo(CircuitState.HALF_OPEN);
+      } else {
+        return Promise.reject(this._createError("CIRCUIT_OPEN", "Circuit breaker is OPEN"));
+      }
+    }
+
+    if (this.state === CircuitState.HALF_OPEN) {
+      if (this.halfOpenInProgress) {
+        return Promise.reject(this._createError("CIRCUIT_HALF_OPEN", "Circuit breaker is HALF_OPEN"));
+      }
+      this.halfOpenInProgress = true;
+    }
+
+    try {
+      const result = await this.action(...args);
+      this._onSuccess();
+      return result;
+    } catch (err) {
+      this._onFailure();
+      throw err;
+    } finally {
+      if (this.state === CircuitState.HALF_OPEN) {
+        this.halfOpenInProgress = false;
+      }
+    }
+  }
+
+  _onSuccess() {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount += 1;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else if (this.state === CircuitState.CLOSED) {
+      this._resetCounts();
+    }
+  }
+
+  _onFailure() {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this._open();
+      return;
+    }
+    if (this.state === CircuitState.OPEN) {
+      this._open();
+      return;
+    }
+    this.failureCount += 1;
+    if (this.failureCount >= this.failureThreshold) {
+      this._open();
+    }
+  }
+
+  _open() {
+    this._transitionTo(CircuitState.OPEN);
+    this.nextAttempt = Date.now() + this.timeout;
+    this._resetCounts();
+  }
+
+  _close() {
+    this._transitionTo(CircuitState.CLOSED);
+    this._resetCounts();
+  }
+
+  _resetCounts() {
+    this.failureCount = 0;
+    this.successCount = 0;
+  }
+
+  _transitionTo(state) {
+    if (this.state !== state) {
+      const prev = this.state;
+      this.state = state;
+      if (this.onStateChange) {
+        try {
+          this.onStateChange(state, prev);
+        } catch (e) {}
+      }
+    }
+  }
+
+  _createError(code, message) {
+    const err = new Error(message);
+    err.code = code;
+    return err;
+  }
+
+  getState() {
+    return this.state;
+  }
+}
+
+const apiBreaker = new CircuitBreaker(
+  (url, options) =>
+    fetch(url, options).then((res) => {
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return res;
+    }),
+  { failureThreshold: 3, successThreshold: 1, timeout: 5000 }
+);
+
+async function apiRequest(url, options) {
+  const response = await apiBreaker.fire(url, options);
+  return response.json();
+}
