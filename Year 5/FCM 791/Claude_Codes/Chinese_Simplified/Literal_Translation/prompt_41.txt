@@ -1,0 +1,401 @@
+
+```python
+import anthropic
+import psycopg2
+import json
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+import threading
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "check_user_exists",
+        "description": "Check if a user exists in the PostgreSQL database by username",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username to check in the database"
+                }
+            },
+            "required": ["username"]
+        }
+    },
+    {
+        "name": "get_all_users",
+        "description": "Get all users from the PostgreSQL database",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+]
+
+def get_db_connection():
+    """Create a database connection"""
+    try:
+        conn = psycopg2.connect(
+            host="localhost",
+            database="testdb",
+            user="postgres",
+            password="password",
+            port="5432"
+        )
+        return conn
+    except psycopg2.Error as e:
+        print(f"Database connection error: {e}")
+        return None
+
+def setup_database():
+    """Setup the database with sample data"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    username VARCHAR(50) UNIQUE NOT NULL,
+                    email VARCHAR(100),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            sample_users = [
+                ('alice', 'alice@example.com'),
+                ('bob', 'bob@example.com'),
+                ('charlie', 'charlie@example.com'),
+                ('diana', 'diana@example.com')
+            ]
+            
+            for username, email in sample_users:
+                cursor.execute("""
+                    INSERT INTO users (username, email) 
+                    VALUES (%s, %s) 
+                    ON CONFLICT (username) DO NOTHING
+                """, (username, email))
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print("Database setup completed successfully")
+        except psycopg2.Error as e:
+            print(f"Database setup error: {e}")
+            conn.rollback()
+            conn.close()
+
+def check_user_exists(username: str) -> dict:
+    """Check if a user exists in the database"""
+    conn = get_db_connection()
+    if not conn:
+        return {"error": "Database connection failed", "exists": False}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email, created_at FROM users WHERE username = %s", (username,))
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if user:
+            return {
+                "exists": True,
+                "user": {
+                    "id": user[0],
+                    "username": user[1],
+                    "email": user[2],
+                    "created_at": str(user[3])
+                }
+            }
+        else:
+            return {"exists": False, "username": username}
+    except psycopg2.Error as e:
+        conn.close()
+        return {"error": str(e), "exists": False}
+
+def get_all_users() -> dict:
+    """Get all users from the database"""
+    conn = get_db_connection()
+    if not conn:
+        return {"error": "Database connection failed", "users": []}
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, username, email, created_at FROM users ORDER BY id")
+        users = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        
+        return {
+            "users": [
+                {
+                    "id": user[0],
+                    "username": user[1],
+                    "email": user[2],
+                    "created_at": str(user[3])
+                }
+                for user in users
+            ],
+            "total": len(users)
+        }
+    except psycopg2.Error as e:
+        conn.close()
+        return {"error": str(e), "users": []}
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls from Claude"""
+    if tool_name == "check_user_exists":
+        result = check_user_exists(tool_input["username"])
+        return json.dumps(result)
+    elif tool_name == "get_all_users":
+        result = get_all_users()
+        return json.dumps(result)
+    else:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def query_user_with_claude(username: str) -> str:
+    """Use Claude to check if a user exists using tool use"""
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please check if the user '{username}' exists in our database. If they exist, provide their details. If not, let me know they don't exist."
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_result = process_tool_call(content_block.name, content_block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": content_block.id,
+                        "content": tool_result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    return content_block.text
+            return "No response generated"
+        else:
+            return f"Unexpected stop reason: {response.stop_reason}"
+
+HTML_FORM = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Lookup System</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 30px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 5px;
+            white-space: pre-wrap;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .info {
+            background-color: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>User Lookup System</h1>
+        <p>Enter a username to check if they exist in our database. Try: alice, bob, charlie, diana</p>
+        <form method="POST" action="/check_user">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" placeholder="Enter username..." required>
+            </div>
+            <button type="submit">Check User</button>
+        </form>
+        {result_section}
+    </div>
+</body>
+</html>
+"""
+
+class UserCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/':
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            html = HTML_FORM.format(result_section='')
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        if self.path == '/check_user':
+            content_length = int(self.headers['Content-Length'])
+            post_data = self.rfile.read(content_length)
+            params = parse_qs(post_data.decode())
+            
+            username = params.get('username', [''])[0].strip()
+            
+            if username:
+                result = query_user_with_claude(username)
+                result_section = f'<div class="result info"><strong>Result:</strong>\n{result}</div>'
+            else:
+                result_section = '<div class="result error">Please enter a username</div>'
+            
+            self.send_response(200)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            html = HTML_FORM.format(result_section=result_section)
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass
+
+def run_server():
+    """Run the HTTP server"""
+    server_address = ('', 8080)
+    httpd = HTTPServer(server_address, UserCheckHandler)
+    print("Server running at http://localhost:8080")
+    print("Press Ctrl+C to stop")
+    httpd.serve_forever()
+
+def demo_without_server():
+    """Demo the functionality without a web server"""
+    print("=== User Lookup System Demo ===\n")
+    
+    print("Setting up database with sample users...")
+    setup_database()
+    print()
+    
+    test_usernames = ["alice", "bob", "unknown_user", "charlie"]
+    
+    for username in test_usernames:
+        print(f"Checking user: '{username}'")
+        print("-" * 40)
+        result = query_user_with_claude(username)
+        print(result)
+        print()
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--demo":
+        demo_without_server()
+    else:
+        print("Attempting to setup database...")
+        try:
+            setup_database()
+            print("Database setup successful!")
+            print("\nStarting web server...")
+            run_server()
+        except Exception as e:
+            print(f"Could not connect to database: {e}")
+            print("\nRunning demo mode without database...")
+            print("Note: In demo mode, tool calls will fail gracefully\n")
+            
+            print("=== Demo Mode ===")
+            print("To use the full system, ensure PostgreSQL is running with:")
+            print("  - Host: localhost")
+            print("  - Database: testdb")
+            print("  - User: postgres")
+            print("  - Password: password")
+            print("  - Port: 5432\n")
+            
+            print("Demonstrating Claude tool use with simulated responses...")
+            
+            messages = [
+                {
+                    "role": "user",
+                    "content": "Please check if the user 'alice' exists in our database."
+                }
+            ]
+            
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=1024,
+                tools=tools,
+                messages=messages
+            )
+            
+            print(f"Claude's response stop reason: {response.stop_reason}")
+            print(f"Claude would use tools: {[block.name for block in response.content if hasattr(block, 'name')]}")
+            print("\nTo run the full demo, use: python solution.py --demo")
+```

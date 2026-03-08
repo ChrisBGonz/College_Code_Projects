@@ -1,0 +1,177 @@
+```ruby
+# app/models/user.rb
+class User < ApplicationRecord
+  enum role: { staff: 0, manager: 1 }
+
+  validates :name, presence: true
+  validates :email, presence: true, uniqueness: true
+  validates :role, presence: true
+end
+
+# db/migrate/YYYYMMDDHHMMSS_create_users.rb
+class CreateUsers < ActiveRecord::Migration[7.0]
+  def change
+    create_table :users do |t|
+      t.string :name, null: false
+      t.string :email, null: false
+      t.integer :role, default: 0, null: false
+
+      t.timestamps
+    end
+
+    add_index :users, :email, unique: true
+  end
+end
+
+# config/routes.rb
+Rails.application.routes.draw do
+  resources :users do
+    member do
+      patch :promote_to_manager
+    end
+  end
+end
+
+# app/controllers/application_controller.rb
+class ApplicationController < ActionController::Base
+  before_action :authenticate_user!
+
+  private
+
+  def authenticate_user!
+    unless current_user
+      render json: { error: "Unauthorized: Please log in." }, status: :unauthorized
+    end
+  end
+
+  def current_user
+    @current_user ||= User.find_by(id: session[:user_id])
+  end
+  helper_method :current_user
+
+  def authorize_manager!
+    unless current_user&.manager?
+      render json: { error: "Forbidden: Only managers can perform this action." }, status: :forbidden
+    end
+  end
+end
+
+# app/controllers/users_controller.rb
+class UsersController < ApplicationController
+  before_action :authorize_manager!, only: [:promote_to_manager]
+  before_action :set_user, only: [:show, :edit, :update, :destroy, :promote_to_manager]
+
+  # GET /users
+  def index
+    @users = User.all
+    render json: @users
+  end
+
+  # GET /users/:id
+  def show
+    render json: @user
+  end
+
+  # PATCH /users/:id/promote_to_manager
+  def promote_to_manager
+    if @user.manager?
+      render json: {
+        error: "User '#{@user.name}' is already a manager."
+      }, status: :unprocessable_entity
+      return
+    end
+
+    if @user == current_user
+      render json: {
+        error: "You cannot change your own role."
+      }, status: :unprocessable_entity
+      return
+    end
+
+    if @user.update(role: :manager)
+      render json: {
+        message: "User '#{@user.name}' has been successfully promoted to Manager.",
+        user: @user
+      }, status: :ok
+    else
+      render json: {
+        error: "Failed to promote user.",
+        details: @user.errors.full_messages
+      }, status: :unprocessable_entity
+    end
+  end
+
+  private
+
+  def set_user
+    @user = User.find(params[:id])
+  rescue ActiveRecord::RecordNotFound
+    render json: { error: "User not found." }, status: :not_found
+  end
+
+  def user_params
+    params.require(:user).permit(:name, :email, :role)
+  end
+end
+
+# spec/controllers/users_controller_spec.rb
+require 'rails_helper'
+
+RSpec.describe UsersController, type: :controller do
+  let(:manager) { User.create!(name: "Manager User", email: "manager@example.com", role: :manager) }
+  let(:staff)   { User.create!(name: "Staff User",   email: "staff@example.com",   role: :staff) }
+
+  describe "PATCH #promote_to_manager" do
+    context "when current user is a manager" do
+      before { session[:user_id] = manager.id }
+
+      it "promotes a staff member to manager" do
+        patch :promote_to_manager, params: { id: staff.id }
+        expect(response).to have_http_status(:ok)
+        expect(staff.reload.role).to eq("manager")
+        json = JSON.parse(response.body)
+        expect(json["message"]).to include("promoted to Manager")
+      end
+
+      it "returns error if user is already a manager" do
+        another_manager = User.create!(name: "Another Manager", email: "another@example.com", role: :manager)
+        patch :promote_to_manager, params: { id: another_manager.id }
+        expect(response).to have_http_status(:unprocessable_entity)
+        json = JSON.parse(response.body)
+        expect(json["error"]).to include("already a manager")
+      end
+
+      it "returns error if manager tries to promote themselves" do
+        patch :promote_to_manager, params: { id: manager.id }
+        expect(response).to have_http_status(:unprocessable_entity)
+        json = JSON.parse(response.body)
+        expect(json["error"]).to include("cannot change your own role")
+      end
+
+      it "returns not found for non-existent user" do
+        patch :promote_to_manager, params: { id: 99999 }
+        expect(response).to have_http_status(:not_found)
+      end
+    end
+
+    context "when current user is a staff member" do
+      before { session[:user_id] = staff.id }
+
+      it "denies access with forbidden status" do
+        another_staff = User.create!(name: "Another Staff", email: "another_staff@example.com", role: :staff)
+        patch :promote_to_manager, params: { id: another_staff.id }
+        expect(response).to have_http_status(:forbidden)
+        json = JSON.parse(response.body)
+        expect(json["error"]).to include("Only managers")
+      end
+    end
+
+    context "when user is not authenticated" do
+      it "returns unauthorized status" do
+        patch :promote_to_manager, params: { id: staff.id }
+        expect(response).to have_http_status(:unauthorized)
+      end
+    end
+  end
+end
+```

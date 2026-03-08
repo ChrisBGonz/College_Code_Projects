@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ============================================================
+# Auto-installer for the latest release of a security tool
+# Default tool: nuclei (projectdiscovery/nuclei)
+# Usage: ./install_security_tool.sh [tool_name]
+# Supported tools: nuclei, httpx, subfinder, naabu, ffuf, trivy
+# ============================================================
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+INSTALL_DIR="/usr/local/bin"
+TMP_DIR="$(mktemp -d)"
+TOOL="${1:-nuclei}"
+
+log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+log_success() { echo -e "${GREEN}[OK]${NC}    $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+cleanup() {
+    log_info "Cleaning up temporary files..."
+    rm -rf "${TMP_DIR}"
+}
+trap cleanup EXIT
+
+check_dependencies() {
+    local deps=("curl" "tar" "unzip" "grep" "awk" "sha256sum")
+    local missing=()
+    for dep in "${deps[@]}"; do
+        if ! command -v "${dep}" &>/dev/null; then
+            missing+=("${dep}")
+        fi
+    done
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing required dependencies: ${missing[*]}"
+        log_info "Install them with: sudo apt-get install -y ${missing[*]}"
+        exit 1
+    fi
+}
+
+detect_os_arch() {
+    OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+    ARCH="$(uname -m)"
+    case "${ARCH}" in
+        x86_64)  ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l)  ARCH="armv7" ;;
+        i386|i686) ARCH="386" ;;
+        *)
+            log_error "Unsupported architecture: ${ARCH}"
+            exit 1
+            ;;
+    esac
+    log_info "Detected OS: ${OS}, Architecture: ${ARCH}"
+}
+
+get_latest_github_release() {
+    local repo="$1"
+    local api_url="https://api.github.com/repos/${repo}/releases/latest"
+    local version
+
+    log_info "Fetching latest release info from GitHub: ${repo}"
+
+    version=$(curl -fsSL \
+        -H "Accept: application/vnd.github+json" \
+        "${api_url}" 2>/dev/null \
+        | grep '"tag_name"' \
+        | head -1 \
+        | awk -F'"' '{print $4}')
+
+    if [[ -z "${version}" ]]; then
+        log_error "Failed to fetch latest release version for ${repo}"
+        exit 1
+    fi
+
+    echo "${version}"
+}
+
+verify_checksum() {
+    local file="$1"
+    local checksum_file="$2"
+    local filename
+    filename="$(basename "${file}")"
+
+    if [[ ! -f "${checksum_file}" ]]; then
+        log_warn "No checksum file found, skipping verification"
+        return 0
+    fi
+
+    log_info "Verifying checksum for ${filename}..."
+
+    if grep -q "${filename}" "${checksum_file}"; then
+        local expected actual
+        expected=$(grep "${filename}" "${checksum_file}" | awk '{print $1}')
+        actual=$(sha256sum "${file}" | awk '{print $1}')
+        if [[ "${expected}" == "${actual}" ]]; then
+            log_success "Checksum verified successfully"
+        else
+            log_error "Checksum mismatch!"
+            log_error "Expected: ${expected}"
+            log_error "Actual:   ${actual}"
+            exit 1
+        fi
+    else
+        log_warn "Checksum entry not found in checksum file, skipping"
+    fi
+}
+
+install_binary() {
+    local binary_path="$1"
+    local tool_name="$2"
+
+    chmod +x "${binary_path}"
+
+    if [[ -w "${INSTALL_DIR}" ]]; then
+        mv "${binary_path}" "${INSTALL_DIR}/${tool_name}"
+    else
+        log_info "Requesting sudo privileges to install to ${INSTALL_DIR}..."
+        sudo mv "${binary_path}" "${INSTALL_DIR}/${tool_name}"
+    fi
+
+    log_success "${tool_name} installed to ${INSTALL_DIR}/${tool_name}"
+}
+
+# ============================================================
+# Tool-specific installers
+# ============================================================
+
+install_nuclei() {
+    local repo="projectdiscovery/nuclei"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing nuclei ${version}..."
+
+    local archive="nuclei_${ver_num}_${OS}_${ARCH}.zip"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/nuclei_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    unzip -q "${TMP_DIR}/${archive}" -d "${TMP_DIR}/nuclei_extracted"
+    install_binary "${TMP_DIR}/nuclei_extracted/nuclei" "nuclei"
+}
+
+install_httpx() {
+    local repo="projectdiscovery/httpx"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing httpx ${version}..."
+
+    local archive="httpx_${ver_num}_${OS}_${ARCH}.zip"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/httpx_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    unzip -q "${TMP_DIR}/${archive}" -d "${TMP_DIR}/httpx_extracted"
+    install_binary "${TMP_DIR}/httpx_extracted/httpx" "httpx"
+}
+
+install_subfinder() {
+    local repo="projectdiscovery/subfinder"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing subfinder ${version}..."
+
+    local archive="subfinder_${ver_num}_${OS}_${ARCH}.zip"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/subfinder_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    unzip -q "${TMP_DIR}/${archive}" -d "${TMP_DIR}/subfinder_extracted"
+    install_binary "${TMP_DIR}/subfinder_extracted/subfinder" "subfinder"
+}
+
+install_naabu() {
+    local repo="projectdiscovery/naabu"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing naabu ${version}..."
+
+    local archive="naabu_${ver_num}_${OS}_${ARCH}.zip"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/naabu_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    unzip -q "${TMP_DIR}/${archive}" -d "${TMP_DIR}/naabu_extracted"
+    install_binary "${TMP_DIR}/naabu_extracted/naabu" "naabu"
+}
+
+install_ffuf() {
+    local repo="ffuf/ffuf"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing ffuf ${version}..."
+
+    local archive="ffuf_${ver_num}_${OS}_${ARCH}.tar.gz"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/ffuf_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    mkdir -p "${TMP_DIR}/ffuf_extracted"
+    tar -xzf "${TMP_DIR}/${archive}" -C "${TMP_DIR}/ffuf_extracted"
+    install_binary "${TMP_DIR}/ffuf_extracted/ffuf" "ffuf"
+}
+
+install_trivy() {
+    local repo="aquasecurity/trivy"
+    local version
+    version="$(get_latest_github_release "${repo}")"
+    local ver_num="${version#v}"
+
+    log_info "Installing trivy ${version}..."
+
+    local os_cap
+    os_cap="$(echo "${OS}" | sed 's/./\u&/')"
+    local arch_trivy="${ARCH}"
+    [[ "${ARCH}" == "amd64" ]] && arch_trivy="64bit"
+    [[ "${ARCH}" == "arm64" ]] && arch_trivy="ARM64"
+
+    local archive="trivy_${ver_num}_${os_cap}-${arch_trivy}.tar.gz"
+    local download_url="https://github.com/${repo}/releases/download/${version}/${archive}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/trivy_${ver_num}_checksums.txt"
+
+    log_info "Downloading: ${download_url}"
+    curl -fsSL -o "${TMP_DIR}/${archive}" "${download_url}"
+    curl -fsSL -o "${TMP_DIR}/checksums.txt" "${checksum_url}" 2>/dev/null || true
+
+    verify_checksum "${TMP_DIR}/${archive}" "${TMP_DIR}/checksums.txt"
+
+    mkdir -p "${TMP_DIR}/trivy_extracted"
+    tar -xzf "${TMP_DIR}/${archive}" -C "${TMP_DIR}/trivy_extracted"
+    install_binary "${TMP_DIR}/trivy_extracted/trivy" "trivy"
+}
+
+# ============================================================
+# Post-install verification
+# ============================================================
+
+verify_installation() {
+    local tool_name="$1"
+    if command -v "${tool_name}" &>/dev/null; then
+        local installed_path
+        installed_path="$(command -v "${tool_name}")"
+        log_success "${tool_name} is available at: ${installed_path}"
+
+        echo -e "${CYAN}--- Version Info ---${NC}"
+        "${tool_name}" --version 2>/dev/null || "${tool_name}" version 2>/dev/null || true
+        echo -e "${CYAN}--------------------${NC}"
+    else
+        log_error "${tool_name} installation could not be verified. Check your PATH."
+        exit 1
+    fi
+}
+
+# ============================================================
+# Main
+# ============================================================
+
+main() {
+    echo -e "${CYAN}"
+    echo "╔══════════════════════════════════════════╗"
+    echo "║     Security Tool Auto-Installer         ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    log_info "Target tool: ${TOOL}"
+
+    check_dependencies
+    detect_os_arch
+
+    case "${TOOL}" in
+        nuclei)    install_nuclei    ;;
+        httpx)     install_httpx     ;;
+        subfinder) install_subfinder ;;
+        naabu)     install_naabu     ;;
+        ffuf)      install_ffuf      ;;
+        trivy)     install_trivy     ;;
+        *)
+            log_error "Unknown tool: '${TOOL}'"
+            echo ""
+            echo "Supported tools:"
+            echo "  nuclei    - Fast and customizable vulnerability scanner"
+            echo "  httpx     - Fast and multi-purpose HTTP toolkit"
+            echo "  subfinder - Subdomain discovery tool"
+            echo "  naabu     - Fast port scanner"
+            echo "  ffuf      - Fast web fuzzer"
+            echo "  trivy     - Comprehensive security scanner"
+            echo ""
+            echo "Usage: $0 [tool_name]"
+            exit 1
+            ;;
+    esac
+
+    verify_installation "${TOOL}"
+
+    echo ""
+    log_success "Installation complete! '${TOOL}' is ready to use."
+}
+
+main "$@"

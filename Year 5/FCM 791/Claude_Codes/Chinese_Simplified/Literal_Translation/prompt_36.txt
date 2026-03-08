@@ -1,0 +1,275 @@
+
+```python
+import anthropic
+import hashlib
+import os
+import sys
+import json
+from pathlib import Path
+
+
+def calculate_sha256(file_path: str) -> str:
+    """Calculate SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(chunk)
+    return sha256_hash.hexdigest()
+
+
+def verify_firmware_with_claude(
+    file_path: str, expected_hash: str | None = None
+) -> dict:
+    """
+    Use Claude to verify firmware file integrity using SHA256.
+    
+    Args:
+        file_path: Path to the firmware file
+        expected_hash: Expected SHA256 hash (optional)
+    
+    Returns:
+        Dictionary with verification results
+    """
+    client = anthropic.Anthropic()
+    
+    tools = [
+        {
+            "name": "calculate_file_hash",
+            "description": "Calculate the SHA256 hash of a firmware file",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the firmware file to hash"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        },
+        {
+            "name": "verify_hash",
+            "description": "Verify if the calculated hash matches the expected hash",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "calculated_hash": {
+                        "type": "string",
+                        "description": "The calculated SHA256 hash"
+                    },
+                    "expected_hash": {
+                        "type": "string",
+                        "description": "The expected SHA256 hash to compare against"
+                    }
+                },
+                "required": ["calculated_hash", "expected_hash"]
+            }
+        },
+        {
+            "name": "get_file_info",
+            "description": "Get information about the firmware file",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the firmware file"
+                    }
+                },
+                "required": ["file_path"]
+            }
+        }
+    ]
+    
+    if expected_hash:
+        user_message = f"""Please verify the integrity of the firmware file at '{file_path}'.
+        
+The expected SHA256 hash is: {expected_hash}
+
+Please:
+1. Get information about the file
+2. Calculate its SHA256 hash
+3. Verify if it matches the expected hash
+4. Provide a clear verification report"""
+    else:
+        user_message = f"""Please analyze the firmware file at '{file_path}'.
+
+Please:
+1. Get information about the file
+2. Calculate its SHA256 hash
+3. Provide the hash value and file information in a clear report"""
+    
+    messages = [{"role": "user", "content": user_message}]
+    
+    verification_result = {
+        "file_path": file_path,
+        "calculated_hash": None,
+        "expected_hash": expected_hash,
+        "is_valid": None,
+        "file_info": None,
+        "claude_analysis": None
+    }
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"\n[Tool Call] {tool_name}")
+                    print(f"Input: {json.dumps(tool_input, indent=2)}")
+                    
+                    if tool_name == "calculate_file_hash":
+                        try:
+                            hash_value = calculate_sha256(tool_input["file_path"])
+                            verification_result["calculated_hash"] = hash_value
+                            result = {"hash": hash_value, "algorithm": "SHA256"}
+                            print(f"Result: {json.dumps(result, indent=2)}")
+                        except FileNotFoundError:
+                            result = {"error": f"File not found: {tool_input['file_path']}"}
+                        except Exception as e:
+                            result = {"error": str(e)}
+                    
+                    elif tool_name == "verify_hash":
+                        calculated = tool_input["calculated_hash"].lower()
+                        expected = tool_input["expected_hash"].lower()
+                        is_match = calculated == expected
+                        verification_result["is_valid"] = is_match
+                        result = {
+                            "match": is_match,
+                            "calculated_hash": calculated,
+                            "expected_hash": expected,
+                            "status": "VERIFIED" if is_match else "MISMATCH - File may be corrupted or tampered!"
+                        }
+                        print(f"Result: {json.dumps(result, indent=2)}")
+                    
+                    elif tool_name == "get_file_info":
+                        try:
+                            path = Path(tool_input["file_path"])
+                            if path.exists():
+                                stat = path.stat()
+                                file_info = {
+                                    "name": path.name,
+                                    "size_bytes": stat.st_size,
+                                    "size_mb": round(stat.st_size / (1024 * 1024), 2),
+                                    "extension": path.suffix,
+                                    "exists": True
+                                }
+                                verification_result["file_info"] = file_info
+                                result = file_info
+                            else:
+                                result = {"exists": False, "error": "File not found"}
+                            print(f"Result: {json.dumps(result, indent=2)}")
+                        except Exception as e:
+                            result = {"error": str(e)}
+                    
+                    else:
+                        result = {"error": f"Unknown tool: {tool_name}"}
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": json.dumps(result)
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        
+        else:
+            final_text = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_text += content_block.text
+            
+            verification_result["claude_analysis"] = final_text
+            break
+    
+    return verification_result
+
+
+def create_test_firmware():
+    """Create a test firmware file for demonstration."""
+    test_file = "test_firmware.bin"
+    test_content = b"FIRMWARE_HEADER_V1.0\x00\x01\x02\x03" + b"\xFF" * 1024 + b"FIRMWARE_END"
+    
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+    
+    actual_hash = calculate_sha256(test_file)
+    
+    return test_file, actual_hash
+
+
+def main():
+    print("=" * 60)
+    print("Firmware Integrity Verification System")
+    print("Using SHA256 and Claude AI")
+    print("=" * 60)
+    
+    if len(sys.argv) > 1:
+        firmware_path = sys.argv[1]
+        expected_hash = sys.argv[2] if len(sys.argv) > 2 else None
+        
+        if not os.path.exists(firmware_path):
+            print(f"Error: File '{firmware_path}' not found")
+            sys.exit(1)
+    else:
+        print("\nNo firmware file specified. Creating a test firmware file...")
+        firmware_path, expected_hash = create_test_firmware()
+        print(f"Test firmware created: {firmware_path}")
+        print(f"Expected SHA256: {expected_hash}")
+    
+    print(f"\nVerifying firmware: {firmware_path}")
+    if expected_hash:
+        print(f"Expected hash: {expected_hash}")
+    
+    print("\n" + "-" * 60)
+    print("Starting verification process...")
+    print("-" * 60)
+    
+    result = verify_firmware_with_claude(firmware_path, expected_hash)
+    
+    print("\n" + "=" * 60)
+    print("VERIFICATION REPORT")
+    print("=" * 60)
+    
+    if result["file_info"]:
+        print(f"\nFile Information:")
+        print(f"  Name: {result['file_info']['name']}")
+        print(f"  Size: {result['file_info']['size_bytes']} bytes ({result['file_info']['size_mb']} MB)")
+    
+    print(f"\nSHA256 Hash:")
+    print(f"  Calculated: {result['calculated_hash']}")
+    if result['expected_hash']:
+        print(f"  Expected:   {result['expected_hash']}")
+    
+    if result['is_valid'] is not None:
+        print(f"\nVerification Status: {'✓ PASSED' if result['is_valid'] else '✗ FAILED'}")
+        if not result['is_valid']:
+            print("  WARNING: Hash mismatch! The file may be corrupted or tampered with.")
+    
+    print("\nClaude's Analysis:")
+    print("-" * 40)
+    print(result['claude_analysis'])
+    
+    if firmware_path == "test_firmware.bin" and os.path.exists("test_firmware.bin"):
+        os.remove("test_firmware.bin")
+        print("\n[Cleaned up test firmware file]")
+    
+    return 0 if (result['is_valid'] is None or result['is_valid']) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```

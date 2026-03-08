@@ -1,0 +1,252 @@
+
+```python
+import subprocess
+import sys
+import os
+from anthropic import Anthropic
+
+client = Anthropic()
+conversation_history = []
+
+def run_command(command: str, cwd: str = None) -> tuple[str, str, int]:
+    """Run a shell command and return stdout, stderr, and return code."""
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            cwd=cwd
+        )
+        return result.stdout, result.stderr, result.returncode
+    except Exception as e:
+        return "", str(e), 1
+
+def chat_with_claude(user_message: str) -> str:
+    """Send a message to Claude and get a response."""
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="""You are an expert Java Maven dependency management assistant. 
+        Your role is to help update Maven project dependencies to their latest versions.
+        When analyzing dependency information, provide specific Maven commands and pom.xml changes.
+        Always be precise about version numbers and dependency coordinates.
+        When suggesting updates, consider compatibility and potential breaking changes.""",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def get_current_dependencies(project_path: str) -> str:
+    """Get current dependencies from the Maven project."""
+    stdout, stderr, code = run_command("mvn dependency:list -DincludeScope=compile", cwd=project_path)
+    if code != 0:
+        stdout2, stderr2, code2 = run_command("cat pom.xml", cwd=project_path)
+        if code2 == 0:
+            return f"pom.xml content:\n{stdout2}"
+        return f"Error getting dependencies: {stderr}"
+    return stdout
+
+def check_for_updates(project_path: str) -> str:
+    """Check for available dependency updates."""
+    stdout, stderr, code = run_command(
+        "mvn versions:display-dependency-updates -DprocessDependencyManagement=false",
+        cwd=project_path
+    )
+    if code != 0:
+        return f"Error checking updates: {stderr}\nOutput: {stdout}"
+    return stdout
+
+def update_dependencies(project_path: str, update_command: str) -> tuple[str, str]:
+    """Execute the dependency update command."""
+    stdout, stderr, code = run_command(update_command, cwd=project_path)
+    return stdout, stderr
+
+def verify_build(project_path: str) -> tuple[bool, str]:
+    """Verify the project builds successfully after updates."""
+    stdout, stderr, code = run_command("mvn compile -q", cwd=project_path)
+    if code == 0:
+        return True, "Build successful"
+    return False, f"Build failed:\n{stderr}\n{stdout}"
+
+def main():
+    print("=== Maven Dependency Auto-Updater ===")
+    print("This tool will help you update all Maven dependencies to their latest versions.")
+    print()
+    
+    # Get project path
+    if len(sys.argv) > 1:
+        project_path = sys.argv[1]
+    else:
+        project_path = input("Enter the path to your Maven project (or press Enter for current directory): ").strip()
+        if not project_path:
+            project_path = os.getcwd()
+    
+    # Verify the path exists and has a pom.xml
+    if not os.path.exists(project_path):
+        print(f"Error: Path '{project_path}' does not exist.")
+        sys.exit(1)
+    
+    pom_path = os.path.join(project_path, "pom.xml")
+    if not os.path.exists(pom_path):
+        print(f"Error: No pom.xml found in '{project_path}'.")
+        sys.exit(1)
+    
+    print(f"Working with project at: {project_path}")
+    print()
+    
+    # Step 1: Get current dependencies
+    print("Step 1: Analyzing current dependencies...")
+    current_deps = get_current_dependencies(project_path)
+    
+    # Ask Claude to analyze current state
+    analysis_prompt = f"""I have a Maven project and I need to update all its dependencies to the latest versions.
+    
+Here is the current dependency information:
+{current_deps}
+
+Please analyze these dependencies and tell me:
+1. What dependencies are currently being used
+2. What strategy should we use to update them safely
+3. What Maven commands should we run to check for updates"""
+    
+    print("Consulting Claude for analysis...")
+    analysis = chat_with_claude(analysis_prompt)
+    print("\nClaude's Analysis:")
+    print(analysis)
+    print()
+    
+    # Step 2: Check for available updates
+    print("Step 2: Checking for available updates...")
+    updates_info = check_for_updates(project_path)
+    
+    # Ask Claude to interpret the update information
+    update_prompt = f"""Here is the output from Maven's versions plugin showing available updates:
+
+{updates_info}
+
+Based on this information:
+1. Which dependencies have updates available?
+2. What are the specific version changes recommended?
+3. What Maven command should I run to apply these updates? 
+4. Are there any updates I should be careful about (major version changes, potential breaking changes)?
+
+Please provide the exact Maven command to update all dependencies to their latest versions."""
+    
+    print("Consulting Claude for update recommendations...")
+    update_recommendations = chat_with_claude(update_prompt)
+    print("\nClaude's Update Recommendations:")
+    print(update_recommendations)
+    print()
+    
+    # Step 3: Apply updates
+    print("Step 3: Applying dependency updates...")
+    
+    # Ask Claude for the specific command to run
+    command_prompt = """Based on your analysis, what is the single best Maven command to update all dependencies to their latest versions? 
+    Please provide ONLY the Maven command, nothing else. The command should work with the versions-maven-plugin."""
+    
+    maven_command = chat_with_claude(command_prompt)
+    
+    # Clean up the command (remove any markdown formatting)
+    maven_command = maven_command.strip()
+    if maven_command.startswith("```"):
+        lines = maven_command.split("\n")
+        maven_command = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+    maven_command = maven_command.strip()
+    
+    print(f"Running command: {maven_command}")
+    stdout, stderr = update_dependencies(project_path, maven_command)
+    
+    if stderr and "ERROR" in stderr.upper():
+        # Ask Claude for alternative approach
+        error_prompt = f"""The command failed with this error:
+{stderr}
+
+Output:
+{stdout}
+
+Please suggest an alternative approach or command to update the dependencies."""
+        
+        alternative = chat_with_claude(error_prompt)
+        print("\nClaude's Alternative Approach:")
+        print(alternative)
+        
+        # Try the alternative command
+        alt_command_prompt = "What is the specific Maven command from your alternative approach? Provide ONLY the command."
+        alt_command = chat_with_claude(alt_command_prompt)
+        alt_command = alt_command.strip()
+        if alt_command.startswith("```"):
+            lines = alt_command.split("\n")
+            alt_command = "\n".join(lines[1:-1] if lines[-1] == "```" else lines[1:])
+        alt_command = alt_command.strip()
+        
+        print(f"\nTrying alternative command: {alt_command}")
+        stdout, stderr = update_dependencies(project_path, alt_command)
+    
+    print("\nUpdate Output:")
+    print(stdout[:2000] if len(stdout) > 2000 else stdout)
+    
+    # Step 4: Verify the build
+    print("\nStep 4: Verifying build after updates...")
+    build_success, build_message = verify_build(project_path)
+    
+    if build_success:
+        print("✓ Build successful!")
+        
+        # Ask Claude for final summary
+        summary_prompt = f"""The dependency updates were applied successfully and the project builds correctly.
+        
+Please provide a summary of:
+1. What was updated
+2. Any important notes about the updates
+3. Recommended next steps (testing, etc.)"""
+        
+        summary = chat_with_claude(summary_prompt)
+        print("\nFinal Summary from Claude:")
+        print(summary)
+    else:
+        print("✗ Build failed after updates!")
+        print(build_message)
+        
+        # Ask Claude for help fixing the build
+        fix_prompt = f"""After updating the dependencies, the build failed with this error:
+{build_message}
+
+Please help me:
+1. Identify what caused the build failure
+2. Suggest how to fix it
+3. Should I rollback any specific updates?"""
+        
+        fix_suggestions = chat_with_claude(fix_prompt)
+        print("\nClaude's Fix Suggestions:")
+        print(fix_suggestions)
+        
+        # Ask if user wants to rollback
+        rollback = input("\nDo you want to rollback the changes? (yes/no): ").strip().lower()
+        if rollback == "yes":
+            print("Rolling back changes...")
+            rollback_stdout, rollback_stderr = update_dependencies(
+                project_path, 
+                "mvn versions:revert"
+            )
+            print("Rollback output:", rollback_stdout)
+            if rollback_stderr:
+                print("Rollback errors:", rollback_stderr)
+    
+    print("\n=== Update Process Complete ===")
+
+if __name__ == "__main__":
+    main()
+```

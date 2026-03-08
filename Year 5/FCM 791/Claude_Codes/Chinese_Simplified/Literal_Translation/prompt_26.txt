@@ -1,0 +1,211 @@
+```yaml
+name: Build and Upload Artifacts
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  ARTIFACT_NAME: build-artifacts
+  BUILD_DIR: dist
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests
+        run: npm test --if-present
+
+      - name: Build Project
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Archive Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: ${{ env.BUILD_DIR }}
+          retention-days: 7
+          if-no-files-found: error
+
+  upload-to-bucket:
+    name: Upload to Storage Bucket
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Download Build Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: ${{ env.BUILD_DIR }}
+
+      - name: List Downloaded Artifacts
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la ${{ env.BUILD_DIR }}
+
+      # ─── AWS S3 ───────────────────────────────────────────────────────────────
+      - name: Configure AWS Credentials
+        if: vars.CLOUD_PROVIDER == 'aws' || vars.CLOUD_PROVIDER == ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Upload to AWS S3
+        if: vars.CLOUD_PROVIDER == 'aws' || vars.CLOUD_PROVIDER == ''
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          SHORT_SHA=${GITHUB_SHA::8}
+          S3_PATH="s3://${{ secrets.AWS_S3_BUCKET }}/builds/${TIMESTAMP}-${SHORT_SHA}/"
+
+          echo "Uploading to: ${S3_PATH}"
+
+          aws s3 sync ${{ env.BUILD_DIR }}/ "${S3_PATH}" \
+            --delete \
+            --cache-control "max-age=31536000,public" \
+            --exclude "*.map" \
+            --acl private
+
+          echo "Upload complete. Path: ${S3_PATH}"
+          echo "S3_UPLOAD_PATH=${S3_PATH}" >> $GITHUB_ENV
+
+      # ─── Google Cloud Storage ─────────────────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        if: vars.CLOUD_PROVIDER == 'gcp'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup Google Cloud SDK
+        if: vars.CLOUD_PROVIDER == 'gcp'
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to Google Cloud Storage
+        if: vars.CLOUD_PROVIDER == 'gcp'
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          SHORT_SHA=${GITHUB_SHA::8}
+          GCS_PATH="gs://${{ secrets.GCP_BUCKET_NAME }}/builds/${TIMESTAMP}-${SHORT_SHA}/"
+
+          echo "Uploading to: ${GCS_PATH}"
+
+          gsutil -m rsync -r -d ${{ env.BUILD_DIR }}/ "${GCS_PATH}"
+
+          echo "Upload complete. Path: ${GCS_PATH}"
+          echo "GCS_UPLOAD_PATH=${GCS_PATH}" >> $GITHUB_ENV
+
+      # ─── Azure Blob Storage ───────────────────────────────────────────────────
+      - name: Upload to Azure Blob Storage
+        if: vars.CLOUD_PROVIDER == 'azure'
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            SHORT_SHA=${GITHUB_SHA::8}
+            CONTAINER_PATH="builds/${TIMESTAMP}-${SHORT_SHA}"
+
+            echo "Uploading to container: ${{ secrets.AZURE_CONTAINER_NAME }}/${CONTAINER_PATH}"
+
+            az storage blob upload-batch \
+              --account-name "${{ secrets.AZURE_STORAGE_ACCOUNT }}" \
+              --account-key "${{ secrets.AZURE_STORAGE_KEY }}" \
+              --source "${{ env.BUILD_DIR }}" \
+              --destination "${{ secrets.AZURE_CONTAINER_NAME }}/${CONTAINER_PATH}" \
+              --overwrite true
+
+            echo "Upload complete."
+
+      - name: Print Upload Summary
+        run: |
+          echo "=============================="
+          echo "  Build & Upload Summary"
+          echo "=============================="
+          echo "Repository : ${{ github.repository }}"
+          echo "Branch     : ${{ github.ref_name }}"
+          echo "Commit SHA : ${{ github.sha }}"
+          echo "Run ID     : ${{ github.run_id }}"
+          echo "Triggered  : ${{ github.event_name }}"
+          echo "=============================="
+
+  notify:
+    name: Notify on Completion
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-bucket]
+    if: always()
+
+    steps:
+      - name: Notify Success
+        if: needs.build.result == 'success' && needs.upload-to-bucket.result == 'success'
+        run: |
+          echo "✅ Build and upload completed successfully!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+
+      - name: Notify Failure
+        if: needs.build.result == 'failure' || needs.upload-to-bucket.result == 'failure'
+        run: |
+          echo "❌ Build or upload failed!"
+          echo "Build status   : ${{ needs.build.result }}"
+          echo "Upload status  : ${{ needs.upload-to-bucket.result }}"
+          exit 1
+
+      - name: Send Slack Notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "${{ needs.build.result == 'success' && needs.upload-to-bucket.result == 'success' && '✅' || '❌' }} *${{ github.repository }}* - Build ${{ needs.build.result == 'success' && needs.upload-to-bucket.result == 'success' && 'succeeded' || 'failed' }}",
+              "attachments": [
+                {
+                  "color": "${{ needs.build.result == 'success' && needs.upload-to-bucket.result == 'success' && 'good' || 'danger' }}",
+                  "fields": [
+                    { "title": "Branch",  "value": "${{ github.ref_name }}", "short": true },
+                    { "title": "Commit",  "value": "${{ github.sha }}",      "short": true },
+                    { "title": "Trigger", "value": "${{ github.event_name }}","short": true },
+                    { "title": "Run",     "value": "${{ github.run_id }}",   "short": true }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+```

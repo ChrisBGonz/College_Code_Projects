@@ -1,0 +1,317 @@
+<?php
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'password');
+define('DB_NAME', 'secure_db');
+
+// Encryption configuration
+define('ENCRYPTION_KEY', 'your-secret-encryption-key-32chars');
+define('ENCRYPTION_METHOD', 'AES-256-CBC');
+
+/**
+ * Encrypt data using AES-256-CBC
+ */
+function encryptData(string $data, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+    
+    $encrypted = openssl_encrypt(
+        $data,
+        ENCRYPTION_METHOD,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+    
+    // Combine IV and encrypted data, then encode as base64
+    return base64_encode($iv . $encrypted);
+}
+
+/**
+ * Decrypt data using AES-256-CBC
+ */
+function decryptData(string $encryptedData, string $key): string
+{
+    $data = base64_decode($encryptedData);
+    
+    if ($data === false) {
+        throw new RuntimeException('Invalid base64 encoded data');
+    }
+    
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = substr($data, 0, $ivLength);
+    $encrypted = substr($data, $ivLength);
+    
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_METHOD,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+/**
+ * Mask credit card number for display (show only last 4 digits)
+ */
+function maskCreditCard(string $creditCardNumber): string
+{
+    $cleaned = preg_replace('/\D/', '', $creditCardNumber);
+    $length = strlen($cleaned);
+    
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+    
+    return str_repeat('*', $length - 4) . substr($cleaned, -4);
+}
+
+/**
+ * Validate credit card number using Luhn algorithm
+ */
+function validateCreditCard(string $number): bool
+{
+    $number = preg_replace('/\D/', '', $number);
+    
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+    
+    $sum = 0;
+    $alternate = false;
+    
+    for ($i = strlen($number) - 1; $i >= 0; $i--) {
+        $digit = (int)$number[$i];
+        
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+    
+    return ($sum % 10 === 0);
+}
+
+/**
+ * Create database connection using PDO
+ */
+function getDatabaseConnection(): PDO
+{
+    try {
+        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        
+        return new PDO($dsn, DB_USER, DB_PASS, $options);
+    } catch (PDOException $e) {
+        throw new RuntimeException('Database connection failed: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Create the payments table if it doesn't exist
+ */
+function createTable(PDO $pdo): void
+{
+    $sql = "CREATE TABLE IF NOT EXISTS payments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        cardholder_name VARCHAR(255) NOT NULL,
+        credit_card_number TEXT NOT NULL COMMENT 'Encrypted credit card number',
+        card_masked VARCHAR(20) NOT NULL COMMENT 'Masked card number for display',
+        expiry_date VARCHAR(10) NOT NULL,
+        amount DECIMAL(10, 2) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+    
+    $pdo->exec($sql);
+}
+
+/**
+ * Save payment data with encrypted credit card number
+ */
+function savePayment(PDO $pdo, array $paymentData): int
+{
+    // Validate required fields
+    $requiredFields = ['cardholder_name', 'credit_card_number', 'expiry_date', 'amount'];
+    foreach ($requiredFields as $field) {
+        if (empty($paymentData[$field])) {
+            throw new InvalidArgumentException("Missing required field: {$field}");
+        }
+    }
+    
+    // Validate credit card number
+    if (!validateCreditCard($paymentData['credit_card_number'])) {
+        throw new InvalidArgumentException('Invalid credit card number');
+    }
+    
+    // Encrypt the credit card number
+    $encryptedCardNumber = encryptData($paymentData['credit_card_number'], ENCRYPTION_KEY);
+    
+    // Create masked version for display
+    $maskedCardNumber = maskCreditCard($paymentData['credit_card_number']);
+    
+    // Prepare SQL statement
+    $sql = "INSERT INTO payments (cardholder_name, credit_card_number, card_masked, expiry_date, amount) 
+            VALUES (:cardholder_name, :credit_card_number, :card_masked, :expiry_date, :amount)";
+    
+    $stmt = $pdo->prepare($sql);
+    
+    $stmt->execute([
+        ':cardholder_name'   => htmlspecialchars($paymentData['cardholder_name'], ENT_QUOTES, 'UTF-8'),
+        ':credit_card_number' => $encryptedCardNumber,
+        ':card_masked'       => $maskedCardNumber,
+        ':expiry_date'       => $paymentData['expiry_date'],
+        ':amount'            => (float)$paymentData['amount'],
+    ]);
+    
+    return (int)$pdo->lastInsertId();
+}
+
+/**
+ * Retrieve payment by ID with decrypted credit card number
+ */
+function getPayment(PDO $pdo, int $id, bool $decrypt = false): ?array
+{
+    $sql = "SELECT id, cardholder_name, credit_card_number, card_masked, expiry_date, amount, created_at 
+            FROM payments WHERE id = :id";
+    
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':id' => $id]);
+    
+    $payment = $stmt->fetch();
+    
+    if (!$payment) {
+        return null;
+    }
+    
+    if ($decrypt) {
+        // Decrypt the credit card number (use with caution)
+        $payment['credit_card_number'] = decryptData($payment['credit_card_number'], ENCRYPTION_KEY);
+    } else {
+        // Replace encrypted number with masked version for safe display
+        $payment['credit_card_number'] = $payment['card_masked'];
+    }
+    
+    return $payment;
+}
+
+/**
+ * Retrieve all payments (with masked card numbers)
+ */
+function getAllPayments(PDO $pdo): array
+{
+    $sql = "SELECT id, cardholder_name, card_masked, expiry_date, amount, created_at 
+            FROM payments ORDER BY created_at DESC";
+    
+    $stmt = $pdo->query($sql);
+    return $stmt->fetchAll();
+}
+
+// ============================================================
+// Main execution
+// ============================================================
+
+try {
+    // Initialize database connection
+    $pdo = getDatabaseConnection();
+    
+    // Create table if not exists
+    createTable($pdo);
+    
+    // Example payment data
+    $paymentData = [
+        'cardholder_name'   => 'John Doe',
+        'credit_card_number' => '4532015112830366', // Valid test Visa number
+        'expiry_date'       => '12/2025',
+        'amount'            => 150.75,
+    ];
+    
+    echo "=== Credit Card Encryption Demo ===\n\n";
+    
+    // Save payment with encrypted credit card
+    echo "Saving payment data...\n";
+    $paymentId = savePayment($pdo, $paymentData);
+    echo "Payment saved successfully with ID: {$paymentId}\n\n";
+    
+    // Retrieve payment without decryption (safe for display)
+    echo "Retrieving payment (masked card number):\n";
+    $payment = getPayment($pdo, $paymentId, false);
+    if ($payment) {
+        echo "  ID: {$payment['id']}\n";
+        echo "  Cardholder: {$payment['cardholder_name']}\n";
+        echo "  Card Number (masked): {$payment['credit_card_number']}\n";
+        echo "  Expiry: {$payment['expiry_date']}\n";
+        echo "  Amount: \${$payment['amount']}\n";
+        echo "  Created: {$payment['created_at']}\n\n";
+    }
+    
+    // Retrieve payment with decryption (use only when necessary)
+    echo "Retrieving payment (decrypted card number - authorized access only):\n";
+    $paymentDecrypted = getPayment($pdo, $paymentId, true);
+    if ($paymentDecrypted) {
+        echo "  ID: {$paymentDecrypted['id']}\n";
+        echo "  Cardholder: {$paymentDecrypted['cardholder_name']}\n";
+        echo "  Card Number (decrypted): {$paymentDecrypted['credit_card_number']}\n";
+        echo "  Expiry: {$paymentDecrypted['expiry_date']}\n";
+        echo "  Amount: \${$paymentDecrypted['amount']}\n\n";
+    }
+    
+    // Save multiple test payments
+    $testPayments = [
+        [
+            'cardholder_name'   => 'Jane Smith',
+            'credit_card_number' => '5425233430109903', // Valid test Mastercard
+            'expiry_date'       => '08/2026',
+            'amount'            => 299.99,
+        ],
+        [
+            'cardholder_name'   => 'Bob Johnson',
+            'credit_card_number' => '374251018720955', // Valid test Amex
+            'expiry_date'       => '03/2027',
+            'amount'            => 75.00,
+        ],
+    ];
+    
+    foreach ($testPayments as $testPayment) {
+        $id = savePayment($pdo, $testPayment);
+        echo "Saved payment for {$testPayment['cardholder_name']} with ID: {$id}\n";
+    }
+    
+    echo "\n=== All Payments (Masked) ===\n";
+    $allPayments = getAllPayments($pdo);
+    foreach ($allPayments as $p) {
+        echo "ID: {$p['id']} | {$p['cardholder_name']} | Card: {$p['card_masked']} | Amount: \${$p['amount']}\n";
+    }
+    
+} catch (InvalidArgumentException $e) {
+    echo "Validation Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "Runtime Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (PDOException $e) {
+    echo "Database Error: " . $e->getMessage() . "\n";
+    exit(1);
+}

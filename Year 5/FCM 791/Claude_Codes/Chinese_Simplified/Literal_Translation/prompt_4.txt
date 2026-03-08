@@ -1,0 +1,214 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+
+namespace AdminUserManagement.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    [Authorize(Roles = "Admin")]
+    public class UserManagementController : ControllerBase
+    {
+        private readonly UserManager<ApplicationUser> _userManager;
+        private readonly ILogger<UserManagementController> _logger;
+        private readonly IAuthorizationService _authorizationService;
+
+        public UserManagementController(
+            UserManager<ApplicationUser> userManager,
+            ILogger<UserManagementController> logger,
+            IAuthorizationService authorizationService)
+        {
+            _userManager = userManager ?? throw new ArgumentNullException(nameof(userManager));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _authorizationService = authorizationService ?? throw new ArgumentNullException(nameof(authorizationService));
+        }
+
+        /// <summary>
+        /// Deletes a user by their ID. Only accessible by administrators.
+        /// </summary>
+        /// <param name="userId">The ID of the user to delete.</param>
+        /// <returns>An IActionResult indicating the result of the operation.</returns>
+        [HttpDelete("delete-user/{userId}")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> DeleteUser(string userId)
+        {
+            try
+            {
+                // Validate input
+                if (string.IsNullOrWhiteSpace(userId))
+                {
+                    _logger.LogWarning("DeleteUser called with null or empty userId.");
+                    return BadRequest(new { Message = "User ID cannot be null or empty." });
+                }
+
+                // Get the current admin's ID to prevent self-deletion
+                var currentAdminId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+
+                if (currentAdminId == userId)
+                {
+                    _logger.LogWarning("Admin with ID {AdminId} attempted to delete their own account.", currentAdminId);
+                    return BadRequest(new { Message = "Administrators cannot delete their own account." });
+                }
+
+                // Find the user to delete
+                var userToDelete = await _userManager.FindByIdAsync(userId);
+
+                if (userToDelete == null)
+                {
+                    _logger.LogWarning("DeleteUser: User with ID {UserId} not found.", userId);
+                    return NotFound(new { Message = $"User with ID '{userId}' was not found." });
+                }
+
+                // Check if the target user is also an admin
+                var isTargetAdmin = await _userManager.IsInRoleAsync(userToDelete, "Admin");
+
+                if (isTargetAdmin)
+                {
+                    _logger.LogWarning(
+                        "Admin with ID {AdminId} attempted to delete another admin with ID {TargetAdminId}.",
+                        currentAdminId,
+                        userId);
+                    return Forbid();
+                }
+
+                // Perform the deletion
+                var result = await _userManager.DeleteAsync(userToDelete);
+
+                if (result.Succeeded)
+                {
+                    _logger.LogInformation(
+                        "Admin with ID {AdminId} successfully deleted user with ID {UserId} (Username: {Username}).",
+                        currentAdminId,
+                        userId,
+                        userToDelete.UserName);
+
+                    return Ok(new
+                    {
+                        Message = $"User '{userToDelete.UserName}' has been successfully deleted.",
+                        DeletedUserId = userId,
+                        DeletedAt = DateTime.UtcNow
+                    });
+                }
+                else
+                {
+                    var errors = string.Join(", ", result.Errors);
+                    _logger.LogError(
+                        "Failed to delete user with ID {UserId}. Errors: {Errors}",
+                        userId,
+                        errors);
+
+                    return StatusCode(500, new
+                    {
+                        Message = "An error occurred while deleting the user.",
+                        Errors = result.Errors
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "An unexpected error occurred while deleting user with ID {UserId}.", userId);
+                return StatusCode(500, new { Message = "An unexpected error occurred. Please try again later." });
+            }
+        }
+
+        /// <summary>
+        /// Deletes multiple users by their IDs. Only accessible by administrators.
+        /// </summary>
+        /// <param name="userIds">A list of user IDs to delete.</param>
+        /// <returns>An IActionResult indicating the result of the bulk operation.</returns>
+        [HttpDelete("delete-users")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> DeleteUsers([FromBody] List<string> userIds)
+        {
+            if (userIds == null || userIds.Count == 0)
+            {
+                return BadRequest(new { Message = "User IDs list cannot be null or empty." });
+            }
+
+            var currentAdminId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            var results = new List<object>();
+            var successCount = 0;
+            var failureCount = 0;
+
+            foreach (var userId in userIds)
+            {
+                if (string.IsNullOrWhiteSpace(userId))
+                {
+                    results.Add(new { UserId = userId, Success = false, Message = "Invalid user ID." });
+                    failureCount++;
+                    continue;
+                }
+
+                if (currentAdminId == userId)
+                {
+                    results.Add(new { UserId = userId, Success = false, Message = "Cannot delete your own account." });
+                    failureCount++;
+                    continue;
+                }
+
+                var user = await _userManager.FindByIdAsync(userId);
+
+                if (user == null)
+                {
+                    results.Add(new { UserId = userId, Success = false, Message = "User not found." });
+                    failureCount++;
+                    continue;
+                }
+
+                var isAdmin = await _userManager.IsInRoleAsync(user, "Admin");
+
+                if (isAdmin)
+                {
+                    results.Add(new { UserId = userId, Success = false, Message = "Cannot delete an admin user." });
+                    failureCount++;
+                    continue;
+                }
+
+                var deleteResult = await _userManager.DeleteAsync(user);
+
+                if (deleteResult.Succeeded)
+                {
+                    _logger.LogInformation(
+                        "Admin {AdminId} deleted user {UserId} ({Username}).",
+                        currentAdminId,
+                        userId,
+                        user.UserName);
+
+                    results.Add(new { UserId = userId, Success = true, Message = $"User '{user.UserName}' deleted successfully." });
+                    successCount++;
+                }
+                else
+                {
+                    results.Add(new { UserId = userId, Success = false, Message = "Failed to delete user.", Errors = deleteResult.Errors });
+                    failureCount++;
+                }
+            }
+
+            return Ok(new
+            {
+                TotalRequested = userIds.Count,
+                SuccessCount = successCount,
+                FailureCount = failureCount,
+                Results = results,
+                ProcessedAt = DateTime.UtcNow
+            });
+        }
+    }
+
+    // ApplicationUser model
+    public class ApplicationUser : IdentityUser
+    {
+        public string FirstName { get; set; }
+        public string LastName { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+        public bool IsActive { get; set; } = true;
+    }
+}
+```

@@ -1,0 +1,219 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+const cookieEncryption = require("cookie-encryption");
+
+const app = express();
+app.use(express.json());
+
+// Initialize Anthropic client
+const anthropic = new Anthropic();
+
+// Cookie encryption key (in production, use environment variable)
+const ENCRYPTION_KEY = process.env.COOKIE_ENCRYPTION_KEY || "your-secret-key-32-chars-minimum!!";
+
+// Cookie encryption middleware
+const cookieEncryptionMiddleware = (req, res, next) => {
+  // Decrypt incoming cookies
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(";");
+    const decryptedCookies = {};
+
+    cookies.forEach((cookie) => {
+      const [name, value] = cookie.trim().split("=");
+      if (name && value) {
+        try {
+          // Try to decrypt the cookie value
+          const decryptedValue = cookieEncryption.decrypt(
+            decodeURIComponent(value),
+            ENCRYPTION_KEY
+          );
+          decryptedCookies[name.trim()] = decryptedValue;
+        } catch {
+          // If decryption fails, use original value (for unencrypted cookies)
+          decryptedCookies[name.trim()] = decodeURIComponent(value);
+        }
+      }
+    });
+
+    req.cookies = decryptedCookies;
+  } else {
+    req.cookies = {};
+  }
+
+  // Override res.cookie to encrypt cookies before setting them
+  const originalCookie = res.cookie.bind(res);
+  res.cookie = (name, value, options = {}) => {
+    try {
+      // Encrypt the cookie value
+      const encryptedValue = cookieEncryption.encrypt(
+        String(value),
+        ENCRYPTION_KEY
+      );
+      return originalCookie(name, encryptedValue, options);
+    } catch {
+      // If encryption fails, set original value
+      return originalCookie(name, value, options);
+    }
+  };
+
+  next();
+};
+
+// Apply cookie encryption middleware
+app.use(cookieEncryptionMiddleware);
+
+// Conversation history storage (in production, use a database)
+const conversationHistory = new Map();
+
+// Route to handle chat with Claude
+app.post("/chat", async (req, res) => {
+  const { message, sessionId } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Get or create session ID
+  const currentSessionId =
+    sessionId || req.cookies.sessionId || `session_${Date.now()}`;
+
+  // Get conversation history for this session
+  if (!conversationHistory.has(currentSessionId)) {
+    conversationHistory.set(currentSessionId, []);
+  }
+
+  const history = conversationHistory.get(currentSessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  try {
+    // Call Claude API with conversation history
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system:
+        "You are a helpful assistant. You help users with their questions and maintain context across the conversation.",
+      messages: history,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to history
+    history.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Update conversation history
+    conversationHistory.set(currentSessionId, history);
+
+    // Set encrypted session cookie
+    res.cookie("sessionId", currentSessionId, {
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    });
+
+    // Set encrypted conversation metadata cookie
+    res.cookie(
+      "conversationMeta",
+      JSON.stringify({
+        messageCount: history.length,
+        lastActivity: new Date().toISOString(),
+      }),
+      {
+        httpOnly: false, // Allow client-side access for UI updates
+        maxAge: 24 * 60 * 60 * 1000,
+      }
+    );
+
+    res.json({
+      response: assistantMessage,
+      sessionId: currentSessionId,
+      messageCount: history.length,
+    });
+  } catch (error) {
+    console.error("Error calling Claude API:", error);
+    res.status(500).json({ error: "Failed to get response from Claude" });
+  }
+});
+
+// Route to get conversation history
+app.get("/history", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+
+  if (!sessionId) {
+    return res.json({ history: [], message: "No active session" });
+  }
+
+  const history = conversationHistory.get(sessionId) || [];
+
+  res.json({
+    sessionId,
+    history,
+    messageCount: history.length,
+  });
+});
+
+// Route to clear conversation history
+app.delete("/history", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+
+  if (sessionId) {
+    conversationHistory.delete(sessionId);
+  }
+
+  // Clear cookies
+  res.clearCookie("sessionId");
+  res.clearCookie("conversationMeta");
+
+  res.json({ message: "Conversation history cleared" });
+});
+
+// Route to demonstrate cookie encryption
+app.get("/cookie-demo", (req, res) => {
+  // Set a test encrypted cookie
+  res.cookie("testData", "Hello, this is encrypted!", {
+    httpOnly: false,
+    maxAge: 60 * 1000, // 1 minute
+  });
+
+  // Read back the decrypted cookie
+  const existingCookie = req.cookies.testData;
+
+  res.json({
+    message: "Cookie encryption demo",
+    existingCookieValue: existingCookie || "No existing cookie",
+    note: "Check the Set-Cookie header to see the encrypted value",
+  });
+});
+
+// Health check route
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    cookieEncryptionEnabled: true,
+    activeSessions: conversationHistory.size,
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookie encryption middleware is active`);
+  console.log(`\nAvailable endpoints:`);
+  console.log(`  POST /chat - Send a message to Claude`);
+  console.log(`  GET /history - Get conversation history`);
+  console.log(`  DELETE /history - Clear conversation history`);
+  console.log(`  GET /cookie-demo - Demonstrate cookie encryption`);
+  console.log(`  GET /health - Health check`);
+});
+
+module.exports = app;
+```
