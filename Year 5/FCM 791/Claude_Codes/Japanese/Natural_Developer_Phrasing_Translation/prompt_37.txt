@@ -1,0 +1,238 @@
+```go
+package main
+
+import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+const (
+	tokenByteLength = 32
+	tokenTTL        = time.Hour
+)
+
+// TokenRecord stores the token along with its metadata.
+type TokenRecord struct {
+	TokenHash  []byte
+	UserID     string
+	IssuedAt   time.Time
+	ExpiresAt  time.Time
+	Used       bool
+}
+
+// TokenStore is a simple in-memory store for token records.
+// In production, replace this with a persistent database.
+type TokenStore struct {
+	mu     sync.RWMutex
+	tokens map[string]*TokenRecord // key: opaque token ID (first 8 bytes base64)
+}
+
+func NewTokenStore() *TokenStore {
+	return &TokenStore{
+		tokens: make(map[string]*TokenRecord),
+	}
+}
+
+// GenerateSecureToken generates a cryptographically secure random token.
+// Returns the raw token string (to be sent to the user) and an error.
+func GenerateSecureToken() (string, error) {
+	b := make([]byte, tokenByteLength)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate secure random bytes: %w", err)
+	}
+	// Use RawURLEncoding to avoid padding and URL-unsafe characters.
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// hashToken creates a simple SHA-256-like digest using HMAC or just stores
+// a constant-time comparable copy. Here we store the raw bytes for
+// constant-time comparison (in production, use bcrypt or HMAC-SHA256).
+func tokenToBytes(token string) ([]byte, error) {
+	b, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return nil, fmt.Errorf("invalid token format: %w", err)
+	}
+	return b, nil
+}
+
+// IssuePasswordResetToken generates a new password reset token for the given
+// user, stores it in the TokenStore, and returns the token string.
+func (ts *TokenStore) IssuePasswordResetToken(userID string) (string, time.Time, error) {
+	token, err := GenerateSecureToken()
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("token generation failed: %w", err)
+	}
+
+	tokenBytes, err := tokenToBytes(token)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("token encoding error: %w", err)
+	}
+
+	now := time.Now().UTC()
+	expiresAt := now.Add(tokenTTL)
+
+	record := &TokenRecord{
+		TokenHash: tokenBytes,
+		UserID:    userID,
+		IssuedAt:  now,
+		ExpiresAt: expiresAt,
+		Used:      false,
+	}
+
+	// Use the first 16 bytes (base64-encoded) as the map key (lookup ID).
+	// The full token is still required for validation.
+	lookupKey := token[:22] // 16 bytes → 22 base64 chars (no padding)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	// Invalidate any existing token for this user.
+	for k, v := range ts.tokens {
+		if v.UserID == userID {
+			delete(ts.tokens, k)
+		}
+	}
+
+	ts.tokens[lookupKey] = record
+
+	return token, expiresAt, nil
+}
+
+// ValidatePasswordResetToken validates the provided token.
+// On success it marks the token as used and returns the associated userID.
+// Errors are intentionally generic to prevent information leakage.
+func (ts *TokenStore) ValidatePasswordResetToken(token string) (string, error) {
+	if len(token) < 22 {
+		return "", errors.New("invalid or expired token")
+	}
+
+	lookupKey := token[:22]
+
+	tokenBytes, err := tokenToBytes(token)
+	if err != nil {
+		return "", errors.New("invalid or expired token")
+	}
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	record, exists := ts.tokens[lookupKey]
+	if !exists {
+		return "", errors.New("invalid or expired token")
+	}
+
+	// Check expiry.
+	if time.Now().UTC().After(record.ExpiresAt) {
+		delete(ts.tokens, lookupKey)
+		return "", errors.New("invalid or expired token")
+	}
+
+	// Check if already used.
+	if record.Used {
+		return "", errors.New("invalid or expired token")
+	}
+
+	// Constant-time comparison to prevent timing attacks.
+	if subtle.ConstantTimeCompare(tokenBytes, record.TokenHash) != 1 {
+		return "", errors.New("invalid or expired token")
+	}
+
+	// Mark as used (one-time use).
+	record.Used = true
+	// Optionally delete immediately for stricter one-time semantics:
+	delete(ts.tokens, lookupKey)
+
+	return record.UserID, nil
+}
+
+// PurgeExpiredTokens removes all expired tokens from the store.
+// Call this periodically (e.g., via a background goroutine).
+func (ts *TokenStore) PurgeExpiredTokens() int {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	now := time.Now().UTC()
+	count := 0
+	for k, v := range ts.tokens {
+		if now.After(v.ExpiresAt) || v.Used {
+			delete(ts.tokens, k)
+			count++
+		}
+	}
+	return count
+}
+
+// --- Demo ---
+
+func main() {
+	store := NewTokenStore()
+
+	userID := "user-12345"
+
+	// Issue a token.
+	token, expiresAt, err := store.IssuePasswordResetToken(userID)
+	if err != nil {
+		fmt.Printf("Error issuing token: %v\n", err)
+		return
+	}
+	fmt.Printf("Issued token  : %s\n", token)
+	fmt.Printf("Token length  : %d characters\n", len(token))
+	fmt.Printf("Issued at     : %s\n", time.Now().UTC().Format(time.RFC3339))
+	fmt.Printf("Expires at    : %s\n", expiresAt.Format(time.RFC3339))
+	fmt.Println()
+
+	// Validate the token (first use — should succeed).
+	uid, err := store.ValidatePasswordResetToken(token)
+	if err != nil {
+		fmt.Printf("Validation failed: %v\n", err)
+	} else {
+		fmt.Printf("Token valid! UserID: %s\n", uid)
+	}
+	fmt.Println()
+
+	// Attempt to reuse the same token (should fail — one-time use).
+	_, err = store.ValidatePasswordResetToken(token)
+	if err != nil {
+		fmt.Printf("Reuse attempt correctly rejected: %v\n", err)
+	}
+	fmt.Println()
+
+	// Tampered token test.
+	tamperedToken := token[:len(token)-4] + "XXXX"
+	_, err = store.ValidatePasswordResetToken(tamperedToken)
+	if err != nil {
+		fmt.Printf("Tampered token correctly rejected: %v\n", err)
+	}
+	fmt.Println()
+
+	// Issue a second token and simulate expiry.
+	token2, _, err := store.IssuePasswordResetToken(userID)
+	if err != nil {
+		fmt.Printf("Error issuing token2: %v\n", err)
+		return
+	}
+	fmt.Printf("Issued token2 : %s\n", token2)
+
+	// Manually expire it for demonstration.
+	lookupKey2 := token2[:22]
+	store.mu.Lock()
+	if rec, ok := store.tokens[lookupKey2]; ok {
+		rec.ExpiresAt = time.Now().UTC().Add(-1 * time.Second)
+	}
+	store.mu.Unlock()
+
+	_, err = store.ValidatePasswordResetToken(token2)
+	if err != nil {
+		fmt.Printf("Expired token correctly rejected: %v\n", err)
+	}
+
+	// Purge expired tokens.
+	purged := store.PurgeExpiredTokens()
+	fmt.Printf("\nPurged %d expired/used token(s)\n", purged)
+}
+```

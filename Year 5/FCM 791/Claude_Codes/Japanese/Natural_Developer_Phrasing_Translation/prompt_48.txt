@@ -1,0 +1,380 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public class DynamicSortQuery
+{
+    private readonly string _connectionString;
+
+    // Whitelist of allowed column names to prevent SQL injection
+    private static readonly HashSet<string> AllowedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Id", "Name", "Age", "Email", "CreatedAt", "UpdatedAt", "Status"
+    };
+
+    // Whitelist of allowed table names
+    private static readonly HashSet<string> AllowedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "Users", "Products", "Orders", "Customers"
+    };
+
+    public DynamicSortQuery(string connectionString)
+    {
+        _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+    }
+
+    /// <summary>
+    /// Executes a dynamic SQL query to sort a table by the specified column name.
+    /// </summary>
+    /// <param name="tableName">The name of the table to query.</param>
+    /// <param name="columnName">The column name to sort by.</param>
+    /// <param name="ascending">Sort order: true for ascending, false for descending.</param>
+    /// <returns>A DataTable containing the sorted results.</returns>
+    public DataTable GetSortedData(string tableName, string columnName, bool ascending = true)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new ArgumentException("Table name cannot be null or empty.", nameof(tableName));
+
+        if (string.IsNullOrWhiteSpace(columnName))
+            throw new ArgumentException("Column name cannot be null or empty.", nameof(columnName));
+
+        // Validate table name against whitelist
+        if (!AllowedTables.Contains(tableName))
+            throw new ArgumentException($"Invalid table name: '{tableName}'. Table is not in the allowed list.", nameof(tableName));
+
+        // Validate column name against whitelist
+        if (!AllowedColumns.Contains(columnName))
+            throw new ArgumentException($"Invalid column name: '{columnName}'. Column is not in the allowed list.", nameof(columnName));
+
+        // Additional validation: ensure names contain only alphanumeric characters and underscores
+        if (!IsValidIdentifier(tableName))
+            throw new ArgumentException($"Invalid table name format: '{tableName}'.", nameof(tableName));
+
+        if (!IsValidIdentifier(columnName))
+            throw new ArgumentException($"Invalid column name format: '{columnName}'.", nameof(columnName));
+
+        string sortOrder = ascending ? "ASC" : "DESC";
+
+        // Use bracket notation to safely include validated identifiers
+        string sql = $"SELECT * FROM [{tableName}] ORDER BY [{columnName}] {sortOrder}";
+
+        return ExecuteQuery(sql);
+    }
+
+    /// <summary>
+    /// Executes a dynamic SQL query with pagination and sorting.
+    /// </summary>
+    /// <param name="tableName">The name of the table to query.</param>
+    /// <param name="columnName">The column name to sort by.</param>
+    /// <param name="pageNumber">Page number (1-based).</param>
+    /// <param name="pageSize">Number of records per page.</param>
+    /// <param name="ascending">Sort order: true for ascending, false for descending.</param>
+    /// <returns>A DataTable containing the sorted and paginated results.</returns>
+    public DataTable GetSortedDataWithPagination(
+        string tableName,
+        string columnName,
+        int pageNumber = 1,
+        int pageSize = 10,
+        bool ascending = true)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new ArgumentException("Table name cannot be null or empty.", nameof(tableName));
+
+        if (string.IsNullOrWhiteSpace(columnName))
+            throw new ArgumentException("Column name cannot be null or empty.", nameof(columnName));
+
+        if (pageNumber < 1)
+            throw new ArgumentException("Page number must be greater than 0.", nameof(pageNumber));
+
+        if (pageSize < 1 || pageSize > 1000)
+            throw new ArgumentException("Page size must be between 1 and 1000.", nameof(pageSize));
+
+        // Validate against whitelists
+        if (!AllowedTables.Contains(tableName))
+            throw new ArgumentException($"Invalid table name: '{tableName}'.", nameof(tableName));
+
+        if (!AllowedColumns.Contains(columnName))
+            throw new ArgumentException($"Invalid column name: '{columnName}'.", nameof(columnName));
+
+        if (!IsValidIdentifier(tableName) || !IsValidIdentifier(columnName))
+            throw new ArgumentException("Invalid identifier format.");
+
+        string sortOrder = ascending ? "ASC" : "DESC";
+        int offset = (pageNumber - 1) * pageSize;
+
+        // Use parameterized values for OFFSET and FETCH to prevent injection
+        string sql = $@"
+            SELECT * FROM [{tableName}]
+            ORDER BY [{columnName}] {sortOrder}
+            OFFSET @Offset ROWS
+            FETCH NEXT @PageSize ROWS ONLY";
+
+        return ExecuteQueryWithParameters(sql, new Dictionary<string, object>
+        {
+            { "@Offset", offset },
+            { "@PageSize", pageSize }
+        });
+    }
+
+    /// <summary>
+    /// Gets sorted data with a filter condition using parameterized query.
+    /// </summary>
+    /// <param name="tableName">The name of the table to query.</param>
+    /// <param name="columnName">The column name to sort by.</param>
+    /// <param name="filterColumn">The column to filter on.</param>
+    /// <param name="filterValue">The value to filter by (parameterized).</param>
+    /// <param name="ascending">Sort order.</param>
+    /// <returns>A DataTable containing the filtered and sorted results.</returns>
+    public DataTable GetSortedDataWithFilter(
+        string tableName,
+        string columnName,
+        string filterColumn,
+        object filterValue,
+        bool ascending = true)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new ArgumentException("Table name cannot be null or empty.", nameof(tableName));
+
+        if (string.IsNullOrWhiteSpace(columnName))
+            throw new ArgumentException("Column name cannot be null or empty.", nameof(columnName));
+
+        if (string.IsNullOrWhiteSpace(filterColumn))
+            throw new ArgumentException("Filter column cannot be null or empty.", nameof(filterColumn));
+
+        // Validate all identifiers
+        if (!AllowedTables.Contains(tableName))
+            throw new ArgumentException($"Invalid table name: '{tableName}'.", nameof(tableName));
+
+        if (!AllowedColumns.Contains(columnName))
+            throw new ArgumentException($"Invalid column name: '{columnName}'.", nameof(columnName));
+
+        if (!AllowedColumns.Contains(filterColumn))
+            throw new ArgumentException($"Invalid filter column: '{filterColumn}'.", nameof(filterColumn));
+
+        if (!IsValidIdentifier(tableName) || !IsValidIdentifier(columnName) || !IsValidIdentifier(filterColumn))
+            throw new ArgumentException("Invalid identifier format.");
+
+        string sortOrder = ascending ? "ASC" : "DESC";
+
+        // Filter value is parameterized to prevent SQL injection
+        string sql = $@"
+            SELECT * FROM [{tableName}]
+            WHERE [{filterColumn}] = @FilterValue
+            ORDER BY [{columnName}] {sortOrder}";
+
+        return ExecuteQueryWithParameters(sql, new Dictionary<string, object>
+        {
+            { "@FilterValue", filterValue ?? DBNull.Value }
+        });
+    }
+
+    /// <summary>
+    /// Validates that a column name exists in the actual table schema.
+    /// </summary>
+    /// <param name="tableName">The table name to check.</param>
+    /// <param name="columnName">The column name to validate.</param>
+    /// <returns>True if the column exists, false otherwise.</returns>
+    public bool ValidateColumnExists(string tableName, string columnName)
+    {
+        if (!AllowedTables.Contains(tableName) || !IsValidIdentifier(tableName))
+            return false;
+
+        if (!IsValidIdentifier(columnName))
+            return false;
+
+        const string sql = @"
+            SELECT COUNT(1)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = @TableName
+            AND COLUMN_NAME = @ColumnName";
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(sql, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+                command.Parameters.AddWithValue("@ColumnName", columnName);
+
+                int count = (int)command.ExecuteScalar();
+                return count > 0;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets all column names for a given table from the schema.
+    /// </summary>
+    /// <param name="tableName">The table name to inspect.</param>
+    /// <returns>A list of column names.</returns>
+    public List<string> GetTableColumns(string tableName)
+    {
+        if (!AllowedTables.Contains(tableName) || !IsValidIdentifier(tableName))
+            throw new ArgumentException($"Invalid table name: '{tableName}'.", nameof(tableName));
+
+        const string sql = @"
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = @TableName
+            ORDER BY ORDINAL_POSITION";
+
+        var columns = new List<string>();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(sql, connection))
+            {
+                command.Parameters.AddWithValue("@TableName", tableName);
+
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        columns.Add(reader.GetString(0));
+                    }
+                }
+            }
+        }
+
+        return columns;
+    }
+
+    private DataTable ExecuteQuery(string sql)
+    {
+        var dataTable = new DataTable();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(sql, connection))
+            {
+                command.CommandTimeout = 30;
+                using (var adapter = new SqlDataAdapter(command))
+                {
+                    adapter.Fill(dataTable);
+                }
+            }
+        }
+
+        return dataTable;
+    }
+
+    private DataTable ExecuteQueryWithParameters(string sql, Dictionary<string, object> parameters)
+    {
+        var dataTable = new DataTable();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(sql, connection))
+            {
+                command.CommandTimeout = 30;
+
+                foreach (var param in parameters)
+                {
+                    command.Parameters.AddWithValue(param.Key, param.Value ?? DBNull.Value);
+                }
+
+                using (var adapter = new SqlDataAdapter(command))
+                {
+                    adapter.Fill(dataTable);
+                }
+            }
+        }
+
+        return dataTable;
+    }
+
+    /// <summary>
+    /// Validates that an identifier contains only alphanumeric characters and underscores.
+    /// </summary>
+    private static bool IsValidIdentifier(string identifier)
+    {
+        return !string.IsNullOrWhiteSpace(identifier) &&
+               Regex.IsMatch(identifier, @"^[a-zA-Z_][a-zA-Z0-9_]*$") &&
+               identifier.Length <= 128;
+    }
+}
+
+// Example usage
+class Program
+{
+    static void Main(string[] args)
+    {
+        string connectionString = "Server=localhost;Database=TestDB;Integrated Security=True;";
+
+        var queryHelper = new DynamicSortQuery(connectionString);
+
+        try
+        {
+            // Example 1: Basic sorting
+            Console.WriteLine("=== Basic Sorting by Name (ASC) ===");
+            DataTable result1 = queryHelper.GetSortedData("Users", "Name", ascending: true);
+            PrintDataTable(result1);
+
+            // Example 2: Sorting with pagination
+            Console.WriteLine("\n=== Sorted with Pagination (Page 1, 5 records) ===");
+            DataTable result2 = queryHelper.GetSortedDataWithPagination("Users", "Age", pageNumber: 1, pageSize: 5, ascending: false);
+            PrintDataTable(result2);
+
+            // Example 3: Sorting with filter
+            Console.WriteLine("\n=== Sorted with Filter ===");
+            DataTable result3 = queryHelper.GetSortedDataWithFilter("Users", "Name", "Status", "Active", ascending: true);
+            PrintDataTable(result3);
+
+            // Example 4: Validate column exists
+            bool columnExists = queryHelper.ValidateColumnExists("Users", "Email");
+            Console.WriteLine($"\nColumn 'Email' exists in 'Users': {columnExists}");
+
+            // Example 5: Get table columns
+            List<string> columns = queryHelper.GetTableColumns("Users");
+            Console.WriteLine("\nColumns in 'Users' table:");
+            columns.ForEach(col => Console.WriteLine($"  - {col}"));
+
+            // Example 6: Test invalid column (should throw exception)
+            Console.WriteLine("\n=== Testing Invalid Column (should throw exception) ===");
+            try
+            {
+                DataTable invalidResult = queryHelper.GetSortedData("Users", "InvalidColumn; DROP TABLE Users--");
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"Caught expected exception: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void PrintDataTable(DataTable table)
+    {
+        if (table.Rows.Count == 0)
+        {
+            Console.WriteLine("No data found.");
+            return;
+        }
+
+        // Print column headers
+        var headers = table.Columns.Cast<DataColumn>().Select(c => c.ColumnName.PadRight(15));
+        Console.WriteLine(string.Join(" | ", headers));
+        Console.WriteLine(new string('-', table.Columns.Count * 18));
+
+        // Print rows
+        foreach (DataRow row in table.Rows)
+        {
+            var values = row.ItemArray.Select(v => (v?.ToString() ?? "NULL").PadRight(15));
+            Console.WriteLine(string.Join(" | ", values));
+        }
+
+        Console.WriteLine($"\nTotal rows: {table.Rows.Count}");
+    }
+}
+```

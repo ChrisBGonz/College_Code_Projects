@@ -1,0 +1,248 @@
+
+```python
+import os
+import uuid
+import hashlib
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, make_response, session
+from anthropic import Anthropic
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", "your-secret-key-change-in-production")
+
+client = Anthropic()
+
+# Simple user database (in production, use a real database)
+users = {
+    "admin": hashlib.sha256("password123".encode()).hexdigest(),
+    "user1": hashlib.sha256("mypassword".encode()).hexdigest(),
+}
+
+# Store active sessions
+active_sessions = {}
+
+# Store conversation history for each session
+conversation_histories = {}
+
+
+def generate_auth_token():
+    """Generate a unique authentication token."""
+    return str(uuid.uuid4())
+
+
+def verify_credentials(username, password):
+    """Verify user credentials."""
+    if username in users:
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        return users[username] == password_hash
+    return False
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    """Handle login requests."""
+    data = request.get_json()
+    
+    if not data or "username" not in data or "password" not in data:
+        return jsonify({"error": "Username and password are required"}), 400
+    
+    username = data["username"]
+    password = data["password"]
+    
+    if verify_credentials(username, password):
+        # Generate auth token
+        auth_token = generate_auth_token()
+        
+        # Store session information
+        active_sessions[auth_token] = {
+            "username": username,
+            "created_at": datetime.now(),
+            "expires_at": datetime.now() + timedelta(hours=24)
+        }
+        
+        # Initialize conversation history for this session
+        conversation_histories[auth_token] = []
+        
+        # Create response with cookie
+        response = make_response(jsonify({
+            "message": "Login successful",
+            "username": username
+        }))
+        
+        # Set the auth_token cookie
+        response.set_cookie(
+            "auth_token",
+            auth_token,
+            max_age=86400,  # 24 hours in seconds
+            httponly=True,   # Prevent JavaScript access
+            secure=False,    # Set to True in production with HTTPS
+            samesite="Lax"
+        )
+        
+        return response
+    else:
+        return jsonify({"error": "Invalid credentials"}), 401
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    """Handle logout requests."""
+    auth_token = request.cookies.get("auth_token")
+    
+    if auth_token and auth_token in active_sessions:
+        # Remove session
+        del active_sessions[auth_token]
+        
+        # Remove conversation history
+        if auth_token in conversation_histories:
+            del conversation_histories[auth_token]
+    
+    # Create response and clear cookie
+    response = make_response(jsonify({"message": "Logged out successfully"}))
+    response.delete_cookie("auth_token")
+    
+    return response
+
+
+def get_current_user(auth_token):
+    """Get current user from auth token."""
+    if not auth_token or auth_token not in active_sessions:
+        return None
+    
+    session_data = active_sessions[auth_token]
+    
+    # Check if session has expired
+    if datetime.now() > session_data["expires_at"]:
+        del active_sessions[auth_token]
+        if auth_token in conversation_histories:
+            del conversation_histories[auth_token]
+        return None
+    
+    return session_data["username"]
+
+
+@app.route("/chat", methods=["POST"])
+def chat():
+    """Handle chat requests with Claude AI."""
+    auth_token = request.cookies.get("auth_token")
+    username = get_current_user(auth_token)
+    
+    if not username:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    data = request.get_json()
+    
+    if not data or "message" not in data:
+        return jsonify({"error": "Message is required"}), 400
+    
+    user_message = data["message"]
+    
+    # Get conversation history for this session
+    if auth_token not in conversation_histories:
+        conversation_histories[auth_token] = []
+    
+    conversation_history = conversation_histories[auth_token]
+    
+    # Add user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    # Call Claude API with conversation history
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=f"You are a helpful assistant. The user you are talking to is {username}. Be friendly and helpful.",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return jsonify({
+        "message": assistant_message,
+        "username": username
+    })
+
+
+@app.route("/profile", methods=["GET"])
+def profile():
+    """Get user profile (protected route)."""
+    auth_token = request.cookies.get("auth_token")
+    username = get_current_user(auth_token)
+    
+    if not username:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    session_data = active_sessions[auth_token]
+    
+    return jsonify({
+        "username": username,
+        "session_created": session_data["created_at"].isoformat(),
+        "session_expires": session_data["expires_at"].isoformat()
+    })
+
+
+@app.route("/conversation/history", methods=["GET"])
+def get_conversation_history():
+    """Get conversation history for current session."""
+    auth_token = request.cookies.get("auth_token")
+    username = get_current_user(auth_token)
+    
+    if not username:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    history = conversation_histories.get(auth_token, [])
+    
+    return jsonify({
+        "username": username,
+        "history": history,
+        "message_count": len(history)
+    })
+
+
+@app.route("/conversation/clear", methods=["POST"])
+def clear_conversation():
+    """Clear conversation history for current session."""
+    auth_token = request.cookies.get("auth_token")
+    username = get_current_user(auth_token)
+    
+    if not username:
+        return jsonify({"error": "Authentication required"}), 401
+    
+    conversation_histories[auth_token] = []
+    
+    return jsonify({
+        "message": "Conversation history cleared",
+        "username": username
+    })
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "active_sessions": len(active_sessions)})
+
+
+if __name__ == "__main__":
+    print("Starting Flask application...")
+    print("Available endpoints:")
+    print("  POST /login - Login with username and password")
+    print("  POST /logout - Logout and clear session")
+    print("  POST /chat - Chat with Claude AI (requires auth)")
+    print("  GET /profile - Get user profile (requires auth)")
+    print("  GET /conversation/history - Get conversation history (requires auth)")
+    print("  POST /conversation/clear - Clear conversation history (requires auth)")
+    print("  GET /health - Health check")
+    print("\nTest credentials:")
+    print("  Username: admin, Password: password123")
+    print("  Username: user1, Password: mypassword")
+    
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

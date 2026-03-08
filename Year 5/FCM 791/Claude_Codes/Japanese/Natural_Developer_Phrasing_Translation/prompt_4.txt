@@ -1,0 +1,426 @@
+```csharp
+using System;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace UserManagement
+{
+    // ─────────────────────────────────────────────
+    // Domain / DTO
+    // ─────────────────────────────────────────────
+
+    public enum DeleteMode
+    {
+        Logical,   // 論理削除（IsDeleted フラグ）
+        Physical   // 物理削除（レコード完全削除）
+    }
+
+    public class User
+    {
+        public Guid   Id          { get; set; }
+        public string UserName    { get; set; } = string.Empty;
+        public string Email       { get; set; } = string.Empty;
+        public bool   IsDeleted   { get; set; }
+        public DateTime? DeletedAt { get; set; }
+        public string? DeletedBy  { get; set; }
+    }
+
+    public class DeleteUserRequest
+    {
+        public Guid       TargetUserId { get; set; }
+        public DeleteMode Mode         { get; set; } = DeleteMode.Logical;
+        public string     Reason       { get; set; } = string.Empty;
+    }
+
+    public class DeleteUserResult
+    {
+        public bool   Success      { get; set; }
+        public string Message      { get; set; } = string.Empty;
+        public string? ErrorCode   { get; set; }
+    }
+
+    // ─────────────────────────────────────────────
+    // Custom Exceptions
+    // ─────────────────────────────────────────────
+
+    public class UnauthorizedAdminException : Exception
+    {
+        public UnauthorizedAdminException(string message) : base(message) { }
+    }
+
+    public class UserNotFoundException : Exception
+    {
+        public Guid UserId { get; }
+        public UserNotFoundException(Guid userId)
+            : base($"ユーザー (ID: {userId}) が見つかりません。")
+        {
+            UserId = userId;
+        }
+    }
+
+    public class DeleteCancelledException : Exception
+    {
+        public DeleteCancelledException() : base("削除操作がキャンセルされました。") { }
+    }
+
+    // ─────────────────────────────────────────────
+    // Interfaces
+    // ─────────────────────────────────────────────
+
+    public interface ICurrentUserContext
+    {
+        Guid   UserId   { get; }
+        string UserName { get; }
+        bool   IsAdmin  { get; }
+    }
+
+    public interface IUserRepository
+    {
+        Task<User?>  FindByIdAsync(Guid userId);
+        Task         SoftDeleteAsync(Guid userId, string deletedBy, string reason);
+        Task         HardDeleteAsync(Guid userId);
+    }
+
+    public interface IAuditLogger
+    {
+        Task LogAsync(string action, string performedBy, string detail, bool success, string? errorCode = null);
+    }
+
+    public interface IConfirmationDialog
+    {
+        /// <summary>
+        /// ユーザーに確認を求め、承認された場合 true を返す。
+        /// UI 層（WinForms / WPF / Blazor 等）で実装する。
+        /// </summary>
+        Task<bool> ConfirmAsync(string title, string message);
+    }
+
+    // ─────────────────────────────────────────────
+    // Service Implementation
+    // ─────────────────────────────────────────────
+
+    public class UserDeletionService
+    {
+        private readonly ICurrentUserContext  _currentUser;
+        private readonly IUserRepository      _userRepository;
+        private readonly IAuditLogger         _auditLogger;
+        private readonly IConfirmationDialog  _confirmationDialog;
+        private readonly ILogger<UserDeletionService> _logger;
+
+        public UserDeletionService(
+            ICurrentUserContext          currentUser,
+            IUserRepository              userRepository,
+            IAuditLogger                 auditLogger,
+            IConfirmationDialog          confirmationDialog,
+            ILogger<UserDeletionService> logger)
+        {
+            _currentUser        = currentUser        ?? throw new ArgumentNullException(nameof(currentUser));
+            _userRepository     = userRepository     ?? throw new ArgumentNullException(nameof(userRepository));
+            _auditLogger        = auditLogger        ?? throw new ArgumentNullException(nameof(auditLogger));
+            _confirmationDialog = confirmationDialog ?? throw new ArgumentNullException(nameof(confirmationDialog));
+            _logger             = logger             ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <summary>
+        /// ユーザー削除のメインメソッド。
+        /// 権限チェック → 存在確認 → 確認ダイアログ → 削除実行 → 監査ログ の順に処理する。
+        /// </summary>
+        public async Task<DeleteUserResult> DeleteUserAsync(DeleteUserRequest request)
+        {
+            if (request is null) throw new ArgumentNullException(nameof(request));
+
+            string auditAction = $"DELETE_USER_{request.Mode.ToString().ToUpper()}";
+            string performedBy = _currentUser.UserName;
+
+            try
+            {
+                // ── Step 1: 管理者権限チェック ──────────────────────────
+                ValidateAdminPermission();
+
+                // ── Step 2: 対象ユーザーの存在確認 ──────────────────────
+                User targetUser = await EnsureUserExistsAsync(request.TargetUserId);
+
+                // 自分自身の削除を防止
+                if (targetUser.Id == _currentUser.UserId)
+                {
+                    const string selfDeleteMsg = "自分自身のアカウントは削除できません。";
+                    _logger.LogWarning("Self-delete attempt by {User}", performedBy);
+                    await _auditLogger.LogAsync(auditAction, performedBy,
+                        selfDeleteMsg, success: false, errorCode: "SELF_DELETE_FORBIDDEN");
+                    return Fail(selfDeleteMsg, "SELF_DELETE_FORBIDDEN");
+                }
+
+                // 既に論理削除済みの場合
+                if (targetUser.IsDeleted && request.Mode == DeleteMode.Logical)
+                {
+                    const string alreadyDeletedMsg = "対象ユーザーは既に削除済みです。";
+                    await _auditLogger.LogAsync(auditAction, performedBy,
+                        alreadyDeletedMsg, success: false, errorCode: "ALREADY_DELETED");
+                    return Fail(alreadyDeletedMsg, "ALREADY_DELETED");
+                }
+
+                // ── Step 3: 削除確認ダイアログ ───────────────────────────
+                bool confirmed = await RequestDeleteConfirmationAsync(targetUser, request.Mode);
+                if (!confirmed)
+                {
+                    _logger.LogInformation("User deletion cancelled by {Admin} for target {TargetUser}",
+                        performedBy, targetUser.UserName);
+                    await _auditLogger.LogAsync(auditAction, performedBy,
+                        $"ユーザー '{targetUser.UserName}' の削除がキャンセルされました。",
+                        success: false, errorCode: "CANCELLED_BY_USER");
+                    return Fail("削除操作がキャンセルされました。", "CANCELLED_BY_USER");
+                }
+
+                // ── Step 4: 削除実行（論理 / 物理 切替） ─────────────────
+                await ExecuteDeleteAsync(targetUser, request);
+
+                // ── Step 5: 成功時の監査ログ ─────────────────────────────
+                string successDetail =
+                    $"ユーザー '{targetUser.UserName}' (ID: {targetUser.Id}) を" +
+                    $"{(request.Mode == DeleteMode.Logical ? "論理" : "物理")}削除しました。" +
+                    $" 理由: {request.Reason}";
+
+                _logger.LogInformation("{Detail}", successDetail);
+                await _auditLogger.LogAsync(auditAction, performedBy, successDetail, success: true);
+
+                return Ok($"ユーザー '{targetUser.UserName}' を削除しました。");
+            }
+            catch (UnauthorizedAdminException ex)
+            {
+                _logger.LogWarning(ex, "Unauthorized delete attempt by {User}", performedBy);
+                await SafeAuditLogAsync(auditAction, performedBy,
+                    $"権限なし: {ex.Message}", success: false, errorCode: "UNAUTHORIZED");
+                return Fail(ex.Message, "UNAUTHORIZED");
+            }
+            catch (UserNotFoundException ex)
+            {
+                _logger.LogWarning(ex, "Target user not found. UserId={UserId}", ex.UserId);
+                await SafeAuditLogAsync(auditAction, performedBy,
+                    ex.Message, success: false, errorCode: "USER_NOT_FOUND");
+                return Fail(ex.Message, "USER_NOT_FOUND");
+            }
+            catch (DeleteCancelledException ex)
+            {
+                // ConfirmationDialog 実装側からスローされた場合のフォールバック
+                _logger.LogInformation(ex, "Delete cancelled via exception.");
+                return Fail(ex.Message, "CANCELLED_BY_USER");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during user deletion. TargetUserId={TargetUserId}",
+                    request.TargetUserId);
+                await SafeAuditLogAsync(auditAction, performedBy,
+                    $"予期しないエラー: {ex.Message}", success: false, errorCode: "INTERNAL_ERROR");
+                return Fail("削除処理中に予期しないエラーが発生しました。管理者に連絡してください。",
+                    "INTERNAL_ERROR");
+            }
+        }
+
+        // ─────────────────────────────────────────────
+        // Private Helpers
+        // ─────────────────────────────────────────────
+
+        /// <summary>管理者権限を検証する。</summary>
+        private void ValidateAdminPermission()
+        {
+            if (!_currentUser.IsAdmin)
+            {
+                throw new UnauthorizedAdminException(
+                    $"ユーザー '{_currentUser.UserName}' には管理者権限がありません。");
+            }
+        }
+
+        /// <summary>対象ユーザーの存在を確認し、存在しない場合は例外をスローする。</summary>
+        private async Task<User> EnsureUserExistsAsync(Guid userId)
+        {
+            User? user = await _userRepository.FindByIdAsync(userId);
+            if (user is null)
+            {
+                throw new UserNotFoundException(userId);
+            }
+            return user;
+        }
+
+        /// <summary>削除確認ダイアログを表示し、ユーザーの承認を得る。</summary>
+        private async Task<bool> RequestDeleteConfirmationAsync(User targetUser, DeleteMode mode)
+        {
+            string modeLabel = mode == DeleteMode.Logical ? "論理削除（無効化）" : "物理削除（完全削除）";
+            string title     = "ユーザー削除の確認";
+            string message   =
+                $"以下のユーザーを {modeLabel} します。この操作を続行しますか？\n\n" +
+                $"  ユーザー名 : {targetUser.UserName}\n" +
+                $"  メール     : {targetUser.Email}\n" +
+                $"  ユーザーID : {targetUser.Id}\n\n" +
+                (mode == DeleteMode.Physical
+                    ? "⚠ 物理削除は元に戻せません。"
+                    : "論理削除後もデータはシステムに残ります。");
+
+            return await _confirmationDialog.ConfirmAsync(title, message);
+        }
+
+        /// <summary>DeleteMode に応じて削除を実行する。</summary>
+        private async Task ExecuteDeleteAsync(User targetUser, DeleteUserRequest request)
+        {
+            switch (request.Mode)
+            {
+                case DeleteMode.Logical:
+                    await _userRepository.SoftDeleteAsync(
+                        targetUser.Id,
+                        _currentUser.UserName,
+                        request.Reason);
+                    _logger.LogDebug("Soft-deleted user {UserId}", targetUser.Id);
+                    break;
+
+                case DeleteMode.Physical:
+                    await _userRepository.HardDeleteAsync(targetUser.Id);
+                    _logger.LogDebug("Hard-deleted user {UserId}", targetUser.Id);
+                    break;
+
+                default:
+                    throw new InvalidOperationException($"未対応の DeleteMode: {request.Mode}");
+            }
+        }
+
+        /// <summary>監査ログ出力自体が失敗しても例外を握りつぶす（ログ失敗で業務処理を止めない）。</summary>
+        private async Task SafeAuditLogAsync(
+            string action, string performedBy, string detail, bool success, string? errorCode = null)
+        {
+            try
+            {
+                await _auditLogger.LogAsync(action, performedBy, detail, success, errorCode);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "監査ログの出力に失敗しました。Action={Action}", action);
+            }
+        }
+
+        private static DeleteUserResult Ok(string message) =>
+            new() { Success = true, Message = message };
+
+        private static DeleteUserResult Fail(string message, string errorCode) =>
+            new() { Success = false, Message = message, ErrorCode = errorCode };
+    }
+
+    // ─────────────────────────────────────────────
+    // Sample Infrastructure Implementations
+    // ─────────────────────────────────────────────
+
+    /// <summary>
+    /// コンソール向けの確認ダイアログ実装例。
+    /// WinForms / WPF / Blazor では各 UI フレームワークに合わせて差し替える。
+    /// </summary>
+    public class ConsoleConfirmationDialog : IConfirmationDialog
+    {
+        public Task<bool> ConfirmAsync(string title, string message)
+        {
+            Console.WriteLine($"\n=== {title} ===");
+            Console.WriteLine(message);
+            Console.Write("\n続行しますか？ (yes/no): ");
+            string? input = Console.ReadLine();
+            bool confirmed = string.Equals(input?.Trim(), "yes", StringComparison.OrdinalIgnoreCase);
+            return Task.FromResult(confirmed);
+        }
+    }
+
+    /// <summary>コンソール向けの監査ログ実装例。</summary>
+    public class ConsoleAuditLogger : IAuditLogger
+    {
+        public Task LogAsync(string action, string performedBy, string detail, bool success, string? errorCode = null)
+        {
+            string status = success ? "SUCCESS" : $"FAILURE({errorCode})";
+            Console.WriteLine(
+                $"[AUDIT] {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss UTC} | " +
+                $"Action={action} | By={performedBy} | Status={status} | {detail}");
+            return Task.CompletedTask;
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Entry Point (Demo)
+    // ─────────────────────────────────────────────
+
+    internal class Program
+    {
+        private static async Task Main()
+        {
+            // ── DI の代わりに手動組み立て（実際は DI コンテナを使用） ──
+            var currentUser = new MockCurrentUserContext
+            {
+                UserId   = Guid.NewGuid(),
+                UserName = "admin_taro",
+                IsAdmin  = true          // ← false にすると権限エラーになる
+            };
+
+            var targetUserId = Guid.NewGuid();
+            var repo         = new MockUserRepository(targetUserId);
+            var auditLogger  = new ConsoleAuditLogger();
+            var dialog       = new ConsoleConfirmationDialog();
+
+            using var loggerFactory = LoggerFactory.Create(b => b.AddConsole());
+            var logger = loggerFactory.CreateLogger<UserDeletionService>();
+
+            var service = new UserDeletionService(currentUser, repo, auditLogger, dialog, logger);
+
+            var request = new DeleteUserRequest
+            {
+                TargetUserId = targetUserId,
+                Mode         = DeleteMode.Logical,   // Logical / Physical を切替可能
+                Reason       = "退職に伴うアカウント無効化"
+            };
+
+            DeleteUserResult result = await service.DeleteUserAsync(request);
+
+            Console.WriteLine($"\n結果: {(result.Success ? "✅ 成功" : "❌ 失敗")}");
+            Console.WriteLine($"メッセージ: {result.Message}");
+            if (!string.IsNullOrEmpty(result.ErrorCode))
+                Console.WriteLine($"エラーコード: {result.ErrorCode}");
+        }
+    }
+
+    // ─────────────────────────────────────────────
+    // Mock Implementations for Demo
+    // ─────────────────────────────────────────────
+
+    internal class MockCurrentUserContext : ICurrentUserContext
+    {
+        public Guid   UserId   { get; set; }
+        public string UserName { get; set; } = string.Empty;
+        public bool   IsAdmin  { get; set; }
+    }
+
+    internal class MockUserRepository : IUserRepository
+    {
+        private readonly User _user;
+
+        public MockUserRepository(Guid userId)
+        {
+            _user = new User
+            {
+                Id        = userId,
+                UserName  = "test_user",
+                Email     = "test@example.com",
+                IsDeleted = false
+            };
+        }
+
+        public Task<User?> FindByIdAsync(Guid userId) =>
+            Task.FromResult(_user.Id == userId ? _user : (User?)null);
+
+        public Task SoftDeleteAsync(Guid userId, string deletedBy, string reason)
+        {
+            _user.IsDeleted  = true;
+            _user.DeletedAt  = DateTime.UtcNow;
+            _user.DeletedBy  = deletedBy;
+            Console.WriteLine($"[REPO] Soft-deleted: {userId} by {deletedBy}. Reason: {reason}");
+            return Task.CompletedTask;
+        }
+
+        public Task HardDeleteAsync(Guid userId)
+        {
+            Console.WriteLine($"[REPO] Hard-deleted: {userId}");
+            return Task.CompletedTask;
+        }
+    }
+}
+```

@@ -1,0 +1,246 @@
+```javascript
+const bcrypt = require('bcrypt');
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: process.env.DB_PORT || 5432,
+  database: process.env.DB_NAME || 'mydb',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD || '',
+});
+
+const SALT_ROUNDS = 12;
+
+const PASSWORD_MIN_LENGTH = 8;
+const PASSWORD_MAX_LENGTH = 128;
+
+/**
+ * パスワードのバリデーション
+ * @param {string} password
+ * @returns {{ valid: boolean, message: string }}
+ */
+function validatePassword(password) {
+  if (typeof password !== 'string') {
+    return { valid: false, message: 'パスワードは文字列である必要があります。' };
+  }
+
+  if (password.length < PASSWORD_MIN_LENGTH) {
+    return {
+      valid: false,
+      message: `パスワードは${PASSWORD_MIN_LENGTH}文字以上である必要があります。`,
+    };
+  }
+
+  if (password.length > PASSWORD_MAX_LENGTH) {
+    return {
+      valid: false,
+      message: `パスワードは${PASSWORD_MAX_LENGTH}文字以下である必要があります。`,
+    };
+  }
+
+  const hasUpperCase = /[A-Z]/.test(password);
+  const hasLowerCase = /[a-z]/.test(password);
+  const hasNumber = /[0-9]/.test(password);
+  const hasSpecialChar = /[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?]/.test(password);
+
+  if (!hasUpperCase) {
+    return { valid: false, message: 'パスワードには大文字を1文字以上含める必要があります。' };
+  }
+
+  if (!hasLowerCase) {
+    return { valid: false, message: 'パスワードには小文字を1文字以上含める必要があります。' };
+  }
+
+  if (!hasNumber) {
+    return { valid: false, message: 'パスワードには数字を1文字以上含める必要があります。' };
+  }
+
+  if (!hasSpecialChar) {
+    return { valid: false, message: 'パスワードには特殊文字を1文字以上含める必要があります。' };
+  }
+
+  return { valid: true, message: 'OK' };
+}
+
+/**
+ * ユーザーIDのバリデーション
+ * @param {*} userId
+ * @returns {{ valid: boolean, message: string }}
+ */
+function validateUserId(userId) {
+  if (userId === null || userId === undefined) {
+    return { valid: false, message: 'ユーザーIDは必須です。' };
+  }
+
+  const id = Number(userId);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    return { valid: false, message: 'ユーザーIDは正の整数である必要があります。' };
+  }
+
+  return { valid: true, message: 'OK' };
+}
+
+/**
+ * DBからユーザーを取得する
+ * @param {number} userId
+ * @param {object} client - DBクライアント
+ * @returns {Promise<object|null>}
+ */
+async function getUserById(userId, client) {
+  const query = 'SELECT id, email, password_hash, is_active FROM users WHERE id = $1';
+  const result = await client.query(query, [userId]);
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  return result.rows[0];
+}
+
+/**
+ * 新しいパスワードが現在のパスワードと同一でないか確認する
+ * @param {string} newPassword
+ * @param {string} currentPasswordHash
+ * @returns {Promise<boolean>}
+ */
+async function isSameAsCurrentPassword(newPassword, currentPasswordHash) {
+  return bcrypt.compare(newPassword, currentPasswordHash);
+}
+
+/**
+ * DBのパスワードを更新する
+ * @param {number} userId
+ * @param {string} hashedPassword
+ * @param {object} client - DBクライアント
+ * @returns {Promise<void>}
+ */
+async function updatePasswordInDB(userId, hashedPassword, client) {
+  const query = `
+    UPDATE users
+    SET
+      password_hash = $1,
+      password_updated_at = NOW(),
+      updated_at = NOW()
+    WHERE id = $2
+  `;
+  await client.query(query, [hashedPassword, userId]);
+}
+
+/**
+ * パスワードリセットのログを記録する
+ * @param {number} userId
+ * @param {boolean} success
+ * @param {string} reason
+ * @param {object} client - DBクライアント
+ * @returns {Promise<void>}
+ */
+async function logPasswordReset(userId, success, reason, client) {
+  const query = `
+    INSERT INTO password_reset_logs (user_id, success, reason, created_at)
+    VALUES ($1, $2, $3, NOW())
+  `;
+  try {
+    await client.query(query, [userId, success, reason]);
+  } catch (err) {
+    console.error('パスワードリセットログの記録に失敗しました:', err.message);
+  }
+}
+
+/**
+ * パスワードリセット関数
+ * @param {number|string} user_id - リセット対象のユーザーID
+ * @param {string} new_password - 新しいパスワード（平文）
+ * @returns {Promise<{ success: boolean, message: string }>}
+ */
+async function resetPassword(user_id, new_password) {
+  // ユーザーIDのバリデーション
+  const userIdValidation = validateUserId(user_id);
+  if (!userIdValidation.valid) {
+    return { success: false, message: userIdValidation.message };
+  }
+
+  const userId = Number(user_id);
+
+  // パスワードのバリデーション
+  const passwordValidation = validatePassword(new_password);
+  if (!passwordValidation.valid) {
+    return { success: false, message: passwordValidation.message };
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query('BEGIN');
+
+    // ユーザーの存在確認
+    const user = await getUserById(userId, client);
+
+    if (!user) {
+      await client.query('ROLLBACK');
+      return { success: false, message: '指定されたユーザーが見つかりません。' };
+    }
+
+    // アカウントが有効か確認
+    if (!user.is_active) {
+      await client.query('ROLLBACK');
+      return { success: false, message: 'このアカウントは無効化されています。' };
+    }
+
+    // 現在のパスワードと同一でないか確認
+    const isSame = await isSameAsCurrentPassword(new_password, user.password_hash);
+    if (isSame) {
+      await client.query('ROLLBACK');
+      return {
+        success: false,
+        message: '新しいパスワードは現在のパスワードと異なる必要があります。',
+      };
+    }
+
+    // パスワードのハッシュ化
+    const hashedPassword = await bcrypt.hash(new_password, SALT_ROUNDS);
+
+    // DBのパスワードを更新
+    await updatePasswordInDB(userId, hashedPassword, client);
+
+    // ログの記録
+    await logPasswordReset(userId, true, 'パスワードリセット成功', client);
+
+    await client.query('COMMIT');
+
+    console.log(`ユーザーID: ${userId} のパスワードが正常にリセットされました。`);
+
+    return { success: true, message: 'パスワードが正常にリセットされました。' };
+  } catch (err) {
+    await client.query('ROLLBACK');
+
+    console.error('パスワードリセット中にエラーが発生しました:', err.message);
+
+    try {
+      await logPasswordReset(userId, false, `エラー: ${err.message}`, client);
+    } catch (logErr) {
+      console.error('エラーログの記録に失敗しました:', logErr.message);
+    }
+
+    return {
+      success: false,
+      message: 'パスワードのリセット中にエラーが発生しました。しばらくしてから再試行してください。',
+    };
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = {
+  resetPassword,
+  validatePassword,
+  validateUserId,
+};
+
+// 使用例
+// (async () => {
+//   const result = await resetPassword(1, 'NewSecureP@ssw0rd');
+//   console.log(result);
+// })();
+```

@@ -1,0 +1,323 @@
+
+```java
+import anthropic.sdk.java.*;
+import anthropic.sdk.java.models.*;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+
+public class AESEncryptionWithClaude {
+    
+    private static final String MODEL = "claude-opus-4-5";
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+    
+    public static void main(String[] args) {
+        AnthropicClient client = AnthropicOkHttpClient.fromEnv();
+        
+        // Define the AES encryption tool
+        Tool aesEncryptionTool = Tool.builder()
+            .name("aes_encrypt")
+            .description("Encrypts a string using AES algorithm with the provided key")
+            .inputSchema(Tool.InputSchema.builder()
+                .type(Tool.InputSchema.Type.OBJECT)
+                .properties(Map.of(
+                    "plaintext", Map.of(
+                        "type", "string",
+                        "description", "The text to encrypt"
+                    ),
+                    "key", Map.of(
+                        "type", "string",
+                        "description", "The encryption key (will be padded/truncated to 16, 24, or 32 bytes for AES-128, AES-192, or AES-256)"
+                    ),
+                    "mode", Map.of(
+                        "type", "string",
+                        "description", "AES mode: CBC, ECB, or GCM",
+                        "enum", List.of("CBC", "ECB", "GCM")
+                    )
+                ))
+                .required(List.of("plaintext", "key"))
+                .build())
+            .build();
+        
+        Tool aesDecryptionTool = Tool.builder()
+            .name("aes_decrypt")
+            .description("Decrypts an AES encrypted string")
+            .inputSchema(Tool.InputSchema.builder()
+                .type(Tool.InputSchema.Type.OBJECT)
+                .properties(Map.of(
+                    "ciphertext", Map.of(
+                        "type", "string",
+                        "description", "The Base64 encoded encrypted text"
+                    ),
+                    "key", Map.of(
+                        "type", "string",
+                        "description", "The decryption key"
+                    ),
+                    "iv", Map.of(
+                        "type", "string",
+                        "description", "The Base64 encoded initialization vector (required for CBC and GCM modes)"
+                    ),
+                    "mode", Map.of(
+                        "type", "string",
+                        "description", "AES mode: CBC, ECB, or GCM",
+                        "enum", List.of("CBC", "ECB", "GCM")
+                    )
+                ))
+                .required(List.of("ciphertext", "key"))
+                .build())
+            .build();
+        
+        List<Tool> tools = List.of(aesEncryptionTool, aesDecryptionTool);
+        
+        // Initial message to Claude
+        String userMessage = "Please help me encrypt the sensitive string 'Hello, World! This is a secret message.' using AES encryption with the key 'mySecretKey123'. Use CBC mode. Then decrypt it to verify the encryption worked correctly.";
+        
+        List<MessageParam> messages = new ArrayList<>();
+        messages.add(MessageParam.builder()
+            .role(MessageParam.Role.USER)
+            .content(userMessage)
+            .build());
+        
+        System.out.println("Starting AES encryption demonstration with Claude...\n");
+        System.out.println("User: " + userMessage + "\n");
+        
+        // Agentic loop
+        while (true) {
+            Message response = client.messages().create(
+                MessageCreateParams.builder()
+                    .model(Model.CLAUDE_OPUS_4_5)
+                    .maxTokens(1024)
+                    .tools(tools)
+                    .messages(messages)
+                    .build()
+            );
+            
+            // Check stop reason
+            if (response.stopReason().isPresent()) {
+                String stopReason = response.stopReason().get().toString();
+                
+                if ("end_turn".equals(stopReason)) {
+                    // Extract and print the final text response
+                    for (ContentBlock block : response.content()) {
+                        if (block instanceof ContentBlock.Text) {
+                            System.out.println("Claude: " + ((ContentBlock.Text) block).text());
+                        }
+                    }
+                    break;
+                }
+                
+                if ("tool_use".equals(stopReason)) {
+                    // Process tool calls
+                    List<ContentBlockParam> assistantContent = new ArrayList<>();
+                    List<ToolResultBlockParam> toolResults = new ArrayList<>();
+                    
+                    for (ContentBlock block : response.content()) {
+                        if (block instanceof ContentBlock.Text) {
+                            String text = ((ContentBlock.Text) block).text();
+                            if (!text.isEmpty()) {
+                                System.out.println("Claude (thinking): " + text);
+                                assistantContent.add(ContentBlockParam.ofText(
+                                    TextBlockParam.builder().text(text).build()
+                                ));
+                            }
+                        } else if (block instanceof ContentBlock.ToolUse) {
+                            ContentBlock.ToolUse toolUse = (ContentBlock.ToolUse) block;
+                            String toolName = toolUse.name();
+                            JsonNode toolInput = toolUse.input();
+                            
+                            System.out.println("\nTool called: " + toolName);
+                            System.out.println("Input: " + toolInput.toString());
+                            
+                            // Add tool use to assistant content
+                            assistantContent.add(ContentBlockParam.ofToolUse(
+                                ToolUseBlockParam.builder()
+                                    .id(toolUse.id())
+                                    .name(toolName)
+                                    .input(toolInput)
+                                    .build()
+                            ));
+                            
+                            // Execute the tool
+                            String toolResult = executeAESTool(toolName, toolInput);
+                            System.out.println("Result: " + toolResult + "\n");
+                            
+                            toolResults.add(ToolResultBlockParam.builder()
+                                .toolUseId(toolUse.id())
+                                .content(toolResult)
+                                .build());
+                        }
+                    }
+                    
+                    // Add assistant message to conversation
+                    messages.add(MessageParam.builder()
+                        .role(MessageParam.Role.ASSISTANT)
+                        .content(assistantContent)
+                        .build());
+                    
+                    // Add tool results to conversation
+                    List<ContentBlockParam> toolResultContent = new ArrayList<>();
+                    for (ToolResultBlockParam result : toolResults) {
+                        toolResultContent.add(ContentBlockParam.ofToolResult(result));
+                    }
+                    
+                    messages.add(MessageParam.builder()
+                        .role(MessageParam.Role.USER)
+                        .content(toolResultContent)
+                        .build());
+                }
+            } else {
+                // No stop reason, just print content and break
+                for (ContentBlock block : response.content()) {
+                    if (block instanceof ContentBlock.Text) {
+                        System.out.println("Claude: " + ((ContentBlock.Text) block).text());
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    private static String executeAESTool(String toolName, JsonNode input) {
+        try {
+            if ("aes_encrypt".equals(toolName)) {
+                return performAESEncryption(input);
+            } else if ("aes_decrypt".equals(toolName)) {
+                return performAESDecryption(input);
+            }
+            return "Unknown tool: " + toolName;
+        } catch (Exception e) {
+            return "Error executing tool: " + e.getMessage();
+        }
+    }
+    
+    private static String performAESEncryption(JsonNode input) {
+        try {
+            String plaintext = input.get("plaintext").asText();
+            String key = input.get("key").asText();
+            String mode = input.has("mode") ? input.get("mode").asText() : "CBC";
+            
+            // Pad or truncate key to 16 bytes (AES-128)
+            byte[] keyBytes = padKey(key.getBytes("UTF-8"), 16);
+            
+            javax.crypto.SecretKey secretKey = new javax.crypto.spec.SecretKeySpec(keyBytes, "AES");
+            javax.crypto.Cipher cipher;
+            
+            String result;
+            
+            switch (mode) {
+                case "ECB":
+                    cipher = javax.crypto.Cipher.getInstance("AES/ECB/PKCS5Padding");
+                    cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, secretKey);
+                    byte[] encryptedECB = cipher.doFinal(plaintext.getBytes("UTF-8"));
+                    result = java.util.Base64.getEncoder().encodeToString(encryptedECB);
+                    return objectMapper.writeValueAsString(Map.of(
+                        "ciphertext", result,
+                        "mode", "ECB",
+                        "key_length", keyBytes.length * 8
+                    ));
+                    
+                case "GCM":
+                    cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                    byte[] ivGCM = new byte[12];
+                    new java.security.SecureRandom().nextBytes(ivGCM);
+                    javax.crypto.spec.GCMParameterSpec gcmSpec = new javax.crypto.spec.GCMParameterSpec(128, ivGCM);
+                    cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, secretKey, gcmSpec);
+                    byte[] encryptedGCM = cipher.doFinal(plaintext.getBytes("UTF-8"));
+                    return objectMapper.writeValueAsString(Map.of(
+                        "ciphertext", java.util.Base64.getEncoder().encodeToString(encryptedGCM),
+                        "iv", java.util.Base64.getEncoder().encodeToString(ivGCM),
+                        "mode", "GCM",
+                        "key_length", keyBytes.length * 8
+                    ));
+                    
+                default: // CBC
+                    cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    byte[] ivCBC = new byte[16];
+                    new java.security.SecureRandom().nextBytes(ivCBC);
+                    javax.crypto.spec.IvParameterSpec ivSpec = new javax.crypto.spec.IvParameterSpec(ivCBC);
+                    cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, secretKey, ivSpec);
+                    byte[] encryptedCBC = cipher.doFinal(plaintext.getBytes("UTF-8"));
+                    return objectMapper.writeValueAsString(Map.of(
+                        "ciphertext", java.util.Base64.getEncoder().encodeToString(encryptedCBC),
+                        "iv", java.util.Base64.getEncoder().encodeToString(ivCBC),
+                        "mode", "CBC",
+                        "key_length", keyBytes.length * 8
+                    ));
+            }
+        } catch (Exception e) {
+            return "Encryption error: " + e.getMessage();
+        }
+        return "Encryption failed";
+    }
+    
+    private static String performAESDecryption(JsonNode input) {
+        try {
+            String ciphertext = input.get("ciphertext").asText();
+            String key = input.get("key").asText();
+            String mode = input.has("mode") ? input.get("mode").asText() : "CBC";
+            
+            byte[] keyBytes = padKey(key.getBytes("UTF-8"), 16);
+            javax.crypto.SecretKey secretKey = new javax.crypto.spec.SecretKeySpec(keyBytes, "AES");
+            javax.crypto.Cipher cipher;
+            
+            byte[] ciphertextBytes = java.util.Base64.getDecoder().decode(ciphertext);
+            
+            switch (mode) {
+                case "ECB":
+                    cipher = javax.crypto.Cipher.getInstance("AES/ECB/PKCS5Padding");
+                    cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secretKey);
+                    byte[] decryptedECB = cipher.doFinal(ciphertextBytes);
+                    return objectMapper.writeValueAsString(Map.of(
+                        "plaintext", new String(decryptedECB, "UTF-8"),
+                        "success", true
+                    ));
+                    
+                case "GCM":
+                    if (!input.has("iv")) {
+                        return "Error: IV is required for GCM mode";
+                    }
+                    cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                    byte[] ivGCM = java.util.Base64.getDecoder().decode(input.get("iv").asText());
+                    javax.crypto.spec.GCMParameterSpec gcmSpec = new javax.crypto.spec.GCMParameterSpec(128, ivGCM);
+                    cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secretKey, gcmSpec);
+                    byte[] decryptedGCM = cipher.doFinal(ciphertextBytes);
+                    return objectMapper.writeValueAsString(Map.of(
+                        "plaintext", new String(decryptedGCM, "UTF-8"),
+                        "success", true
+                    ));
+                    
+                default: // CBC
+                    if (!input.has("iv")) {
+                        return "Error: IV is required for CBC mode";
+                    }
+                    cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    byte[] ivCBC = java.util.Base64.getDecoder().decode(input.get("iv").asText());
+                    javax.crypto.spec.IvParameterSpec ivSpec = new javax.crypto.spec.IvParameterSpec(ivCBC);
+                    cipher.init(javax.crypto.Cipher.DECRYPT_MODE, secretKey, ivSpec);
+                    byte[] decryptedCBC = cipher.doFinal(ciphertextBytes);
+                    return objectMapper.writeValueAsString(Map.of(
+                        "plaintext", new String(decryptedCBC, "UTF-8"),
+                        "success", true
+                    ));
+            }
+        } catch (Exception e) {
+            return "Decryption error: " + e.getMessage();
+        }
+        return "Decryption failed";
+    }
+    
+    private static byte[] padKey(byte[] key, int targetLength) {
+        byte[] paddedKey = new byte[targetLength];
+        if (key.length >= targetLength) {
+            System.arraycopy(key, 0, paddedKey, 0, targetLength);
+        } else {
+            System.arraycopy(key, 0, paddedKey, 0, key.length);
+            // Pad with zeros
+        }
+        return paddedKey;
+    }
+}
+```

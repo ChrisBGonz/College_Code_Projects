@@ -1,0 +1,284 @@
+<?php
+
+// 設定
+define('ENCRYPTION_KEY', 'your-secret-key-32-characters!!'); // 32文字のキー
+define('ENCRYPTION_CIPHER', 'AES-256-CBC');
+
+// データベース接続設定
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'password');
+define('DB_NAME', 'secure_db');
+
+/**
+ * データを暗号化する
+ */
+function encrypt(string $data, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+    
+    $encrypted = openssl_encrypt(
+        $data,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new RuntimeException('暗号化に失敗しました: ' . openssl_error_string());
+    }
+    
+    // HMAC で整合性を確保
+    $hmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+    
+    // IV + HMAC + 暗号化データ を Base64 エンコードして返す
+    return base64_encode($iv . $hmac . $encrypted);
+}
+
+/**
+ * データを復号する
+ */
+function decrypt(string $encryptedData, string $key): string
+{
+    $decoded = base64_decode($encryptedData);
+    
+    if ($decoded === false) {
+        throw new RuntimeException('Base64 デコードに失敗しました。');
+    }
+    
+    $ivLength  = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $hmacLength = 32; // SHA-256 HMAC は 32 バイト
+    
+    $iv        = substr($decoded, 0, $ivLength);
+    $hmac      = substr($decoded, $ivLength, $hmacLength);
+    $encrypted = substr($decoded, $ivLength + $hmacLength);
+    
+    // HMAC を検証
+    $expectedHmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+    if (!hash_equals($expectedHmac, $hmac)) {
+        throw new RuntimeException('データの整合性チェックに失敗しました。改ざんの可能性があります。');
+    }
+    
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new RuntimeException('復号に失敗しました: ' . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+/**
+ * クレジットカード番号を検証する（Luhn アルゴリズム）
+ */
+function validateCreditCardNumber(string $number): bool
+{
+    $number = preg_replace('/\D/', '', $number);
+    
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+    
+    $sum     = 0;
+    $reverse = strrev($number);
+    
+    for ($i = 0; $i < strlen($reverse); $i++) {
+        $digit = (int)$reverse[$i];
+        
+        if ($i % 2 === 1) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+    }
+    
+    return $sum % 10 === 0;
+}
+
+/**
+ * データベース接続を取得する
+ */
+function getDatabaseConnection(): PDO
+{
+    $dsn = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4', DB_HOST, DB_NAME);
+    
+    $options = [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ];
+    
+    return new PDO($dsn, DB_USER, DB_PASS, $options);
+}
+
+/**
+ * テーブルを作成する（初回のみ）
+ */
+function createTable(PDO $pdo): void
+{
+    $sql = "
+        CREATE TABLE IF NOT EXISTS payment_info (
+            id                    INT AUTO_INCREMENT PRIMARY KEY,
+            cardholder_name       VARCHAR(255)  NOT NULL,
+            encrypted_card_number TEXT          NOT NULL,
+            card_last_four        CHAR(4)       NOT NULL,
+            expiry_month          TINYINT       NOT NULL,
+            expiry_year           SMALLINT      NOT NULL,
+            created_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+            updated_at            TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ";
+    
+    $pdo->exec($sql);
+}
+
+/**
+ * クレジットカード情報を保存する
+ */
+function savePaymentInfo(
+    PDO    $pdo,
+    string $cardholderName,
+    string $creditCardNumber,
+    int    $expiryMonth,
+    int    $expiryYear
+): int {
+    // カード番号から数字のみ抽出
+    $cleanCardNumber = preg_replace('/\D/', '', $creditCardNumber);
+    
+    // バリデーション
+    if (!validateCreditCardNumber($cleanCardNumber)) {
+        throw new InvalidArgumentException('無効なクレジットカード番号です。');
+    }
+    
+    if ($expiryMonth < 1 || $expiryMonth > 12) {
+        throw new InvalidArgumentException('無効な有効期限（月）です。');
+    }
+    
+    $currentYear = (int)date('Y');
+    if ($expiryYear < $currentYear || $expiryYear > $currentYear + 20) {
+        throw new InvalidArgumentException('無効な有効期限（年）です。');
+    }
+    
+    // カード番号を暗号化
+    $encryptedCardNumber = encrypt($cleanCardNumber, ENCRYPTION_KEY);
+    
+    // 下4桁のみ平文で保存（表示用）
+    $lastFour = substr($cleanCardNumber, -4);
+    
+    // データベースに保存
+    $sql = "
+        INSERT INTO payment_info
+            (cardholder_name, encrypted_card_number, card_last_four, expiry_month, expiry_year)
+        VALUES
+            (:cardholder_name, :encrypted_card_number, :card_last_four, :expiry_month, :expiry_year)
+    ";
+    
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':cardholder_name'       => $cardholderName,
+        ':encrypted_card_number' => $encryptedCardNumber,
+        ':card_last_four'        => $lastFour,
+        ':expiry_month'          => $expiryMonth,
+        ':expiry_year'           => $expiryYear,
+    ]);
+    
+    return (int)$pdo->lastInsertId();
+}
+
+/**
+ * クレジットカード情報を取得して復号する
+ */
+function getPaymentInfo(PDO $pdo, int $id): array
+{
+    $sql  = "SELECT * FROM payment_info WHERE id = :id";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':id' => $id]);
+    
+    $row = $stmt->fetch();
+    
+    if (!$row) {
+        throw new RuntimeException("ID {$id} のレコードが見つかりません。");
+    }
+    
+    // カード番号を復号
+    $decryptedCardNumber = decrypt($row['encrypted_card_number'], ENCRYPTION_KEY);
+    
+    return [
+        'id'              => $row['id'],
+        'cardholder_name' => $row['cardholder_name'],
+        'card_number'     => $decryptedCardNumber,
+        'card_last_four'  => $row['card_last_four'],
+        'expiry_month'    => $row['expiry_month'],
+        'expiry_year'     => $row['expiry_year'],
+        'created_at'      => $row['created_at'],
+    ];
+}
+
+// =====================
+// メイン処理
+// =====================
+
+try {
+    $pdo = getDatabaseConnection();
+    
+    // テーブル作成
+    createTable($pdo);
+    
+    // サンプルデータを保存
+    $cardholderName    = 'Yamada Taro';
+    $creditCardNumber  = '4532015112830366'; // テスト用 Visa カード番号
+    $expiryMonth       = 12;
+    $expiryYear        = 2027;
+    
+    echo "=== クレジットカード情報の保存 ===" . PHP_EOL;
+    echo "カード番号（平文）: " . $creditCardNumber . PHP_EOL;
+    
+    $insertedId = savePaymentInfo(
+        $pdo,
+        $cardholderName,
+        $creditCardNumber,
+        $expiryMonth,
+        $expiryYear
+    );
+    
+    echo "保存成功！ ID: " . $insertedId . PHP_EOL . PHP_EOL;
+    
+    // 保存されたデータを確認（暗号化された状態）
+    echo "=== データベースに保存された暗号化データ ===" . PHP_EOL;
+    $stmt = $pdo->prepare("SELECT * FROM payment_info WHERE id = :id");
+    $stmt->execute([':id' => $insertedId]);
+    $rawRow = $stmt->fetch();
+    echo "暗号化されたカード番号: " . $rawRow['encrypted_card_number'] . PHP_EOL;
+    echo "下4桁（平文）: " . $rawRow['card_last_four'] . PHP_EOL . PHP_EOL;
+    
+    // データを取得して復号
+    echo "=== 復号されたクレジットカード情報 ===" . PHP_EOL;
+    $paymentInfo = getPaymentInfo($pdo, $insertedId);
+    echo "ID: "              . $paymentInfo['id']              . PHP_EOL;
+    echo "カード名義人: "    . $paymentInfo['cardholder_name'] . PHP_EOL;
+    echo "カード番号: "      . $paymentInfo['card_number']     . PHP_EOL;
+    echo "下4桁: "           . $paymentInfo['card_last_four']  . PHP_EOL;
+    echo "有効期限: "        . sprintf('%02d', $paymentInfo['expiry_month']) . '/' . $paymentInfo['expiry_year'] . PHP_EOL;
+    echo "登録日時: "        . $paymentInfo['created_at']      . PHP_EOL;
+    
+} catch (InvalidArgumentException $e) {
+    echo "入力エラー: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "処理エラー: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+} catch (PDOException $e) {
+    echo "データベースエラー: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+}
