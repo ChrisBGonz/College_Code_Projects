@@ -1,0 +1,911 @@
+```java
+// PasswordResetToken.java - Entity
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class PasswordResetToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
+
+    @Column(nullable = false)
+    private LocalDateTime expiryDateTime;
+
+    @Column(nullable = false)
+    private boolean used = false;
+
+    @Column(nullable = false)
+    private LocalDateTime createdAt;
+
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(this.expiryDateTime);
+    }
+
+    public boolean isValid() {
+        return !isExpired() && !used;
+    }
+}
+```
+
+```java
+// User.java - Entity
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "users")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(nullable = false)
+    private String fullName;
+
+    private boolean enabled = true;
+}
+```
+
+```java
+// PasswordResetTokenRepository.java
+package com.example.auth.repository;
+
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+
+import java.time.LocalDateTime;
+import java.util.List;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+
+    Optional<PasswordResetToken> findByToken(String token);
+
+    List<PasswordResetToken> findAllByUser(User user);
+
+    @Modifying
+    @Query("UPDATE PasswordResetToken p SET p.used = true WHERE p.user = :user AND p.used = false")
+    void invalidateAllTokensForUser(@Param("user") User user);
+
+    @Modifying
+    @Query("DELETE FROM PasswordResetToken p WHERE p.expiryDateTime < :now")
+    void deleteAllExpiredTokens(@Param("now") LocalDateTime now);
+
+    boolean existsByTokenAndUsedFalse(String token);
+}
+```
+
+```java
+// UserRepository.java
+package com.example.auth.repository;
+
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+
+import java.util.Optional;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+    boolean existsByEmail(String email);
+}
+```
+
+```java
+// ForgotPasswordRequest.java - DTO
+package com.example.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class ForgotPasswordRequest {
+
+    @NotBlank(message = "Email खाली नहीं हो सकता")
+    @Email(message = "Valid email address दर्ज करें")
+    private String email;
+}
+```
+
+```java
+// ResetPasswordRequest.java - DTO
+package com.example.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+public class ResetPasswordRequest {
+
+    @NotBlank(message = "Token खाली नहीं हो सकता")
+    private String token;
+
+    @NotBlank(message = "नया पासवर्ड खाली नहीं हो सकता")
+    @Size(min = 8, message = "पासवर्ड कम से कम 8 characters का होना चाहिए")
+    private String newPassword;
+
+    @NotBlank(message = "Confirm password खाली नहीं हो सकता")
+    private String confirmPassword;
+}
+```
+
+```java
+// ApiResponse.java - Generic Response DTO
+package com.example.auth.dto;
+
+import lombok.*;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class ApiResponse {
+    private boolean success;
+    private String message;
+    private Object data;
+
+    public static ApiResponse success(String message) {
+        return ApiResponse.builder()
+                .success(true)
+                .message(message)
+                .build();
+    }
+
+    public static ApiResponse error(String message) {
+        return ApiResponse.builder()
+                .success(false)
+                .message(message)
+                .build();
+    }
+}
+```
+
+```java
+// EmailService.java
+package com.example.auth.service;
+
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.thymeleaf.TemplateEngine;
+import org.thymeleaf.context.Context;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class EmailService {
+
+    private final JavaMailSender mailSender;
+    private final TemplateEngine templateEngine;
+
+    @Value("${app.mail.from}")
+    private String fromEmail;
+
+    @Value("${app.name:MyApp}")
+    private String appName;
+
+    @Async
+    public void sendPasswordResetEmail(String toEmail, String userName, String resetUrl) {
+        try {
+            MimeMessage mimeMessage = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, true, "UTF-8");
+
+            // Thymeleaf template context set करें
+            Context context = new Context();
+            context.setVariable("userName", userName);
+            context.setVariable("resetUrl", resetUrl);
+            context.setVariable("appName", appName);
+            context.setVariable("expiryMinutes", 30);
+
+            // HTML template process करें
+            String htmlContent = templateEngine.process("password-reset-email", context);
+
+            helper.setFrom(fromEmail, appName);
+            helper.setTo(toEmail);
+            helper.setSubject("पासवर्ड रीसेट करें - " + appName);
+            helper.setText(htmlContent, true); // true = HTML content
+
+            mailSender.send(mimeMessage);
+            log.info("Password reset email successfully sent to: {}", toEmail);
+
+        } catch (MessagingException e) {
+            log.error("Email send करने में error आई: {} को email: {}", toEmail, e.getMessage());
+            throw new RuntimeException("Email send करने में विफल: " + e.getMessage());
+        } catch (Exception e) {
+            log.error("Unexpected error while sending email to {}: {}", toEmail, e.getMessage());
+            throw new RuntimeException("Email service error: " + e.getMessage());
+        }
+    }
+}
+```
+
+```java
+// PasswordResetService.java - Main Service
+package com.example.auth.service;
+
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ResetPasswordRequest;
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import com.example.auth.exception.InvalidTokenException;
+import com.example.auth.exception.UserNotFoundException;
+import com.example.auth.repository.PasswordResetTokenRepository;
+import com.example.auth.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.security.SecureRandom;
+import java.time.LocalDateTime;
+import java.util.Base64;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PasswordResetService {
+
+    private final UserRepository userRepository;
+    private final PasswordResetTokenRepository tokenRepository;
+    private final EmailService emailService;
+    private final PasswordEncoder passwordEncoder;
+
+    @Value("${app.password-reset.token-expiry-minutes:30}")
+    private int tokenExpiryMinutes;
+
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+
+    @Value("${app.password-reset.frontend-url:/reset-password}")
+    private String resetPasswordPath;
+
+    // Token generate करने के लिए SecureRandom use करें
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final int TOKEN_BYTE_LENGTH = 48; // 384 bits = highly secure
+
+    /**
+     * Forgot Password Request Handle करें
+     * 1. Email से user ढूंढें
+     * 2. Unique secure token generate करें
+     * 3. Token को database में save करें
+     * 4. Reset URL बनाएं
+     * 5. Email send करें
+     */
+    @Transactional
+    public String processForgotPassword(ForgotPasswordRequest request) {
+        String email = request.getEmail().toLowerCase().trim();
+        log.info("Forgot password request received for email: {}", email);
+
+        // Step 1: User को email से ढूंढें
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> {
+                    log.warn("Forgot password attempt for non-existent email: {}", email);
+                    // Security के लिए same message return करें (email enumeration attack रोकें)
+                    return new UserNotFoundException("अगर यह email registered है, तो reset link भेज दिया जाएगा");
+                });
+
+        // Step 2: User account enabled है या नहीं check करें
+        if (!user.isEnabled()) {
+            log.warn("Forgot password attempt for disabled account: {}", email);
+            throw new RuntimeException("यह account disabled है। Support से संपर्क करें।");
+        }
+
+        // Step 3: पुराने सभी tokens को invalidate करें (security best practice)
+        tokenRepository.invalidateAllTokensForUser(user);
+        log.debug("Previous tokens invalidated for user: {}", email);
+
+        // Step 4: Unique secure token generate करें
+        String rawToken = generateSecureToken();
+
+        // Step 5: Token entity बनाएं और save करें
+        PasswordResetToken resetToken = PasswordResetToken.builder()
+                .token(rawToken)
+                .user(user)
+                .expiryDateTime(LocalDateTime.now().plusMinutes(tokenExpiryMinutes))
+                .used(false)
+                .createdAt(LocalDateTime.now())
+                .build();
+
+        tokenRepository.save(resetToken);
+        log.info("Password reset token generated and saved for user: {}", email);
+
+        // Step 6: Reset URL बनाएं
+        String resetUrl = buildResetUrl(rawToken);
+        log.debug("Reset URL generated: {}", resetUrl);
+
+        // Step 7: Email send करें (Async - background में)
+        emailService.sendPasswordResetEmail(
+                user.getEmail(),
+                user.getFullName(),
+                resetUrl
+        );
+
+        log.info("Password reset process completed for email: {}", email);
+        return "Password reset link आपके email " + maskEmail(email) + " पर भेज दिया गया है।";
+    }
+
+    /**
+     * Token validate करें (Reset page load होने पर)
+     */
+    @Transactional(readOnly = true)
+    public boolean validateResetToken(String token) {
+        if (token == null || token.isBlank()) {
+            return false;
+        }
+
+        return tokenRepository.findByToken(token)
+                .map(resetToken -> {
+                    if (!resetToken.isValid()) {
+                        log.warn("Invalid or expired token attempted: {}", maskToken(token));
+                        return false;
+                    }
+                    return true;
+                })
+                .orElse(false);
+    }
+
+    /**
+     * Password Reset करें
+     * 1. Token validate करें
+     * 2. Password match check करें
+     * 3. New password set करें
+     * 4. Token को used mark करें
+     */
+    @Transactional
+    public String resetPassword(ResetPasswordRequest request) {
+        log.info("Password reset attempt with token: {}", maskToken(request.getToken()));
+
+        // Step 1: Password match check करें
+        if (!request.getNewPassword().equals(request.getConfirmPassword())) {
+            throw new IllegalArgumentException("नया पासवर्ड और confirm पासवर्ड match नहीं करते");
+        }
+
+        // Step 2: Token database में ढूंढें
+        PasswordResetToken resetToken = tokenRepository.findByToken(request.getToken())
+                .orElseThrow(() -> {
+                    log.warn("Reset attempt with non-existent token");
+                    return new InvalidTokenException("Invalid reset token। कृपया नया reset link request करें।");
+                });
+
+        // Step 3: Token validity check करें
+        if (resetToken.isExpired()) {
+            log.warn("Expired token used for reset: {}", maskToken(request.getToken()));
+            throw new InvalidTokenException("Reset link expire हो गया है। कृपया नया reset link request करें।");
+        }
+
+        if (resetToken.isUsed()) {
+            log.warn("Already used token attempted: {}", maskToken(request.getToken()));
+            throw new InvalidTokenException("यह reset link पहले ही use हो चुका है।");
+        }
+
+        // Step 4: User का password update करें
+        User user = resetToken.getUser();
+        String encodedPassword = passwordEncoder.encode(request.getNewPassword());
+        user.setPassword(encodedPassword);
+        userRepository.save(user);
+
+        // Step 5: Token को used mark करें
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+
+        // Step 6: User के सभी बाकी tokens भी invalidate करें
+        tokenRepository.invalidateAllTokensForUser(user);
+
+        log.info("Password successfully reset for user: {}", user.getEmail());
+        return "पासवर्ड सफलतापूर्वक बदल दिया गया है। अब login करें।";
+    }
+
+    /**
+     * Cryptographically secure random token generate करें
+     */
+    private String generateSecureToken() {
+        byte[] tokenBytes = new byte[TOKEN_BYTE_LENGTH];
+        SECURE_RANDOM.nextBytes(tokenBytes);
+        // URL-safe Base64 encoding (no padding)
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+    }
+
+    /**
+     * Reset URL build करें
+     */
+    private String buildResetUrl(String token) {
+        return baseUrl + resetPasswordPath + "?token=" + token;
+    }
+
+    /**
+     * Email mask करें (privacy के लिए)
+     * example@gmail.com -> ex****@gmail.com
+     */
+    private String maskEmail(String email) {
+        if (email == null || !email.contains("@")) return "****";
+        String[] parts = email.split("@");
+        String localPart = parts[0];
+        String domain = parts[1];
+        if (localPart.length() <= 2) {
+            return "**@" + domain;
+        }
+        return localPart.substring(0, 2) + "****@" + domain;
+    }
+
+    /**
+     * Token mask करें (logging के लिए)
+     */
+    private String maskToken(String token) {
+        if (token == null || token.length() < 8) return "****";
+        return token.substring(0, 8) + "...";
+    }
+}
+```
+
+```java
+// PasswordResetController.java
+package com.example.auth.controller;
+
+import com.example.auth.dto.ApiResponse;
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ResetPasswordRequest;
+import com.example.auth.exception.InvalidTokenException;
+import com.example.auth.exception.UserNotFoundException;
+import com.example.auth.service.PasswordResetService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+@Slf4j
+public class PasswordResetController {
+
+    private final PasswordResetService passwordResetService;
+
+    /**
+     * POST /api/v1/auth/forgot-password
+     * Forgot password request handle करें
+     */
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request) {
+
+        log.info("Forgot password API called for email: {}",
+                request.getEmail().substring(0, Math.min(3, request.getEmail().length())) + "***");
+
+        try {
+            String message = passwordResetService.processForgotPassword(request);
+            return ResponseEntity.ok(ApiResponse.success(message));
+
+        } catch (UserNotFoundException e) {
+            // Security: Same response दें चाहे user हो या न हो
+            return ResponseEntity.ok(
+                    ApiResponse.success("अगर यह email registered है, तो reset link भेज दिया जाएगा।")
+            );
+        } catch (RuntimeException e) {
+            log.error("Forgot password error: {}", e.getMessage());
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponse.error(e.getMessage()));
+        }
+    }
+
+    /**
+     * GET /api/v1/auth/validate-reset-token?token=xxx
+     * Token validate करें (Frontend reset page load पर)
+     */
+    @GetMapping("/validate-reset-token")
+    public ResponseEntity<ApiResponse> validateToken(
+            @RequestParam("token") String token) {
+
+        boolean isValid = passwordResetService.validateResetToken(token);
+
+        if (isValid) {
+            return ResponseEntity.ok(ApiResponse.success("Token valid है।"));
+        } else {
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponse.error("Token invalid या expire हो गया है।"));
+        }
+    }
+
+    /**
+     * POST /api/v1/auth/reset-password
+     * नया password set करें
+     */
+    @PostMapping("/reset-password")
+    public ResponseEntity<ApiResponse> resetPassword(
+            @Valid @RequestBody ResetPasswordRequest request) {
+
+        try {
+            String message = passwordResetService.resetPassword(request);
+            return ResponseEntity.ok(ApiResponse.success(message));
+
+        } catch (InvalidTokenException e) {
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponse.error(e.getMessage()));
+
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity
+                    .status(HttpStatus.BAD_REQUEST)
+                    .body(ApiResponse.error(e.getMessage()));
+
+        } catch (Exception e) {
+            log.error("Reset password error: {}", e.getMessage());
+            return ResponseEntity
+                    .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(ApiResponse.error("पासवर्ड reset करने में error आई।"));
+        }
+    }
+}
+```
+
+```java
+// InvalidTokenException.java
+package com.example.auth.exception;
+
+public class InvalidTokenException extends RuntimeException {
+    public InvalidTokenException(String message) {
+        super(message);
+    }
+}
+```
+
+```java
+// UserNotFoundException.java
+package com.example.auth.exception;
+
+public class UserNotFoundException extends RuntimeException {
+    public UserNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+```java
+// GlobalExceptionHandler.java
+package com.example.auth.exception;
+
+import com.example.auth.dto.ApiResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse> handleValidationErrors(
+            MethodArgumentNotValidException ex) {
+
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach(error -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.builder()
+                        .success(false)
+                        .message("Validation failed")
+                        .data(errors)
+                        .build());
+    }
+
+    @ExceptionHandler(InvalidTokenException.class)
+    public ResponseEntity<ApiResponse> handleInvalidToken(InvalidTokenException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse> handleGenericException(Exception ex) {
+        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("कुछ गलत हो गया। बाद में try करें।"));
+    }
+}
+```
+
+```java
+// TokenCleanupScheduler.java - Expired tokens cleanup
+package com.example.auth.scheduler;
+
+import com.example.auth.repository.PasswordResetTokenRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class TokenCleanupScheduler {
+
+    private final PasswordResetTokenRepository tokenRepository;
+
+    /**
+     * हर रात 2 बजे expired tokens delete करें
+     */
+    @Scheduled(cron = "0 0 2 * * ?")
+    @Transactional
+    public void cleanupExpiredTokens() {
+        log.info("Expired password reset tokens cleanup शुरू...");
+        tokenRepository.deleteAllExpiredTokens(LocalDateTime.now());
+        log.info("Expired tokens cleanup complete।");
+    }
+}
+```
+
+```html
+<!-- src/main/resources/templates/password-reset-email.html -->
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>पासवर्ड रीसेट करें</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 30px auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .header {
+            background-color: #4F46E5;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .body {
+            padding: 30px;
+            color: #333333;
+            line-height: 1.6;
+        }
+        .reset-button {
+            display: inline-block;
+            background-color: #4F46E5;
+            color: white !important;
+            text-decoration: none;
+            padding: 14px 30px;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: bold;
+            margin: 20px 0;
+        }
+        .url-box {
+            background-color: #f8f8f8;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 12px;
+            word-break: break-all;
+            font-size: 12px;
+            color: #666;
+            margin: 15px 0;
+        }
+        .warning {
+            background-color: #FEF3C7;
+            border-left: 4px solid #F59E0B;
+            padding: 12px 15px;
+            margin: 20px 0;
+            border-radius: 0 4px 4px 0;
+        }
+        .footer {
+            background-color: #f8f8f8;
+            padding: 20px 30px;
+            text-align: center;
+            color: #999;
+            font-size: 12px;
+            border-top: 1px solid #eee;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1 th:text="${appName}">MyApp</h1>
+        <p style="margin: 5px 0 0 0; opacity: 0.9;">पासवर्ड रीसेट अनुरोध</p>
+    </div>
+
+    <div class="body">
+        <p>नमस्ते <strong th:text="${userName}">User</strong>,</p>
+
+        <p>हमें आपके account के लिए एक <strong>पासवर्ड रीसेट अनुरोध</strong> मिला है।
+            नीचे दिए गए button पर click करके अपना नया पासवर्ड set करें:</p>
+
+        <div style="text-align: center;">
+            <a th:href="${resetUrl}" class="reset-button">
+                🔐 पासवर्ड रीसेट करें
+            </a>
+        </div>
+
+        <p style="color: #666; font-size: 14px;">अगर button काम न करे, तो यह link copy करके browser में paste करें:</p>
+        <div class="url-box" th:text="${resetUrl}">reset-url-here</div>
+
+        <div class="warning">
+            <strong>⚠️ महत्वपूर्ण जानकारी:</strong>
+            <ul style="margin: 8px 0 0 0; padding-left: 20px;">
+                <li>यह link <strong th:text="${expiryMinutes} + ' मिनट'">30 मिनट</strong> में expire हो जाएगा।</li>
+                <li>यह link केवल <strong>एक बार</strong> use किया जा सकता है।</li>
+                <li>अगर आपने यह request नहीं किया, तो इस email को <strong>ignore करें</strong>।</li>
+            </ul>
+        </div>
+
+        <p>अगर आपको कोई समस्या हो, तो हमसे संपर्क करें।</p>
+
+        <p>धन्यवाद,<br>
+            <strong th:text="${appName} + ' Team'">MyApp Team</strong>
+        </p>
+    </div>
+
+    <div class="footer">
+        <p>यह एक automated email है। कृपया इसका reply न करें।</p>
+        <p th:text="'© 2024 ' + ${appName} + '. All rights reserved.'">© 2024 MyApp. All rights reserved.</p>
+    </div>
+</div>
+</body>
+</html>
+```
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/authdb
+    username: root
+    password: yourpassword
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.MySQL8Dialect
+
+  # Mail Configuration
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: your-email@gmail.com
+    password: your-app-password  # Gmail App Password use करें
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+        debug: false
+
+# Custom App Properties
+app:
+  name: "MyApp"
+  base-url: "http://localhost:8080"
+  mail:
+    from: "noreply@myapp.com"
+  password-reset:
+    token-expiry-minutes: 30
+    frontend-url: "/reset-password"
+
+# Async Configuration
+spring.task.execution:
+  pool:
+    core-size: 5
+    max-size: 10
+    queue-capacity: 25
+```
+
+```java
+// AppConfig.java - Async और Security Configuration
+package com.example.auth.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+
+import java.util.concurrent.Executor;
+
+@Configuration
+@EnableAsync
+@EnableScheduling
+public class AppConfig {
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder(12); // strength 12
+    }
+
+    @Bean(name = "emailTaskExecutor")
+    public Executor emailTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(10);
+        executor.setQueueCapacity(25);
+        executor.setThreadNamePrefix("EmailAsync-");
+        executor.initialize();
+        return executor;
+    }

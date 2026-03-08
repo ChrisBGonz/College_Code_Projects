@@ -1,0 +1,339 @@
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/joho/godotenv"
+)
+
+// Config JWT configuration के लिए struct
+type Config struct {
+	SecretKey       string
+	TokenExpiration time.Duration
+	Issuer          string
+}
+
+// CustomClaims standard + custom claims के लिए struct
+type CustomClaims struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// TokenDetails generated token की details
+type TokenDetails struct {
+	AccessToken string
+	ExpiresAt   time.Time
+	IssuedAt    time.Time
+	Subject     string
+}
+
+// User login के बाद user की information
+type User struct {
+	ID       string
+	Username string
+	Email    string
+	Role     string
+}
+
+// LoadConfig environment variables से config load करता है
+func LoadConfig() (*Config, error) {
+	// .env file load करो (development के लिए)
+	if err := godotenv.Load(); err != nil {
+		log.Println("Warning: .env file नहीं मिली, system environment variables use होंगे")
+	}
+
+	secretKey := os.Getenv("JWT_SECRET_KEY")
+	if secretKey == "" {
+		return nil, errors.New("JWT_SECRET_KEY environment variable set नहीं है")
+	}
+
+	if len(secretKey) < 32 {
+		return nil, errors.New("JWT_SECRET_KEY कम से कम 32 characters का होना चाहिए")
+	}
+
+	// Token expiration duration parse करो
+	expirationStr := os.Getenv("JWT_EXPIRATION")
+	if expirationStr == "" {
+		expirationStr = "24h" // default 24 hours
+	}
+
+	expiration, err := time.ParseDuration(expirationStr)
+	if err != nil {
+		return nil, fmt.Errorf("JWT_EXPIRATION invalid format: %w", err)
+	}
+
+	issuer := os.Getenv("JWT_ISSUER")
+	if issuer == "" {
+		issuer = "myapp" // default issuer
+	}
+
+	return &Config{
+		SecretKey:       secretKey,
+		TokenExpiration: expiration,
+		Issuer:          issuer,
+	}, nil
+}
+
+// GenerateJWT user के लिए JWT token generate करता है
+// Parameters:
+//   - user: logged in user की information
+//   - config: JWT configuration
+//
+// Returns:
+//   - *TokenDetails: generated token और उसकी details
+//   - error: कोई error हो तो
+func GenerateJWT(user User, config *Config) (*TokenDetails, error) {
+	// Input validation
+	if user.ID == "" {
+		return nil, errors.New("user ID empty नहीं हो सकती")
+	}
+	if user.Email == "" {
+		return nil, errors.New("user email empty नहीं हो सकती")
+	}
+	if config == nil {
+		return nil, errors.New("config nil नहीं हो सकती")
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(config.TokenExpiration)
+
+	// Custom claims बनाओ जिसमें standard + custom fields हों
+	claims := CustomClaims{
+		// Custom claims
+		UserID:   user.ID,
+		Username: user.Username,
+		Email:    user.Email,
+		Role:     user.Role,
+
+		// Standard RegisteredClaims (RFC 7519)
+		RegisteredClaims: jwt.RegisteredClaims{
+			// sub (Subject): token किसके लिए है
+			Subject: user.ID,
+
+			// iat (Issued At): token कब बना
+			IssuedAt: jwt.NewNumericDate(now),
+
+			// exp (Expiration Time): token कब expire होगा
+			ExpiresAt: jwt.NewNumericDate(expiresAt),
+
+			// nbf (Not Before): token इससे पहले valid नहीं
+			NotBefore: jwt.NewNumericDate(now),
+
+			// iss (Issuer): token किसने issue किया
+			Issuer: config.Issuer,
+
+			// jti (JWT ID): unique token identifier
+			ID: generateTokenID(user.ID, now),
+		},
+	}
+
+	// HS256 (HMAC-SHA256) signing method के साथ token बनाओ
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	// Secret key से token sign करो
+	secretKey := []byte(config.SecretKey)
+	signedToken, err := token.SignedString(secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("token sign करने में error: %w", err)
+	}
+
+	return &TokenDetails{
+		AccessToken: signedToken,
+		ExpiresAt:   expiresAt,
+		IssuedAt:    now,
+		Subject:     user.ID,
+	}, nil
+}
+
+// ValidateJWT token को validate और parse करता है
+// Parameters:
+//   - tokenString: validate करने वाला JWT token
+//   - config: JWT configuration
+//
+// Returns:
+//   - *CustomClaims: parsed claims
+//   - error: validation error
+func ValidateJWT(tokenString string, config *Config) (*CustomClaims, error) {
+	if tokenString == "" {
+		return nil, errors.New("token empty नहीं हो सकता")
+	}
+
+	// Token parse और validate करो
+	token, err := jwt.ParseWithClaims(
+		tokenString,
+		&CustomClaims{},
+		func(token *jwt.Token) (interface{}, error) {
+			// Signing method verify करो - HMAC होना चाहिए
+			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+			}
+
+			// HS256 specifically check करो
+			if token.Method.Alg() != jwt.SigningMethodHS256.Alg() {
+				return nil, fmt.Errorf("expected HS256 algorithm, got: %v", token.Method.Alg())
+			}
+
+			return []byte(config.SecretKey), nil
+		},
+		// Additional validation options
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithIssuedAt(),
+	)
+
+	if err != nil {
+		// Specific error types handle करो
+		switch {
+		case errors.Is(err, jwt.ErrTokenExpired):
+			return nil, errors.New("token expire हो गया है, फिर से login करें")
+		case errors.Is(err, jwt.ErrTokenNotValidYet):
+			return nil, errors.New("token अभी valid नहीं है")
+		case errors.Is(err, jwt.ErrTokenMalformed):
+			return nil, errors.New("token malformed है")
+		case errors.Is(err, jwt.ErrSignatureInvalid):
+			return nil, errors.New("token signature invalid है")
+		default:
+			return nil, fmt.Errorf("token validation failed: %w", err)
+		}
+	}
+
+	// Claims extract करो
+	claims, ok := token.Claims.(*CustomClaims)
+	if !ok || !token.Valid {
+		return nil, errors.New("invalid token claims")
+	}
+
+	// Issuer verify करो
+	if claims.Issuer != config.Issuer {
+		return nil, fmt.Errorf("invalid issuer: expected %s, got %s", config.Issuer, claims.Issuer)
+	}
+
+	return claims, nil
+}
+
+// RefreshJWT existing valid token को refresh करता है
+func RefreshJWT(tokenString string, config *Config) (*TokenDetails, error) {
+	claims, err := ValidateJWT(tokenString, config)
+	if err != nil {
+		return nil, fmt.Errorf("token refresh नहीं हो सकता: %w", err)
+	}
+
+	// User information claims से निकालो
+	user := User{
+		ID:       claims.UserID,
+		Username: claims.Username,
+		Email:    claims.Email,
+		Role:     claims.Role,
+	}
+
+	// नया token generate करो
+	return GenerateJWT(user, config)
+}
+
+// generateTokenID unique JWT ID generate करता है
+func generateTokenID(userID string, t time.Time) string {
+	return fmt.Sprintf("%s-%d", userID, t.UnixNano())
+}
+
+// JWTService JWT operations के लिए service struct
+type JWTService struct {
+	config *Config
+}
+
+// NewJWTService नई JWT service बनाता है
+func NewJWTService(config *Config) *JWTService {
+	return &JWTService{config: config}
+}
+
+// Generate token generate करता है
+func (s *JWTService) Generate(user User) (*TokenDetails, error) {
+	return GenerateJWT(user, s.config)
+}
+
+// Validate token validate करता है
+func (s *JWTService) Validate(tokenString string) (*CustomClaims, error) {
+	return ValidateJWT(tokenString, s.config)
+}
+
+// Refresh token refresh करता है
+func (s *JWTService) Refresh(tokenString string) (*TokenDetails, error) {
+	return RefreshJWT(tokenString, s.config)
+}
+
+func main() {
+	// Config load करो
+	config, err := LoadConfig()
+	if err != nil {
+		log.Fatalf("Config load error: %v", err)
+	}
+
+	fmt.Println("=== JWT Token Generation Demo ===")
+	fmt.Printf("Issuer: %s\n", config.Issuer)
+	fmt.Printf("Token Expiration: %v\n\n", config.TokenExpiration)
+
+	// JWT Service बनाओ
+	jwtService := NewJWTService(config)
+
+	// Demo user (login के बाद मिलने वाला user)
+	loggedInUser := User{
+		ID:       "usr_12345",
+		Username: "rahul_sharma",
+		Email:    "rahul@example.com",
+		Role:     "admin",
+	}
+
+	// Token generate करो
+	fmt.Println("--- Token Generate करना ---")
+	tokenDetails, err := jwtService.Generate(loggedInUser)
+	if err != nil {
+		log.Fatalf("Token generation error: %v", err)
+	}
+
+	fmt.Printf("✅ Token Successfully Generated!\n")
+	fmt.Printf("Access Token: %s\n\n", tokenDetails.AccessToken)
+	fmt.Printf("Issued At: %v\n", tokenDetails.IssuedAt.Format(time.RFC3339))
+	fmt.Printf("Expires At: %v\n", tokenDetails.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("Subject: %s\n\n", tokenDetails.Subject)
+
+	// Token validate करो
+	fmt.Println("--- Token Validate करना ---")
+	claims, err := jwtService.Validate(tokenDetails.AccessToken)
+	if err != nil {
+		log.Fatalf("Token validation error: %v", err)
+	}
+
+	fmt.Printf("✅ Token Valid!\n")
+	fmt.Printf("User ID: %s\n", claims.UserID)
+	fmt.Printf("Username: %s\n", claims.Username)
+	fmt.Printf("Email: %s\n", claims.Email)
+	fmt.Printf("Role: %s\n", claims.Role)
+	fmt.Printf("Issuer: %s\n", claims.Issuer)
+	fmt.Printf("JWT ID: %s\n", claims.ID)
+	fmt.Printf("Expires At: %v\n\n", claims.ExpiresAt.Time.Format(time.RFC3339))
+
+	// Invalid token test
+	fmt.Println("--- Invalid Token Test ---")
+	_, err = jwtService.Validate("invalid.token.here")
+	if err != nil {
+		fmt.Printf("✅ Invalid token correctly rejected: %v\n\n", err)
+	}
+
+	// Token refresh करो
+	fmt.Println("--- Token Refresh करना ---")
+	refreshedToken, err := jwtService.Refresh(tokenDetails.AccessToken)
+	if err != nil {
+		log.Fatalf("Token refresh error: %v", err)
+	}
+	fmt.Printf("✅ Token Successfully Refreshed!\n")
+	fmt.Printf("New Token: %s...\n", refreshedToken.AccessToken[:50])
+	fmt.Printf("New Expires At: %v\n", refreshedToken.ExpiresAt.Format(time.RFC3339))
+}
+```

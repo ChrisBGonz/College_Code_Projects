@@ -1,0 +1,871 @@
+```javascript
+// ============================================================
+// Circuit Breaker Pattern - Frontend Implementation
+// ============================================================
+
+/**
+ * Circuit Breaker States:
+ * CLOSED   → सब ठीक है, requests जा रही हैं
+ * OPEN     → बहुत failures हुए, requests रोक दी हैं (fail-fast)
+ * HALF_OPEN → कुछ समय बाद test request भेजी जा रही है
+ */
+
+const CircuitBreakerState = {
+  CLOSED: "CLOSED",
+  OPEN: "OPEN",
+  HALF_OPEN: "HALF_OPEN",
+};
+
+// ============================================================
+// Core Circuit Breaker Class
+// ============================================================
+
+class CircuitBreaker {
+  constructor(options = {}) {
+    // Configuration
+    this.name = options.name || "CircuitBreaker";
+    this.failureThreshold = options.failureThreshold || 5; // कितनी failures के बाद OPEN हो
+    this.successThreshold = options.successThreshold || 2; // HALF_OPEN में कितनी success के बाद CLOSED हो
+    this.timeout = options.timeout || 60000; // OPEN रहने का समय (ms) - default 1 minute
+    this.requestTimeout = options.requestTimeout || 10000; // एक request का timeout (ms)
+    this.volumeThreshold = options.volumeThreshold || 10; // minimum requests before tripping
+    this.errorThresholdPercentage = options.errorThresholdPercentage || 50; // error % threshold
+
+    // State
+    this.state = CircuitBreakerState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.requestCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+
+    // Statistics
+    this.stats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rejectedRequests: 0, // OPEN state में reject हुई requests
+      timeouts: 0,
+      stateChanges: [],
+    };
+
+    // Event Listeners
+    this.listeners = {
+      open: [],
+      close: [],
+      halfOpen: [],
+      success: [],
+      failure: [],
+      reject: [],
+    };
+
+    console.log(
+      `🔌 Circuit Breaker "${this.name}" initialized - State: ${this.state}`
+    );
+  }
+
+  // ============================================================
+  // Main Execute Method
+  // ============================================================
+
+  async execute(requestFn, fallbackFn = null) {
+    this.stats.totalRequests++;
+
+    // OPEN state check - fail fast
+    if (this.state === CircuitBreakerState.OPEN) {
+      if (this._shouldAttemptReset()) {
+        this._transitionTo(CircuitBreakerState.HALF_OPEN);
+      } else {
+        // Fail Fast - request reject करो
+        this.stats.rejectedRequests++;
+        this._emit("reject", {
+          message: "Circuit is OPEN - Request rejected",
+          nextAttemptTime: this.nextAttemptTime,
+          timeRemaining: this._getTimeRemaining(),
+        });
+
+        console.warn(
+          `⚡ [${this.name}] FAIL-FAST: Circuit OPEN - Request rejected. ` +
+            `Retry in ${this._getTimeRemaining()}ms`
+        );
+
+        // Fallback execute करो अगर available है
+        if (fallbackFn) {
+          return await this._executeFallback(fallbackFn);
+        }
+
+        throw new CircuitBreakerOpenError(
+          `Circuit Breaker "${this.name}" is OPEN. ` +
+            `Next attempt in ${this._getTimeRemaining()}ms`,
+          {
+            state: this.state,
+            nextAttemptTime: this.nextAttemptTime,
+            stats: this.getStats(),
+          }
+        );
+      }
+    }
+
+    // HALF_OPEN state में सिर्फ एक request allow करो
+    if (this.state === CircuitBreakerState.HALF_OPEN) {
+      console.log(`🔄 [${this.name}] HALF_OPEN: Testing with probe request...`);
+    }
+
+    // Request execute करो with timeout
+    try {
+      const result = await this._executeWithTimeout(requestFn);
+      this._onSuccess();
+      return result;
+    } catch (error) {
+      this._onFailure(error);
+
+      // Fallback try करो
+      if (fallbackFn) {
+        return await this._executeFallback(fallbackFn);
+      }
+
+      throw error;
+    }
+  }
+
+  // ============================================================
+  // Private Methods
+  // ============================================================
+
+  async _executeWithTimeout(requestFn) {
+    return new Promise(async (resolve, reject) => {
+      // Timeout timer
+      const timeoutId = setTimeout(() => {
+        this.stats.timeouts++;
+        reject(
+          new RequestTimeoutError(
+            `Request timeout after ${this.requestTimeout}ms`,
+            { timeout: this.requestTimeout }
+          )
+        );
+      }, this.requestTimeout);
+
+      try {
+        const result = await requestFn();
+        clearTimeout(timeoutId);
+        resolve(result);
+      } catch (error) {
+        clearTimeout(timeoutId);
+        reject(error);
+      }
+    });
+  }
+
+  async _executeFallback(fallbackFn) {
+    try {
+      console.log(`🔄 [${this.name}] Executing fallback...`);
+      const result = await fallbackFn();
+      console.log(`✅ [${this.name}] Fallback successful`);
+      return result;
+    } catch (fallbackError) {
+      console.error(`❌ [${this.name}] Fallback also failed:`, fallbackError);
+      throw fallbackError;
+    }
+  }
+
+  _onSuccess() {
+    this.stats.successfulRequests++;
+    this.requestCount++;
+    this._emit("success", { state: this.state });
+
+    if (this.state === CircuitBreakerState.HALF_OPEN) {
+      this.successCount++;
+      console.log(
+        `✅ [${this.name}] HALF_OPEN success ${this.successCount}/${this.successThreshold}`
+      );
+
+      if (this.successCount >= this.successThreshold) {
+        this._reset();
+        this._transitionTo(CircuitBreakerState.CLOSED);
+      }
+    } else if (this.state === CircuitBreakerState.CLOSED) {
+      // Success पर failure count reset करो
+      this.failureCount = 0;
+    }
+  }
+
+  _onFailure(error) {
+    this.stats.failedRequests++;
+    this.requestCount++;
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    this._emit("failure", { error, state: this.state, failureCount: this.failureCount });
+
+    console.error(
+      `❌ [${this.name}] Failure ${this.failureCount}/${this.failureThreshold}: ${error.message}`
+    );
+
+    if (this.state === CircuitBreakerState.HALF_OPEN) {
+      // HALF_OPEN में failure → वापस OPEN
+      console.warn(`⚠️ [${this.name}] HALF_OPEN probe failed - reopening circuit`);
+      this._transitionTo(CircuitBreakerState.OPEN);
+    } else if (this.state === CircuitBreakerState.CLOSED) {
+      // Check करो क्या circuit trip करना चाहिए
+      if (this._shouldTrip()) {
+        this._transitionTo(CircuitBreakerState.OPEN);
+      }
+    }
+  }
+
+  _shouldTrip() {
+    // Volume threshold check
+    if (this.requestCount < this.volumeThreshold) {
+      return false;
+    }
+
+    // Failure count threshold
+    if (this.failureCount >= this.failureThreshold) {
+      return true;
+    }
+
+    // Error percentage threshold
+    const errorPercentage = (this.failureCount / this.requestCount) * 100;
+    return errorPercentage >= this.errorThresholdPercentage;
+  }
+
+  _shouldAttemptReset() {
+    return Date.now() >= this.nextAttemptTime;
+  }
+
+  _getTimeRemaining() {
+    if (!this.nextAttemptTime) return 0;
+    return Math.max(0, this.nextAttemptTime - Date.now());
+  }
+
+  _transitionTo(newState) {
+    const oldState = this.state;
+    this.state = newState;
+
+    const transition = {
+      from: oldState,
+      to: newState,
+      timestamp: new Date().toISOString(),
+      failureCount: this.failureCount,
+    };
+
+    this.stats.stateChanges.push(transition);
+
+    console.log(
+      `🔄 [${this.name}] State: ${oldState} → ${newState} ` +
+        `(Failures: ${this.failureCount})`
+    );
+
+    switch (newState) {
+      case CircuitBreakerState.OPEN:
+        this.nextAttemptTime = Date.now() + this.timeout;
+        this._emit("open", {
+          failureCount: this.failureCount,
+          nextAttemptTime: this.nextAttemptTime,
+        });
+        console.warn(
+          `🔴 [${this.name}] Circuit OPENED - Will retry at ${new Date(this.nextAttemptTime).toLocaleTimeString()}`
+        );
+        break;
+
+      case CircuitBreakerState.HALF_OPEN:
+        this.successCount = 0;
+        this._emit("halfOpen", { timestamp: Date.now() });
+        console.log(`🟡 [${this.name}] Circuit HALF-OPEN - Testing...`);
+        break;
+
+      case CircuitBreakerState.CLOSED:
+        this._emit("close", { timestamp: Date.now() });
+        console.log(`🟢 [${this.name}] Circuit CLOSED - Normal operation resumed`);
+        break;
+    }
+  }
+
+  _reset() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.requestCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+  }
+
+  _emit(event, data) {
+    if (this.listeners[event]) {
+      this.listeners[event].forEach((listener) => {
+        try {
+          listener({ event, ...data, circuitName: this.name });
+        } catch (e) {
+          console.error(`Event listener error:`, e);
+        }
+      });
+    }
+  }
+
+  // ============================================================
+  // Public API
+  // ============================================================
+
+  on(event, listener) {
+    if (this.listeners[event]) {
+      this.listeners[event].push(listener);
+    }
+    return this; // Chaining के लिए
+  }
+
+  getStats() {
+    const errorRate =
+      this.stats.totalRequests > 0
+        ? ((this.stats.failedRequests / this.stats.totalRequests) * 100).toFixed(2)
+        : 0;
+
+    return {
+      name: this.name,
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      ...this.stats,
+      errorRate: `${errorRate}%`,
+      timeRemaining: this._getTimeRemaining(),
+      nextAttemptTime: this.nextAttemptTime
+        ? new Date(this.nextAttemptTime).toISOString()
+        : null,
+    };
+  }
+
+  // Manual reset (admin use)
+  forceClose() {
+    this._reset();
+    this._transitionTo(CircuitBreakerState.CLOSED);
+    console.log(`🔧 [${this.name}] Manually forced to CLOSED state`);
+  }
+
+  forceOpen() {
+    this._transitionTo(CircuitBreakerState.OPEN);
+    console.log(`🔧 [${this.name}] Manually forced to OPEN state`);
+  }
+}
+
+// ============================================================
+// Custom Error Classes
+// ============================================================
+
+class CircuitBreakerOpenError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "CircuitBreakerOpenError";
+    this.details = details;
+    this.isCircuitBreakerError = true;
+  }
+}
+
+class RequestTimeoutError extends Error {
+  constructor(message, details = {}) {
+    super(message);
+    this.name = "RequestTimeoutError";
+    this.details = details;
+    this.isTimeoutError = true;
+  }
+}
+
+// ============================================================
+// HTTP Client with Circuit Breaker
+// ============================================================
+
+class ResilientHttpClient {
+  constructor(baseURL, options = {}) {
+    this.baseURL = baseURL;
+
+    // अलग-अलग endpoints के लिए अलग circuit breakers
+    this.circuitBreakers = new Map();
+
+    this.defaultOptions = {
+      failureThreshold: options.failureThreshold || 5,
+      successThreshold: options.successThreshold || 2,
+      timeout: options.timeout || 30000,
+      requestTimeout: options.requestTimeout || 10000,
+      volumeThreshold: options.volumeThreshold || 5,
+      errorThresholdPercentage: options.errorThresholdPercentage || 50,
+    };
+
+    // Retry configuration
+    this.retryConfig = {
+      maxRetries: options.maxRetries || 3,
+      retryDelay: options.retryDelay || 1000,
+      retryMultiplier: options.retryMultiplier || 2, // Exponential backoff
+      retryableStatusCodes: options.retryableStatusCodes || [408, 429, 500, 502, 503, 504],
+    };
+
+    console.log(`🌐 ResilientHttpClient initialized for: ${baseURL}`);
+  }
+
+  _getCircuitBreaker(endpoint) {
+    if (!this.circuitBreakers.has(endpoint)) {
+      const cb = new CircuitBreaker({
+        name: `${this.baseURL}${endpoint}`,
+        ...this.defaultOptions,
+      });
+
+      // Event listeners setup
+      cb.on("open", (data) => {
+        console.warn(`🚨 Circuit OPEN for endpoint: ${endpoint}`, data);
+        this._notifyUI("circuit-open", { endpoint, ...data });
+      })
+        .on("close", (data) => {
+          console.log(`✅ Circuit CLOSED for endpoint: ${endpoint}`, data);
+          this._notifyUI("circuit-close", { endpoint, ...data });
+        })
+        .on("halfOpen", (data) => {
+          console.log(`🔄 Circuit HALF-OPEN for endpoint: ${endpoint}`, data);
+          this._notifyUI("circuit-half-open", { endpoint, ...data });
+        });
+
+      this.circuitBreakers.set(endpoint, cb);
+    }
+
+    return this.circuitBreakers.get(endpoint);
+  }
+
+  async request(method, endpoint, data = null, options = {}) {
+    const circuitBreaker = this._getCircuitBreaker(endpoint);
+    const url = `${this.baseURL}${endpoint}`;
+
+    // Fallback function
+    const fallback = options.fallback || null;
+
+    // Request function
+    const requestFn = async () => {
+      const fetchOptions = {
+        method: method.toUpperCase(),
+        headers: {
+          "Content-Type": "application/json",
+          ...options.headers,
+        },
+      };
+
+      if (data && ["POST", "PUT", "PATCH"].includes(method.toUpperCase())) {
+        fetchOptions.body = JSON.stringify(data);
+      }
+
+      const response = await fetch(url, fetchOptions);
+
+      // HTTP error codes check
+      if (!response.ok) {
+        const error = new Error(`HTTP ${response.status}: ${response.statusText}`);
+        error.status = response.status;
+        error.response = response;
+
+        // Retryable errors
+        if (this.retryConfig.retryableStatusCodes.includes(response.status)) {
+          throw error;
+        }
+
+        // 4xx errors (client errors) - circuit trip नहीं करना चाहिए
+        if (response.status >= 400 && response.status < 500) {
+          error.isClientError = true;
+        }
+
+        throw error;
+      }
+
+      return await response.json();
+    };
+
+    // Retry wrapper के साथ circuit breaker execute करो
+    return await circuitBreaker.execute(
+      () => this._withRetry(requestFn, endpoint),
+      fallback
+    );
+  }
+
+  async _withRetry(fn, endpoint, attempt = 1) {
+    try {
+      return await fn();
+    } catch (error) {
+      // Client errors retry नहीं करते
+      if (error.isClientError) {
+        throw error;
+      }
+
+      // Circuit breaker errors retry नहीं करते
+      if (error.isCircuitBreakerError) {
+        throw error;
+      }
+
+      if (attempt < this.retryConfig.maxRetries) {
+        const delay =
+          this.retryConfig.retryDelay *
+          Math.pow(this.retryConfig.retryMultiplier, attempt - 1);
+
+        console.log(
+          `🔄 [${endpoint}] Retry ${attempt}/${this.retryConfig.maxRetries} ` +
+            `in ${delay}ms... Error: ${error.message}`
+        );
+
+        await this._sleep(delay);
+        return this._withRetry(fn, endpoint, attempt + 1);
+      }
+
+      throw error;
+    }
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  _notifyUI(eventType, data) {
+    // Custom event dispatch करो UI update के लिए
+    const event = new CustomEvent("circuit-breaker-event", {
+      detail: { type: eventType, ...data },
+    });
+    window.dispatchEvent(event);
+  }
+
+  // Convenience methods
+  async get(endpoint, options = {}) {
+    return this.request("GET", endpoint, null, options);
+  }
+
+  async post(endpoint, data, options = {}) {
+    return this.request("POST", endpoint, data, options);
+  }
+
+  async put(endpoint, data, options = {}) {
+    return this.request("PUT", endpoint, data, options);
+  }
+
+  async delete(endpoint, options = {}) {
+    return this.request("DELETE", endpoint, null, options);
+  }
+
+  // सभी circuit breakers की stats
+  getAllStats() {
+    const stats = {};
+    this.circuitBreakers.forEach((cb, endpoint) => {
+      stats[endpoint] = cb.getStats();
+    });
+    return stats;
+  }
+
+  // Specific endpoint का circuit breaker reset करो
+  resetCircuit(endpoint) {
+    const cb = this.circuitBreakers.get(endpoint);
+    if (cb) {
+      cb.forceClose();
+    }
+  }
+}
+
+// ============================================================
+// Circuit Breaker Dashboard (UI Component)
+// ============================================================
+
+class CircuitBreakerDashboard {
+  constructor(containerId, httpClient) {
+    this.container = document.getElementById(containerId);
+    this.httpClient = httpClient;
+    this.updateInterval = null;
+
+    if (this.container) {
+      this._init();
+    }
+  }
+
+  _init() {
+    this._render();
+    this._startAutoUpdate();
+    this._listenToEvents();
+  }
+
+  _render() {
+    this.container.innerHTML = `
+      <div class="circuit-dashboard" style="
+        font-family: 'Segoe UI', sans-serif;
+        background: #1a1a2e;
+        color: #eee;
+        padding: 20px;
+        border-radius: 12px;
+        max-width: 800px;
+        margin: 20px auto;
+        box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+      ">
+        <h2 style="
+          color: #00d4ff;
+          margin: 0 0 20px 0;
+          display: flex;
+          align-items: center;
+          gap: 10px;
+        ">
+          ⚡ Circuit Breaker Dashboard
+          <span id="cb-last-update" style="font-size: 12px; color: #888; margin-left: auto;"></span>
+        </h2>
+        
+        <div id="cb-circuits-container" style="display: grid; gap: 15px;"></div>
+        
+        <div style="margin-top: 20px; padding: 15px; background: #16213e; border-radius: 8px;">
+          <h3 style="color: #00d4ff; margin: 0 0 10px 0; font-size: 14px;">📊 Event Log</h3>
+          <div id="cb-event-log" style="
+            height: 150px;
+            overflow-y: auto;
+            font-size: 12px;
+            font-family: monospace;
+            color: #aaa;
+          "></div>
+        </div>
+      </div>
+    `;
+  }
+
+  _updateStats() {
+    const stats = this.httpClient.getAllStats();
+    const container = document.getElementById("cb-circuits-container");
+    const lastUpdate = document.getElementById("cb-last-update");
+
+    if (!container) return;
+
+    lastUpdate.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+
+    container.innerHTML = Object.entries(stats)
+      .map(([endpoint, stat]) => this._renderCircuitCard(endpoint, stat))
+      .join("");
+
+    // Reset buttons
+    container.querySelectorAll("[data-reset-endpoint]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const ep = btn.getAttribute("data-reset-endpoint");
+        this.httpClient.resetCircuit(ep);
+        this._addLog(`🔧 Manual reset: ${ep}`);
+      });
+    });
+  }
+
+  _renderCircuitCard(endpoint, stat) {
+    const stateColors = {
+      CLOSED: { bg: "#1a3a1a", border: "#00ff88", icon: "🟢", text: "#00ff88" },
+      OPEN: { bg: "#3a1a1a", border: "#ff4444", icon: "🔴", text: "#ff4444" },
+      HALF_OPEN: { bg: "#3a3a1a", border: "#ffaa00", icon: "🟡", text: "#ffaa00" },
+    };
+
+    const colors = stateColors[stat.state] || stateColors.CLOSED;
+    const shortEndpoint = endpoint.replace(/^https?:\/\/[^/]+/, "");
+
+    return `
+      <div style="
+        background: ${colors.bg};
+        border: 2px solid ${colors.border};
+        border-radius: 10px;
+        padding: 15px;
+        transition: all 0.3s ease;
+      ">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+          <div>
+            <span style="font-size: 18px;">${colors.icon}</span>
+            <span style="color: ${colors.text}; font-weight: bold; margin-left: 8px;">
+              ${stat.state}
+            </span>
+            <span style="color: #888; font-size: 12px; margin-left: 10px;">${shortEndpoint}</span>
+          </div>
+          <button 
+            data-reset-endpoint="${shortEndpoint}"
+            style="
+              background: #333;
+              color: #aaa;
+              border: 1px solid #555;
+              padding: 4px 10px;
+              border-radius: 5px;
+              cursor: pointer;
+              font-size: 11px;
+            "
+          >Reset</button>
+        </div>
+        
+        <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;">
+          ${this._statBox("Total", stat.totalRequests, "#00d4ff")}
+          ${this._statBox("Success", stat.successfulRequests, "#00ff88")}
+          ${this._statBox("Failed", stat.failedRequests, "#ff4444")}
+          ${this._statBox("Rejected", stat.rejectedRequests, "#ff8800")}
+        </div>
+        
+        <div style="margin-top: 10px; display: flex; gap: 15px; font-size: 12px; color: #888;">
+          <span>Error Rate: <strong style="color: #ff6666;">${stat.errorRate}</strong></span>
+          <span>Failures: <strong style="color: #ff4444;">${stat.failureCount}</strong></span>
+          ${
+            stat.state === "OPEN"
+              ? `<span>Retry in: <strong style="color: #ffaa00;">${Math.ceil(stat.timeRemaining / 1000)}s</strong></span>`
+              : ""
+          }
+        </div>
+        
+        ${
+          stat.state === "OPEN"
+            ? `
+          <div style="margin-top: 10px; background: #2a1a1a; border-radius: 5px; overflow: hidden; height: 4px;">
+            <div style="
+              height: 100%;
+              background: #ff4444;
+              width: ${Math.max(0, 100 - (stat.timeRemaining / 30000) * 100)}%;
+              transition: width 1s linear;
+            "></div>
+          </div>
+        `
+            : ""
+        }
+      </div>
+    `;
+  }
+
+  _statBox(label, value, color) {
+    return `
+      <div style="
+        background: rgba(0,0,0,0.3);
+        border-radius: 6px;
+        padding: 8px;
+        text-align: center;
+      ">
+        <div style="color: ${color}; font-size: 20px; font-weight: bold;">${value}</div>
+        <div style="color: #666; font-size: 11px;">${label}</div>
+      </div>
+    `;
+  }
+
+  _addLog(message) {
+    const log = document.getElementById("cb-event-log");
+    if (!log) return;
+
+    const time = new Date().toLocaleTimeString();
+    const entry = document.createElement("div");
+    entry.style.cssText = "padding: 2px 0; border-bottom: 1px solid #222;";
+    entry.textContent = `[${time}] ${message}`;
+    log.insertBefore(entry, log.firstChild);
+
+    // Max 50 entries
+    while (log.children.length > 50) {
+      log.removeChild(log.lastChild);
+    }
+  }
+
+  _listenToEvents() {
+    window.addEventListener("circuit-breaker-event", (e) => {
+      const { type, endpoint } = e.detail;
+      const messages = {
+        "circuit-open": `🔴 Circuit OPENED: ${endpoint}`,
+        "circuit-close": `🟢 Circuit CLOSED: ${endpoint}`,
+        "circuit-half-open": `🟡 Circuit HALF-OPEN: ${endpoint}`,
+      };
+      this._addLog(messages[type] || `Event: ${type}`);
+      this._updateStats();
+    });
+  }
+
+  _startAutoUpdate() {
+    this._updateStats();
+    this.updateInterval = setInterval(() => this._updateStats(), 2000);
+  }
+
+  destroy() {
+    if (this.updateInterval) {
+      clearInterval(this.updateInterval);
+    }
+  }
+}
+
+// ============================================================
+// Demo & Testing
+// ============================================================
+
+async function runDemo() {
+  console.log("\n" + "=".repeat(60));
+  console.log("🚀 Circuit Breaker Demo Starting...");
+  console.log("=".repeat(60) + "\n");
+
+  // HTTP Client बनाओ
+  const apiClient = new ResilientHttpClient("https://api.example.com", {
+    failureThreshold: 3,
+    successThreshold: 2,
+    timeout: 15000, // 15 seconds OPEN रहेगा
+    requestTimeout: 5000,
+    volumeThreshold: 3,
+    maxRetries: 2,
+    retryDelay: 500,
+  });
+
+  // Standalone Circuit Breaker test
+  const cb = new CircuitBreaker({
+    name: "TestService",
+    failureThreshold: 3,
+    successThreshold: 2,
+    timeout: 5000, // 5 seconds for demo
+    requestTimeout: 2000,
+    volumeThreshold: 3,
+  });
+
+  // Event listeners
+  cb.on("open", (data) =>
+    console.log(`\n🚨 ALERT: Circuit opened! Next retry: ${new Date(data.nextAttemptTime).toLocaleTimeString()}`)
+  );
+  cb.on("close", () => console.log(`\n✅ ALERT: Circuit closed! Service recovered!`));
+  cb.on("halfOpen", () => console.log(`\n🔄 ALERT: Testing service recovery...`));
+
+  // Simulate failing service
+  let callCount = 0;
+  const unreliableService = async () => {
+    callCount++;
+    // पहले 6 calls fail करो, फिर succeed
+    if (callCount <= 6) {
+      throw new Error(`Service unavailable (call #${callCount})`);
+    }
+    return { data: "Success!", callCount };
+  };
+
+  // Fallback function
+  const fallback = async () => {
+    return { data: "Cached/Fallback data", source: "cache" };
+  };
+
+  console.log("📡 Testing Circuit Breaker with failing service...\n");
+
+  // Multiple requests भेजो
+  for (let i = 1; i <= 10; i++) {
+    try {
+      console.log(`\n--- Request #${i} ---`);
+      const result = await cb.execute(unreliableService, fallback);
+      console.log(`✅ Result:`, result);
+    } catch (error) {
+      if (error.isCircuitBreakerError) {
+        console.error(`⚡ CIRCUIT OPEN: ${error.message}`);
+      } else {
+        console.error(`❌ Error: ${error.message}`);
+      }
+    }
+
+    // Stats print करो
+    const stats = cb.getStats();
+    console.log(
+      `📊 State: ${stats.state} | ` +
+        `Total: ${stats.totalRequests} | ` +
+        `Failed: ${stats.failedRequests} | ` +
+        `Rejected: ${stats.rejectedRequests}`
+    );
+
+    // थोड़ा wait करो
+    await new Promise((r) => setTimeout(r, 500));
+  }
+
+  // Circuit के OPEN होने के बाद wait करो
+  console.log("\n⏳ Waiting for circuit to attempt reset (5 seconds)...");
+  await new Promise((r) => setTimeout(r, 6000));
+
+  // Recovery test
+  console.log("\n🔄 Testing recovery after timeout...");
+  for (let i = 11; i <= 15; i++) {
+    try {
+      console.log(`\n--- Request #${i} ---`);
+      const result = await cb.execute(unreliableService, fallback);
+      console.log(`✅ Result:`, result);
+    } catch (error) {
+      console.error(`❌ Error: ${error.message}`);
+    }
+
+    const stats = cb.getStats();
+    console.log(`📊 State: ${stats.state}`);
+    await new Promise((r) => setTimeout(

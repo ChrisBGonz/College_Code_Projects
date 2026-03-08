@@ -1,0 +1,589 @@
+<?php
+
+// Configuration
+define('ADMIN_EMAIL', 'admin@example.com');
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK');
+define('LOG_FILE', __DIR__ . '/security_log.txt');
+define('MAX_ATTEMPTS', 3);
+define('BLOCK_DURATION', 1800); // 30 minutes in seconds
+define('SEND_EMAIL_ALERT', true);
+define('SEND_SLACK_ALERT', true);
+
+session_start();
+
+// Simulate user authentication
+function isLoggedIn() {
+    return isset($_SESSION['user_id']) && !empty($_SESSION['user_id']);
+}
+
+function isAdmin() {
+    return isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
+}
+
+function getUserInfo() {
+    return [
+        'user_id'  => $_SESSION['user_id'] ?? 'Guest',
+        'username' => $_SESSION['username'] ?? 'Unknown',
+        'role'     => $_SESSION['role'] ?? 'none',
+        'email'    => $_SESSION['email'] ?? 'N/A',
+    ];
+}
+
+// Get real IP address
+function getRealIP() {
+    $ip_keys = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR'
+    ];
+
+    foreach ($ip_keys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ips = explode(',', $_SERVER[$key]);
+            $ip  = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $_SERVER['REMOTE_ADDR'] ?? 'Unknown';
+}
+
+// Log unauthorized access attempt
+function logUnauthorizedAccess($user_info, $ip, $url, $attempt_count) {
+    $timestamp   = date('Y-m-d H:i:s');
+    $user_agent  = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
+    $referer     = $_SERVER['HTTP_REFERER'] ?? 'Direct Access';
+    $method      = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+    $log_entry = "[{$timestamp}] UNAUTHORIZED ACCESS ATTEMPT #{$attempt_count}\n";
+    $log_entry .= "  IP Address  : {$ip}\n";
+    $log_entry .= "  URL         : {$url}\n";
+    $log_entry .= "  Method      : {$method}\n";
+    $log_entry .= "  User ID     : {$user_info['user_id']}\n";
+    $log_entry .= "  Username    : {$user_info['username']}\n";
+    $log_entry .= "  Role        : {$user_info['role']}\n";
+    $log_entry .= "  User Email  : {$user_info['email']}\n";
+    $log_entry .= "  User Agent  : {$user_agent}\n";
+    $log_entry .= "  Referer     : {$referer}\n";
+    $log_entry .= str_repeat('-', 60) . "\n";
+
+    file_put_contents(LOG_FILE, $log_entry, FILE_APPEND | LOCK_EX);
+
+    return $log_entry;
+}
+
+// Send Email Alert
+function sendEmailAlert($user_info, $ip, $url, $attempt_count, $is_blocked) {
+    if (!SEND_EMAIL_ALERT) {
+        return false;
+    }
+
+    $timestamp  = date('Y-m-d H:i:s');
+    $user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
+    $status     = $is_blocked ? '🚫 USER HAS BEEN BLOCKED' : '⚠️ WARNING';
+
+    $subject = "🚨 Security Alert: Unauthorized Admin Access Attempt - {$timestamp}";
+
+    $message = "
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <style>
+            body { font-family: Arial, sans-serif; background-color: #f4f4f4; }
+            .container { max-width: 600px; margin: 20px auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            .header { background: #dc3545; color: white; padding: 20px; text-align: center; }
+            .header h1 { margin: 0; font-size: 24px; }
+            .content { padding: 25px; }
+            .alert-box { background: #fff3cd; border: 1px solid #ffc107; border-radius: 5px; padding: 15px; margin-bottom: 20px; }
+            .info-table { width: 100%; border-collapse: collapse; }
+            .info-table th { background: #f8f9fa; text-align: left; padding: 10px; border: 1px solid #dee2e6; width: 35%; }
+            .info-table td { padding: 10px; border: 1px solid #dee2e6; }
+            .blocked { background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 5px; padding: 15px; margin-top: 20px; color: #721c24; }
+            .footer { background: #f8f9fa; padding: 15px; text-align: center; font-size: 12px; color: #6c757d; }
+        </style>
+    </head>
+    <body>
+        <div class='container'>
+            <div class='header'>
+                <h1>🚨 Security Alert</h1>
+                <p>Unauthorized Admin Access Attempt Detected</p>
+            </div>
+            <div class='content'>
+                <div class='alert-box'>
+                    <strong>{$status}</strong><br>
+                    Attempt #{$attempt_count} detected at {$timestamp}
+                </div>
+                
+                <h3>📋 Incident Details</h3>
+                <table class='info-table'>
+                    <tr><th>Timestamp</th><td>{$timestamp}</td></tr>
+                    <tr><th>IP Address</th><td><strong>{$ip}</strong></td></tr>
+                    <tr><th>Attempted URL</th><td>{$url}</td></tr>
+                    <tr><th>HTTP Method</th><td>{$_SERVER['REQUEST_METHOD']}</td></tr>
+                    <tr><th>Attempt Count</th><td><strong>{$attempt_count}</strong></td></tr>
+                </table>
+                
+                <h3>👤 User Information</h3>
+                <table class='info-table'>
+                    <tr><th>User ID</th><td>{$user_info['user_id']}</td></tr>
+                    <tr><th>Username</th><td>{$user_info['username']}</td></tr>
+                    <tr><th>Role</th><td>{$user_info['role']}</td></tr>
+                    <tr><th>User Email</th><td>{$user_info['email']}</td></tr>
+                    <tr><th>User Agent</th><td style='font-size:12px;'>{$user_agent}</td></tr>
+                </table>
+    ";
+
+    if ($is_blocked) {
+        $message .= "
+                <div class='blocked'>
+                    <strong>🚫 Action Taken:</strong> This IP address has been temporarily blocked for " . (BLOCK_DURATION / 60) . " minutes due to multiple unauthorized access attempts.
+                </div>
+        ";
+    }
+
+    $message .= "
+            </div>
+            <div class='footer'>
+                <p>This is an automated security alert. Please investigate immediately.</p>
+                <p>Server: {$_SERVER['SERVER_NAME']} | Time: {$timestamp}</p>
+            </div>
+        </div>
+    </body>
+    </html>
+    ";
+
+    $headers  = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: Security System <security@" . ($_SERVER['SERVER_NAME'] ?? 'example.com') . ">\r\n";
+    $headers .= "X-Priority: 1\r\n";
+    $headers .= "X-Mailer: PHP/" . phpversion() . "\r\n";
+
+    $result = mail(ADMIN_EMAIL, $subject, $message, $headers);
+
+    return $result;
+}
+
+// Send Slack Alert
+function sendSlackAlert($user_info, $ip, $url, $attempt_count, $is_blocked) {
+    if (!SEND_SLACK_ALERT || empty(SLACK_WEBHOOK_URL) || SLACK_WEBHOOK_URL === 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK') {
+        return false;
+    }
+
+    $timestamp  = date('Y-m-d H:i:s');
+    $user_agent = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
+    $status     = $is_blocked ? ':no_entry: *USER BLOCKED*' : ':warning: *WARNING*';
+    $color      = $is_blocked ? '#dc3545' : '#ffc107';
+
+    $payload = [
+        'username'   => 'Security Bot',
+        'icon_emoji' => ':rotating_light:',
+        'text'       => ':rotating_light: *SECURITY ALERT: Unauthorized Admin Access Attempt!*',
+        'attachments' => [
+            [
+                'color'  => $color,
+                'title'  => "Unauthorized /admin Access - Attempt #{$attempt_count}",
+                'text'   => "{$status}\n*Time:* {$timestamp}",
+                'fields' => [
+                    [
+                        'title' => ':globe_with_meridians: IP Address',
+                        'value' => "`{$ip}`",
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':link: Attempted URL',
+                        'value' => "`{$url}`",
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':bust_in_silhouette: User ID',
+                        'value' => $user_info['user_id'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':name_badge: Username',
+                        'value' => $user_info['username'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':shield: User Role',
+                        'value' => $user_info['role'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':email: User Email',
+                        'value' => $user_info['email'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => ':computer: User Agent',
+                        'value' => substr($user_agent, 0, 100) . '...',
+                        'short' => false,
+                    ],
+                ],
+                'footer'      => 'Security Alert System',
+                'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                'ts'          => time(),
+            ],
+        ],
+    ];
+
+    if ($is_blocked) {
+        $payload['attachments'][] = [
+            'color' => '#dc3545',
+            'text'  => ":no_entry: *Action Taken:* IP `{$ip}` has been temporarily blocked for " . (BLOCK_DURATION / 60) . " minutes.",
+        ];
+    }
+
+    $json_payload = json_encode($payload);
+
+    $ch = curl_init(SLACK_WEBHOOK_URL);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $json_payload);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, [
+        'Content-Type: application/json',
+        'Content-Length: ' . strlen($json_payload),
+    ]);
+
+    $result   = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return ($http_code === 200 && $result === 'ok');
+}
+
+// Track and check brute force attempts
+function trackAttempt($ip) {
+    $attempts_file = sys_get_temp_dir() . '/admin_attempts_' . md5($ip) . '.json';
+    $current_time  = time();
+    $attempts      = [];
+
+    if (file_exists($attempts_file)) {
+        $data = json_decode(file_get_contents($attempts_file), true);
+        if ($data && isset($data['attempts'])) {
+            // Remove old attempts outside the block window
+            $attempts = array_filter($data['attempts'], function ($timestamp) use ($current_time) {
+                return ($current_time - $timestamp) < BLOCK_DURATION;
+            });
+        }
+    }
+
+    $attempts[] = $current_time;
+    file_put_contents($attempts_file, json_encode(['attempts' => array_values($attempts)]), LOCK_EX);
+
+    return count($attempts);
+}
+
+function isIPBlocked($ip) {
+    $attempts_file = sys_get_temp_dir() . '/admin_attempts_' . md5($ip) . '.json';
+    $current_time  = time();
+
+    if (!file_exists($attempts_file)) {
+        return false;
+    }
+
+    $data = json_decode(file_get_contents($attempts_file), true);
+    if (!$data || !isset($data['attempts'])) {
+        return false;
+    }
+
+    $recent_attempts = array_filter($data['attempts'], function ($timestamp) use ($current_time) {
+        return ($current_time - $timestamp) < BLOCK_DURATION;
+    });
+
+    return count($recent_attempts) >= MAX_ATTEMPTS;
+}
+
+// Main Admin Access Guard
+function checkAdminAccess() {
+    $ip         = getRealIP();
+    $url        = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http') . '://' . ($_SERVER['HTTP_HOST'] ?? 'localhost') . ($_SERVER['REQUEST_URI'] ?? '/admin');
+    $user_info  = getUserInfo();
+    $is_blocked = isIPBlocked($ip);
+
+    // Check if IP is already blocked
+    if ($is_blocked) {
+        http_response_code(403);
+        echo renderBlockedPage($ip);
+        exit;
+    }
+
+    // Check if user has admin access
+    if (!isLoggedIn() || !isAdmin()) {
+        // Track this attempt
+        $attempt_count = trackAttempt($ip);
+        $is_now_blocked = ($attempt_count >= MAX_ATTEMPTS);
+
+        // Log the attempt
+        logUnauthorizedAccess($user_info, $ip, $url, $attempt_count);
+
+        // Send alerts
+        $email_sent = sendEmailAlert($user_info, $ip, $url, $attempt_count, $is_now_blocked);
+        $slack_sent = sendSlackAlert($user_info, $ip, $url, $attempt_count, $is_now_blocked);
+
+        // Log alert status
+        $alert_log = "[" . date('Y-m-d H:i:s') . "] ALERTS SENT - Email: " . ($email_sent ? 'YES' : 'NO/DISABLED') . " | Slack: " . ($slack_sent ? 'YES' : 'NO/DISABLED') . "\n";
+        file_put_contents(LOG_FILE, $alert_log, FILE_APPEND | LOCK_EX);
+
+        // Return 403 Forbidden
+        http_response_code(403);
+        echo renderAccessDeniedPage($ip, $attempt_count, $is_now_blocked);
+        exit;
+    }
+}
+
+// Render Access Denied Page
+function renderAccessDeniedPage($ip, $attempt_count, $is_blocked) {
+    $remaining_attempts = max(0, MAX_ATTEMPTS - $attempt_count);
+    $block_minutes      = BLOCK_DURATION / 60;
+
+    ob_start();
+    ?>
+    <!DOCTYPE html>
+    <html lang="hi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>403 - Access Denied</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+            }
+            .container {
+                text-align: center;
+                padding: 40px;
+                max-width: 600px;
+                background: rgba(255,255,255,0.05);
+                border-radius: 20px;
+                border: 1px solid rgba(255,255,255,0.1);
+                backdrop-filter: blur(10px);
+                box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+            }
+            .icon { font-size: 80px; margin-bottom: 20px; animation: pulse 2s infinite; }
+            @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+            h1 { font-size: 48px; color: #e74c3c; margin-bottom: 10px; }
+            h2 { font-size: 24px; color: #ecf0f1; margin-bottom: 20px; }
+            .message { color: #bdc3c7; font-size: 16px; line-height: 1.6; margin-bottom: 25px; }
+            .warning-box {
+                background: rgba(231, 76, 60, 0.2);
+                border: 1px solid #e74c3c;
+                border-radius: 10px;
+                padding: 15px;
+                margin: 20px 0;
+                color: #e74c3c;
+            }
+            .blocked-box {
+                background: rgba(192, 57, 43, 0.3);
+                border: 2px solid #c0392b;
+                border-radius: 10px;
+                padding: 20px;
+                margin: 20px 0;
+                color: #ff6b6b;
+            }
+            .info { color: #95a5a6; font-size: 13px; margin-top: 20px; }
+            .btn {
+                display: inline-block;
+                margin-top: 20px;
+                padding: 12px 30px;
+                background: #3498db;
+                color: white;
+                text-decoration: none;
+                border-radius: 25px;
+                font-size: 16px;
+                transition: background 0.3s;
+            }
+            .btn:hover { background: #2980b9; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="icon">🚫</div>
+            <h1>403</h1>
+            <h2>Access Denied!</h2>
+            <p class="message">
+                आपके पास इस पेज को access करने की permission नहीं है।<br>
+                यह incident record कर लिया गया है और administrator को alert भेज दिया गया है।
+            </p>
+
+            <?php if ($is_blocked): ?>
+            <div class="blocked-box">
+                <strong>🚫 आपका IP Block कर दिया गया है!</strong><br>
+                Multiple unauthorized attempts के कारण आपका IP address <strong><?= htmlspecialchars($ip) ?></strong>
+                अगले <strong><?= $block_minutes ?> minutes</strong> के लिए block कर दिया गया है।
+            </div>
+            <?php else: ?>
+            <div class="warning-box">
+                <strong>⚠️ चेतावनी!</strong><br>
+                यह आपका attempt #<?= $attempt_count ?> है।
+                <?php if ($remaining_attempts > 0): ?>
+                    <?= $remaining_attempts ?> और attempts के बाद आपका IP block हो जाएगा।
+                <?php endif; ?>
+            </div>
+            <?php endif; ?>
+
+            <div class="info">
+                <p>🌐 Your IP: <?= htmlspecialchars($ip) ?></p>
+                <p>🕐 Time: <?= date('Y-m-d H:i:s') ?></p>
+                <p>📧 Administrator को alert भेज दिया गया है।</p>
+            </div>
+
+            <a href="/" class="btn">🏠 Home Page पर जाएं</a>
+        </div>
+    </body>
+    </html>
+    <?php
+    return ob_get_clean();
+}
+
+// Render Blocked Page
+function renderBlockedPage($ip) {
+    $block_minutes = BLOCK_DURATION / 60;
+    ob_start();
+    ?>
+    <!DOCTYPE html>
+    <html lang="hi">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>IP Blocked</title>
+        <style>
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #2c0000 0%, #4a0000 100%);
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+            }
+            .container {
+                text-align: center;
+                padding: 40px;
+                max-width: 600px;
+                background: rgba(0,0,0,0.4);
+                border-radius: 20px;
+                border: 2px solid #c0392b;
+            }
+            .icon { font-size: 80px; margin-bottom: 20px; }
+            h1 { font-size: 36px; color: #e74c3c; margin-bottom: 15px; }
+            p { color: #bdc3c7; font-size: 16px; line-height: 1.8; }
+            .ip { color: #e74c3c; font-weight: bold; font-size: 18px; }
+            .time { color: #f39c12; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="icon">🔒</div>
+            <h1>IP Address Blocked!</h1>
+            <p>
+                आपका IP address <span class="ip"><?= htmlspecialchars($ip) ?></span>
+                को block कर दिया गया है।<br><br>
+                Multiple unauthorized access attempts के कारण यह IP
+                <span class="time"><?= $block_minutes ?> minutes</span> के लिए block है।<br><br>
+                अगर आप legitimate user हैं, तो administrator से contact करें।
+            </p>
+        </div>
+    </body>
+    </html>
+    <?php
+    return ob_get_clean();
+}
+
+// ============================================================
+// DEMO: Test करने के लिए different scenarios
+// ============================================================
+
+// Uncomment these lines to test different scenarios:
+
+// Test as non-logged-in user (unauthorized):
+// $_SESSION = [];
+
+// Test as logged-in but non-admin user (unauthorized):
+// $_SESSION = ['user_id' => 123, 'username' => 'john_doe', 'role' => 'user', 'email' => 'john@example.com'];
+
+// Test as admin user (authorized):
+// $_SESSION = ['user_id' => 1, 'username' => 'admin_user', 'role' => 'admin', 'email' => 'admin@example.com'];
+
+// For demo, simulate a non-admin user trying to access /admin
+if (!isset($_SESSION['user_id'])) {
+    $_SESSION['user_id']  = 456;
+    $_SESSION['username'] = 'regular_user';
+    $_SESSION['role']     = 'user';
+    $_SESSION['email']    = 'user@example.com';
+}
+
+// ============================================================
+// EXECUTE: Admin Access Check
+// ============================================================
+checkAdminAccess();
+
+// If we reach here, user is authorized
+?>
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Panel</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #fff;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            max-width: 600px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 20px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .icon { font-size: 60px; margin-bottom: 20px; }
+        h1 { font-size: 36px; color: #2ecc71; margin-bottom: 15px; }
+        p { color: #bdc3c7; font-size: 16px; line-height: 1.8; }
+        .success-box {
+            background: rgba(46, 204, 113, 0.2);
+            border: 1px solid #2ecc71;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 20px 0;
+            color: #2ecc71;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🛡️</div>
+        <h1>Welcome, Admin!</h1>
+        <div class="success-box">
+            ✅ आप successfully admin panel में access कर चुके हैं।
+        </div>
+        <p>
+            User: <strong><?= htmlspecialchars($_SESSION['username'] ?? 'Admin') ?></strong><br>
+            Role: <strong><?= htmlspecialchars($_SESSION['role'] ?? 'admin') ?></strong><br>
+            Time: <strong><?= date('Y-m-d H:i:s') ?></strong>
+        </p>
+    </div>
+</body>
+</html>

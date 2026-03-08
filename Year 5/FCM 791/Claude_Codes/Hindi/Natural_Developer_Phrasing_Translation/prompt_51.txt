@@ -1,0 +1,310 @@
+```python
+import os
+import re
+import logging
+from datetime import datetime, timezone
+from functools import wraps
+
+from flask import Flask, request, jsonify, g
+from flask_sqlalchemy import SQLAlchemy
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import bcrypt
+import jwt
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(name)s  %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+# ── App & Config ──────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///users.db"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-me-in-production")
+app.config["JWT_ALGORITHM"] = "HS256"
+
+# bcrypt work factor – increase on faster hardware
+BCRYPT_ROUNDS = int(os.environ.get("BCRYPT_ROUNDS", 12))
+
+# Password policy
+PASSWORD_MIN_LENGTH = 8
+PASSWORD_MAX_LENGTH = 128
+PASSWORD_POLICY_RE = re.compile(
+    r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};':\"\\|,.<>\/?]).{8,128}$"
+)
+
+db = SQLAlchemy(app)
+
+# ── Rate Limiter ──────────────────────────────────────────────────────────────
+limiter = Limiter(
+    key_func=get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://",
+)
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+class User(db.Model):
+    __tablename__ = "users"
+
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    password_changed_at = db.Column(
+        db.DateTime(timezone=True), nullable=True
+    )
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(
+        db.DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    def set_password(self, plain_password: str) -> None:
+        """Hash और store करो – plain text कभी persist नहीं होता।"""
+        if not isinstance(plain_password, str):
+            raise TypeError("Password must be a string.")
+        password_bytes = plain_password.encode("utf-8")
+        salt = bcrypt.gensalt(rounds=BCRYPT_ROUNDS)
+        self.password_hash = bcrypt.hashpw(password_bytes, salt).decode("utf-8")
+        self.password_changed_at = datetime.now(timezone.utc)
+
+    def check_password(self, plain_password: str) -> bool:
+        """Stored hash के against verify करो।"""
+        if not isinstance(plain_password, str):
+            return False
+        return bcrypt.checkpw(
+            plain_password.encode("utf-8"),
+            self.password_hash.encode("utf-8"),
+        )
+
+    def __repr__(self) -> str:
+        return f"<User id={self.id} username={self.username!r}>"
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _validate_password_policy(password: str) -> tuple[bool, str]:
+    """
+    Password policy enforce करो।
+    Returns (is_valid: bool, error_message: str)
+    """
+    if not password:
+        return False, "Password cannot be empty."
+    if len(password) < PASSWORD_MIN_LENGTH:
+        return False, f"Password must be at least {PASSWORD_MIN_LENGTH} characters long."
+    if len(password) > PASSWORD_MAX_LENGTH:
+        return False, f"Password must not exceed {PASSWORD_MAX_LENGTH} characters."
+    if not PASSWORD_POLICY_RE.match(password):
+        return (
+            False,
+            "Password must contain at least one uppercase letter, "
+            "one lowercase letter, one digit, and one special character.",
+        )
+    return True, ""
+
+
+def _decode_jwt(token: str) -> dict | None:
+    """JWT decode करो; failure पर None return करो।"""
+    try:
+        payload = jwt.decode(
+            token,
+            app.config["SECRET_KEY"],
+            algorithms=[app.config["JWT_ALGORITHM"]],
+        )
+        return payload
+    except jwt.ExpiredSignatureError:
+        logger.warning("JWT token expired.")
+    except jwt.InvalidTokenError as exc:
+        logger.warning("Invalid JWT token: %s", exc)
+    return None
+
+
+# ── Auth Decorator ────────────────────────────────────────────────────────────
+
+def require_auth(f):
+    """
+    Authorization header से JWT verify करो और
+    authenticated user को `g.current_user` में inject करो।
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return jsonify({"error": "Authorization header missing or malformed."}), 401
+
+        token = auth_header.split(" ", 1)[1].strip()
+        payload = _decode_jwt(token)
+        if payload is None:
+            return jsonify({"error": "Invalid or expired token."}), 401
+
+        user_id = payload.get("sub")
+        if not user_id:
+            return jsonify({"error": "Token payload missing 'sub' claim."}), 401
+
+        user = db.session.get(User, int(user_id))
+        if user is None:
+            return jsonify({"error": "User not found."}), 401
+        if not user.is_active:
+            return jsonify({"error": "Account is deactivated."}), 403
+
+        # Flask's g object में store करो – request lifetime तक valid
+        g.current_user = user
+        return f(*args, **kwargs)
+
+    return decorated
+
+
+# ── Password Change Endpoint ──────────────────────────────────────────────────
+
+@app.route("/api/v1/auth/change-password", methods=["POST"])
+@limiter.limit("5 per minute")          # brute-force protection
+@require_auth
+def change_password():
+    """
+    POST /api/v1/auth/change-password
+
+    Headers:
+        Authorization: Bearer <jwt_token>
+
+    Body (JSON):
+        {
+            "current_password": "OldPass@123",
+            "new_password":     "NewPass@456"
+        }
+
+    Flow:
+        1. JWT से user_id resolve (require_auth decorator)
+        2. current_password verify (re-authentication)
+        3. new_password policy validate
+        4. new_password != current_password check
+        5. bcrypt hash generate
+        6. DB update + commit
+    """
+    # ── 1. Authenticated user (g में already set है) ──────────────────────────
+    current_user: User = g.current_user
+    logger.info("Password change attempt for user_id=%s", current_user.id)
+
+    # ── 2. Request body parse ─────────────────────────────────────────────────
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"error": "Request body must be valid JSON."}), 400
+
+    current_password = data.get("current_password")
+    new_password = data.get("new_password")
+
+    if not current_password or not isinstance(current_password, str):
+        return jsonify({"error": "'current_password' is required."}), 400
+    if not new_password or not isinstance(new_password, str):
+        return jsonify({"error": "'new_password' is required."}), 400
+
+    # ── 3. Re-authentication – current password verify ────────────────────────
+    # Timing-safe comparison bcrypt.checkpw internally करता है
+    if not current_user.check_password(current_password):
+        logger.warning(
+            "Incorrect current_password for user_id=%s", current_user.id
+        )
+        # Generic message – enumeration prevent करने के लिए
+        return jsonify({"error": "Current password is incorrect."}), 403
+
+    # ── 4. New password policy validate ──────────────────────────────────────
+    is_valid, policy_error = _validate_password_policy(new_password)
+    if not is_valid:
+        return jsonify({"error": policy_error}), 422
+
+    # ── 5. New password ≠ current password check ──────────────────────────────
+    if current_user.check_password(new_password):
+        return (
+            jsonify({"error": "New password must be different from the current password."}),
+            422,
+        )
+
+    # ── 6. Hash + DB update + commit ──────────────────────────────────────────
+    try:
+        current_user.set_password(new_password)   # hash internally करता है
+        db.session.commit()
+        logger.info(
+            "Password successfully changed for user_id=%s at %s",
+            current_user.id,
+            current_user.password_changed_at,
+        )
+    except Exception as exc:
+        db.session.rollback()
+        logger.error(
+            "DB error while changing password for user_id=%s: %s",
+            current_user.id,
+            exc,
+            exc_info=True,
+        )
+        return jsonify({"error": "An internal error occurred. Please try again."}), 500
+
+    return (
+        jsonify(
+            {
+                "message": "Password changed successfully.",
+                "password_changed_at": current_user.password_changed_at.isoformat(),
+            }
+        ),
+        200,
+    )
+
+
+# ── Dev-only: seed + token helper ────────────────────────────────────────────
+
+@app.route("/dev/seed", methods=["POST"])
+def dev_seed():
+    """Development only – test user बनाओ।"""
+    if not app.debug:
+        return jsonify({"error": "Not available in production."}), 403
+
+    db.create_all()
+    if User.query.filter_by(username="testuser").first():
+        return jsonify({"message": "User already exists."}), 200
+
+    user = User(username="testuser", email="test@example.com")
+    user.set_password("OldPass@123")
+    db.session.add(user)
+    db.session.commit()
+    return jsonify({"message": "Test user created.", "user_id": user.id}), 201
+
+
+@app.route("/dev/token/<int:user_id>", methods=["GET"])
+def dev_token(user_id: int):
+    """Development only – JWT generate करो।"""
+    if not app.debug:
+        return jsonify({"error": "Not available in production."}), 403
+
+    import time
+
+    payload = {
+        "sub": str(user_id),
+        "iat": int(time.time()),
+        "exp": int(time.time()) + 3600,
+    }
+    token = jwt.encode(
+        payload,
+        app.config["SECRET_KEY"],
+        algorithm=app.config["JWT_ALGORITHM"],
+    )
+    return jsonify({"token": token}), 200
+
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    with app.app_context():
+        db.create_all()
+        logger.info("Database tables ensured.")
+
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

@@ -1,0 +1,480 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+// AppConfig represents the application configuration
+type AppConfig struct {
+	Name        string                 `json:"name"`
+	Version     string                 `json:"version"`
+	Debug       bool                   `json:"debug"`
+	MaxRetries  int                    `json:"max_retries"`
+	Timeout     float64                `json:"timeout"`
+	Features    []string               `json:"features"`
+	Settings    map[string]interface{} `json:"settings"`
+	Database    DatabaseConfig         `json:"database"`
+	Server      ServerConfig           `json:"server"`
+}
+
+// DatabaseConfig represents database configuration
+type DatabaseConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Name     string `json:"name"`
+	Username string `json:"username"`
+	Password string `json:"password"`
+	MaxConns int    `json:"max_connections"`
+}
+
+// ServerConfig represents server configuration
+type ServerConfig struct {
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	TLS     bool   `json:"tls"`
+	Timeout int    `json:"timeout"`
+}
+
+// Application represents the main application with dynamic properties
+type Application struct {
+	Config     AppConfig
+	Properties map[string]interface{}
+}
+
+// ReadAndParseConfig reads and parses a JSON configuration file
+func ReadAndParseConfig(filename string) (*AppConfig, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("config file read error: %v", err)
+	}
+
+	var config AppConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("JSON parse error: %v", err)
+	}
+
+	return &config, nil
+}
+
+// SetPropertyByPath dynamically sets a property value using dot notation path
+func SetPropertyByPath(obj interface{}, path string, value interface{}) error {
+	parts := strings.Split(path, ".")
+	v := reflect.ValueOf(obj)
+
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	for i, part := range parts {
+		if v.Kind() == reflect.Struct {
+			field := v.FieldByNameFunc(func(name string) bool {
+				return strings.EqualFold(name, part)
+			})
+
+			if !field.IsValid() {
+				// Try JSON tag matching
+				t := v.Type()
+				found := false
+				for j := 0; j < t.NumField(); j++ {
+					tag := t.Field(j).Tag.Get("json")
+					tagName := strings.Split(tag, ",")[0]
+					if tagName == part {
+						field = v.Field(j)
+						found = true
+						break
+					}
+				}
+				if !found {
+					return fmt.Errorf("field '%s' not found in struct", part)
+				}
+			}
+
+			if i == len(parts)-1 {
+				// Last part - set the value
+				if !field.CanSet() {
+					return fmt.Errorf("field '%s' cannot be set", part)
+				}
+				return setFieldValue(field, value)
+			}
+			v = field
+		} else if v.Kind() == reflect.Map {
+			if i == len(parts)-1 {
+				mapKey := reflect.ValueOf(part)
+				v.SetMapIndex(mapKey, reflect.ValueOf(value))
+				return nil
+			}
+			mapVal := v.MapIndex(reflect.ValueOf(part))
+			if !mapVal.IsValid() {
+				return fmt.Errorf("map key '%s' not found", part)
+			}
+			v = mapVal.Elem()
+		} else {
+			return fmt.Errorf("cannot traverse into %s", v.Kind())
+		}
+	}
+
+	return nil
+}
+
+// setFieldValue sets a reflect.Value with proper type conversion
+func setFieldValue(field reflect.Value, value interface{}) error {
+	if value == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+
+	val := reflect.ValueOf(value)
+
+	// Handle type conversions
+	switch field.Kind() {
+	case reflect.String:
+		field.SetString(fmt.Sprintf("%v", value))
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := value.(type) {
+		case int:
+			field.SetInt(int64(v))
+		case int64:
+			field.SetInt(v)
+		case float64:
+			field.SetInt(int64(v))
+		case string:
+			var intVal int64
+			fmt.Sscanf(v, "%d", &intVal)
+			field.SetInt(intVal)
+		default:
+			return fmt.Errorf("cannot convert %T to int", value)
+		}
+	case reflect.Float32, reflect.Float64:
+		switch v := value.(type) {
+		case float64:
+			field.SetFloat(v)
+		case float32:
+			field.SetFloat(float64(v))
+		case int:
+			field.SetFloat(float64(v))
+		default:
+			return fmt.Errorf("cannot convert %T to float", value)
+		}
+	case reflect.Bool:
+		switch v := value.(type) {
+		case bool:
+			field.SetBool(v)
+		case string:
+			field.SetBool(strings.ToLower(v) == "true")
+		default:
+			return fmt.Errorf("cannot convert %T to bool", value)
+		}
+	case reflect.Slice:
+		if val.Type().AssignableTo(field.Type()) {
+			field.Set(val)
+		} else {
+			return fmt.Errorf("cannot assign %T to %s", value, field.Type())
+		}
+	case reflect.Map:
+		if val.Type().AssignableTo(field.Type()) {
+			field.Set(val)
+		} else {
+			return fmt.Errorf("cannot assign %T to %s", value, field.Type())
+		}
+	default:
+		if val.Type().AssignableTo(field.Type()) {
+			field.Set(val)
+		} else {
+			return fmt.Errorf("cannot assign %T to %s", value, field.Type())
+		}
+	}
+
+	return nil
+}
+
+// GetPropertyByPath gets a property value using dot notation path
+func GetPropertyByPath(obj interface{}, path string) (interface{}, error) {
+	parts := strings.Split(path, ".")
+	v := reflect.ValueOf(obj)
+
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+
+	for _, part := range parts {
+		if v.Kind() == reflect.Struct {
+			field := v.FieldByNameFunc(func(name string) bool {
+				return strings.EqualFold(name, part)
+			})
+
+			if !field.IsValid() {
+				t := v.Type()
+				found := false
+				for j := 0; j < t.NumField(); j++ {
+					tag := t.Field(j).Tag.Get("json")
+					tagName := strings.Split(tag, ",")[0]
+					if tagName == part {
+						field = v.Field(j)
+						found = true
+						break
+					}
+				}
+				if !found {
+					return nil, fmt.Errorf("field '%s' not found", part)
+				}
+			}
+			v = field
+		} else if v.Kind() == reflect.Map {
+			mapVal := v.MapIndex(reflect.ValueOf(part))
+			if !mapVal.IsValid() {
+				return nil, fmt.Errorf("map key '%s' not found", part)
+			}
+			v = mapVal
+		} else {
+			return nil, fmt.Errorf("cannot traverse into %s", v.Kind())
+		}
+	}
+
+	return v.Interface(), nil
+}
+
+// UpdateConfigFromJSON updates configuration from a JSON string
+func UpdateConfigFromJSON(app *Application, jsonStr string) error {
+	var updates map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &updates); err != nil {
+		return fmt.Errorf("JSON parse error: %v", err)
+	}
+
+	for path, value := range updates {
+		if err := SetPropertyByPath(&app.Config, path, value); err != nil {
+			// Try setting in Properties map
+			app.Properties[path] = value
+			fmt.Printf("Property '%s' set in dynamic properties map\n", path)
+		} else {
+			fmt.Printf("Property '%s' successfully updated to: %v\n", path, value)
+		}
+	}
+
+	return nil
+}
+
+// ConfigToJSON converts configuration to JSON string
+func ConfigToJSON(config *AppConfig) (string, error) {
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("JSON marshal error: %v", err)
+	}
+	return string(data), nil
+}
+
+// CreateSampleConfig creates a sample configuration file
+func CreateSampleConfig(filename string) error {
+	config := AppConfig{
+		Name:       "MyApp",
+		Version:    "1.0.0",
+		Debug:      false,
+		MaxRetries: 3,
+		Timeout:    30.0,
+		Features:   []string{"auth", "logging", "cache"},
+		Settings: map[string]interface{}{
+			"theme":    "dark",
+			"language": "hi",
+		},
+		Database: DatabaseConfig{
+			Host:     "localhost",
+			Port:     5432,
+			Name:     "mydb",
+			Username: "admin",
+			Password: "secret",
+			MaxConns: 10,
+		},
+		Server: ServerConfig{
+			Host:    "0.0.0.0",
+			Port:    8080,
+			TLS:     false,
+			Timeout: 60,
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(filename, data, 0644)
+}
+
+func main() {
+	// Create sample config file
+	configFile := "config.json"
+	if err := CreateSampleConfig(configFile); err != nil {
+		log.Fatalf("Config file creation error: %v", err)
+	}
+	fmt.Println("✅ Sample config file created:", configFile)
+
+	// Read and parse config
+	config, err := ReadAndParseConfig(configFile)
+	if err != nil {
+		log.Fatalf("Config read error: %v", err)
+	}
+	fmt.Println("\n✅ Config file successfully read and parsed")
+
+	// Create application
+	app := &Application{
+		Config:     *config,
+		Properties: make(map[string]interface{}),
+	}
+
+	// Display initial config
+	fmt.Println("\n📋 Initial Configuration:")
+	fmt.Printf("  App Name: %s\n", app.Config.Name)
+	fmt.Printf("  Version: %s\n", app.Config.Version)
+	fmt.Printf("  Debug: %v\n", app.Config.Debug)
+	fmt.Printf("  Database Host: %s\n", app.Config.Database.Host)
+	fmt.Printf("  Server Port: %d\n", app.Config.Server.Port)
+
+	// Use Claude AI to generate dynamic configuration updates
+	client := anthropic.NewClient()
+
+	fmt.Println("\n🤖 Claude AI से dynamic configuration updates generate हो रहे हैं...")
+
+	// Prepare conversation for streaming
+	messages := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(
+			`मुझे एक Go application के लिए JSON configuration updates generate करने हैं। 
+			
+			Current config:
+			- App Name: MyApp
+			- Version: 1.0.0  
+			- Debug: false
+			- Database Port: 5432
+			- Server Port: 8080
+			
+			Please generate a JSON object with the following updates (use dot notation for nested fields):
+			1. debug को true करो
+			2. server.port को 9090 करो
+			3. database.max_connections को 20 करो
+			4. name को "MyApp-Production" करो
+			5. max_retries को 5 करो
+			
+			Only return a valid JSON object with these updates, nothing else. Example format:
+			{"debug": true, "server.port": 9090}`)),
+	}
+
+	// Use streaming to get Claude's response
+	fmt.Println("\n📡 Streaming response from Claude AI:")
+	fmt.Println(strings.Repeat("-", 50))
+
+	var fullResponse strings.Builder
+
+	stream := client.Messages.NewStreaming(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5HaikuLatest,
+		MaxTokens: 1024,
+		Messages:  messages,
+	})
+
+	for stream.Next() {
+		event := stream.Current()
+		switch delta := event.Delta.(type) {
+		case anthropic.ContentBlockDeltaEventDelta:
+			if delta.Type == "text_delta" {
+				fmt.Print(delta.Text)
+				fullResponse.WriteString(delta.Text)
+			}
+		}
+	}
+
+	if err := stream.Err(); err != nil {
+		log.Fatalf("Streaming error: %v", err)
+	}
+
+	fmt.Println("\n" + strings.Repeat("-", 50))
+
+	// Parse and apply the updates
+	responseText := fullResponse.String()
+	
+	// Extract JSON from response
+	startIdx := strings.Index(responseText, "{")
+	endIdx := strings.LastIndex(responseText, "}")
+	
+	if startIdx != -1 && endIdx != -1 && endIdx > startIdx {
+		jsonStr := responseText[startIdx : endIdx+1]
+		
+		fmt.Println("\n🔄 Configuration updates apply हो रहे हैं...")
+		if err := UpdateConfigFromJSON(app, jsonStr); err != nil {
+			fmt.Printf("Update error: %v\n", err)
+		}
+	}
+
+	// Display updated config
+	fmt.Println("\n📋 Updated Configuration:")
+	fmt.Printf("  App Name: %s\n", app.Config.Name)
+	fmt.Printf("  Version: %s\n", app.Config.Version)
+	fmt.Printf("  Debug: %v\n", app.Config.Debug)
+	fmt.Printf("  Max Retries: %d\n", app.Config.MaxRetries)
+	fmt.Printf("  Database Max Connections: %d\n", app.Config.Database.MaxConns)
+	fmt.Printf("  Server Port: %d\n", app.Config.Server.Port)
+
+	// Demonstrate GetPropertyByPath
+	fmt.Println("\n🔍 Dynamic Property Access:")
+	paths := []string{"name", "debug", "database.host", "server.port", "max_retries"}
+	for _, path := range paths {
+		val, err := GetPropertyByPath(&app.Config, path)
+		if err != nil {
+			fmt.Printf("  %s: Error - %v\n", path, err)
+		} else {
+			fmt.Printf("  %s: %v\n", path, val)
+		}
+	}
+
+	// Save updated config
+	updatedJSON, err := ConfigToJSON(&app.Config)
+	if err != nil {
+		log.Fatalf("JSON conversion error: %v", err)
+	}
+
+	if err := os.WriteFile("config_updated.json", []byte(updatedJSON), 0644); err != nil {
+		log.Fatalf("File write error: %v", err)
+	}
+	fmt.Println("\n✅ Updated config saved to: config_updated.json")
+
+	// Ask Claude for more specific updates using streaming
+	fmt.Println("\n🤖 Claude AI से additional configuration advice ले रहे हैं...")
+	
+	messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(responseText)))
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(
+		`अब मुझे बताओ कि production environment के लिए और कौन से configuration changes करने चाहिए? 
+		Brief में 3-4 points में बताओ।`)))
+
+	fmt.Println("\n📡 Production Configuration Advice:")
+	fmt.Println(strings.Repeat("-", 50))
+
+	stream2 := client.Messages.NewStreaming(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5HaikuLatest,
+		MaxTokens: 512,
+		Messages:  messages,
+	})
+
+	for stream2.Next() {
+		event := stream2.Current()
+		switch delta := event.Delta.(type) {
+		case anthropic.ContentBlockDeltaEventDelta:
+			if delta.Type == "text_delta" {
+				fmt.Print(delta.Text)
+			}
+		}
+	}
+
+	if err := stream2.Err(); err != nil {
+		log.Fatalf("Streaming error: %v", err)
+	}
+
+	fmt.Println("\n" + strings.Repeat("-", 50))
+	fmt.Println("\n✅ Dynamic configuration management successfully completed!")
+}
+```

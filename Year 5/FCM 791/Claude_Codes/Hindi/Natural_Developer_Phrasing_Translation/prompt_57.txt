@@ -1,0 +1,894 @@
+```php
+<?php
+/**
+ * Secure File Upload System for Company Shared Drive
+ * Employees can upload PDF files to company shared directory
+ */
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+define('UPLOAD_DIR', __DIR__ . '/company_shared_drive/');
+define('MAX_FILE_SIZE', 10 * 1024 * 1024); // 10 MB
+define('ALLOWED_MIME_TYPES', ['application/pdf']);
+define('ALLOWED_EXTENSION', 'pdf');
+define('LOG_FILE', __DIR__ . '/logs/upload_log.txt');
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+/**
+ * Create required directories if not exist
+ */
+function createDirectories(): void {
+    $dirs = [UPLOAD_DIR, dirname(LOG_FILE)];
+    foreach ($dirs as $dir) {
+        if (!is_dir($dir)) {
+            mkdir($dir, 0755, true);
+        }
+    }
+}
+
+/**
+ * Log upload activity
+ */
+function logActivity(string $message, string $level = 'INFO'): void {
+    $timestamp = date('Y-m-d H:i:s');
+    $ip = $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN';
+    $logEntry = "[{$timestamp}] [{$level}] [IP: {$ip}] {$message}" . PHP_EOL;
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Sanitize filename - remove dangerous characters
+ */
+function sanitizeFilename(string $filename): string {
+    // Remove path traversal attempts
+    $filename = basename($filename);
+    
+    // Remove null bytes
+    $filename = str_replace("\0", '', $filename);
+    
+    // Allow only alphanumeric, dash, underscore, dot
+    $filename = preg_replace('/[^a-zA-Z0-9\-\_\.]/', '_', $filename);
+    
+    // Remove multiple consecutive dots (prevent double extension attacks)
+    $filename = preg_replace('/\.{2,}/', '.', $filename);
+    
+    // Trim dots and spaces from beginning and end
+    $filename = trim($filename, '. ');
+    
+    // Limit filename length
+    if (strlen($filename) > 100) {
+        $filename = substr($filename, 0, 100);
+    }
+    
+    return $filename ?: 'unnamed_file';
+}
+
+/**
+ * Generate unique secure filename
+ */
+function generateSecureFilename(string $originalName, string $employeeId): string {
+    $sanitized = sanitizeFilename($originalName);
+    
+    // Remove extension from sanitized name
+    $nameWithoutExt = pathinfo($sanitized, PATHINFO_FILENAME);
+    
+    // Generate unique name: employeeId_timestamp_randomhash_originalname.pdf
+    $timestamp = date('Ymd_His');
+    $randomHash = bin2hex(random_bytes(8));
+    
+    return "{$employeeId}_{$timestamp}_{$randomHash}_{$nameWithoutExt}.pdf";
+}
+
+/**
+ * Validate uploaded file - Multiple security checks
+ */
+function validateUploadedFile(array $file): array {
+    $errors = [];
+    
+    // Check 1: Upload error check
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $uploadErrors = [
+            UPLOAD_ERR_INI_SIZE   => 'फाइल PHP ini की size limit से बड़ी है।',
+            UPLOAD_ERR_FORM_SIZE  => 'फाइल form की size limit से बड़ी है।',
+            UPLOAD_ERR_PARTIAL    => 'फाइल partially upload हुई है।',
+            UPLOAD_ERR_NO_FILE    => 'कोई फाइल upload नहीं हुई।',
+            UPLOAD_ERR_NO_TMP_DIR => 'Temporary directory नहीं मिली।',
+            UPLOAD_ERR_CANT_WRITE => 'Disk पर write नहीं हो सका।',
+            UPLOAD_ERR_EXTENSION  => 'PHP extension ने upload रोका।',
+        ];
+        $errors[] = $uploadErrors[$file['error']] ?? 'Unknown upload error.';
+        return $errors;
+    }
+    
+    // Check 2: File size validation
+    if ($file['size'] > MAX_FILE_SIZE) {
+        $maxMB = MAX_FILE_SIZE / (1024 * 1024);
+        $errors[] = "फाइल size {$maxMB}MB से अधिक नहीं होनी चाहिए। आपकी फाइल: " . round($file['size'] / (1024 * 1024), 2) . "MB";
+    }
+    
+    // Check 3: File size should not be zero
+    if ($file['size'] === 0) {
+        $errors[] = 'फाइल empty है।';
+    }
+    
+    // Check 4: Extension validation
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($extension !== ALLOWED_EXTENSION) {
+        $errors[] = "केवल PDF files allowed हैं। आपकी फाइल extension: .{$extension}";
+    }
+    
+    // Check 5: MIME type validation using finfo (most reliable)
+    if (is_uploaded_file($file['tmp_name'])) {
+        $finfo = new finfo(FILEINFO_MIME_TYPE);
+        $mimeType = $finfo->file($file['tmp_name']);
+        
+        if (!in_array($mimeType, ALLOWED_MIME_TYPES, true)) {
+            $errors[] = "Invalid file type: {$mimeType}. केवल PDF files (application/pdf) allowed हैं।";
+        }
+        
+        // Check 6: PDF magic bytes validation (first 4 bytes should be %PDF)
+        $handle = fopen($file['tmp_name'], 'rb');
+        if ($handle) {
+            $magicBytes = fread($handle, 4);
+            fclose($handle);
+            
+            if ($magicBytes !== '%PDF') {
+                $errors[] = 'फाइल valid PDF नहीं है (magic bytes mismatch)।';
+            }
+        }
+    } else {
+        $errors[] = 'Security Error: यह valid uploaded file नहीं है।';
+    }
+    
+    // Check 7: Filename length
+    if (strlen($file['name']) > 255) {
+        $errors[] = 'Filename बहुत लंबा है।';
+    }
+    
+    return $errors;
+}
+
+/**
+ * Get employee info (in real app, fetch from session/database)
+ */
+function getEmployeeInfo(): array {
+    // In production: fetch from session after authentication
+    // session_start();
+    // return $_SESSION['employee'] ?? [];
+    
+    // Demo employee data
+    return [
+        'id'         => 'EMP' . str_pad(rand(1, 999), 3, '0', STR_PAD_LEFT),
+        'name'       => 'Demo Employee',
+        'department' => 'IT',
+    ];
+}
+
+/**
+ * Get list of uploaded files from shared drive
+ */
+function getUploadedFiles(): array {
+    $files = [];
+    
+    if (!is_dir(UPLOAD_DIR)) {
+        return $files;
+    }
+    
+    $iterator = new DirectoryIterator(UPLOAD_DIR);
+    foreach ($iterator as $fileInfo) {
+        if ($fileInfo->isFile() && strtolower($fileInfo->getExtension()) === 'pdf') {
+            $files[] = [
+                'name'     => $fileInfo->getFilename(),
+                'size'     => $fileInfo->getSize(),
+                'modified' => date('d M Y, H:i', $fileInfo->getMTime()),
+            ];
+        }
+    }
+    
+    // Sort by modification time (newest first)
+    usort($files, fn($a, $b) => strtotime($b['modified']) - strtotime($a['modified']));
+    
+    return $files;
+}
+
+/**
+ * Format file size for display
+ */
+function formatFileSize(int $bytes): string {
+    if ($bytes >= 1048576) {
+        return round($bytes / 1048576, 2) . ' MB';
+    } elseif ($bytes >= 1024) {
+        return round($bytes / 1024, 2) . ' KB';
+    }
+    return $bytes . ' Bytes';
+}
+
+// ============================================================
+// MAIN PROCESSING
+// ============================================================
+
+createDirectories();
+
+$uploadResult = null;
+$errors = [];
+$employee = getEmployeeInfo();
+
+// Handle file upload POST request
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['pdf_file'])) {
+    
+    // CSRF Token validation (basic implementation)
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== ($_SESSION['csrf_token'] ?? '')) {
+        // For demo, we skip strict CSRF - in production, enforce this
+        // $errors[] = 'Invalid CSRF token.';
+    }
+    
+    $uploadedFile = $_FILES['pdf_file'];
+    
+    // Validate the file
+    $validationErrors = validateUploadedFile($uploadedFile);
+    
+    if (!empty($validationErrors)) {
+        $errors = $validationErrors;
+        logActivity("Upload FAILED for employee {$employee['id']} - Errors: " . implode(', ', $errors), 'WARNING');
+    } else {
+        // Generate secure filename
+        $secureFilename = generateSecureFilename($uploadedFile['name'], $employee['id']);
+        $destinationPath = UPLOAD_DIR . $secureFilename;
+        
+        // Move file to shared drive
+        if (move_uploaded_file($uploadedFile['tmp_name'], $destinationPath)) {
+            // Set proper file permissions (read-only for web server)
+            chmod($destinationPath, 0644);
+            
+            $uploadResult = [
+                'success'       => true,
+                'original_name' => htmlspecialchars($uploadedFile['name']),
+                'saved_name'    => $secureFilename,
+                'size'          => formatFileSize($uploadedFile['size']),
+                'path'          => 'company_shared_drive/' . $secureFilename,
+                'employee'      => $employee,
+                'timestamp'     => date('d M Y, H:i:s'),
+            ];
+            
+            logActivity(
+                "Upload SUCCESS - Employee: {$employee['id']}, " .
+                "Original: {$uploadedFile['name']}, " .
+                "Saved as: {$secureFilename}, " .
+                "Size: " . formatFileSize($uploadedFile['size']),
+                'INFO'
+            );
+        } else {
+            $errors[] = 'फाइल save करने में error आई। Please try again।';
+            logActivity("File move FAILED for employee {$employee['id']} - File: {$uploadedFile['name']}", 'ERROR');
+        }
+    }
+}
+
+// Generate CSRF token
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+$uploadedFiles = getUploadedFiles();
+$maxFileSizeMB = MAX_FILE_SIZE / (1024 * 1024);
+?>
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Company Shared Drive - PDF Upload</title>
+    <style>
+        /* ============================================================
+           CSS STYLES
+           ============================================================ */
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            color: #e0e0e0;
+        }
+
+        /* Header */
+        .header {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding: 15px 30px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .header-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-logo .icon {
+            width: 45px;
+            height: 45px;
+            background: linear-gradient(135deg, #e94560, #0f3460);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 22px;
+        }
+
+        .header-logo h1 {
+            font-size: 20px;
+            font-weight: 700;
+            color: #ffffff;
+        }
+
+        .header-logo p {
+            font-size: 12px;
+            color: #a0a0b0;
+        }
+
+        .employee-badge {
+            background: rgba(233, 69, 96, 0.2);
+            border: 1px solid rgba(233, 69, 96, 0.4);
+            border-radius: 20px;
+            padding: 8px 16px;
+            font-size: 13px;
+            color: #e94560;
+        }
+
+        /* Main Container */
+        .container {
+            max-width: 900px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        /* Cards */
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 16px;
+            padding: 30px;
+            margin-bottom: 25px;
+        }
+
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #ffffff;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .card-title::before {
+            content: '';
+            width: 4px;
+            height: 22px;
+            background: linear-gradient(to bottom, #e94560, #0f3460);
+            border-radius: 2px;
+        }
+
+        /* Upload Zone */
+        .upload-zone {
+            border: 2px dashed rgba(233, 69, 96, 0.4);
+            border-radius: 12px;
+            padding: 50px 30px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: rgba(233, 69, 96, 0.03);
+            position: relative;
+        }
+
+        .upload-zone:hover,
+        .upload-zone.dragover {
+            border-color: #e94560;
+            background: rgba(233, 69, 96, 0.08);
+            transform: translateY(-2px);
+        }
+
+        .upload-zone .upload-icon {
+            font-size: 60px;
+            margin-bottom: 15px;
+            display: block;
+        }
+
+        .upload-zone h3 {
+            font-size: 18px;
+            color: #ffffff;
+            margin-bottom: 8px;
+        }
+
+        .upload-zone p {
+            color: #a0a0b0;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+
+        .upload-zone .file-input {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+
+        /* File Preview */
+        .file-preview {
+            display: none;
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin-top: 15px;
+            align-items: center;
+            gap: 15px;
+        }
+
+        .file-preview.show {
+            display: flex;
+        }
+
+        .file-preview .pdf-icon {
+            width: 45px;
+            height: 45px;
+            background: linear-gradient(135deg, #e94560, #c0392b);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .file-preview .file-info {
+            flex: 1;
+        }
+
+        .file-preview .file-name {
+            font-weight: 600;
+            color: #ffffff;
+            font-size: 14px;
+        }
+
+        .file-preview .file-size {
+            color: #a0a0b0;
+            font-size: 12px;
+            margin-top: 3px;
+        }
+
+        .file-preview .remove-btn {
+            background: rgba(233, 69, 96, 0.2);
+            border: 1px solid rgba(233, 69, 96, 0.4);
+            color: #e94560;
+            border-radius: 6px;
+            padding: 6px 12px;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .file-preview .remove-btn:hover {
+            background: rgba(233, 69, 96, 0.4);
+        }
+
+        /* Progress Bar */
+        .progress-container {
+            display: none;
+            margin-top: 15px;
+        }
+
+        .progress-container.show {
+            display: block;
+        }
+
+        .progress-bar-wrapper {
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            height: 8px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #e94560, #0f3460);
+            border-radius: 10px;
+            width: 0%;
+            transition: width 0.3s ease;
+            animation: shimmer 1.5s infinite;
+        }
+
+        @keyframes shimmer {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+
+        .progress-text {
+            text-align: center;
+            font-size: 13px;
+            color: #a0a0b0;
+            margin-top: 8px;
+        }
+
+        /* Submit Button */
+        .btn-upload {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #e94560, #c0392b);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            margin-top: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+        }
+
+        .btn-upload:hover {
+            background: linear-gradient(135deg, #c0392b, #a93226);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(233, 69, 96, 0.4);
+        }
+
+        .btn-upload:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        /* Alerts */
+        .alert {
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+        }
+
+        .alert-success {
+            background: rgba(39, 174, 96, 0.15);
+            border: 1px solid rgba(39, 174, 96, 0.4);
+            color: #2ecc71;
+        }
+
+        .alert-error {
+            background: rgba(231, 76, 60, 0.15);
+            border: 1px solid rgba(231, 76, 60, 0.4);
+            color: #e74c3c;
+        }
+
+        .alert-icon {
+            font-size: 20px;
+            flex-shrink: 0;
+        }
+
+        .alert-content h4 {
+            font-size: 15px;
+            font-weight: 600;
+            margin-bottom: 5px;
+        }
+
+        .alert-content p,
+        .alert-content li {
+            font-size: 13px;
+            opacity: 0.9;
+        }
+
+        .alert-content ul {
+            padding-left: 18px;
+        }
+
+        /* Success Details */
+        .success-details {
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 10px;
+        }
+
+        .success-details .detail-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            font-size: 13px;
+        }
+
+        .success-details .detail-row:last-child {
+            border-bottom: none;
+        }
+
+        .success-details .detail-label {
+            color: #a0a0b0;
+        }
+
+        .success-details .detail-value {
+            color: #2ecc71;
+            font-weight: 500;
+            word-break: break-all;
+            text-align: right;
+            max-width: 60%;
+        }
+
+        /* Requirements Box */
+        .requirements {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 10px;
+            padding: 15px 20px;
+            margin-top: 20px;
+        }
+
+        .requirements h4 {
+            font-size: 13px;
+            color: #a0a0b0;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .requirements ul {
+            list-style: none;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 6px;
+        }
+
+        .requirements li {
+            font-size: 13px;
+            color: #c0c0d0;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .requirements li::before {
+            content: '✓';
+            color: #2ecc71;
+            font-weight: bold;
+        }
+
+        /* Files Table */
+        .files-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .files-table th {
+            text-align: left;
+            padding: 12px 15px;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            color: #a0a0b0;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .files-table td {
+            padding: 12px 15px;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+            color: #c0c0d0;
+        }
+
+        .files-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .files-table tr:hover td {
+            background: rgba(255, 255, 255, 0.03);
+        }
+
+        .file-badge {
+            background: rgba(231, 76, 60, 0.2);
+            color: #e74c3c;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #a0a0b0;
+        }
+
+        .empty-state .empty-icon {
+            font-size: 50px;
+            margin-bottom: 15px;
+            opacity: 0.5;
+        }
+
+        /* Stats Bar */
+        .stats-bar {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .stat-card {
+            background: rgba(255, 255, 255, 0.05);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 12px;
+            padding: 20px;
+            text-align: center;
+        }
+
+        .stat-card .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #e94560;
+        }
+
+        .stat-card .stat-label {
+            font-size: 12px;
+            color: #a0a0b0;
+            margin-top: 5px;
+        }
+
+        /* Responsive */
+        @media (max-width: 600px) {
+            .stats-bar {
+                grid-template-columns: 1fr;
+            }
+            .requirements ul {
+                grid-template-columns: 1fr;
+            }
+            .header {
+                flex-direction: column;
+                gap: 10px;
+                text-align: center;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<!-- Header -->
+<div class="header">
+    <div class="header-logo">
+        <div class="icon">🏢</div>
+        <div>
+            <h1>Company Shared Drive</h1>
+            <p>Secure Document Management System</p>
+        </div>
+    </div>
+    <div class="employee-badge">
+        👤 <?= htmlspecialchars($employee['name']) ?> | <?= htmlspecialchars($employee['id']) ?>
+    </div>
+</div>
+
+<!-- Main Container -->
+<div class="container">
+
+    <!-- Stats Bar -->
+    <div class="stats-bar">
+        <div class="stat-card">
+            <div class="stat-value"><?= count($uploadedFiles) ?></div>
+            <div class="stat-label">📁 Total Files</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value"><?= $maxFileSizeMB ?>MB</div>
+            <div class="stat-label">📏 Max File Size</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value">PDF</div>
+            <div class="stat-label">📄 Allowed Format</div>
+        </div>
+    </div>
+
+    <!-- Success Message -->
+    <?php if ($uploadResult && $uploadResult['success']): ?>
+    <div class="alert alert-success">
+        <span class="alert-icon">✅</span>
+        <div class="alert-content">
+            <h4>फाइल Successfully Upload हो गई!</h4>
+            <div class="success-details">
+                <div class="detail-row">
+                    <span class="detail-label">Original Filename:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['original_name']) ?></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Saved As:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['saved_name']) ?></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">File Size:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['size']) ?></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Saved Path:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['path']) ?></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Uploaded By:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['employee']['id']) ?></span>
+                </div>
+                <div class="detail-row">
+                    <span class="detail-label">Timestamp:</span>
+                    <span class="detail-value"><?= htmlspecialchars($uploadResult['timestamp']) ?></span>
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Error Messages -->
+    <?php if (!empty($errors)): ?>
+    <div class="alert alert-error">
+        <span class="alert-icon">❌</span>
+        <div class="alert-content">
+            <h4>Upload Failed - निम्न errors हैं:</h4>
+            <ul>
+                <?php foreach ($errors as $error): ?>
+                    <li><?= htmlspecialchars($error) ?></li>
+                <?php endforeach; ?>
+            </ul>
+        </div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Upload Card -->
+    <div class="card">
+        <div class="card-title">PDF File Upload करें</div>
+
+        <form method="POST" enctype="multipart/form-data" id="uploadForm">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
+            <input type="hidden" name="MAX_FILE_SIZE" value="<?= MAX_FILE_SIZE ?>">
+
+            <!-- Upload Zone -->
+            <div class="upload-zone" id="uploadZone">
+                <input
+                    type="file"
+                    name="pdf_file"
+                    id="pdfFile"
+                    class="file-input"
+                    accept=".pdf,application/pdf"
+                    required
+                >
+                <span class="upload-icon">📤</span>
+                <h3>PDF File यहाँ Drop करें</h3>
+                <p>या <strong style="color: #e94560;">Browse</strong> करके select करें</p>
+                <p style="font-size: 12px; margin-top: 10px;">Maximum size: <?= $maxFileSizeMB ?>MB | Format: PDF only</p>
+            </div>
+
+            <!-- File Preview -->
+            <div class="file-preview" id="filePreview">
+                <div class="pdf-icon">📄</div>
+                <div class="file-info">
+                    <div class="file-name" id="previewName">-</div>
+                    <div class="file-size" id="previewSize">-</div>
+                </div>
+                <button type="button" class="remove-btn" id="removeFile">✕ Remove</button>
+            </div>
+
+            <!-- Progress Bar -->
+            <div class="progress-container" id="progress

@@ -1,0 +1,295 @@
+
+```python
+import anthropic
+import os
+import time
+import gzip
+import shutil
+import schedule
+import threading
+from datetime import datetime
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+def create_sample_log_files(log_dir: str):
+    """Create sample log files for demonstration"""
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_files = ['app.log', 'error.log', 'access.log']
+    for log_file in log_files:
+        log_path = os.path.join(log_dir, log_file)
+        if not os.path.exists(log_path):
+            with open(log_path, 'w') as f:
+                for i in range(100):
+                    f.write(f"[{datetime.now().isoformat()}] Sample log entry {i}\n")
+    
+    print(f"Sample log files created in {log_dir}")
+
+def get_log_rotation_strategy(log_dir: str, max_size_mb: int = 10, keep_days: int = 7) -> str:
+    """Use Claude to get log rotation strategy with streaming"""
+    
+    log_info = []
+    if os.path.exists(log_dir):
+        for file in os.listdir(log_dir):
+            file_path = os.path.join(log_dir, file)
+            if os.path.isfile(file_path):
+                size = os.path.getsize(file_path)
+                modified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                log_info.append(f"- {file}: {size/1024:.2f} KB, last modified: {modified.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    log_files_info = "\n".join(log_info) if log_info else "No log files found"
+    
+    prompt = f"""मुझे एक Python log rotation system के लिए strategy चाहिए।
+
+Current log directory: {log_dir}
+Current log files:
+{log_files_info}
+
+Requirements:
+- Maximum file size: {max_size_mb} MB
+- Keep logs for: {keep_days} days
+- Compress old logs
+- Run every 24 hours
+
+Please provide:
+1. Best practices for log rotation
+2. Specific steps to implement
+3. How to handle edge cases
+4. Monitoring recommendations
+
+Please respond in Hindi."""
+
+    print("\n🤖 Claude से log rotation strategy प्राप्त हो रही है...\n")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    return full_response
+
+def rotate_log_file(log_path: str, max_size_mb: int = 10, keep_backups: int = 5):
+    """Rotate a single log file"""
+    if not os.path.exists(log_path):
+        return False
+    
+    file_size_mb = os.path.getsize(log_path) / (1024 * 1024)
+    
+    if file_size_mb < max_size_mb:
+        return False
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = f"{log_path}.{timestamp}"
+    
+    shutil.copy2(log_path, backup_path)
+    
+    with gzip.open(f"{backup_path}.gz", 'wb') as gz_file:
+        with open(backup_path, 'rb') as f:
+            gz_file.write(f.read())
+    
+    os.remove(backup_path)
+    
+    with open(log_path, 'w') as f:
+        f.write(f"[{datetime.now().isoformat()}] Log rotated - Previous log archived\n")
+    
+    log_dir = os.path.dirname(log_path)
+    log_name = os.path.basename(log_path)
+    
+    backups = sorted([
+        f for f in os.listdir(log_dir) 
+        if f.startswith(log_name) and f.endswith('.gz')
+    ])
+    
+    while len(backups) > keep_backups:
+        old_backup = os.path.join(log_dir, backups.pop(0))
+        os.remove(old_backup)
+        print(f"  🗑️  Old backup deleted: {old_backup}")
+    
+    return True
+
+def cleanup_old_logs(log_dir: str, keep_days: int = 7):
+    """Remove log backups older than keep_days"""
+    if not os.path.exists(log_dir):
+        return
+    
+    current_time = time.time()
+    cutoff_time = current_time - (keep_days * 24 * 3600)
+    
+    deleted_count = 0
+    for file in os.listdir(log_dir):
+        if file.endswith('.gz'):
+            file_path = os.path.join(log_dir, file)
+            if os.path.getmtime(file_path) < cutoff_time:
+                os.remove(file_path)
+                deleted_count += 1
+                print(f"  🗑️  Expired log deleted: {file}")
+    
+    if deleted_count > 0:
+        print(f"  ✅ {deleted_count} expired log files deleted")
+
+def perform_log_rotation(log_dir: str, max_size_mb: int = 10, keep_days: int = 7, keep_backups: int = 5):
+    """Perform complete log rotation for all files in directory"""
+    print(f"\n🔄 Log rotation शुरू हो रही है - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+    
+    if not os.path.exists(log_dir):
+        print(f"❌ Log directory नहीं मिली: {log_dir}")
+        return
+    
+    rotated_count = 0
+    for file in os.listdir(log_dir):
+        if file.endswith('.log'):
+            file_path = os.path.join(log_dir, file)
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            
+            print(f"\n📄 Processing: {file} ({file_size_mb:.2f} MB)")
+            
+            if rotate_log_file(file_path, max_size_mb, keep_backups):
+                print(f"  ✅ Rotated successfully")
+                rotated_count += 1
+            else:
+                print(f"  ℹ️  Rotation not needed (size < {max_size_mb} MB)")
+    
+    print(f"\n🧹 Cleaning up old logs (older than {keep_days} days)...")
+    cleanup_old_logs(log_dir, keep_days)
+    
+    print(f"\n📊 Summary:")
+    print(f"  - Files rotated: {rotated_count}")
+    print(f"  - Log directory: {log_dir}")
+    
+    total_size = sum(
+        os.path.getsize(os.path.join(log_dir, f)) 
+        for f in os.listdir(log_dir) 
+        if os.path.isfile(os.path.join(log_dir, f))
+    )
+    print(f"  - Total directory size: {total_size/1024:.2f} KB")
+    print("=" * 60)
+
+def get_rotation_report(log_dir: str) -> str:
+    """Use Claude to generate a rotation report with streaming"""
+    
+    files_info = []
+    if os.path.exists(log_dir):
+        for file in os.listdir(log_dir):
+            file_path = os.path.join(log_dir, file)
+            if os.path.isfile(file_path):
+                size = os.path.getsize(file_path)
+                modified = datetime.fromtimestamp(os.path.getmtime(file_path))
+                files_info.append({
+                    'name': file,
+                    'size_kb': size/1024,
+                    'modified': modified.strftime('%Y-%m-%d %H:%M:%S'),
+                    'is_compressed': file.endswith('.gz')
+                })
+    
+    files_summary = "\n".join([
+        f"- {f['name']}: {f['size_kb']:.2f} KB, modified: {f['modified']}, compressed: {f['is_compressed']}"
+        for f in files_info
+    ])
+    
+    prompt = f"""Log rotation complete हो गई है। यहाँ current status है:
+
+Log Directory: {log_dir}
+Files:
+{files_summary}
+
+Please provide a brief report in Hindi about:
+1. Current disk usage status
+2. Rotation effectiveness
+3. Any recommendations
+4. Next steps
+
+Keep it concise and practical."""
+
+    print("\n📋 Claude से rotation report प्राप्त हो रही है...\n")
+    print("-" * 50)
+    
+    full_report = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=512,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_report += text
+    
+    print("\n" + "-" * 50)
+    return full_report
+
+def schedule_log_rotation(log_dir: str, max_size_mb: int = 10, keep_days: int = 7):
+    """Schedule log rotation every 24 hours"""
+    
+    def rotation_job():
+        perform_log_rotation(log_dir, max_size_mb, keep_days)
+        get_rotation_report(log_dir)
+    
+    schedule.every(24).hours.do(rotation_job)
+    
+    print(f"\n⏰ Log rotation scheduled every 24 hours")
+    print(f"   Log directory: {log_dir}")
+    print(f"   Max file size: {max_size_mb} MB")
+    print(f"   Keep logs for: {keep_days} days")
+    print("\nPress Ctrl+C to stop the scheduler\n")
+    
+    while True:
+        schedule.run_pending()
+        time.sleep(60)
+
+def main():
+    log_dir = "/tmp/sample_logs"
+    max_size_mb = 0.001
+    keep_days = 7
+    keep_backups = 3
+    
+    print("🚀 Log Rotation System शुरू हो रहा है")
+    print("=" * 60)
+    
+    create_sample_log_files(log_dir)
+    
+    strategy = get_log_rotation_strategy(log_dir, max_size_mb, keep_days)
+    
+    print("\n\n🔄 Initial log rotation perform हो रही है...")
+    perform_log_rotation(log_dir, max_size_mb, keep_days, keep_backups)
+    
+    report = get_rotation_report(log_dir)
+    
+    print("\n\n📅 Scheduler setup हो रहा है...")
+    print("Note: Scheduler को background में चलाने के लिए 'schedule_log_rotation' function call करें")
+    print("\nDemo के लिए, हम एक बार manual rotation perform करेंगे।")
+    
+    print("\n\n✅ Log Rotation System successfully setup हो गया!")
+    print("\nScheduler को start करने के लिए निम्न code uncomment करें:")
+    print("schedule_log_rotation(log_dir, max_size_mb, keep_days)")
+    
+    scheduler_thread = threading.Thread(
+        target=schedule_log_rotation,
+        args=(log_dir, max_size_mb, keep_days),
+        daemon=True
+    )
+    
+    print("\n💡 Tip: Production में scheduler_thread.start() call करें")
+
+if __name__ == "__main__":
+    main()
+```

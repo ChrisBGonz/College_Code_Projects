@@ -1,0 +1,218 @@
+
+```csharp
+using System;
+using System.Threading.Tasks;
+using Microsoft.Data.SqlClient;
+
+class BankTransactionExample
+{
+    private static readonly string connectionString = 
+        "Server=localhost;Database=BankDB;Trusted_Connection=true;TrustServerCertificate=true;";
+
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("Bank Transaction System");
+        Console.WriteLine("======================");
+        
+        // Display initial balances
+        await DisplayBalances();
+        
+        Console.WriteLine("\nAccount A से $100 डेबिट करके Account B में $100 क्रेडिट कर रहे हैं...\n");
+        
+        bool success = await TransferFunds(accountFromId: 1, accountToId: 2, amount: 100.00m);
+        
+        if (success)
+        {
+            Console.WriteLine("Transaction सफलतापूर्वक पूर्ण हुई!");
+        }
+        else
+        {
+            Console.WriteLine("Transaction विफल हुई!");
+        }
+        
+        // Display final balances
+        Console.WriteLine("\nTransaction के बाद:");
+        await DisplayBalances();
+    }
+
+    static async Task<bool> TransferFunds(int accountFromId, int accountToId, decimal amount)
+    {
+        using SqlConnection connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        
+        // Transaction शुरू करें
+        using SqlTransaction transaction = connection.BeginTransaction();
+        
+        try
+        {
+            // Step 1: Account A का balance check करें
+            decimal currentBalance = await GetAccountBalance(connection, transaction, accountFromId);
+            
+            Console.WriteLine($"Account A (ID: {accountFromId}) का वर्तमान balance: ${currentBalance}");
+            
+            if (currentBalance < amount)
+            {
+                Console.WriteLine("Error: Insufficient funds! Account A में पर्याप्त balance नहीं है।");
+                await transaction.RollbackAsync();
+                return false;
+            }
+            
+            // Step 2: Account A से $100 डेबिट करें
+            string debitQuery = @"
+                UPDATE Accounts 
+                SET Balance = Balance - @Amount,
+                    LastModified = GETDATE()
+                WHERE AccountId = @AccountId";
+            
+            using (SqlCommand debitCommand = new SqlCommand(debitQuery, connection, transaction))
+            {
+                debitCommand.Parameters.AddWithValue("@Amount", amount);
+                debitCommand.Parameters.AddWithValue("@AccountId", accountFromId);
+                
+                int rowsAffected = await debitCommand.ExecuteNonQueryAsync();
+                
+                if (rowsAffected == 0)
+                {
+                    throw new Exception($"Account ID {accountFromId} नहीं मिला!");
+                }
+                
+                Console.WriteLine($"✓ Account A (ID: {accountFromId}) से ${amount} डेबिट किया गया।");
+            }
+            
+            // Step 3: Account B में $100 क्रेडिट करें
+            string creditQuery = @"
+                UPDATE Accounts 
+                SET Balance = Balance + @Amount,
+                    LastModified = GETDATE()
+                WHERE AccountId = @AccountId";
+            
+            using (SqlCommand creditCommand = new SqlCommand(creditQuery, connection, transaction))
+            {
+                creditCommand.Parameters.AddWithValue("@Amount", amount);
+                creditCommand.Parameters.AddWithValue("@AccountId", accountToId);
+                
+                int rowsAffected = await creditCommand.ExecuteNonQueryAsync();
+                
+                if (rowsAffected == 0)
+                {
+                    throw new Exception($"Account ID {accountToId} नहीं मिला!");
+                }
+                
+                Console.WriteLine($"✓ Account B (ID: {accountToId}) में ${amount} क्रेडिट किया गया।");
+            }
+            
+            // Step 4: Transaction log में entry करें
+            string logQuery = @"
+                INSERT INTO TransactionLog 
+                    (FromAccountId, ToAccountId, Amount, TransactionDate, Status)
+                VALUES 
+                    (@FromAccountId, @ToAccountId, @Amount, GETDATE(), 'SUCCESS')";
+            
+            using (SqlCommand logCommand = new SqlCommand(logQuery, connection, transaction))
+            {
+                logCommand.Parameters.AddWithValue("@FromAccountId", accountFromId);
+                logCommand.Parameters.AddWithValue("@ToAccountId", accountToId);
+                logCommand.Parameters.AddWithValue("@Amount", amount);
+                
+                await logCommand.ExecuteNonQueryAsync();
+                Console.WriteLine("✓ Transaction log में entry की गई।");
+            }
+            
+            // Step 5: सब कुछ सही है, तो Commit करें
+            await transaction.CommitAsync();
+            Console.WriteLine("\n✓ Transaction Committed!");
+            
+            return true;
+        }
+        catch (Exception ex)
+        {
+            // कोई भी error आने पर Rollback करें
+            Console.WriteLine($"\nError: {ex.Message}");
+            Console.WriteLine("Transaction Rollback हो रही है...");
+            
+            try
+            {
+                await transaction.RollbackAsync();
+                Console.WriteLine("✓ Transaction Rollback सफल!");
+            }
+            catch (Exception rollbackEx)
+            {
+                Console.WriteLine($"Rollback Error: {rollbackEx.Message}");
+            }
+            
+            return false;
+        }
+    }
+
+    static async Task<decimal> GetAccountBalance(SqlConnection connection, SqlTransaction transaction, int accountId)
+    {
+        string query = "SELECT Balance FROM Accounts WHERE AccountId = @AccountId";
+        
+        using SqlCommand command = new SqlCommand(query, connection, transaction);
+        command.Parameters.AddWithValue("@AccountId", accountId);
+        
+        object? result = await command.ExecuteScalarAsync();
+        
+        if (result == null)
+        {
+            throw new Exception($"Account ID {accountId} नहीं मिला!");
+        }
+        
+        return Convert.ToDecimal(result);
+    }
+
+    static async Task DisplayBalances()
+    {
+        using SqlConnection connection = new SqlConnection(connectionString);
+        await connection.OpenAsync();
+        
+        string query = "SELECT AccountId, AccountName, Balance FROM Accounts WHERE AccountId IN (1, 2)";
+        
+        using SqlCommand command = new SqlCommand(query, connection);
+        using SqlDataReader reader = await command.ExecuteReaderAsync();
+        
+        Console.WriteLine("Account Balances:");
+        Console.WriteLine("-----------------");
+        
+        while (await reader.ReadAsync())
+        {
+            Console.WriteLine($"Account {reader["AccountName"]} (ID: {reader["AccountId"]}): ${reader["Balance"]}");
+        }
+    }
+}
+
+/* 
+Database Setup Script:
+======================
+
+-- Database बनाएं
+CREATE DATABASE BankDB;
+GO
+
+USE BankDB;
+GO
+
+-- Accounts table बनाएं
+CREATE TABLE Accounts (
+    AccountId INT PRIMARY KEY IDENTITY(1,1),
+    AccountName NVARCHAR(100) NOT NULL,
+    Balance DECIMAL(18,2) NOT NULL DEFAULT 0,
+    LastModified DATETIME DEFAULT GETDATE()
+);
+
+-- TransactionLog table बनाएं
+CREATE TABLE TransactionLog (
+    LogId INT PRIMARY KEY IDENTITY(1,1),
+    FromAccountId INT NOT NULL,
+    ToAccountId INT NOT NULL,
+    Amount DECIMAL(18,2) NOT NULL,
+    TransactionDate DATETIME DEFAULT GETDATE(),
+    Status NVARCHAR(50) NOT NULL
+);
+
+-- Test data insert करें
+INSERT INTO Accounts (AccountName, Balance) VALUES ('Account A', 500.00);
+INSERT INTO Accounts (AccountName, Balance) VALUES ('Account B', 200.00);
+
+*/
+```

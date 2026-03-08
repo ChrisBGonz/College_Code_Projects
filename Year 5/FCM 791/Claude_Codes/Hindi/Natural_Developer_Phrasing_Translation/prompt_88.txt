@@ -1,0 +1,589 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Logging;
+
+namespace MFAEventLogger
+{
+    // MFA Change Event Types
+    public enum MFAEventType
+    {
+        MFAEnabled,
+        MFADisabled,
+        MFAMethodAdded,
+        MFAMethodRemoved,
+        MFAMethodUpdated,
+        MFARecoveryCodesGenerated,
+        MFAPrimaryMethodChanged
+    }
+
+    // MFA Method Types
+    public enum MFAMethodType
+    {
+        Authenticator,
+        SMS,
+        Email,
+        HardwareToken,
+        BackupCodes,
+        BiometricKey
+    }
+
+    // MFA Change Event Model
+    public class MFAChangeEvent
+    {
+        public string EventId { get; set; } = Guid.NewGuid().ToString();
+        public string UserId { get; set; }
+        public string UserEmail { get; set; }
+        public MFAEventType EventType { get; set; }
+        public MFAMethodType? AffectedMethod { get; set; }
+        public MFAMethodType? PreviousMethod { get; set; }
+        public DateTime Timestamp { get; set; } = DateTime.UtcNow;
+        public string IPAddress { get; set; }
+        public string UserAgent { get; set; }
+        public string SessionId { get; set; }
+        public string DeviceId { get; set; }
+        public bool IsSuccessful { get; set; }
+        public string FailureReason { get; set; }
+        public Dictionary<string, string> AdditionalMetadata { get; set; } = new();
+    }
+
+    // Audit Log Entry
+    public class AuditLogEntry
+    {
+        public string LogId { get; set; } = Guid.NewGuid().ToString();
+        public string EventId { get; set; }
+        public string Category { get; set; } = "Security.MFA";
+        public string Action { get; set; }
+        public string UserId { get; set; }
+        public string UserEmail { get; set; }
+        public DateTime Timestamp { get; set; }
+        public string IPAddress { get; set; }
+        public string UserAgent { get; set; }
+        public string SessionId { get; set; }
+        public string Severity { get; set; }
+        public bool IsSuccessful { get; set; }
+        public string Details { get; set; }
+        public string RawEventJson { get; set; }
+    }
+
+    // Interface for MFA Event Logger
+    public interface IMFAEventLogger
+    {
+        Task LogMFAChangeAsync(MFAChangeEvent mfaEvent);
+        Task LogMFAEnabledAsync(string userId, string userEmail, MFAMethodType method, string ipAddress, string sessionId);
+        Task LogMFADisabledAsync(string userId, string userEmail, string ipAddress, string sessionId, string reason = null);
+        Task LogMFAMethodAddedAsync(string userId, string userEmail, MFAMethodType method, string ipAddress, string sessionId);
+        Task LogMFAMethodRemovedAsync(string userId, string userEmail, MFAMethodType method, string ipAddress, string sessionId);
+        Task LogMFAPrimaryMethodChangedAsync(string userId, string userEmail, MFAMethodType oldMethod, MFAMethodType newMethod, string ipAddress, string sessionId);
+    }
+
+    // MFA Event Logger Implementation
+    public class MFAEventLogger : IMFAEventLogger
+    {
+        private readonly ILogger<MFAEventLogger> _logger;
+        private readonly IAuditLogRepository _auditLogRepository;
+        private readonly ISecurityAlertService _securityAlertService;
+
+        public MFAEventLogger(
+            ILogger<MFAEventLogger> logger,
+            IAuditLogRepository auditLogRepository,
+            ISecurityAlertService securityAlertService)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _auditLogRepository = auditLogRepository ?? throw new ArgumentNullException(nameof(auditLogRepository));
+            _securityAlertService = securityAlertService ?? throw new ArgumentNullException(nameof(securityAlertService));
+        }
+
+        // Main method to log any MFA change event
+        public async Task LogMFAChangeAsync(MFAChangeEvent mfaEvent)
+        {
+            if (mfaEvent == null)
+                throw new ArgumentNullException(nameof(mfaEvent));
+
+            try
+            {
+                // Validate required fields
+                ValidateMFAEvent(mfaEvent);
+
+                // Create audit log entry
+                var auditEntry = CreateAuditLogEntry(mfaEvent);
+
+                // Log to application logger
+                LogToApplicationLogger(mfaEvent, auditEntry);
+
+                // Save to audit log repository
+                await _auditLogRepository.SaveAsync(auditEntry);
+
+                // Send security alert if needed
+                await HandleSecurityAlertsAsync(mfaEvent);
+
+                _logger.LogInformation(
+                    "MFA Change Event logged successfully. EventId: {EventId}, UserId: {UserId}, EventType: {EventType}",
+                    mfaEvent.EventId,
+                    mfaEvent.UserId,
+                    mfaEvent.EventType);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Failed to log MFA Change Event. EventId: {EventId}, UserId: {UserId}, EventType: {EventType}",
+                    mfaEvent.EventId,
+                    mfaEvent.UserId,
+                    mfaEvent.EventType);
+                throw;
+            }
+        }
+
+        // Log MFA Enabled Event
+        public async Task LogMFAEnabledAsync(
+            string userId,
+            string userEmail,
+            MFAMethodType method,
+            string ipAddress,
+            string sessionId)
+        {
+            var mfaEvent = new MFAChangeEvent
+            {
+                UserId = userId,
+                UserEmail = userEmail,
+                EventType = MFAEventType.MFAEnabled,
+                AffectedMethod = method,
+                IPAddress = ipAddress,
+                SessionId = sessionId,
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "Action", "MFA_ENABLED" },
+                    { "Method", method.ToString() }
+                }
+            };
+
+            await LogMFAChangeAsync(mfaEvent);
+        }
+
+        // Log MFA Disabled Event
+        public async Task LogMFADisabledAsync(
+            string userId,
+            string userEmail,
+            string ipAddress,
+            string sessionId,
+            string reason = null)
+        {
+            var mfaEvent = new MFAChangeEvent
+            {
+                UserId = userId,
+                UserEmail = userEmail,
+                EventType = MFAEventType.MFADisabled,
+                IPAddress = ipAddress,
+                SessionId = sessionId,
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "Action", "MFA_DISABLED" },
+                    { "Reason", reason ?? "User requested" }
+                }
+            };
+
+            await LogMFAChangeAsync(mfaEvent);
+        }
+
+        // Log MFA Method Added Event
+        public async Task LogMFAMethodAddedAsync(
+            string userId,
+            string userEmail,
+            MFAMethodType method,
+            string ipAddress,
+            string sessionId)
+        {
+            var mfaEvent = new MFAChangeEvent
+            {
+                UserId = userId,
+                UserEmail = userEmail,
+                EventType = MFAEventType.MFAMethodAdded,
+                AffectedMethod = method,
+                IPAddress = ipAddress,
+                SessionId = sessionId,
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "Action", "METHOD_ADDED" },
+                    { "NewMethod", method.ToString() }
+                }
+            };
+
+            await LogMFAChangeAsync(mfaEvent);
+        }
+
+        // Log MFA Method Removed Event
+        public async Task LogMFAMethodRemovedAsync(
+            string userId,
+            string userEmail,
+            MFAMethodType method,
+            string ipAddress,
+            string sessionId)
+        {
+            var mfaEvent = new MFAChangeEvent
+            {
+                UserId = userId,
+                UserEmail = userEmail,
+                EventType = MFAEventType.MFAMethodRemoved,
+                AffectedMethod = method,
+                IPAddress = ipAddress,
+                SessionId = sessionId,
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "Action", "METHOD_REMOVED" },
+                    { "RemovedMethod", method.ToString() }
+                }
+            };
+
+            await LogMFAChangeAsync(mfaEvent);
+        }
+
+        // Log MFA Primary Method Changed Event
+        public async Task LogMFAPrimaryMethodChangedAsync(
+            string userId,
+            string userEmail,
+            MFAMethodType oldMethod,
+            MFAMethodType newMethod,
+            string ipAddress,
+            string sessionId)
+        {
+            var mfaEvent = new MFAChangeEvent
+            {
+                UserId = userId,
+                UserEmail = userEmail,
+                EventType = MFAEventType.MFAPrimaryMethodChanged,
+                AffectedMethod = newMethod,
+                PreviousMethod = oldMethod,
+                IPAddress = ipAddress,
+                SessionId = sessionId,
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "Action", "PRIMARY_METHOD_CHANGED" },
+                    { "OldMethod", oldMethod.ToString() },
+                    { "NewMethod", newMethod.ToString() }
+                }
+            };
+
+            await LogMFAChangeAsync(mfaEvent);
+        }
+
+        // Private helper methods
+        private void ValidateMFAEvent(MFAChangeEvent mfaEvent)
+        {
+            if (string.IsNullOrWhiteSpace(mfaEvent.UserId))
+                throw new ArgumentException("UserId cannot be null or empty.", nameof(mfaEvent.UserId));
+
+            if (string.IsNullOrWhiteSpace(mfaEvent.UserEmail))
+                throw new ArgumentException("UserEmail cannot be null or empty.", nameof(mfaEvent.UserEmail));
+
+            if (string.IsNullOrWhiteSpace(mfaEvent.IPAddress))
+                throw new ArgumentException("IPAddress cannot be null or empty.", nameof(mfaEvent.IPAddress));
+        }
+
+        private AuditLogEntry CreateAuditLogEntry(MFAChangeEvent mfaEvent)
+        {
+            var severity = DetermineSeverity(mfaEvent);
+            var action = GetActionDescription(mfaEvent);
+
+            return new AuditLogEntry
+            {
+                EventId = mfaEvent.EventId,
+                Action = action,
+                UserId = mfaEvent.UserId,
+                UserEmail = mfaEvent.UserEmail,
+                Timestamp = mfaEvent.Timestamp,
+                IPAddress = mfaEvent.IPAddress,
+                UserAgent = mfaEvent.UserAgent,
+                SessionId = mfaEvent.SessionId,
+                Severity = severity,
+                IsSuccessful = mfaEvent.IsSuccessful,
+                Details = BuildDetailsString(mfaEvent),
+                RawEventJson = JsonSerializer.Serialize(mfaEvent, new JsonSerializerOptions
+                {
+                    WriteIndented = false
+                })
+            };
+        }
+
+        private void LogToApplicationLogger(MFAChangeEvent mfaEvent, AuditLogEntry auditEntry)
+        {
+            var logLevel = mfaEvent.EventType == MFAEventType.MFADisabled
+                ? LogLevel.Warning
+                : LogLevel.Information;
+
+            _logger.Log(logLevel,
+                "[MFA_CHANGE] EventId={EventId} | UserId={UserId} | Email={UserEmail} | " +
+                "EventType={EventType} | Method={Method} | IP={IPAddress} | " +
+                "Session={SessionId} | Success={IsSuccessful} | Timestamp={Timestamp}",
+                mfaEvent.EventId,
+                mfaEvent.UserId,
+                mfaEvent.UserEmail,
+                mfaEvent.EventType,
+                mfaEvent.AffectedMethod?.ToString() ?? "N/A",
+                mfaEvent.IPAddress,
+                mfaEvent.SessionId,
+                mfaEvent.IsSuccessful,
+                mfaEvent.Timestamp);
+        }
+
+        private async Task HandleSecurityAlertsAsync(MFAChangeEvent mfaEvent)
+        {
+            // Send high-priority alert when MFA is disabled
+            if (mfaEvent.EventType == MFAEventType.MFADisabled)
+            {
+                await _securityAlertService.SendAlertAsync(new SecurityAlert
+                {
+                    AlertType = "MFA_DISABLED",
+                    UserId = mfaEvent.UserId,
+                    UserEmail = mfaEvent.UserEmail,
+                    Message = $"MFA has been disabled for user {mfaEvent.UserEmail}",
+                    Severity = "HIGH",
+                    Timestamp = mfaEvent.Timestamp,
+                    IPAddress = mfaEvent.IPAddress
+                });
+            }
+        }
+
+        private string DetermineSeverity(MFAChangeEvent mfaEvent)
+        {
+            return mfaEvent.EventType switch
+            {
+                MFAEventType.MFADisabled => "HIGH",
+                MFAEventType.MFAEnabled => "MEDIUM",
+                MFAEventType.MFAMethodRemoved => "MEDIUM",
+                MFAEventType.MFAMethodAdded => "LOW",
+                MFAEventType.MFAMethodUpdated => "LOW",
+                MFAEventType.MFAPrimaryMethodChanged => "MEDIUM",
+                MFAEventType.MFARecoveryCodesGenerated => "LOW",
+                _ => "INFO"
+            };
+        }
+
+        private string GetActionDescription(MFAChangeEvent mfaEvent)
+        {
+            return mfaEvent.EventType switch
+            {
+                MFAEventType.MFAEnabled => "Multi-Factor Authentication Enabled",
+                MFAEventType.MFADisabled => "Multi-Factor Authentication Disabled",
+                MFAEventType.MFAMethodAdded => $"MFA Method Added: {mfaEvent.AffectedMethod}",
+                MFAEventType.MFAMethodRemoved => $"MFA Method Removed: {mfaEvent.AffectedMethod}",
+                MFAEventType.MFAMethodUpdated => $"MFA Method Updated: {mfaEvent.AffectedMethod}",
+                MFAEventType.MFAPrimaryMethodChanged => $"Primary MFA Method Changed from {mfaEvent.PreviousMethod} to {mfaEvent.AffectedMethod}",
+                MFAEventType.MFARecoveryCodesGenerated => "MFA Recovery Codes Generated",
+                _ => "Unknown MFA Change"
+            };
+        }
+
+        private string BuildDetailsString(MFAChangeEvent mfaEvent)
+        {
+            var details = new List<string>
+            {
+                $"EventType: {mfaEvent.EventType}",
+                $"UserId: {mfaEvent.UserId}",
+                $"UserEmail: {mfaEvent.UserEmail}",
+                $"Timestamp: {mfaEvent.Timestamp:yyyy-MM-dd HH:mm:ss} UTC",
+                $"IPAddress: {mfaEvent.IPAddress}",
+                $"Success: {mfaEvent.IsSuccessful}"
+            };
+
+            if (mfaEvent.AffectedMethod.HasValue)
+                details.Add($"AffectedMethod: {mfaEvent.AffectedMethod}");
+
+            if (mfaEvent.PreviousMethod.HasValue)
+                details.Add($"PreviousMethod: {mfaEvent.PreviousMethod}");
+
+            if (!string.IsNullOrEmpty(mfaEvent.FailureReason))
+                details.Add($"FailureReason: {mfaEvent.FailureReason}");
+
+            if (mfaEvent.AdditionalMetadata?.Count > 0)
+            {
+                foreach (var meta in mfaEvent.AdditionalMetadata)
+                    details.Add($"{meta.Key}: {meta.Value}");
+            }
+
+            return string.Join(" | ", details);
+        }
+    }
+
+    // Supporting interfaces and models
+    public interface IAuditLogRepository
+    {
+        Task SaveAsync(AuditLogEntry entry);
+    }
+
+    public interface ISecurityAlertService
+    {
+        Task SendAlertAsync(SecurityAlert alert);
+    }
+
+    public class SecurityAlert
+    {
+        public string AlertType { get; set; }
+        public string UserId { get; set; }
+        public string UserEmail { get; set; }
+        public string Message { get; set; }
+        public string Severity { get; set; }
+        public DateTime Timestamp { get; set; }
+        public string IPAddress { get; set; }
+    }
+
+    // In-Memory implementation for demonstration
+    public class InMemoryAuditLogRepository : IAuditLogRepository
+    {
+        private readonly List<AuditLogEntry> _logs = new();
+        private readonly ILogger<InMemoryAuditLogRepository> _logger;
+
+        public InMemoryAuditLogRepository(ILogger<InMemoryAuditLogRepository> logger)
+        {
+            _logger = logger;
+        }
+
+        public Task SaveAsync(AuditLogEntry entry)
+        {
+            _logs.Add(entry);
+            _logger.LogDebug("Audit log saved. LogId: {LogId}, EventId: {EventId}", entry.LogId, entry.EventId);
+            return Task.CompletedTask;
+        }
+
+        public IReadOnlyList<AuditLogEntry> GetAllLogs() => _logs.AsReadOnly();
+    }
+
+    public class ConsoleSecurityAlertService : ISecurityAlertService
+    {
+        private readonly ILogger<ConsoleSecurityAlertService> _logger;
+
+        public ConsoleSecurityAlertService(ILogger<ConsoleSecurityAlertService> logger)
+        {
+            _logger = logger;
+        }
+
+        public Task SendAlertAsync(SecurityAlert alert)
+        {
+            _logger.LogWarning(
+                "[SECURITY ALERT] Type={AlertType} | Severity={Severity} | " +
+                "UserId={UserId} | Email={UserEmail} | IP={IPAddress} | Message={Message}",
+                alert.AlertType,
+                alert.Severity,
+                alert.UserId,
+                alert.UserEmail,
+                alert.IPAddress,
+                alert.Message);
+
+            return Task.CompletedTask;
+        }
+    }
+
+    // Demo Program
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            // Setup logging
+            using var loggerFactory = LoggerFactory.Create(builder =>
+            {
+                builder
+                    .AddConsole()
+                    .SetMinimumLevel(LogLevel.Debug);
+            });
+
+            var mfaLogger = loggerFactory.CreateLogger<MFAEventLogger>();
+            var repoLogger = loggerFactory.CreateLogger<InMemoryAuditLogRepository>();
+            var alertLogger = loggerFactory.CreateLogger<ConsoleSecurityAlertService>();
+
+            // Create dependencies
+            var auditRepo = new InMemoryAuditLogRepository(repoLogger);
+            var alertService = new ConsoleSecurityAlertService(alertLogger);
+            var mfaEventLogger = new MFAEventLogger(mfaLogger, auditRepo, alertService);
+
+            Console.WriteLine("=== MFA Event Logger Demo ===\n");
+
+            // Test Case 1: User enables MFA
+            Console.WriteLine("--- Test 1: User enables MFA ---");
+            await mfaEventLogger.LogMFAEnabledAsync(
+                userId: "user-001",
+                userEmail: "rahul@example.com",
+                method: MFAMethodType.Authenticator,
+                ipAddress: "192.168.1.100",
+                sessionId: "sess-abc123");
+
+            Console.WriteLine();
+
+            // Test Case 2: User adds SMS method
+            Console.WriteLine("--- Test 2: User adds SMS method ---");
+            await mfaEventLogger.LogMFAMethodAddedAsync(
+                userId: "user-001",
+                userEmail: "rahul@example.com",
+                method: MFAMethodType.SMS,
+                ipAddress: "192.168.1.100",
+                sessionId: "sess-abc123");
+
+            Console.WriteLine();
+
+            // Test Case 3: User changes primary method
+            Console.WriteLine("--- Test 3: User changes primary MFA method ---");
+            await mfaEventLogger.LogMFAPrimaryMethodChangedAsync(
+                userId: "user-001",
+                userEmail: "rahul@example.com",
+                oldMethod: MFAMethodType.SMS,
+                newMethod: MFAMethodType.Authenticator,
+                ipAddress: "192.168.1.100",
+                sessionId: "sess-abc123");
+
+            Console.WriteLine();
+
+            // Test Case 4: User removes a method
+            Console.WriteLine("--- Test 4: User removes SMS method ---");
+            await mfaEventLogger.LogMFAMethodRemovedAsync(
+                userId: "user-001",
+                userEmail: "rahul@example.com",
+                method: MFAMethodType.SMS,
+                ipAddress: "10.0.0.50",
+                sessionId: "sess-xyz789");
+
+            Console.WriteLine();
+
+            // Test Case 5: User disables MFA (High severity - triggers alert)
+            Console.WriteLine("--- Test 5: User disables MFA (HIGH SEVERITY) ---");
+            await mfaEventLogger.LogMFADisabledAsync(
+                userId: "user-001",
+                userEmail: "rahul@example.com",
+                ipAddress: "203.0.113.45",
+                sessionId: "sess-def456",
+                reason: "User requested account simplification");
+
+            Console.WriteLine();
+
+            // Test Case 6: Custom MFA event with full details
+            Console.WriteLine("--- Test 6: Custom MFA event with full details ---");
+            var customEvent = new MFAChangeEvent
+            {
+                UserId = "user-002",
+                UserEmail = "priya@example.com",
+                EventType = MFAEventType.MFARecoveryCodesGenerated,
+                IPAddress = "172.16.0.1",
+                UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+                SessionId = "sess-ghi012",
+                DeviceId = "device-laptop-001",
+                IsSuccessful = true,
+                AdditionalMetadata = new Dictionary<string, string>
+                {
+                    { "CodesGenerated", "10" },
+                    { "PreviousCodesInvalidated", "true" },
+                    { "RequestSource", "SecuritySettings" }
+                }
+            };
+
+            await mfaEventLogger.LogMFAChangeAsync(customEvent);
+
+            Console.WriteLine("\n=== All MFA events logged successfully! ===");
+        }
+    }
+}
+```

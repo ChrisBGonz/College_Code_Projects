@@ -1,0 +1,608 @@
+```python
+#!/usr/bin/env python3
+"""
+Large File Line Counter
+=======================
+Counts lines in very large files (e.g., 10GB+) using:
+- Binary chunked reading (no full file load in memory)
+- Buffered I/O with configurable chunk size
+- Fast newline counting via bytes.count()
+- Progress reporting with speed metrics
+- Low RAM footprint (~chunk_size memory usage at any time)
+"""
+
+import os
+import sys
+import time
+import argparse
+import mmap
+from pathlib import Path
+from typing import Optional
+
+
+# ─────────────────────────────────────────────
+# Core Counting Functions
+# ─────────────────────────────────────────────
+
+def count_lines_chunked(
+    filepath: str,
+    chunk_size: int = 1024 * 1024,  # 1 MB default chunk
+    show_progress: bool = True,
+    encoding_check: bool = False,
+) -> dict:
+    """
+    Count lines using binary chunked reading.
+    
+    Strategy:
+    - Read file in fixed-size binary chunks
+    - Count b'\\n' occurrences in each chunk
+    - Handle edge case: last line without trailing newline
+    
+    Args:
+        filepath    : Path to the large file
+        chunk_size  : Bytes to read per iteration (default: 1MB)
+        show_progress: Print progress to stderr
+        encoding_check: Also detect if file has Windows (\\r\\n) line endings
+    
+    Returns:
+        dict with line_count, file_size, time_taken, speed_mbps, etc.
+    """
+    filepath = Path(filepath)
+    
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    
+    if not filepath.is_file():
+        raise ValueError(f"Path is not a file: {filepath}")
+    
+    file_size = filepath.stat().st_size
+    
+    if file_size == 0:
+        return {
+            "line_count": 0,
+            "file_size_bytes": 0,
+            "file_size_human": "0 B",
+            "time_taken_sec": 0.0,
+            "speed_mbps": 0.0,
+            "chunks_processed": 0,
+            "has_trailing_newline": True,
+            "line_ending": "unknown",
+        }
+    
+    line_count = 0
+    bytes_read = 0
+    chunks_processed = 0
+    last_byte = b""
+    crlf_count = 0  # Windows \r\n count
+    
+    start_time = time.perf_counter()
+    last_progress_time = start_time
+    
+    # ── Open in binary mode with explicit buffer size ──
+    with open(filepath, "rb", buffering=chunk_size * 2) as f:
+        
+        while True:
+            chunk = f.read(chunk_size)
+            
+            if not chunk:
+                break  # EOF
+            
+            # ── Fast newline count ──
+            line_count += chunk.count(b"\n")
+            
+            # ── Optional: detect Windows line endings ──
+            if encoding_check:
+                crlf_count += chunk.count(b"\r\n")
+            
+            # ── Track last byte for trailing newline check ──
+            last_byte = chunk[-1:]
+            
+            bytes_read += len(chunk)
+            chunks_processed += 1
+            
+            # ── Progress reporting (every 2 seconds) ──
+            if show_progress:
+                now = time.perf_counter()
+                if now - last_progress_time >= 2.0:
+                    elapsed = now - start_time
+                    percent = (bytes_read / file_size) * 100
+                    speed = (bytes_read / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                    eta = ((file_size - bytes_read) / (bytes_read / elapsed)) if bytes_read > 0 and elapsed > 0 else 0
+                    
+                    print(
+                        f"\r  Progress: {percent:6.2f}% | "
+                        f"Read: {_human_size(bytes_read):>10} / {_human_size(file_size)} | "
+                        f"Lines: {line_count:,} | "
+                        f"Speed: {speed:7.2f} MB/s | "
+                        f"ETA: {_format_time(eta)}",
+                        end="",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    last_progress_time = now
+    
+    if show_progress:
+        print("", file=sys.stderr)  # newline after progress
+    
+    end_time = time.perf_counter()
+    time_taken = end_time - start_time
+    
+    # ── Handle last line without trailing newline ──
+    has_trailing_newline = (last_byte == b"\n")
+    if not has_trailing_newline and file_size > 0:
+        line_count += 1  # last line exists but has no \n
+    
+    # ── Determine line ending style ──
+    if encoding_check:
+        if crlf_count > 0 and crlf_count == line_count - (0 if has_trailing_newline else 1):
+            line_ending = "CRLF (Windows \\r\\n)"
+        elif crlf_count > 0:
+            line_ending = f"Mixed (CRLF: {crlf_count:,}, LF: {line_count - crlf_count:,})"
+        else:
+            line_ending = "LF (Unix \\n)"
+    else:
+        line_ending = "not checked"
+    
+    speed_mbps = (file_size / (1024 * 1024)) / time_taken if time_taken > 0 else 0
+    
+    return {
+        "line_count": line_count,
+        "file_size_bytes": file_size,
+        "file_size_human": _human_size(file_size),
+        "time_taken_sec": round(time_taken, 4),
+        "speed_mbps": round(speed_mbps, 2),
+        "chunks_processed": chunks_processed,
+        "chunk_size_bytes": chunk_size,
+        "has_trailing_newline": has_trailing_newline,
+        "line_ending": line_ending,
+    }
+
+
+def count_lines_mmap(
+    filepath: str,
+    show_progress: bool = True,
+) -> dict:
+    """
+    Alternative: Count lines using memory-mapped file.
+    
+    mmap maps file into virtual address space without loading it all into RAM.
+    OS handles paging automatically — only accessed pages are in RAM.
+    
+    Best for: SSDs, repeated counting of same file (OS page cache)
+    Note: On 32-bit Python, limited to ~2GB files. Use chunked for larger.
+    
+    Args:
+        filepath    : Path to the large file
+        show_progress: Print progress to stderr
+    
+    Returns:
+        dict with line_count and metrics
+    """
+    filepath = Path(filepath)
+    
+    if not filepath.exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    
+    file_size = filepath.stat().st_size
+    
+    if file_size == 0:
+        return {
+            "line_count": 0,
+            "file_size_bytes": 0,
+            "file_size_human": "0 B",
+            "time_taken_sec": 0.0,
+            "speed_mbps": 0.0,
+            "method": "mmap",
+        }
+    
+    start_time = time.perf_counter()
+    
+    with open(filepath, "rb") as f:
+        # ── Create read-only memory map ──
+        with mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ) as mm:
+            
+            if show_progress:
+                print(f"  [mmap] Mapping {_human_size(file_size)} file...", file=sys.stderr)
+            
+            # ── Count newlines across entire mmap ──
+            # mmap supports .count() just like bytes
+            line_count = mm.count(b"\n")
+            
+            # ── Check trailing newline ──
+            mm.seek(-1, 2)  # seek to last byte
+            last_byte = mm.read(1)
+            has_trailing_newline = (last_byte == b"\n")
+            
+            if not has_trailing_newline:
+                line_count += 1
+    
+    end_time = time.perf_counter()
+    time_taken = end_time - start_time
+    speed_mbps = (file_size / (1024 * 1024)) / time_taken if time_taken > 0 else 0
+    
+    return {
+        "line_count": line_count,
+        "file_size_bytes": file_size,
+        "file_size_human": _human_size(file_size),
+        "time_taken_sec": round(time_taken, 4),
+        "speed_mbps": round(speed_mbps, 2),
+        "has_trailing_newline": has_trailing_newline,
+        "method": "mmap",
+    }
+
+
+def count_lines_wc_style(
+    filepath: str,
+    chunk_size: int = 64 * 1024,  # 64KB — matches wc's typical buffer
+    show_progress: bool = True,
+) -> dict:
+    """
+    Ultra-fast line counter mimicking Unix `wc -l` behavior.
+    Uses smallest practical chunk size for maximum throughput.
+    
+    This is the fastest pure-Python approach for sequential reads.
+    
+    Args:
+        filepath  : Path to file
+        chunk_size: Read buffer size (64KB matches kernel page size multiples)
+    
+    Returns:
+        dict with line_count and metrics
+    """
+    return count_lines_chunked(
+        filepath=filepath,
+        chunk_size=chunk_size,
+        show_progress=show_progress,
+        encoding_check=True,
+    )
+
+
+# ─────────────────────────────────────────────
+# Utility Functions
+# ─────────────────────────────────────────────
+
+def _human_size(size_bytes: int) -> str:
+    """Convert bytes to human-readable string."""
+    if size_bytes == 0:
+        return "0 B"
+    
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    unit_index = 0
+    size = float(size_bytes)
+    
+    while size >= 1024.0 and unit_index < len(units) - 1:
+        size /= 1024.0
+        unit_index += 1
+    
+    if unit_index == 0:
+        return f"{int(size)} {units[unit_index]}"
+    return f"{size:.2f} {units[unit_index]}"
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds into human-readable time string."""
+    if seconds < 0:
+        return "??:??"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {s}s"
+    else:
+        h, rem = divmod(int(seconds), 3600)
+        m, s = divmod(rem, 60)
+        return f"{h}h {m}m {s}s"
+
+
+def print_results(results: dict, method: str = "chunked") -> None:
+    """Pretty print the counting results."""
+    print("\n" + "═" * 55)
+    print("  📄 LARGE FILE LINE COUNTER — RESULTS")
+    print("═" * 55)
+    print(f"  Method          : {method}")
+    print(f"  Line Count      : {results['line_count']:,}")
+    print(f"  File Size       : {results['file_size_human']} ({results['file_size_bytes']:,} bytes)")
+    print(f"  Time Taken      : {results['time_taken_sec']} seconds")
+    print(f"  Read Speed      : {results['speed_mbps']} MB/s")
+    
+    if "chunks_processed" in results:
+        print(f"  Chunks Read     : {results['chunks_processed']:,} × {_human_size(results['chunk_size_bytes'])}")
+    
+    if "has_trailing_newline" in results:
+        trailing = "Yes ✓" if results["has_trailing_newline"] else "No (last line counted)"
+        print(f"  Trailing Newline: {trailing}")
+    
+    if "line_ending" in results and results["line_ending"] != "not checked":
+        print(f"  Line Endings    : {results['line_ending']}")
+    
+    print("═" * 55)
+    print(f"\n  ✅ Total Lines: {results['line_count']:,}\n")
+
+
+# ─────────────────────────────────────────────
+# Benchmark: Compare All Methods
+# ─────────────────────────────────────────────
+
+def benchmark_all_methods(filepath: str) -> None:
+    """
+    Run all counting methods and compare performance.
+    Useful for choosing the best method for your system.
+    """
+    print(f"\n{'═' * 60}")
+    print("  🏁 BENCHMARK: Comparing All Line Counting Methods")
+    print(f"{'═' * 60}")
+    print(f"  File: {filepath}")
+    print(f"  Size: {_human_size(Path(filepath).stat().st_size)}")
+    print(f"{'─' * 60}\n")
+    
+    methods = [
+        ("Chunked (1MB chunks)",  lambda: count_lines_chunked(filepath, chunk_size=1024*1024,    show_progress=False)),
+        ("Chunked (8MB chunks)",  lambda: count_lines_chunked(filepath, chunk_size=8*1024*1024,  show_progress=False)),
+        ("Chunked (64KB chunks)", lambda: count_lines_chunked(filepath, chunk_size=64*1024,      show_progress=False)),
+        ("mmap",                  lambda: count_lines_mmap(filepath,                             show_progress=False)),
+    ]
+    
+    results_table = []
+    
+    for name, method_fn in methods:
+        print(f"  Running: {name}...", end="", flush=True)
+        try:
+            result = method_fn()
+            results_table.append({
+                "name": name,
+                "lines": result["line_count"],
+                "time": result["time_taken_sec"],
+                "speed": result["speed_mbps"],
+            })
+            print(f" ✓ {result['time_taken_sec']}s @ {result['speed_mbps']} MB/s")
+        except Exception as e:
+            print(f" ✗ Error: {e}")
+            results_table.append({"name": name, "lines": "ERROR", "time": 999, "speed": 0})
+    
+    # ── Sort by speed ──
+    results_table.sort(key=lambda x: x["time"] if isinstance(x["time"], (int, float)) else 999)
+    
+    print(f"\n{'─' * 60}")
+    print(f"  {'Method':<28} {'Lines':>12} {'Time':>8} {'Speed':>12}")
+    print(f"{'─' * 60}")
+    
+    for i, r in enumerate(results_table):
+        medal = ["🥇", "🥈", "🥉", "  "][min(i, 3)]
+        lines_str = f"{r['lines']:,}" if isinstance(r['lines'], int) else str(r['lines'])
+        time_str  = f"{r['time']}s"  if isinstance(r['time'],  float) else str(r['time'])
+        speed_str = f"{r['speed']} MB/s" if isinstance(r['speed'], float) else "N/A"
+        print(f"  {medal} {r['name']:<26} {lines_str:>12} {time_str:>8} {speed_str:>12}")
+    
+    print(f"{'═' * 60}\n")
+
+
+# ─────────────────────────────────────────────
+# Test File Generator (for testing)
+# ─────────────────────────────────────────────
+
+def generate_test_file(
+    filepath: str,
+    size_mb: int = 100,
+    line_length: int = 80,
+) -> None:
+    """
+    Generate a test file of specified size for benchmarking.
+    
+    Args:
+        filepath   : Output file path
+        size_mb    : Target file size in MB
+        line_length: Average characters per line
+    """
+    target_bytes = size_mb * 1024 * 1024
+    chunk_lines = 10_000
+    
+    # Sample line template
+    line_template = (
+        "The quick brown fox jumps over the lazy dog. "
+        "0123456789 ABCDEFGHIJKLMNOPQRSTUVWXYZ "
+    )
+    # Pad/trim to desired length
+    sample_line = (line_template * ((line_length // len(line_template)) + 1))[:line_length - 1] + "\n"
+    sample_line = sample_line.encode("utf-8")
+    
+    chunk = sample_line * chunk_lines
+    bytes_written = 0
+    lines_written = 0
+    
+    print(f"  Generating {size_mb}MB test file: {filepath}", file=sys.stderr)
+    start = time.perf_counter()
+    
+    with open(filepath, "wb", buffering=8 * 1024 * 1024) as f:
+        while bytes_written < target_bytes:
+            remaining = target_bytes - bytes_written
+            if remaining < len(chunk):
+                # Write partial chunk
+                partial_lines = remaining // len(sample_line)
+                write_data = sample_line * partial_lines
+            else:
+                write_data = chunk
+            
+            f.write(write_data)
+            bytes_written += len(write_data)
+            lines_written += len(write_data) // len(sample_line)
+    
+    elapsed = time.perf_counter() - start
+    print(
+        f"  ✅ Generated: {_human_size(bytes_written)} | "
+        f"{lines_written:,} lines | "
+        f"{elapsed:.2f}s",
+        file=sys.stderr,
+    )
+
+
+# ─────────────────────────────────────────────
+# CLI Interface
+# ─────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Count lines in large files without loading them into memory",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Count lines in a large file (default: 1MB chunks)
+  python solution.py /path/to/large_file.txt
+
+  # Use 8MB chunks for faster SSD reads
+  python solution.py /path/to/large_file.txt --chunk-size 8388608
+
+  # Use mmap method
+  python solution.py /path/to/large_file.txt --method mmap
+
+  # Benchmark all methods
+  python solution.py /path/to/large_file.txt --benchmark
+
+  # Generate a 500MB test file then count
+  python solution.py --generate-test /tmp/test_500mb.txt --test-size 500
+  python solution.py /tmp/test_500mb.txt --benchmark
+
+  # Silent mode (only print line count)
+  python solution.py /path/to/large_file.txt --quiet
+        """,
+    )
+    
+    parser.add_argument(
+        "filepath",
+        nargs="?",
+        help="Path to the large file to count lines in",
+    )
+    parser.add_argument(
+        "--method",
+        choices=["chunked", "mmap", "wc"],
+        default="chunked",
+        help="Counting method to use (default: chunked)",
+    )
+    parser.add_argument(
+        "--chunk-size",
+        type=int,
+        default=1024 * 1024,  # 1MB
+        metavar="BYTES",
+        help="Chunk size in bytes for chunked reading (default: 1048576 = 1MB)",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Benchmark all methods and compare performance",
+    )
+    parser.add_argument(
+        "--quiet", "-q",
+        action="store_true",
+        help="Only print the line count number",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress reporting",
+    )
+    parser.add_argument(
+        "--generate-test",
+        metavar="OUTPUT_PATH",
+        help="Generate a test file at the specified path",
+    )
+    parser.add_argument(
+        "--test-size",
+        type=int,
+        default=100,
+        metavar="MB",
+        help="Size of test file to generate in MB (default: 100)",
+    )
+    
+    return parser.parse_args()
+
+
+# ─────────────────────────────────────────────
+# Main Entry Point
+# ─────────────────────────────────────────────
+
+def main() -> int:
+    args = parse_args()
+    
+    # ── Generate test file if requested ──
+    if args.generate_test:
+        generate_test_file(args.generate_test, size_mb=args.test_size)
+        if not args.filepath:
+            return 0
+    
+    # ── Validate input ──
+    if not args.filepath:
+        print("Error: Please provide a filepath. Use --help for usage.", file=sys.stderr)
+        return 1
+    
+    filepath = args.filepath
+    show_progress = not args.quiet and not args.no_progress
+    
+    # ── Benchmark mode ──
+    if args.benchmark:
+        benchmark_all_methods(filepath)
+        return 0
+    
+    # ── Single method counting ──
+    if not args.quiet:
+        print(f"\n  📂 File: {filepath}")
+        print(f"  📏 Size: {_human_size(Path(filepath).stat().st_size)}")
+        print(f"  🔧 Method: {args.method}")
+        if args.method == "chunked":
+            print(f"  📦 Chunk Size: {_human_size(args.chunk_size)}")
+        print()
+    
+    try:
+        if args.method == "mmap":
+            results = count_lines_mmap(
+                filepath=filepath,
+                show_progress=show_progress,
+            )
+            method_name = "mmap (memory-mapped)"
+            
+        elif args.method == "wc":
+            results = count_lines_wc_style(
+                filepath=filepath,
+                show_progress=show_progress,
+            )
+            method_name = "wc-style (64KB chunks)"
+            
+        else:  # chunked (default)
+            results = count_lines_chunked(
+                filepath=filepath,
+                chunk_size=args.chunk_size,
+                show_progress=show_progress,
+                encoding_check=True,
+            )
+            method_name = f"chunked ({_human_size(args.chunk_size)} chunks)"
+        
+        # ── Output results ──
+        if args.quiet:
+            print(results["line_count"])
+        else:
+            print_results(results, method=method_name)
+        
+        return 0
+    
+    except FileNotFoundError as e:
+        print(f"\n  ❌ Error: {e}", file=sys.stderr)
+        return 2
+    
+    except PermissionError as e:
+        print(f"\n  ❌ Permission denied: {e}", file=sys.stderr)
+        return 3
+    
+    except MemoryError:
+        print(
+            "\n  ❌ MemoryError: mmap failed (file too large for 32-bit Python?).\n"
+            "     Try --method chunked instead.",
+            file=sys.stderr,
+        )
+        return 4
+    
+    except KeyboardInterrupt:
+        print("\n\n  ⚠️  Interrupted by user.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```

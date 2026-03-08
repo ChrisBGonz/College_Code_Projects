@@ -1,0 +1,362 @@
+
+```python
+import os
+import hashlib
+import secrets
+from flask import Flask, request, jsonify, session
+from flask_sqlalchemy import SQLAlchemy
+from datetime import datetime
+from anthropic import Anthropic
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+client = Anthropic()
+
+# Database Models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    salt = db.Column(db.String(64), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_login = db.Column(db.DateTime)
+    is_active = db.Column(db.Boolean, default=True)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+class LoginAttempt(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), nullable=False)
+    success = db.Column(db.Boolean, nullable=False)
+    ip_address = db.Column(db.String(45))
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+# Helper Functions
+def hash_password(password: str, salt: str) -> str:
+    """Hash password with salt using SHA-256"""
+    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
+
+def create_user(username: str, password: str, email: str) -> dict:
+    """Create a new user in the database"""
+    # Check if user already exists
+    if User.query.filter_by(username=username).first():
+        return {"success": False, "message": "Username already exists"}
+    
+    if User.query.filter_by(email=email).first():
+        return {"success": False, "message": "Email already exists"}
+    
+    # Generate salt and hash password
+    salt = secrets.token_hex(32)
+    password_hash = hash_password(password, salt)
+    
+    # Create new user
+    new_user = User(
+        username=username,
+        password_hash=password_hash,
+        salt=salt,
+        email=email
+    )
+    
+    db.session.add(new_user)
+    db.session.commit()
+    
+    return {"success": True, "message": f"User '{username}' created successfully"}
+
+def verify_user(username: str, password: str) -> dict:
+    """Verify user credentials against database"""
+    user = User.query.filter_by(username=username).first()
+    
+    if not user:
+        return {"success": False, "message": "User not found"}
+    
+    if not user.is_active:
+        return {"success": False, "message": "Account is deactivated"}
+    
+    # Verify password
+    password_hash = hash_password(password, user.salt)
+    
+    if password_hash == user.password_hash:
+        # Update last login
+        user.last_login = datetime.utcnow()
+        db.session.commit()
+        return {
+            "success": True, 
+            "message": "Login successful",
+            "user": {
+                "id": user.id,
+                "username": user.username,
+                "email": user.email,
+                "last_login": str(user.last_login)
+            }
+        }
+    else:
+        return {"success": False, "message": "Invalid password"}
+
+def log_login_attempt(username: str, success: bool, ip_address: str):
+    """Log login attempt to database"""
+    attempt = LoginAttempt(
+        username=username,
+        success=success,
+        ip_address=ip_address
+    )
+    db.session.add(attempt)
+    db.session.commit()
+
+# Conversation history for multi-turn chat
+conversation_history = []
+
+def chat_with_claude(user_message: str) -> str:
+    """Send message to Claude and get response"""
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="""You are a helpful assistant for a Flask login system. You can help users with:
+        1. Creating new accounts (provide username, password, email)
+        2. Logging in (provide username and password)
+        3. Checking login history
+        4. Getting user information
+        
+        When users want to create an account or login, extract the credentials from their message and respond with a JSON-like format:
+        - For registration: {"action": "register", "username": "...", "password": "...", "email": "..."}
+        - For login: {"action": "login", "username": "...", "password": "..."}
+        - For other queries: Just respond normally
+        
+        Always be helpful and guide users through the process.""",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def process_claude_response(response: str, ip_address: str) -> dict:
+    """Process Claude's response and execute appropriate actions"""
+    import json
+    import re
+    
+    # Try to extract JSON from response
+    json_pattern = r'\{[^{}]*"action"[^{}]*\}'
+    matches = re.findall(json_pattern, response)
+    
+    if matches:
+        try:
+            action_data = json.loads(matches[0])
+            action = action_data.get("action")
+            
+            if action == "register":
+                username = action_data.get("username")
+                password = action_data.get("password")
+                email = action_data.get("email")
+                
+                if username and password and email:
+                    result = create_user(username, password, email)
+                    return {
+                        "claude_response": response,
+                        "action_result": result
+                    }
+            
+            elif action == "login":
+                username = action_data.get("username")
+                password = action_data.get("password")
+                
+                if username and password:
+                    result = verify_user(username, password)
+                    log_login_attempt(username, result["success"], ip_address)
+                    
+                    if result["success"]:
+                        session['user_id'] = result['user']['id']
+                        session['username'] = result['user']['username']
+                    
+                    return {
+                        "claude_response": response,
+                        "action_result": result
+                    }
+        except json.JSONDecodeError:
+            pass
+    
+    return {"claude_response": response}
+
+# Flask Routes
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Main chat endpoint for interacting with Claude"""
+    data = request.get_json()
+    
+    if not data or 'message' not in data:
+        return jsonify({"error": "Message is required"}), 400
+    
+    user_message = data['message']
+    ip_address = request.remote_addr
+    
+    # Get Claude's response
+    claude_response = chat_with_claude(user_message)
+    
+    # Process the response and execute actions
+    result = process_claude_response(claude_response, ip_address)
+    
+    return jsonify(result)
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Direct login endpoint"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "JSON data required"}), 400
+    
+    username = data.get('username')
+    password = data.get('password')
+    
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    
+    ip_address = request.remote_addr
+    result = verify_user(username, password)
+    log_login_attempt(username, result["success"], ip_address)
+    
+    if result["success"]:
+        session['user_id'] = result['user']['id']
+        session['username'] = result['user']['username']
+        return jsonify(result), 200
+    else:
+        return jsonify(result), 401
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Direct registration endpoint"""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "JSON data required"}), 400
+    
+    username = data.get('username')
+    password = data.get('password')
+    email = data.get('email')
+    
+    if not username or not password or not email:
+        return jsonify({"error": "Username, password, and email are required"}), 400
+    
+    result = create_user(username, password, email)
+    
+    if result["success"]:
+        return jsonify(result), 201
+    else:
+        return jsonify(result), 400
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout endpoint"""
+    session.clear()
+    return jsonify({"success": True, "message": "Logged out successfully"})
+
+@app.route('/profile', methods=['GET'])
+def profile():
+    """Get current user profile"""
+    if 'user_id' not in session:
+        return jsonify({"error": "Not logged in"}), 401
+    
+    user = User.query.get(session['user_id'])
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    return jsonify({
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "created_at": str(user.created_at),
+        "last_login": str(user.last_login) if user.last_login else None
+    })
+
+@app.route('/login-history', methods=['GET'])
+def login_history():
+    """Get login history for current user"""
+    if 'username' not in session:
+        return jsonify({"error": "Not logged in"}), 401
+    
+    attempts = LoginAttempt.query.filter_by(
+        username=session['username']
+    ).order_by(LoginAttempt.timestamp.desc()).limit(10).all()
+    
+    history = [{
+        "success": attempt.success,
+        "ip_address": attempt.ip_address,
+        "timestamp": str(attempt.timestamp)
+    } for attempt in attempts]
+    
+    return jsonify({"login_history": history})
+
+@app.route('/reset-conversation', methods=['POST'])
+def reset_conversation():
+    """Reset the conversation history with Claude"""
+    global conversation_history
+    conversation_history = []
+    return jsonify({"success": True, "message": "Conversation reset successfully"})
+
+@app.route('/', methods=['GET'])
+def index():
+    """Home endpoint with API documentation"""
+    return jsonify({
+        "message": "Flask Login System with Claude AI",
+        "endpoints": {
+            "POST /chat": "Chat with Claude AI for login/registration assistance",
+            "POST /login": "Direct login with username/password",
+            "POST /register": "Direct registration with username/password/email",
+            "POST /logout": "Logout current user",
+            "GET /profile": "Get current user profile",
+            "GET /login-history": "Get login history",
+            "POST /reset-conversation": "Reset Claude conversation history"
+        },
+        "example_chat_messages": [
+            "I want to create a new account",
+            "Register me with username: john, password: secret123, email: john@example.com",
+            "Login with username: john and password: secret123",
+            "Show me my login history"
+        ]
+    })
+
+def initialize_database():
+    """Initialize database and create sample users"""
+    with app.app_context():
+        db.create_all()
+        
+        # Create sample users if they don't exist
+        if not User.query.filter_by(username='admin').first():
+            create_user('admin', 'admin123', 'admin@example.com')
+            print("Created sample user: admin/admin123")
+        
+        if not User.query.filter_by(username='testuser').first():
+            create_user('testuser', 'test123', 'test@example.com')
+            print("Created sample user: testuser/test123")
+
+if __name__ == '__main__':
+    initialize_database()
+    print("\n=== Flask Login System with Claude AI ===")
+    print("Server starting on http://localhost:5000")
+    print("\nSample users created:")
+    print("  - Username: admin, Password: admin123")
+    print("  - Username: testuser, Password: test123")
+    print("\nYou can interact via:")
+    print("  1. POST /chat - Chat with Claude AI")
+    print("  2. POST /login - Direct login")
+    print("  3. POST /register - Direct registration")
+    print("\nExample curl commands:")
+    print('  curl -X POST http://localhost:5000/login -H "Content-Type: application/json" -d \'{"username":"admin","password":"admin123"}\'')
+    print('  curl -X POST http://localhost:5000/chat -H "Content-Type: application/json" -d \'{"message":"Login with username admin and password admin123"}\'')
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

@@ -1,0 +1,202 @@
+```cpp
+#include <iostream>
+#include <cstring>
+#include <cerrno>
+#include <cstdint>
+#include <memory>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+// ─────────────────────────────────────────────
+// Constants / limits
+// ─────────────────────────────────────────────
+static constexpr uint32_t MIN_BUFFER_SIZE  =        1u;          // 1 byte
+static constexpr uint32_t MAX_BUFFER_SIZE  = 64u * 1024u * 1024u; // 64 MiB hard cap
+static constexpr int      RECV_TIMEOUT_SEC =        30;          // socket read timeout
+
+// ─────────────────────────────────────────────
+// Custom exception hierarchy
+// ─────────────────────────────────────────────
+struct NetworkError    : public std::runtime_error { using std::runtime_error::runtime_error; };
+struct ValidationError : public std::runtime_error { using std::runtime_error::runtime_error; };
+struct AllocationError : public std::runtime_error { using std::runtime_error::runtime_error; };
+
+// ─────────────────────────────────────────────
+// Helper: recv() wrapper that guarantees a full read
+//   Returns false on peer disconnect, throws on error / timeout.
+// ─────────────────────────────────────────────
+static bool recvFull(int sockfd, void* buf, size_t needed)
+{
+    auto* ptr      = static_cast<uint8_t*>(buf);
+    size_t received = 0;
+
+    while (received < needed) {
+        ssize_t n = ::recv(sockfd,
+                           ptr + received,
+                           needed - received,
+                           0);          // MSG_WAITALL could also be used
+        if (n == 0) {
+            // Peer closed connection gracefully
+            return false;
+        }
+        if (n < 0) {
+            if (errno == EINTR) continue;   // interrupted by signal – retry
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                throw NetworkError("Socket read timed out (EAGAIN/EWOULDBLOCK)");
+            }
+            throw NetworkError(std::string("recv() failed: ") + std::strerror(errno));
+        }
+        received += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+// ─────────────────────────────────────────────
+// Helper: set a receive timeout on the socket
+// ─────────────────────────────────────────────
+static void setRecvTimeout(int sockfd, int seconds)
+{
+    struct timeval tv{};
+    tv.tv_sec  = seconds;
+    tv.tv_usec = 0;
+    if (::setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO,
+                     &tv, sizeof(tv)) < 0) {
+        throw NetworkError(std::string("setsockopt(SO_RCVTIMEO) failed: ")
+                           + std::strerror(errno));
+    }
+}
+
+// ─────────────────────────────────────────────
+// Result structure returned to the caller
+// ─────────────────────────────────────────────
+struct ReadResult {
+    std::unique_ptr<uint8_t[]> buffer;   // owning buffer
+    uint32_t                   size;     // actual payload bytes stored
+};
+
+// ─────────────────────────────────────────────
+// Main function
+//
+// Protocol (little-endian, fixed header):
+//   [4 bytes] uint32_t  – payload size requested by client
+//   [N bytes] payload   – actual data
+//
+// Returns a ReadResult on success.
+// Throws NetworkError / ValidationError / AllocationError on failure.
+// ─────────────────────────────────────────────
+ReadResult readClientBuffer(int sockfd)
+{
+    // ── 1. Set receive timeout ────────────────────────────────────────────
+    setRecvTimeout(sockfd, RECV_TIMEOUT_SEC);
+
+    // ── 2. Read the 4-byte size header ───────────────────────────────────
+    uint32_t rawSize = 0;
+    {
+        bool ok = recvFull(sockfd, &rawSize, sizeof(rawSize));
+        if (!ok) {
+            throw NetworkError("Client disconnected before sending size header");
+        }
+    }
+
+    // ── 3. Convert from network byte order (big-endian) to host order ─────
+    //       If your protocol uses little-endian, replace with le32toh().
+    uint32_t requestedSize = ntohl(rawSize);
+
+    // ── 4. Validate the requested size ───────────────────────────────────
+    if (requestedSize < MIN_BUFFER_SIZE) {
+        throw ValidationError("Requested size is zero or below minimum ("
+                              + std::to_string(requestedSize) + " bytes)");
+    }
+
+    if (requestedSize > MAX_BUFFER_SIZE) {
+        throw ValidationError("Requested size exceeds maximum cap ("
+                              + std::to_string(requestedSize)
+                              + " > " + std::to_string(MAX_BUFFER_SIZE) + " bytes)");
+    }
+
+    // ── 5. Overflow-safe allocation size check ────────────────────────────
+    //       requestedSize is uint32_t; on 64-bit systems size_t is 64-bit,
+    //       so the cast itself cannot overflow. We still guard explicitly.
+    static_assert(sizeof(size_t) >= sizeof(uint32_t),
+                  "size_t must be at least 32 bits wide");
+
+    size_t allocSize = static_cast<size_t>(requestedSize);
+
+    // ── 6. Allocate buffer ────────────────────────────────────────────────
+    std::unique_ptr<uint8_t[]> buffer;
+    try {
+        buffer = std::make_unique<uint8_t[]>(allocSize);
+    } catch (const std::bad_alloc& e) {
+        throw AllocationError("Memory allocation failed for "
+                              + std::to_string(allocSize)
+                              + " bytes: " + e.what());
+    }
+
+    // Zero-initialise (make_unique already does this for scalar arrays,
+    // but being explicit is safer if the code is ever refactored).
+    std::memset(buffer.get(), 0, allocSize);
+
+    // ── 7. Read the actual payload ────────────────────────────────────────
+    {
+        bool ok = recvFull(sockfd, buffer.get(), allocSize);
+        if (!ok) {
+            throw NetworkError("Client disconnected during payload read "
+                               "(short read: expected "
+                               + std::to_string(allocSize) + " bytes)");
+        }
+    }
+
+    // ── 8. Return result ──────────────────────────────────────────────────
+    return ReadResult{ std::move(buffer), requestedSize };
+}
+
+// ─────────────────────────────────────────────
+// Demo / usage example
+// ─────────────────────────────────────────────
+int main()
+{
+    // In a real server you would accept() a connection here.
+    // For demonstration we use a self-connected socket pair.
+    int sv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        std::cerr << "socketpair failed: " << std::strerror(errno) << '\n';
+        return 1;
+    }
+
+    // ── Simulate a client sending: size=5, payload="Hello" ───────────────
+    {
+        const char payload[]  = "Hello";
+        uint32_t   payloadLen = static_cast<uint32_t>(std::strlen(payload));
+        uint32_t   netLen     = htonl(payloadLen);   // network byte order
+
+        ::send(sv[1], &netLen,  sizeof(netLen),  0);
+        ::send(sv[1], payload,  payloadLen,       0);
+        ::close(sv[1]);   // signal EOF after sending
+    }
+
+    // ── Server side reads the buffer ─────────────────────────────────────
+    try {
+        ReadResult result = readClientBuffer(sv[0]);
+
+        std::cout << "Successfully read " << result.size << " bytes.\n";
+        std::cout << "Payload: ";
+        std::cout.write(reinterpret_cast<char*>(result.buffer.get()),
+                        result.size);
+        std::cout << '\n';
+
+    } catch (const ValidationError& e) {
+        std::cerr << "[VALIDATION ERROR] " << e.what() << '\n';
+    } catch (const AllocationError& e) {
+        std::cerr << "[ALLOCATION ERROR] " << e.what() << '\n';
+    } catch (const NetworkError& e) {
+        std::cerr << "[NETWORK ERROR]    " << e.what() << '\n';
+    } catch (const std::exception& e) {
+        std::cerr << "[UNKNOWN ERROR]    " << e.what() << '\n';
+    }
+
+    ::close(sv[0]);
+    return 0;
+}
+```

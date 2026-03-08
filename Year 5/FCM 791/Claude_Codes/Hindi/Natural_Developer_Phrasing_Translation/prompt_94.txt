@@ -1,0 +1,313 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Custom Error Classes
+class AppError extends Error {
+  constructor(message, statusCode, errorCode = null) {
+    super(message);
+    this.statusCode = statusCode;
+    this.errorCode = errorCode;
+    this.isOperational = true;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(message) {
+    super(message, 400, "VALIDATION_ERROR");
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(message = "Resource not found") {
+    super(message, 404, "NOT_FOUND");
+  }
+}
+
+class UnauthorizedError extends AppError {
+  constructor(message = "Unauthorized access") {
+    super(message, 401, "UNAUTHORIZED");
+  }
+}
+
+// Error Logger
+const logError = (err, req = null) => {
+  const timestamp = new Date().toISOString();
+  const errorInfo = {
+    timestamp,
+    message: err.message,
+    statusCode: err.statusCode || 500,
+    stack: err.stack,
+    path: req ? req.path : "N/A",
+    method: req ? req.method : "N/A",
+  };
+
+  console.error("=== ERROR LOG ===");
+  console.error(JSON.stringify(errorInfo, null, 2));
+  console.error("=================");
+};
+
+// Format Error Response
+const formatErrorResponse = (err, req) => {
+  const isDevelopment = process.env.NODE_ENV !== "production";
+  const statusCode = err.statusCode || 500;
+
+  const response = {
+    success: false,
+    error: {
+      message: err.message || "Internal Server Error",
+      code: err.errorCode || "INTERNAL_ERROR",
+      statusCode,
+    },
+  };
+
+  // Include stack trace only in development
+  if (isDevelopment) {
+    response.error.stack = err.stack;
+    response.error.details = {
+      path: req.path,
+      method: req.method,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  return response;
+};
+
+// Global Error Handler Middleware
+const globalErrorHandler = (err, req, res, next) => {
+  // Log the error
+  logError(err, req);
+
+  // Handle specific error types
+  let error = err;
+
+  // Mongoose/Database errors
+  if (err.name === "CastError") {
+    error = new AppError(`Invalid ${err.path}: ${err.value}`, 400, "CAST_ERROR");
+  }
+
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyValue)[0];
+    error = new AppError(`Duplicate field value: ${field}`, 409, "DUPLICATE_ERROR");
+  }
+
+  if (err.name === "ValidationError") {
+    const messages = Object.values(err.errors).map((val) => val.message);
+    error = new AppError(messages.join(", "), 400, "VALIDATION_ERROR");
+  }
+
+  // JWT errors
+  if (err.name === "JsonWebTokenError") {
+    error = new UnauthorizedError("Invalid token");
+  }
+
+  if (err.name === "TokenExpiredError") {
+    error = new UnauthorizedError("Token expired");
+  }
+
+  // SyntaxError (invalid JSON)
+  if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+    error = new AppError("Invalid JSON in request body", 400, "INVALID_JSON");
+  }
+
+  const statusCode = error.statusCode || 500;
+  const response = formatErrorResponse(error, req);
+
+  res.status(statusCode).json(response);
+};
+
+// 404 Handler
+const notFoundHandler = (req, res, next) => {
+  next(new NotFoundError(`Route ${req.originalUrl} not found`));
+};
+
+// Async Error Wrapper
+const asyncHandler = (fn) => {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+};
+
+// AI-Powered Error Analysis Route
+app.post(
+  "/api/analyze-error",
+  asyncHandler(async (req, res) => {
+    const { errorMessage, errorStack, context } = req.body;
+
+    if (!errorMessage) {
+      throw new ValidationError("Error message is required");
+    }
+
+    const prompt = `You are an expert Node.js/Express error handler and debugger. 
+    
+Analyze the following error and provide:
+1. Error type and severity
+2. Root cause analysis
+3. Suggested fix
+4. Prevention strategies
+5. HTTP status code recommendation
+
+Error Message: ${errorMessage}
+${errorStack ? `Stack Trace: ${errorStack}` : ""}
+${context ? `Context: ${context}` : ""}
+
+Provide a structured analysis in JSON format with fields: errorType, severity, rootCause, suggestedFix, prevention, recommendedStatusCode`;
+
+    console.log("Analyzing error with Claude AI...");
+
+    let fullResponse = "";
+
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: prompt,
+        },
+      ],
+    });
+
+    // Stream the response
+    res.setHeader("Content-Type", "application/json");
+    res.setHeader("Transfer-Encoding", "chunked");
+
+    for await (const chunk of stream) {
+      if (chunk.type === "content_block_delta" && chunk.delta.type === "text_delta") {
+        fullResponse += chunk.delta.text;
+        process.stdout.write(chunk.delta.text);
+      }
+    }
+
+    console.log("\n\nAnalysis complete!");
+
+    // Parse and return the analysis
+    let analysis;
+    try {
+      // Extract JSON from the response
+      const jsonMatch = fullResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        analysis = JSON.parse(jsonMatch[0]);
+      } else {
+        analysis = { rawAnalysis: fullResponse };
+      }
+    } catch {
+      analysis = { rawAnalysis: fullResponse };
+    }
+
+    res.json({
+      success: true,
+      analysis,
+      originalError: {
+        message: errorMessage,
+        hasStack: !!errorStack,
+      },
+    });
+  })
+);
+
+// Test Routes for Error Handling
+app.get("/api/test/validation-error", (req, res, next) => {
+  throw new ValidationError("Test validation error - missing required fields");
+});
+
+app.get("/api/test/not-found", (req, res, next) => {
+  throw new NotFoundError("Test resource not found");
+});
+
+app.get("/api/test/unauthorized", (req, res, next) => {
+  throw new UnauthorizedError("Test unauthorized access");
+});
+
+app.get("/api/test/server-error", (req, res, next) => {
+  throw new Error("Test internal server error");
+});
+
+app.get(
+  "/api/test/async-error",
+  asyncHandler(async (req, res) => {
+    await new Promise((_, reject) => {
+      setTimeout(() => reject(new AppError("Async operation failed", 503, "SERVICE_UNAVAILABLE")), 100);
+    });
+  })
+);
+
+app.get("/api/test/success", (req, res) => {
+  res.json({
+    success: true,
+    message: "Everything is working correctly!",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Health Check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    environment: process.env.NODE_ENV || "development",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Apply 404 handler before global error handler
+app.use(notFoundHandler);
+
+// Apply Global Error Handler (must be last)
+app.use(globalErrorHandler);
+
+// Handle Unhandled Promise Rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("=== UNHANDLED REJECTION ===");
+  console.error("Reason:", reason);
+  console.error("Promise:", promise);
+  console.error("===========================");
+
+  // In production, you might want to gracefully shutdown
+  // process.exit(1);
+});
+
+// Handle Uncaught Exceptions
+process.on("uncaughtException", (err) => {
+  console.error("=== UNCAUGHT EXCEPTION ===");
+  console.error("Error:", err);
+  console.error("==========================");
+
+  // Gracefully shutdown
+  process.exit(1);
+});
+
+// Start Server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`
+🚀 Global Error Handler Server Started!
+📍 Port: ${PORT}
+🌍 Environment: ${process.env.NODE_ENV || "development"}
+  
+📋 Available Test Routes:
+  GET  /health                    - Health check
+  GET  /api/test/success          - Success response
+  GET  /api/test/validation-error - Test 400 error
+  GET  /api/test/not-found        - Test 404 error
+  GET  /api/test/unauthorized     - Test 401 error
+  GET  /api/test/server-error     - Test 500 error
+  GET  /api/test/async-error      - Test async error
+  POST /api/analyze-error         - AI-powered error analysis
+  
+💡 Error Analysis Example:
+  curl -X POST http://localhost:${PORT}/api/analyze-error \\
+    -H "Content-Type: application/json" \\
+    -d '{"errorMessage": "Cannot read property of undefined", "context": "User authentication"}'
+  `);
+});
+
+module.exports = { app, AppError, ValidationError, NotFoundError, UnauthorizedError, asyncHandler };
+```

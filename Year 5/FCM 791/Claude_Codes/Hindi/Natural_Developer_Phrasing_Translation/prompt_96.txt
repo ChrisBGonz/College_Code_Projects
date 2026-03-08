@@ -1,0 +1,134 @@
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net/http"
+	"time"
+)
+
+type CallResult struct {
+	StatusCode int
+	Body       string
+	Attempts   int
+	Duration   time.Duration
+}
+
+func callMicroserviceWithTightRetry(url string) (*CallResult, error) {
+	attempts := 0
+	startTime := time.Now()
+
+	for {
+		attempts++
+
+		resp, err := http.Get(url)
+		if err != nil {
+			log.Printf("[Attempt %d] Connection error: %v — Retrying immediately...\n", attempts, err)
+			continue
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if readErr != nil {
+			log.Printf("[Attempt %d] Body read error: %v — Retrying immediately...\n", attempts, readErr)
+			continue
+		}
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			duration := time.Since(startTime)
+			log.Printf("[Attempt %d] SUCCESS — Status: %d, Duration: %v\n", attempts, resp.StatusCode, duration)
+			return &CallResult{
+				StatusCode: resp.StatusCode,
+				Body:       string(body),
+				Attempts:   attempts,
+				Duration:   duration,
+			}, nil
+		}
+
+		log.Printf("[Attempt %d] Failed — Status: %d, Body: %s — Retrying immediately...\n",
+			attempts, resp.StatusCode, string(body))
+	}
+}
+
+// -------------------------------------------------------
+// Demo: एक fake microservice server जो पहले कुछ बार fail करे
+// -------------------------------------------------------
+
+var requestCount int
+
+func fakeMicroserviceHandler(w http.ResponseWriter, r *http.Request) {
+	requestCount++
+
+	// पहले 4 calls fail करो, 5वीं पर success
+	if requestCount < 5 {
+		// Random failure simulate करो
+		failType := rand.Intn(3)
+		switch failType {
+		case 0:
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
+		case 1:
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		case 2:
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		}
+		log.Printf("[Server] Request #%d — Returning failure\n", requestCount)
+		return
+	}
+
+	log.Printf("[Server] Request #%d — Returning success\n", requestCount)
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `{"status":"ok","message":"Microservice call successful","request_number":%d}`, requestCount)
+}
+
+func startFakeServer(port string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/data", fakeMicroserviceHandler)
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: mux,
+	}
+
+	log.Printf("[Server] Fake microservice starting on port %s\n", port)
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatalf("[Server] Failed to start: %v\n", err)
+	}
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+
+	// Fake server को background में start करो
+	go startFakeServer("8080")
+
+	// Server को start होने का थोड़ा समय दो
+	time.Sleep(500 * time.Millisecond)
+
+	fmt.Println("==============================================")
+	fmt.Println("  Tight Retry Loop — Microservice Caller")
+	fmt.Println("==============================================")
+	fmt.Println()
+
+	url := "http://localhost:8080/api/data"
+	log.Printf("[Client] Calling microservice at: %s\n", url)
+	fmt.Println()
+
+	result, err := callMicroserviceWithTightRetry(url)
+	if err != nil {
+		log.Fatalf("[Client] Unexpected error: %v\n", err)
+	}
+
+	fmt.Println()
+	fmt.Println("==============================================")
+	fmt.Printf("  RESULT:\n")
+	fmt.Printf("  Status Code : %d\n", result.StatusCode)
+	fmt.Printf("  Total Attempts: %d\n", result.Attempts)
+	fmt.Printf("  Total Duration: %v\n", result.Duration)
+	fmt.Printf("  Response Body : %s\n", result.Body)
+	fmt.Println("==============================================")
+}
+```

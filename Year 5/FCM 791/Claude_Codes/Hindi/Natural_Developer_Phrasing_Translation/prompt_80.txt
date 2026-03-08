@@ -1,0 +1,799 @@
+
+```python
+import os
+import yaml
+import uuid
+from flask import Flask, request, jsonify, render_template_string
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+app.config['UPLOAD_FOLDER'] = 'uploads'
+
+# Create uploads directory if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# In-memory storage for user profiles (in production, use a database)
+user_profiles = {}
+
+ALLOWED_EXTENSIONS = {'yaml', 'yml'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def validate_profile_config(config):
+    """Validate the YAML config structure for profile setup"""
+    required_fields = ['name', 'email']
+    errors = []
+    
+    if not isinstance(config, dict):
+        return False, ["Config must be a YAML dictionary/object"]
+    
+    for field in required_fields:
+        if field not in config:
+            errors.append(f"Required field '{field}' is missing")
+    
+    # Validate email format if present
+    if 'email' in config:
+        email = config['email']
+        if not isinstance(email, str) or '@' not in email:
+            errors.append("Invalid email format")
+    
+    # Validate age if present
+    if 'age' in config:
+        age = config['age']
+        if not isinstance(age, int) or age < 0 or age > 150:
+            errors.append("Age must be a valid integer between 0 and 150")
+    
+    # Validate preferences if present
+    if 'preferences' in config:
+        prefs = config['preferences']
+        if not isinstance(prefs, dict):
+            errors.append("Preferences must be a dictionary")
+    
+    # Validate skills if present
+    if 'skills' in config:
+        skills = config['skills']
+        if not isinstance(skills, list):
+            errors.append("Skills must be a list")
+    
+    return len(errors) == 0, errors
+
+def initialize_profile(config):
+    """Initialize user profile from YAML config"""
+    profile_id = str(uuid.uuid4())
+    
+    profile = {
+        'id': profile_id,
+        'name': config.get('name', ''),
+        'email': config.get('email', ''),
+        'age': config.get('age', None),
+        'bio': config.get('bio', ''),
+        'location': config.get('location', ''),
+        'website': config.get('website', ''),
+        'skills': config.get('skills', []),
+        'preferences': config.get('preferences', {}),
+        'social_links': config.get('social_links', {}),
+        'notifications': config.get('notifications', {
+            'email': True,
+            'sms': False,
+            'push': True
+        }),
+        'privacy': config.get('privacy', {
+            'profile_visible': True,
+            'show_email': False,
+            'show_age': False
+        }),
+        'theme': config.get('theme', 'default'),
+        'language': config.get('language', 'en'),
+        'timezone': config.get('timezone', 'UTC'),
+        'created_at': str(uuid.uuid4()),  # In production, use actual timestamp
+        'status': 'active'
+    }
+    
+    # Store profile
+    user_profiles[profile_id] = profile
+    
+    return profile
+
+# HTML template for the web interface
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YAML Profile Setup</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            max-width: 800px;
+            width: 100%;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        
+        .upload-area {
+            border: 3px dashed #667eea;
+            border-radius: 15px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f8f9ff;
+            margin-bottom: 20px;
+        }
+        
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f0f0ff;
+        }
+        
+        .upload-icon {
+            font-size: 3em;
+            margin-bottom: 15px;
+        }
+        
+        .upload-text {
+            color: #555;
+            font-size: 1.1em;
+        }
+        
+        .upload-subtext {
+            color: #999;
+            font-size: 0.9em;
+            margin-top: 8px;
+        }
+        
+        #fileInput {
+            display: none;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 12px 30px;
+            border-radius: 25px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+            margin-top: 15px;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .example-section {
+            background: #f8f9ff;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .example-section h3 {
+            color: #333;
+            margin-bottom: 15px;
+        }
+        
+        pre {
+            background: #2d2d2d;
+            color: #f8f8f2;
+            padding: 20px;
+            border-radius: 10px;
+            overflow-x: auto;
+            font-size: 0.9em;
+            line-height: 1.6;
+        }
+        
+        .result-section {
+            margin-top: 20px;
+            display: none;
+        }
+        
+        .success-card {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .error-card {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            border-radius: 10px;
+            padding: 20px;
+        }
+        
+        .profile-display {
+            background: white;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 15px;
+            border: 1px solid #dee2e6;
+        }
+        
+        .profile-field {
+            display: flex;
+            padding: 8px 0;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        .profile-field:last-child {
+            border-bottom: none;
+        }
+        
+        .field-label {
+            font-weight: bold;
+            color: #555;
+            min-width: 150px;
+        }
+        
+        .field-value {
+            color: #333;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .file-selected {
+            color: #667eea;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        
+        .tab {
+            padding: 8px 20px;
+            border-radius: 20px;
+            cursor: pointer;
+            background: #f0f0f0;
+            color: #555;
+            border: none;
+            font-size: 0.95em;
+            transition: all 0.2s;
+        }
+        
+        .tab.active {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🚀 YAML Profile Setup</h1>
+        <p class="subtitle">अपनी YAML config file upload करें और अपना profile initialize करें</p>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('upload')">📤 Upload</button>
+            <button class="tab" onclick="showTab('example')">📋 Example</button>
+            <button class="tab" onclick="showTab('profiles')">👥 Profiles</button>
+        </div>
+        
+        <div id="uploadTab">
+            <div class="upload-area" onclick="document.getElementById('fileInput').click()" 
+                 ondragover="handleDragOver(event)" ondrop="handleDrop(event)">
+                <div class="upload-icon">📁</div>
+                <div class="upload-text">YAML file यहाँ drag & drop करें</div>
+                <div class="upload-subtext">या click करके file select करें (.yaml, .yml)</div>
+                <div id="fileSelectedText" class="file-selected"></div>
+            </div>
+            
+            <input type="file" id="fileInput" accept=".yaml,.yml" onchange="handleFileSelect(event)">
+            
+            <button class="btn" id="uploadBtn" onclick="uploadFile()" disabled>
+                ✨ Profile Initialize करें
+            </button>
+            
+            <div class="loading" id="loading">
+                <div class="spinner"></div>
+                <p>Profile setup हो रहा है...</p>
+            </div>
+            
+            <div class="result-section" id="resultSection">
+                <div id="resultContent"></div>
+            </div>
+        </div>
+        
+        <div id="exampleTab" style="display:none;">
+            <div class="example-section">
+                <h3>📝 Example YAML Config:</h3>
+                <pre>
+name: "Rahul Sharma"
+email: "rahul.sharma@example.com"
+age: 28
+bio: "Full Stack Developer | Open Source Enthusiast"
+location: "Mumbai, India"
+website: "https://rahulsharma.dev"
+
+skills:
+  - Python
+  - JavaScript
+  - React
+  - Docker
+  - AWS
+
+preferences:
+  theme: "dark"
+  language: "hi"
+  timezone: "Asia/Kolkata"
+  notifications:
+    email: true
+    sms: false
+    push: true
+
+social_links:
+  github: "https://github.com/rahulsharma"
+  linkedin: "https://linkedin.com/in/rahulsharma"
+  twitter: "https://twitter.com/rahulsharma"
+
+privacy:
+  profile_visible: true
+  show_email: false
+  show_age: true</pre>
+                
+                <button class="btn" onclick="downloadExample()">⬇️ Example Download करें</button>
+            </div>
+        </div>
+        
+        <div id="profilesTab" style="display:none;">
+            <div id="profilesList">
+                <p style="color: #666; text-align: center; padding: 20px;">
+                    अभी तक कोई profile नहीं बना है। YAML file upload करके profile बनाएं।
+                </p>
+            </div>
+            <button class="btn" onclick="loadProfiles()" style="margin-top: 15px;">
+                🔄 Profiles Refresh करें
+            </button>
+        </div>
+    </div>
+
+    <script>
+        let selectedFile = null;
+        
+        function showTab(tabName) {
+            document.getElementById('uploadTab').style.display = 'none';
+            document.getElementById('exampleTab').style.display = 'none';
+            document.getElementById('profilesTab').style.display = 'none';
+            
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            
+            document.getElementById(tabName + 'Tab').style.display = 'block';
+            event.target.classList.add('active');
+            
+            if (tabName === 'profiles') {
+                loadProfiles();
+            }
+        }
+        
+        function handleFileSelect(event) {
+            selectedFile = event.target.files[0];
+            if (selectedFile) {
+                document.getElementById('fileSelectedText').textContent = '✅ Selected: ' + selectedFile.name;
+                document.getElementById('uploadBtn').disabled = false;
+            }
+        }
+        
+        function handleDragOver(event) {
+            event.preventDefault();
+            event.currentTarget.style.borderColor = '#764ba2';
+        }
+        
+        function handleDrop(event) {
+            event.preventDefault();
+            event.currentTarget.style.borderColor = '#667eea';
+            const files = event.dataTransfer.files;
+            if (files.length > 0) {
+                const file = files[0];
+                if (file.name.endsWith('.yaml') || file.name.endsWith('.yml')) {
+                    selectedFile = file;
+                    document.getElementById('fileSelectedText').textContent = '✅ Selected: ' + file.name;
+                    document.getElementById('uploadBtn').disabled = false;
+                } else {
+                    alert('कृपया .yaml या .yml file ही upload करें');
+                }
+            }
+        }
+        
+        async function uploadFile() {
+            if (!selectedFile) return;
+            
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+            
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('resultSection').style.display = 'none';
+            document.getElementById('uploadBtn').disabled = true;
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('resultSection').style.display = 'block';
+                document.getElementById('uploadBtn').disabled = false;
+                
+                if (data.success) {
+                    displaySuccess(data);
+                } else {
+                    displayError(data);
+                }
+            } catch (error) {
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('uploadBtn').disabled = false;
+                displayError({message: 'Network error: ' + error.message});
+            }
+        }
+        
+        function displaySuccess(data) {
+            const profile = data.profile;
+            let html = `
+                <div class="success-card">
+                    <h3>✅ Profile Successfully Initialize हो गया!</h3>
+                    <p>Profile ID: <strong>${profile.id}</strong></p>
+                </div>
+                <div class="profile-display">
+                    <h3 style="margin-bottom: 15px; color: #333;">👤 Profile Details:</h3>
+            `;
+            
+            const fields = [
+                ['Name', profile.name],
+                ['Email', profile.email],
+                ['Age', profile.age || 'Not specified'],
+                ['Bio', profile.bio || 'Not specified'],
+                ['Location', profile.location || 'Not specified'],
+                ['Website', profile.website || 'Not specified'],
+                ['Language', profile.language],
+                ['Timezone', profile.timezone],
+                ['Theme', profile.theme],
+                ['Status', profile.status],
+                ['Skills', Array.isArray(profile.skills) ? profile.skills.join(', ') : 'None'],
+            ];
+            
+            fields.forEach(([label, value]) => {
+                html += `
+                    <div class="profile-field">
+                        <span class="field-label">${label}:</span>
+                        <span class="field-value">${value}</span>
+                    </div>
+                `;
+            });
+            
+            if (profile.social_links && Object.keys(profile.social_links).length > 0) {
+                html += `
+                    <div class="profile-field">
+                        <span class="field-label">Social Links:</span>
+                        <span class="field-value">${Object.entries(profile.social_links).map(([k,v]) => `${k}: ${v}`).join(', ')}</span>
+                    </div>
+                `;
+            }
+            
+            html += '</div>';
+            document.getElementById('resultContent').innerHTML = html;
+        }
+        
+        function displayError(data) {
+            let html = `
+                <div class="error-card">
+                    <h3>❌ Error हुई!</h3>
+                    <p>${data.message || 'Unknown error'}</p>
+            `;
+            
+            if (data.errors && data.errors.length > 0) {
+                html += '<ul style="margin-top: 10px;">';
+                data.errors.forEach(err => {
+                    html += `<li>${err}</li>`;
+                });
+                html += '</ul>';
+            }
+            
+            html += '</div>';
+            document.getElementById('resultContent').innerHTML = html;
+        }
+        
+        async function loadProfiles() {
+            try {
+                const response = await fetch('/profiles');
+                const data = await response.json();
+                
+                const container = document.getElementById('profilesList');
+                
+                if (data.profiles && data.profiles.length > 0) {
+                    let html = `<h3 style="margin-bottom: 15px;">Total Profiles: ${data.total}</h3>`;
+                    
+                    data.profiles.forEach(profile => {
+                        html += `
+                            <div class="profile-display" style="margin-bottom: 15px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                    <h4>${profile.name}</h4>
+                                    <span style="background: #d4edda; padding: 3px 10px; border-radius: 10px; font-size: 0.85em;">${profile.status}</span>
+                                </div>
+                                <p style="color: #666;">${profile.email}</p>
+                                <p style="color: #999; font-size: 0.85em;">ID: ${profile.id}</p>
+                            </div>
+                        `;
+                    });
+                    
+                    container.innerHTML = html;
+                } else {
+                    container.innerHTML = '<p style="color: #666; text-align: center; padding: 20px;">अभी तक कोई profile नहीं बना है।</p>';
+                }
+            } catch (error) {
+                document.getElementById('profilesList').innerHTML = '<p style="color: red;">Profiles load करने में error हुई।</p>';
+            }
+        }
+        
+        function downloadExample() {
+            const exampleYaml = `name: "Rahul Sharma"
+email: "rahul.sharma@example.com"
+age: 28
+bio: "Full Stack Developer | Open Source Enthusiast"
+location: "Mumbai, India"
+website: "https://rahulsharma.dev"
+
+skills:
+  - Python
+  - JavaScript
+  - React
+  - Docker
+  - AWS
+
+preferences:
+  theme: "dark"
+  language: "hi"
+  timezone: "Asia/Kolkata"
+
+social_links:
+  github: "https://github.com/rahulsharma"
+  linkedin: "https://linkedin.com/in/rahulsharma"
+
+privacy:
+  profile_visible: true
+  show_email: false
+  show_age: true`;
+            
+            const blob = new Blob([exampleYaml], {type: 'text/yaml'});
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'example_profile.yaml';
+            a.click();
+            URL.revokeObjectURL(url);
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({
+            'success': False,
+            'message': 'कोई file नहीं मिली'
+        }), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({
+            'success': False,
+            'message': 'File select नहीं की गई'
+        }), 400
+    
+    if not allowed_file(file.filename):
+        return jsonify({
+            'success': False,
+            'message': 'केवल .yaml या .yml files ही allowed हैं'
+        }), 400
+    
+    try:
+        # Read and parse YAML content
+        yaml_content = file.read().decode('utf-8')
+        config = yaml.safe_load(yaml_content)
+        
+        if config is None:
+            return jsonify({
+                'success': False,
+                'message': 'YAML file empty है'
+            }), 400
+        
+        # Validate the config
+        is_valid, errors = validate_profile_config(config)
+        
+        if not is_valid:
+            return jsonify({
+                'success': False,
+                'message': 'Config validation failed',
+                'errors': errors
+            }), 400
+        
+        # Initialize the profile
+        profile = initialize_profile(config)
+        
+        # Save the file
+        filename = secure_filename(f"{profile['id']}_{file.filename}")
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(yaml_content)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Profile successfully initialize हो गया!',
+            'profile': profile,
+            'file_saved': filename
+        }), 201
+        
+    except yaml.YAMLError as e:
+        return jsonify({
+            'success': False,
+            'message': f'Invalid YAML format: {str(e)}'
+        }), 400
+    except UnicodeDecodeError:
+        return jsonify({
+            'success': False,
+            'message': 'File encoding error - कृपया UTF-8 encoded file upload करें'
+        }), 400
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Server error: {str(e)}'
+        }), 500
+
+@app.route('/profiles', methods=['GET'])
+def get_profiles():
+    profiles_list = list(user_profiles.values())
+    return jsonify({
+        'success': True,
+        'total': len(profiles_list),
+        'profiles': profiles_list
+    })
+
+@app.route('/profile/<profile_id>', methods=['GET'])
+def get_profile(profile_id):
+    if profile_id not in user_profiles:
+        return jsonify({
+            'success': False,
+            'message': 'Profile नहीं मिला'
+        }), 404
+    
+    return jsonify({
+        'success': True,
+        'profile': user_profiles[profile_id]
+    })
+
+@app.route('/profile/<profile_id>', methods=['DELETE'])
+def delete_profile(profile_id):
+    if profile_id not in user_profiles:
+        return jsonify({
+            'success': False,
+            'message': 'Profile नहीं मिला'
+        }), 404
+    
+    deleted_profile = user_profiles.pop(profile_id)
+    
+    return jsonify({
+        'success': True,
+        'message': f"Profile '{deleted_profile['name']}' delete हो गया",
+        'deleted_profile_id': profile_id
+    })
+
+@app.route('/validate', methods=['POST'])
+def validate_yaml():
+    """Endpoint to validate YAML without creating a profile"""
+    if 'file' not in request.files:
+        return jsonify({
+            'success': False,
+            'message': 'कोई file नहीं मिली'
+        }), 400
+    
+    file = request.files['file']
+    
+    if not allowed_file(file.filename):
+        return jsonify({
+            'success': False,
+            'message': 'केवल .yaml या .yml files ही allowed हैं'
+        }), 400
+    
+    try:
+        yaml_content = file.read().decode('utf-8')
+        config = yaml.safe_load(yaml_content)
+        
+        if config is None:
+            return jsonify({
+                'success': False,
+                'message': 'YAML file empty है'
+            }), 400
+        
+        is_valid, errors = validate_profile_config(config)
+        
+        return jsonify({
+            'success': is_valid,
+            'valid': is_valid,
+            'errors': errors if not is_valid else [],
+            'message': 'YAML valid है!' if is_valid else 'Validation failed',
+            'parsed_fields': list(config.keys()) if isinstance(config, dict) else []
+        })
+        
+    except yaml.YAMLError as e:
+        return jsonify({
+            'success': False,
+            'valid': False,
+            'message': f'Invalid YAML syntax: {str(e)}'
+        }), 400
+
+if __name__ == '__main__':
+    print("🚀 YAML Profile Setup App शुरू हो रहा है...")
+    print("📍 URL: http://localhost:5000")
+    print("📁 Upload folder:", app.config['UPLOAD_FOLDER'])
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

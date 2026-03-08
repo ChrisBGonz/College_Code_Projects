@@ -1,0 +1,644 @@
+```python
+#!/usr/bin/env python3
+"""
+Free Trial Signup Handler
+Cookie-based trial tracking system
+"""
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.cookies import SimpleCookie
+import json
+import urllib.parse
+from datetime import datetime, timedelta
+import hashlib
+import secrets
+
+
+# ============================================================
+# Configuration
+# ============================================================
+SERVER_HOST = "localhost"
+SERVER_PORT = 8080
+TRIAL_COOKIE_NAME = "has_used_trial"
+COOKIE_MAX_AGE_DAYS = 365  # 1 year
+SECRET_KEY = "your-secret-key-change-in-production"
+
+
+# ============================================================
+# Cookie Utility Functions
+# ============================================================
+
+def generate_cookie_token(user_identifier: str) -> str:
+    """
+    Tamper-proof cookie value generate karo
+    Format: timestamp:hash
+    """
+    timestamp = str(int(datetime.now().timestamp()))
+    raw = f"{user_identifier}:{timestamp}:{SECRET_KEY}"
+    token_hash = hashlib.sha256(raw.encode()).hexdigest()
+    return f"{timestamp}:{token_hash}"
+
+
+def validate_cookie_token(token: str) -> bool:
+    """
+    Cookie token validate karo - check karo ki tamper toh nahi hua
+    Simple format validation (production mein proper HMAC use karo)
+    """
+    try:
+        parts = token.split(":")
+        if len(parts) != 2:
+            return False
+        
+        timestamp_str, token_hash = parts
+        
+        # Timestamp valid integer hai?
+        timestamp = int(timestamp_str)
+        
+        # Token reasonable length ka hai?
+        if len(token_hash) != 64:  # SHA256 hex = 64 chars
+            return False
+        
+        # Cookie expired toh nahi? (1 year check)
+        cookie_date = datetime.fromtimestamp(timestamp)
+        expiry_date = cookie_date + timedelta(days=COOKIE_MAX_AGE_DAYS)
+        
+        if datetime.now() > expiry_date:
+            return False
+        
+        return True
+        
+    except (ValueError, TypeError):
+        return False
+
+
+def parse_cookies(cookie_header: str) -> dict:
+    """
+    Request headers se cookies parse karo
+    """
+    cookies = {}
+    if not cookie_header:
+        return cookies
+    
+    cookie = SimpleCookie()
+    try:
+        cookie.load(cookie_header)
+        for key, morsel in cookie.items():
+            cookies[key] = morsel.value
+    except Exception:
+        pass
+    
+    return cookies
+
+
+def create_trial_cookie(user_ip: str) -> str:
+    """
+    Trial cookie value create karo
+    """
+    # User identifier (production mein user ID use karo)
+    user_identifier = hashlib.md5(
+        f"{user_ip}:{secrets.token_hex(8)}".encode()
+    ).hexdigest()
+    
+    return generate_cookie_token(user_identifier)
+
+
+def build_set_cookie_header(
+    name: str,
+    value: str,
+    max_age_days: int = COOKIE_MAX_AGE_DAYS,
+    http_only: bool = True,
+    secure: bool = False,  # Production mein True karo (HTTPS ke liye)
+    same_site: str = "Strict"
+) -> str:
+    """
+    Set-Cookie header string build karo
+    """
+    expires = datetime.utcnow() + timedelta(days=max_age_days)
+    expires_str = expires.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    
+    cookie_parts = [
+        f"{name}={value}",
+        f"Max-Age={max_age_days * 24 * 3600}",
+        f"Expires={expires_str}",
+        "Path=/",
+        f"SameSite={same_site}",
+    ]
+    
+    if http_only:
+        cookie_parts.append("HttpOnly")
+    
+    if secure:
+        cookie_parts.append("Secure")
+    
+    return "; ".join(cookie_parts)
+
+
+# ============================================================
+# Trial Logic
+# ============================================================
+
+def check_trial_eligibility(cookies: dict) -> dict:
+    """
+    Check karo ki user trial ke liye eligible hai ya nahi
+    
+    Returns:
+        dict: {
+            'eligible': bool,
+            'reason': str,
+            'cookie_found': bool,
+            'cookie_valid': bool
+        }
+    """
+    result = {
+        "eligible": True,
+        "reason": "",
+        "cookie_found": False,
+        "cookie_valid": False
+    }
+    
+    # Step 1: Cookie exist karti hai?
+    if TRIAL_COOKIE_NAME not in cookies:
+        result["eligible"] = True
+        result["reason"] = "No previous trial found. Eligible for free trial."
+        return result
+    
+    result["cookie_found"] = True
+    cookie_value = cookies[TRIAL_COOKIE_NAME]
+    
+    # Step 2: Cookie value valid hai?
+    if not cookie_value or cookie_value.strip() == "":
+        # Empty cookie - allow karo (edge case)
+        result["eligible"] = True
+        result["reason"] = "Empty cookie found. Eligible for free trial."
+        return result
+    
+    # Step 3: Cookie tamper toh nahi hua?
+    if not validate_cookie_token(cookie_value):
+        # Invalid/tampered cookie - deny karo (security measure)
+        result["eligible"] = False
+        result["cookie_valid"] = False
+        result["reason"] = "Invalid trial cookie detected. Trial denied for security."
+        return result
+    
+    # Step 4: Valid cookie mili - trial already used
+    result["eligible"] = False
+    result["cookie_valid"] = True
+    result["reason"] = "Free trial already used. Please upgrade to continue."
+    
+    return result
+
+
+def process_trial_signup(
+    user_data: dict,
+    cookies: dict,
+    user_ip: str
+) -> dict:
+    """
+    Trial signup process karo
+    
+    Args:
+        user_data: Form data (name, email, etc.)
+        cookies: Parsed cookies from request
+        user_ip: User's IP address
+    
+    Returns:
+        dict: Response with status, message, and cookie info
+    """
+    
+    # Basic validation
+    if not user_data.get("email"):
+        return {
+            "success": False,
+            "status": "error",
+            "message": "Email required hai.",
+            "set_cookie": None
+        }
+    
+    if not user_data.get("name"):
+        return {
+            "success": False,
+            "status": "error", 
+            "message": "Name required hai.",
+            "set_cookie": None
+        }
+    
+    # Trial eligibility check
+    eligibility = check_trial_eligibility(cookies)
+    
+    print(f"\n{'='*50}")
+    print(f"Trial Signup Request:")
+    print(f"  Email: {user_data.get('email')}")
+    print(f"  Name: {user_data.get('name')}")
+    print(f"  IP: {user_ip}")
+    print(f"  Cookie Found: {eligibility['cookie_found']}")
+    print(f"  Cookie Valid: {eligibility['cookie_valid']}")
+    print(f"  Eligible: {eligibility['eligible']}")
+    print(f"  Reason: {eligibility['reason']}")
+    print(f"{'='*50}\n")
+    
+    # Trial already used - BLOCK
+    if not eligibility["eligible"]:
+        return {
+            "success": False,
+            "status": "trial_blocked",
+            "message": eligibility["reason"],
+            "details": {
+                "cookie_found": eligibility["cookie_found"],
+                "cookie_valid": eligibility["cookie_valid"],
+                "suggestion": "Upgrade to premium plan for full access.",
+                "upgrade_url": "/upgrade"
+            },
+            "set_cookie": None
+        }
+    
+    # Trial allowed - APPROVE
+    # New trial cookie create karo
+    cookie_value = create_trial_cookie(user_ip)
+    cookie_header = build_set_cookie_header(
+        name=TRIAL_COOKIE_NAME,
+        value=cookie_value,
+        max_age_days=COOKIE_MAX_AGE_DAYS
+    )
+    
+    return {
+        "success": True,
+        "status": "trial_activated",
+        "message": "Free trial successfully activated! Welcome aboard.",
+        "details": {
+            "user_name": user_data.get("name"),
+            "user_email": user_data.get("email"),
+            "trial_duration": "14 days",
+            "trial_start": datetime.now().isoformat(),
+            "trial_end": (datetime.now() + timedelta(days=14)).isoformat(),
+            "features": [
+                "Full access to all features",
+                "Up to 5 projects",
+                "Email support",
+                "Export functionality"
+            ]
+        },
+        "set_cookie": cookie_header
+    }
+
+
+# ============================================================
+# HTTP Request Handler
+# ============================================================
+
+class TrialSignupHandler(BaseHTTPRequestHandler):
+    
+    def log_message(self, format, *args):
+        """Custom logging"""
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+              f"{self.address_string()} - {format % args}")
+    
+    def send_json_response(
+        self,
+        data: dict,
+        status_code: int = 200,
+        extra_headers: dict = None
+    ):
+        """JSON response send karo"""
+        response_body = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+        
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", len(response_body))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        
+        # Extra headers (jaise Set-Cookie)
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
+        
+        self.end_headers()
+        self.wfile.write(response_body)
+    
+    def get_request_cookies(self) -> dict:
+        """Request se cookies extract karo"""
+        cookie_header = self.headers.get("Cookie", "")
+        return parse_cookies(cookie_header)
+    
+    def get_client_ip(self) -> str:
+        """Client IP get karo"""
+        # Proxy headers check karo
+        forwarded_for = self.headers.get("X-Forwarded-For")
+        if forwarded_for:
+            return forwarded_for.split(",")[0].strip()
+        
+        real_ip = self.headers.get("X-Real-IP")
+        if real_ip:
+            return real_ip
+        
+        return self.client_address[0]
+    
+    def read_request_body(self) -> dict:
+        """Request body parse karo"""
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length == 0:
+            return {}
+        
+        body = self.rfile.read(content_length).decode("utf-8")
+        content_type = self.headers.get("Content-Type", "")
+        
+        try:
+            if "application/json" in content_type:
+                return json.loads(body)
+            elif "application/x-www-form-urlencoded" in content_type:
+                parsed = urllib.parse.parse_qs(body)
+                return {k: v[0] for k, v in parsed.items()}
+            else:
+                return {}
+        except (json.JSONDecodeError, Exception):
+            return {}
+    
+    # ----------------------------------------------------------
+    # Route Handlers
+    # ----------------------------------------------------------
+    
+    def handle_trial_signup(self):
+        """POST /api/trial/signup - Trial signup handle karo"""
+        user_data = self.read_request_body()
+        cookies = self.get_request_cookies()
+        user_ip = self.get_client_ip()
+        
+        result = process_trial_signup(user_data, cookies, user_ip)
+        
+        # HTTP status code determine karo
+        if result["status"] == "trial_activated":
+            status_code = 201  # Created
+        elif result["status"] == "trial_blocked":
+            status_code = 403  # Forbidden
+        else:
+            status_code = 400  # Bad Request
+        
+        # Extra headers (Set-Cookie)
+        extra_headers = {}
+        if result.get("set_cookie"):
+            extra_headers["Set-Cookie"] = result["set_cookie"]
+        
+        # Response mein set_cookie field remove karo (internal use only)
+        response_data = {k: v for k, v in result.items() if k != "set_cookie"}
+        
+        self.send_json_response(response_data, status_code, extra_headers)
+    
+    def handle_trial_status(self):
+        """GET /api/trial/status - Trial status check karo"""
+        cookies = self.get_request_cookies()
+        eligibility = check_trial_eligibility(cookies)
+        
+        response = {
+            "has_used_trial": not eligibility["eligible"],
+            "eligible_for_trial": eligibility["eligible"],
+            "message": eligibility["reason"],
+            "cookie_info": {
+                "cookie_name": TRIAL_COOKIE_NAME,
+                "cookie_found": eligibility["cookie_found"],
+                "cookie_valid": eligibility["cookie_valid"]
+            }
+        }
+        
+        self.send_json_response(response, 200)
+    
+    def handle_home(self):
+        """GET / - Simple info page"""
+        info = {
+            "service": "Free Trial Signup API",
+            "version": "1.0.0",
+            "endpoints": {
+                "POST /api/trial/signup": "Free trial ke liye signup karo",
+                "GET /api/trial/status": "Trial status check karo",
+                "DELETE /api/trial/reset": "Trial cookie reset karo (testing only)"
+            },
+            "cookie": {
+                "name": TRIAL_COOKIE_NAME,
+                "purpose": "Track whether user has used free trial",
+                "max_age": f"{COOKIE_MAX_AGE_DAYS} days"
+            }
+        }
+        self.send_json_response(info, 200)
+    
+    def handle_trial_reset(self):
+        """DELETE /api/trial/reset - Cookie reset karo (testing ke liye)"""
+        # Cookie expire karo (Max-Age=0)
+        expired_cookie = (
+            f"{TRIAL_COOKIE_NAME}=; "
+            f"Max-Age=0; "
+            f"Expires=Thu, 01 Jan 1970 00:00:00 GMT; "
+            f"Path=/; "
+            f"HttpOnly; "
+            f"SameSite=Strict"
+        )
+        
+        response = {
+            "success": True,
+            "message": "Trial cookie reset kar diya gaya. Ab aap dobara trial le sakte hain.",
+            "note": "Yeh endpoint sirf testing ke liye hai."
+        }
+        
+        self.send_json_response(
+            response,
+            200,
+            {"Set-Cookie": expired_cookie}
+        )
+    
+    # ----------------------------------------------------------
+    # HTTP Method Handlers
+    # ----------------------------------------------------------
+    
+    def do_GET(self):
+        """GET requests handle karo"""
+        path = self.path.split("?")[0]  # Query string remove karo
+        
+        if path == "/":
+            self.handle_home()
+        elif path == "/api/trial/status":
+            self.handle_trial_status()
+        else:
+            self.send_json_response(
+                {"error": "Route not found", "path": path},
+                404
+            )
+    
+    def do_POST(self):
+        """POST requests handle karo"""
+        path = self.path.split("?")[0]
+        
+        if path == "/api/trial/signup":
+            self.handle_trial_signup()
+        else:
+            self.send_json_response(
+                {"error": "Route not found", "path": path},
+                404
+            )
+    
+    def do_DELETE(self):
+        """DELETE requests handle karo"""
+        path = self.path.split("?")[0]
+        
+        if path == "/api/trial/reset":
+            self.handle_trial_reset()
+        else:
+            self.send_json_response(
+                {"error": "Route not found", "path": path},
+                404
+            )
+
+
+# ============================================================
+# Demo / Testing Functions
+# ============================================================
+
+def demo_trial_flow():
+    """
+    Cookie-based trial flow ka demo (server ke bina)
+    """
+    print("\n" + "="*60)
+    print("FREE TRIAL SIGNUP - COOKIE DEMO")
+    print("="*60)
+    
+    # ---- Scenario 1: Pehli baar signup ----
+    print("\n📋 SCENARIO 1: Pehli baar signup (No cookie)")
+    print("-" * 40)
+    
+    empty_cookies = {}
+    user_data_1 = {"name": "Rahul Sharma", "email": "rahul@example.com"}
+    
+    result_1 = process_trial_signup(user_data_1, empty_cookies, "192.168.1.1")
+    
+    print(f"Status: {result_1['status']}")
+    print(f"Success: {result_1['success']}")
+    print(f"Message: {result_1['message']}")
+    
+    if result_1.get("set_cookie"):
+        print(f"Cookie Set: ✅ YES")
+        print(f"Cookie Header: {result_1['set_cookie'][:80]}...")
+    
+    # Cookie value extract karo next test ke liye
+    cookie_value = None
+    if result_1.get("set_cookie"):
+        # "has_used_trial=VALUE; ..." se value extract karo
+        cookie_part = result_1["set_cookie"].split(";")[0]
+        cookie_value = cookie_part.split("=", 1)[1]
+    
+    # ---- Scenario 2: Dobara signup (Cookie present) ----
+    print("\n\n📋 SCENARIO 2: Dobara signup attempt (Cookie present)")
+    print("-" * 40)
+    
+    if cookie_value:
+        existing_cookies = {TRIAL_COOKIE_NAME: cookie_value}
+        user_data_2 = {"name": "Rahul Sharma", "email": "rahul@example.com"}
+        
+        result_2 = process_trial_signup(user_data_2, existing_cookies, "192.168.1.1")
+        
+        print(f"Status: {result_2['status']}")
+        print(f"Success: {result_2['success']}")
+        print(f"Message: {result_2['message']}")
+        
+        if result_2.get("details"):
+            print(f"Suggestion: {result_2['details'].get('suggestion', 'N/A')}")
+        
+        if result_2.get("set_cookie") is None:
+            print(f"Cookie Set: ❌ NO (Blocked)")
+    
+    # ---- Scenario 3: Tampered cookie ----
+    print("\n\n📋 SCENARIO 3: Tampered/Invalid cookie")
+    print("-" * 40)
+    
+    tampered_cookies = {TRIAL_COOKIE_NAME: "fake:tampered_value_12345"}
+    user_data_3 = {"name": "Hacker", "email": "hacker@example.com"}
+    
+    result_3 = process_trial_signup(user_data_3, tampered_cookies, "10.0.0.1")
+    
+    print(f"Status: {result_3['status']}")
+    print(f"Success: {result_3['success']}")
+    print(f"Message: {result_3['message']}")
+    
+    # ---- Scenario 4: Missing fields ----
+    print("\n\n📋 SCENARIO 4: Missing required fields")
+    print("-" * 40)
+    
+    incomplete_data = {"name": "Test User"}  # Email missing
+    result_4 = process_trial_signup(incomplete_data, {}, "192.168.1.2")
+    
+    print(f"Status: {result_4['status']}")
+    print(f"Success: {result_4['success']}")
+    print(f"Message: {result_4['message']}")
+    
+    # ---- Cookie Validation Tests ----
+    print("\n\n📋 COOKIE VALIDATION TESTS")
+    print("-" * 40)
+    
+    test_cases = [
+        ("Valid token", generate_cookie_token("test_user")),
+        ("Empty string", ""),
+        ("Random string", "random_garbage"),
+        ("Partial format", "1234567890:"),
+        ("Wrong hash length", "1234567890:abc123"),
+    ]
+    
+    for test_name, test_value in test_cases:
+        is_valid = validate_cookie_token(test_value)
+        status = "✅ Valid" if is_valid else "❌ Invalid"
+        print(f"  {test_name}: {status}")
+    
+    print("\n" + "="*60)
+    print("Demo complete!")
+    print("="*60)
+
+
+# ============================================================
+# Main Entry Point
+# ============================================================
+
+def main():
+    """Main function"""
+    import sys
+    
+    # Command line argument check karo
+    if len(sys.argv) > 1 and sys.argv[1] == "demo":
+        # Demo mode - server ke bina run karo
+        demo_trial_flow()
+        return
+    
+    # Server mode
+    print(f"\n{'='*60}")
+    print("FREE TRIAL SIGNUP SERVER")
+    print(f"{'='*60}")
+    print(f"Server: http://{SERVER_HOST}:{SERVER_PORT}")
+    print(f"\nAvailable Endpoints:")
+    print(f"  GET  http://{SERVER_HOST}:{SERVER_PORT}/")
+    print(f"  GET  http://{SERVER_HOST}:{SERVER_PORT}/api/trial/status")
+    print(f"  POST http://{SERVER_HOST}:{SERVER_PORT}/api/trial/signup")
+    print(f"  DELETE http://{SERVER_HOST}:{SERVER_PORT}/api/trial/reset")
+    print(f"\nTest Commands:")
+    print(f"  # Pehli baar signup:")
+    print(f"  curl -X POST http://{SERVER_HOST}:{SERVER_PORT}/api/trial/signup \\")
+    print(f"    -H 'Content-Type: application/json' \\")
+    print(f"    -d '{{\"name\": \"Rahul\", \"email\": \"rahul@example.com\"}}' \\")
+    print(f"    -c cookies.txt -b cookies.txt")
+    print(f"\n  # Dobara signup (blocked hoga):")
+    print(f"  curl -X POST http://{SERVER_HOST}:{SERVER_PORT}/api/trial/signup \\")
+    print(f"    -H 'Content-Type: application/json' \\")
+    print(f"    -d '{{\"name\": \"Rahul\", \"email\": \"rahul@example.com\"}}' \\")
+    print(f"    -c cookies.txt -b cookies.txt")
+    print(f"\n  # Demo mode (server ke bina):")
+    print(f"  python {sys.argv[0]} demo")
+    print(f"{'='*60}\n")
+    
+    try:
+        server = HTTPServer((SERVER_HOST, SERVER_PORT), TrialSignupHandler)
+        print(f"✅ Server started on http://{SERVER_HOST}:{SERVER_PORT}")
+        print("Press Ctrl+C to stop...\n")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n🛑 Server stopped.")
+        server.server_close()
+    except OSError as e:
+        print(f"❌ Server start nahi ho saka: {e}")
+        print(f"   Port {SERVER_PORT} already in use ho sakta hai.")
+
+
+if __name__ == "__main__":
+    main()
+```

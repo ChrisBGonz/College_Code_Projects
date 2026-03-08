@@ -1,0 +1,200 @@
+
+```python
+import hmac
+import hashlib
+import struct
+import time
+import base64
+import os
+import anthropic
+
+client = anthropic.Anthropic()
+
+def generate_totp(secret: str, time_step: int = 30, digits: int = 6) -> str:
+    """Generate a TOTP code based on the secret and current time."""
+    # Decode the base32 secret
+    secret_bytes = base64.b32decode(secret.upper() + '=' * ((8 - len(secret) % 8) % 8))
+    
+    # Get current time counter
+    counter = int(time.time()) // time_step
+    
+    # Pack counter as 8-byte big-endian
+    counter_bytes = struct.pack('>Q', counter)
+    
+    # Generate HMAC-SHA1
+    hmac_hash = hmac.new(secret_bytes, counter_bytes, hashlib.sha1).digest()
+    
+    # Dynamic truncation
+    offset = hmac_hash[-1] & 0x0F
+    truncated = struct.unpack('>I', hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
+    
+    # Generate OTP
+    otp = truncated % (10 ** digits)
+    return str(otp).zfill(digits)
+
+def verify_totp_with_claude(secret: str, user_code: str) -> dict:
+    """Use Claude to verify TOTP code with detailed explanation."""
+    
+    # Generate current valid codes (current + previous window for tolerance)
+    current_time = int(time.time())
+    time_step = 30
+    
+    codes_info = []
+    for offset in [-1, 0, 1]:  # Check previous, current, and next window
+        counter = (current_time // time_step) + offset
+        counter_bytes = struct.pack('>Q', counter)
+        secret_bytes = base64.b32decode(secret.upper() + '=' * ((8 - len(secret) % 8) % 8))
+        hmac_hash = hmac.new(secret_bytes, counter_bytes, hashlib.sha1).digest()
+        trunc_offset = hmac_hash[-1] & 0x0F
+        truncated = struct.unpack('>I', hmac_hash[trunc_offset:trunc_offset + 4])[0] & 0x7FFFFFFF
+        otp = str(truncated % 1000000).zfill(6)
+        
+        window_start = counter * time_step
+        window_end = window_start + time_step
+        codes_info.append({
+            "window": offset,
+            "code": otp,
+            "valid_from": window_start,
+            "valid_until": window_end
+        })
+    
+    # Prepare verification context for Claude
+    verification_context = f"""
+    TOTP Verification Request:
+    - User provided code: {user_code}
+    - Current timestamp: {current_time}
+    - Time step: {time_step} seconds
+    - Current time window: {current_time // time_step}
+    
+    Valid codes for verification (with ±1 window tolerance):
+    - Previous window code: {codes_info[0]['code']} (valid {codes_info[0]['valid_from']} to {codes_info[0]['valid_until']})
+    - Current window code: {codes_info[1]['code']} (valid {codes_info[1]['valid_from']} to {codes_info[1]['valid_until']})
+    - Next window code: {codes_info[2]['code']} (valid {codes_info[2]['valid_until'] - time_step} to {codes_info[2]['valid_until']})
+    
+    Please verify if the user's code matches any of the valid codes and provide:
+    1. Whether the code is valid (YES/NO)
+    2. Which time window it matches (if valid)
+    3. Security assessment
+    4. Recommendation for the authentication system
+    
+    Format your response as a structured analysis.
+    """
+    
+    # Use streaming with Claude
+    print("\n🔐 Claude AI TOTP Verification Analysis:")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": verification_context
+            }
+        ],
+        system="You are a security expert specializing in two-factor authentication systems. Analyze TOTP verification requests and provide detailed security assessments. Be precise and security-focused in your analysis."
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    
+    # Determine actual verification result
+    is_valid = user_code in [code_info['code'] for code_info in codes_info]
+    matched_window = None
+    
+    if is_valid:
+        for code_info in codes_info:
+            if code_info['code'] == user_code:
+                matched_window = code_info['window']
+                break
+    
+    return {
+        "is_valid": is_valid,
+        "matched_window": matched_window,
+        "user_code": user_code,
+        "claude_analysis": full_response
+    }
+
+def demonstrate_totp_system():
+    """Demonstrate the complete TOTP verification system."""
+    
+    print("=" * 60)
+    print("🔑 TOTP (Time-based One-Time Password) Verification System")
+    print("=" * 60)
+    
+    # Generate a demo secret (in real world, this would be user-specific)
+    demo_secret = base64.b32encode(os.urandom(20)).decode('utf-8').rstrip('=')
+    print(f"\n📱 Demo Secret Key: {demo_secret}")
+    print("(In production, this would be stored securely per user)")
+    
+    # Generate current valid TOTP
+    current_totp = generate_totp(demo_secret)
+    print(f"\n⏰ Current Valid TOTP Code: {current_totp}")
+    print(f"   (Valid for ~{30 - int(time.time()) % 30} more seconds)")
+    
+    print("\n" + "=" * 60)
+    print("Test Case 1: Valid TOTP Code")
+    print("=" * 60)
+    
+    # Test with valid code
+    result1 = verify_totp_with_claude(demo_secret, current_totp)
+    print(f"\n✅ Verification Result: {'AUTHENTICATED' if result1['is_valid'] else 'REJECTED'}")
+    
+    print("\n" + "=" * 60)
+    print("Test Case 2: Invalid TOTP Code")
+    print("=" * 60)
+    
+    # Test with invalid code
+    invalid_code = "123456" if current_totp != "123456" else "654321"
+    result2 = verify_totp_with_claude(demo_secret, invalid_code)
+    print(f"\n❌ Verification Result: {'AUTHENTICATED' if result2['is_valid'] else 'REJECTED'}")
+    
+    print("\n" + "=" * 60)
+    print("Test Case 3: Interactive Verification")
+    print("=" * 60)
+    
+    print(f"\nFor testing, the current valid code is: {current_totp}")
+    user_input = input("Enter a 6-digit TOTP code to verify (or press Enter to use current valid code): ").strip()
+    
+    if not user_input:
+        user_input = current_totp
+    
+    if len(user_input) == 6 and user_input.isdigit():
+        result3 = verify_totp_with_claude(demo_secret, user_input)
+        
+        print("\n" + "=" * 60)
+        print("📊 Final Authentication Decision")
+        print("=" * 60)
+        
+        if result3['is_valid']:
+            window_desc = {
+                -1: "previous time window (clock skew tolerance)",
+                0: "current time window",
+                1: "next time window (clock skew tolerance)"
+            }
+            print(f"✅ ACCESS GRANTED")
+            print(f"   Code matched: {window_desc.get(result3['matched_window'], 'unknown window')}")
+        else:
+            print(f"❌ ACCESS DENIED")
+            print(f"   Invalid or expired TOTP code")
+    else:
+        print("⚠️  Invalid input format. TOTP code must be exactly 6 digits.")
+    
+    print("\n" + "=" * 60)
+    print("🔒 Security Notes:")
+    print("=" * 60)
+    print("• TOTP codes expire every 30 seconds")
+    print("• Each code can only be used once (replay protection)")
+    print("• ±1 window tolerance handles clock synchronization issues")
+    print("• Secret keys should be stored encrypted in production")
+    print("• Failed attempts should be rate-limited")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    demonstrate_totp_system()
+```

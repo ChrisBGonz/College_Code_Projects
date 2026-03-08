@@ -1,0 +1,261 @@
+
+```python
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def compute_file_hash(file_path: str, algorithm: str = "sha256") -> str:
+    """Compute hash of a file using specified algorithm."""
+    hash_func = hashlib.new(algorithm)
+    
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_func.update(chunk)
+    
+    return hash_func.hexdigest()
+
+
+def read_manifest(manifest_path: str) -> dict:
+    """Read manifest file and return its contents."""
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def verify_files_with_claude(manifest_path: str, project_dir: str) -> None:
+    """Use Claude to verify file hashes against manifest."""
+    
+    client = anthropic.Anthropic()
+    
+    # Read manifest
+    manifest = read_manifest(manifest_path)
+    
+    # Compute hashes for all files in manifest
+    verification_results = []
+    
+    for file_info in manifest.get("files", []):
+        file_path = file_info.get("path", "")
+        expected_hash = file_info.get("hash", "")
+        algorithm = file_info.get("algorithm", "sha256")
+        
+        full_path = os.path.join(project_dir, file_path)
+        
+        if os.path.exists(full_path):
+            actual_hash = compute_file_hash(full_path, algorithm)
+            matches = actual_hash == expected_hash
+            
+            verification_results.append({
+                "file": file_path,
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash,
+                "algorithm": algorithm,
+                "matches": matches,
+                "status": "PASS" if matches else "FAIL"
+            })
+        else:
+            verification_results.append({
+                "file": file_path,
+                "expected_hash": expected_hash,
+                "actual_hash": None,
+                "algorithm": algorithm,
+                "matches": False,
+                "status": "MISSING"
+            })
+    
+    # Prepare data for Claude analysis
+    verification_data = {
+        "manifest_path": manifest_path,
+        "project_directory": project_dir,
+        "manifest_metadata": manifest.get("metadata", {}),
+        "verification_results": verification_results,
+        "summary": {
+            "total_files": len(verification_results),
+            "passed": sum(1 for r in verification_results if r["status"] == "PASS"),
+            "failed": sum(1 for r in verification_results if r["status"] == "FAIL"),
+            "missing": sum(1 for r in verification_results if r["status"] == "MISSING")
+        }
+    }
+    
+    # Use Claude with streaming to analyze results
+    prompt = f"""
+    मैंने एक manifest file के against project files के hashes verify किए हैं।
+    यहाँ verification results हैं:
+    
+    {json.dumps(verification_data, indent=2, ensure_ascii=False)}
+    
+    कृपया इन results का विश्लेषण करें और:
+    1. Overall verification status बताएं
+    2. किसी भी failed या missing files को highlight करें
+    3. Security implications explain करें
+    4. अगर कोई issues हैं तो recommendations दें
+    5. Hindi में एक clear summary provide करें
+    
+    Format your response clearly with sections for:
+    - Overall Status
+    - Detailed Analysis
+    - Security Assessment
+    - Recommendations (if any)
+    """
+    
+    print("\n" + "="*60)
+    print("FILE HASH VERIFICATION REPORT")
+    print("="*60)
+    print(f"\nManifest: {manifest_path}")
+    print(f"Project Directory: {project_dir}")
+    print(f"\nVerification Summary:")
+    print(f"  Total Files: {verification_data['summary']['total_files']}")
+    print(f"  Passed: {verification_data['summary']['passed']}")
+    print(f"  Failed: {verification_data['summary']['failed']}")
+    print(f"  Missing: {verification_data['summary']['missing']}")
+    
+    print("\n" + "-"*60)
+    print("Detailed Results:")
+    print("-"*60)
+    
+    for result in verification_results:
+        status_symbol = "✓" if result["status"] == "PASS" else "✗" if result["status"] == "FAIL" else "?"
+        print(f"\n{status_symbol} {result['file']}")
+        print(f"  Status: {result['status']}")
+        print(f"  Algorithm: {result['algorithm']}")
+        print(f"  Expected: {result['expected_hash']}")
+        if result['actual_hash']:
+            print(f"  Actual:   {result['actual_hash']}")
+        else:
+            print(f"  Actual:   FILE NOT FOUND")
+    
+    print("\n" + "="*60)
+    print("CLAUDE AI ANALYSIS (Streaming)")
+    print("="*60 + "\n")
+    
+    # Stream Claude's analysis
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n\n" + "="*60)
+
+
+def create_sample_manifest(project_dir: str, manifest_path: str) -> None:
+    """Create a sample manifest file for demonstration."""
+    
+    files_data = []
+    
+    # Scan project directory for files
+    for root, dirs, files in os.walk(project_dir):
+        # Skip hidden directories and common non-essential directories
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', '.git']]
+        
+        for file in files:
+            if file.endswith(('.py', '.js', '.json', '.txt', '.md', '.html', '.css')):
+                file_path = os.path.relpath(os.path.join(root, file), project_dir)
+                
+                try:
+                    file_hash = compute_file_hash(os.path.join(root, file))
+                    files_data.append({
+                        "path": file_path,
+                        "hash": file_hash,
+                        "algorithm": "sha256"
+                    })
+                except Exception as e:
+                    print(f"Warning: Could not hash {file_path}: {e}")
+    
+    manifest = {
+        "metadata": {
+            "version": "1.0",
+            "created_at": "2024-01-01",
+            "description": "Project file integrity manifest"
+        },
+        "files": files_data
+    }
+    
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    print(f"Sample manifest created at: {manifest_path}")
+    print(f"Total files indexed: {len(files_data)}")
+
+
+def main():
+    # Default paths
+    project_dir = os.getcwd()
+    manifest_path = os.path.join(project_dir, "manifest.json")
+    
+    # Check command line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--create-manifest":
+            # Create a sample manifest
+            if len(sys.argv) > 2:
+                project_dir = sys.argv[2]
+            if len(sys.argv) > 3:
+                manifest_path = sys.argv[3]
+            
+            print(f"Creating manifest for directory: {project_dir}")
+            create_sample_manifest(project_dir, manifest_path)
+            return
+        else:
+            manifest_path = sys.argv[1]
+            if len(sys.argv) > 2:
+                project_dir = sys.argv[2]
+    
+    # Check if manifest exists
+    if not os.path.exists(manifest_path):
+        print(f"Manifest file not found: {manifest_path}")
+        print("\nUsage:")
+        print("  python solution.py [manifest_path] [project_dir]")
+        print("  python solution.py --create-manifest [project_dir] [manifest_path]")
+        print("\nExample:")
+        print("  python solution.py manifest.json /path/to/project")
+        print("  python solution.py --create-manifest /path/to/project manifest.json")
+        
+        # Create a demo manifest for demonstration
+        print("\n" + "="*60)
+        print("Creating demo manifest for demonstration...")
+        print("="*60)
+        
+        # Create some sample files for demo
+        demo_dir = os.path.join(os.getcwd(), "demo_project")
+        os.makedirs(demo_dir, exist_ok=True)
+        
+        # Create sample files
+        sample_files = {
+            "main.py": "print('Hello, World!')\n",
+            "config.json": '{"version": "1.0", "debug": false}\n',
+            "README.md": "# Demo Project\nThis is a demo project.\n"
+        }
+        
+        for filename, content in sample_files.items():
+            with open(os.path.join(demo_dir, filename), "w") as f:
+                f.write(content)
+        
+        demo_manifest = os.path.join(os.getcwd(), "demo_manifest.json")
+        create_sample_manifest(demo_dir, demo_manifest)
+        
+        print("\nRunning verification on demo project...")
+        verify_files_with_claude(demo_manifest, demo_dir)
+        
+        # Cleanup demo files
+        import shutil
+        shutil.rmtree(demo_dir)
+        os.remove(demo_manifest)
+        
+        return
+    
+    # Verify files against manifest
+    verify_files_with_claude(manifest_path, project_dir)
+
+
+if __name__ == "__main__":
+    main()
+```

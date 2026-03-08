@@ -1,0 +1,330 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = new Map();
+const votes = new Map(); // key: `${pollId}_${ip}`, value: optionId
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// Helper function to generate unique IDs
+function generateId() {
+  return Math.random().toString(36).substr(2, 9);
+}
+
+// Helper function to get current timestamp
+function getCurrentTimestamp() {
+  return new Date().toISOString();
+}
+
+// Poll management functions
+function createPoll(title, options) {
+  const pollId = generateId();
+  const poll = {
+    id: pollId,
+    title,
+    options: options.map((opt) => ({
+      id: generateId(),
+      text: opt,
+      votes: 0,
+    })),
+    createdAt: getCurrentTimestamp(),
+    active: true,
+  };
+  polls.set(pollId, poll);
+  return poll;
+}
+
+function castVote(pollId, optionId, voterIp) {
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return { success: false, message: "Poll not found" };
+  }
+
+  if (!poll.active) {
+    return { success: false, message: "Poll is closed" };
+  }
+
+  const voteKey = `${pollId}_${voterIp}`;
+  if (votes.has(voteKey)) {
+    const existingVote = votes.get(voteKey);
+    return {
+      success: false,
+      message: `You have already voted for option: ${existingVote.optionText}`,
+    };
+  }
+
+  const option = poll.options.find((opt) => opt.id === optionId);
+  if (!option) {
+    return { success: false, message: "Option not found" };
+  }
+
+  option.votes++;
+  votes.set(voteKey, { optionId, optionText: option.text });
+
+  return {
+    success: true,
+    message: `Vote cast successfully for: ${option.text}`,
+    poll: getPollResults(pollId),
+  };
+}
+
+function getPollResults(pollId) {
+  const poll = polls.get(pollId);
+  if (!poll) return null;
+
+  const totalVotes = poll.options.reduce((sum, opt) => sum + opt.votes, 0);
+  return {
+    ...poll,
+    totalVotes,
+    options: poll.options.map((opt) => ({
+      ...opt,
+      percentage:
+        totalVotes > 0 ? ((opt.votes / totalVotes) * 100).toFixed(1) : 0,
+    })),
+  };
+}
+
+function getAllPolls() {
+  return Array.from(polls.values()).map((poll) => getPollResults(poll.id));
+}
+
+function closePoll(pollId) {
+  const poll = polls.get(pollId);
+  if (!poll) return { success: false, message: "Poll not found" };
+
+  poll.active = false;
+  return { success: true, message: "Poll closed successfully" };
+}
+
+// Process AI response and execute commands
+function processAICommand(command) {
+  try {
+    const parsed = JSON.parse(command);
+
+    switch (parsed.action) {
+      case "create_poll":
+        const newPoll = createPoll(parsed.title, parsed.options);
+        return {
+          success: true,
+          data: newPoll,
+          message: `Poll created with ID: ${newPoll.id}`,
+        };
+
+      case "cast_vote":
+        return castVote(parsed.pollId, parsed.optionId, parsed.voterIp);
+
+      case "get_results":
+        const results = getPollResults(parsed.pollId);
+        if (!results) return { success: false, message: "Poll not found" };
+        return { success: true, data: results };
+
+      case "list_polls":
+        return { success: true, data: getAllPolls() };
+
+      case "close_poll":
+        return closePoll(parsed.pollId);
+
+      default:
+        return { success: false, message: "Unknown action" };
+    }
+  } catch (e) {
+    return { success: false, message: "Invalid command format" };
+  }
+}
+
+// Format poll results for display
+function formatPollResults(poll) {
+  if (!poll) return "Poll not found";
+
+  let result = `\n📊 Poll: ${poll.title}\n`;
+  result += `Status: ${poll.active ? "🟢 Active" : "🔴 Closed"}\n`;
+  result += `Total Votes: ${poll.totalVotes}\n\n`;
+
+  poll.options.forEach((opt, index) => {
+    const bar = "█".repeat(Math.floor(opt.percentage / 5));
+    result += `${index + 1}. ${opt.text}\n`;
+    result += `   ${bar} ${opt.percentage}% (${opt.votes} votes)\n`;
+    result += `   Option ID: ${opt.id}\n\n`;
+  });
+
+  return result;
+}
+
+// Main chat function with streaming
+async function chat(userMessage) {
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  const systemPrompt = `You are a voting system assistant that helps users create polls, cast votes, and view results.
+
+You have access to the following voting system functions. When you need to perform an action, output a JSON command in this exact format:
+
+COMMAND: {"action": "...", ...}
+
+Available actions:
+1. Create a poll: {"action": "create_poll", "title": "Poll title", "options": ["Option 1", "Option 2", "Option 3"]}
+2. Cast a vote: {"action": "cast_vote", "pollId": "poll_id", "optionId": "option_id", "voterIp": "ip_address"}
+3. Get poll results: {"action": "get_results", "pollId": "poll_id"}
+4. List all polls: {"action": "list_polls"}
+5. Close a poll: {"action": "close_poll", "pollId": "poll_id"}
+
+Current system state:
+- Total polls: ${polls.size}
+- Total votes cast: ${votes.size}
+
+Important rules:
+- Each IP address can only vote once per poll (duplicate vote prevention)
+- Always use realistic IP addresses like "192.168.1.1" or "10.0.0.1" for demo purposes
+- When showing poll results, format them clearly with percentages
+- If a user wants to vote, ask for their IP address or use a demo IP
+- Always explain what you're doing before executing commands
+- After executing a command, show the results in a user-friendly format
+
+Respond in Hindi when the user writes in Hindi, and in English when they write in English.`;
+
+  let fullResponse = "";
+  let commandBuffer = "";
+  let inCommand = false;
+
+  process.stdout.write("\nAssistant: ");
+
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 2048,
+    system: systemPrompt,
+    messages: conversationHistory,
+  });
+
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      const text = chunk.delta.text;
+      fullResponse += text;
+
+      // Check for command in the stream
+      if (text.includes("COMMAND:")) {
+        inCommand = true;
+        commandBuffer = "";
+        process.stdout.write(text.split("COMMAND:")[0]);
+      } else if (inCommand) {
+        commandBuffer += text;
+        // Check if we have a complete JSON command
+        if (commandBuffer.includes("}")) {
+          const jsonMatch = commandBuffer.match(/\{[^}]+\}/);
+          if (jsonMatch) {
+            const result = processAICommand(jsonMatch[0]);
+            inCommand = false;
+
+            // Display command result
+            if (result.success) {
+              if (result.data) {
+                if (result.data.options) {
+                  // It's a poll result
+                  process.stdout.write(formatPollResults(result.data));
+                } else if (Array.isArray(result.data)) {
+                  // It's a list of polls
+                  if (result.data.length === 0) {
+                    process.stdout.write("\nNo polls found.\n");
+                  } else {
+                    result.data.forEach((poll) => {
+                      process.stdout.write(formatPollResults(poll));
+                    });
+                  }
+                } else {
+                  // New poll created
+                  process.stdout.write(
+                    `\n✅ ${result.message}\nPoll ID: ${result.data.id}\n`
+                  );
+                  process.stdout.write(formatPollResults(result.data));
+                }
+              } else {
+                process.stdout.write(`\n✅ ${result.message}\n`);
+              }
+            } else {
+              process.stdout.write(`\n❌ ${result.message}\n`);
+            }
+
+            // Continue with remaining text after command
+            const remainingText = commandBuffer.replace(
+              /COMMAND:\s*\{[^}]+\}/,
+              ""
+            );
+            if (remainingText) {
+              process.stdout.write(remainingText);
+            }
+            commandBuffer = "";
+          }
+        }
+      } else {
+        process.stdout.write(text);
+      }
+    }
+  }
+
+  console.log("\n");
+
+  conversationHistory.push({
+    role: "assistant",
+    content: fullResponse,
+  });
+
+  return fullResponse;
+}
+
+// Main function
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("🗳️  Voting System - AI Assistant");
+  console.log("================================");
+  console.log("आप polls बना सकते हैं, vote कर सकते हैं, और results देख सकते हैं।");
+  console.log('Type "exit" to quit\n');
+
+  // Initial greeting
+  await chat(
+    "नमस्ते! मुझे voting system के बारे में बताओ और एक demo poll बनाओ।"
+  );
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye! धन्यवाद!");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        await chat(userInput);
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main().catch(console.error);
+```
