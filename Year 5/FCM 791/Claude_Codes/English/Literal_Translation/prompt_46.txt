@@ -1,0 +1,165 @@
+
+```python
+import anthropic
+import requests
+from urllib.parse import urlparse, parse_qs
+
+def validate_url(url: str) -> bool:
+    """Validate if the provided URL is valid."""
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+def get_redirect_url_from_query(query_string: str) -> str | None:
+    """Extract redirect_url from query string."""
+    params = parse_qs(query_string)
+    redirect_urls = params.get('redirect_url', [])
+    if redirect_urls:
+        return redirect_urls[0]
+    return None
+
+def perform_redirect(redirect_url: str) -> dict:
+    """Perform the actual redirect and return response information."""
+    if not validate_url(redirect_url):
+        return {
+            "success": False,
+            "error": f"Invalid URL: {redirect_url}",
+            "redirect_url": redirect_url
+        }
+    
+    try:
+        response = requests.get(redirect_url, allow_redirects=True, timeout=10)
+        return {
+            "success": True,
+            "redirect_url": redirect_url,
+            "final_url": response.url,
+            "status_code": response.status_code,
+            "redirect_history": [r.url for r in response.history],
+            "content_type": response.headers.get('content-type', 'unknown')
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "redirect_url": redirect_url
+        }
+
+def process_with_claude(query_string: str) -> str:
+    """Use Claude to process the redirect request with tool use."""
+    client = anthropic.Anthropic()
+    
+    tools = [
+        {
+            "name": "extract_redirect_url",
+            "description": "Extract the redirect_url parameter from a query string",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "query_string": {
+                        "type": "string",
+                        "description": "The URL query string to parse"
+                    }
+                },
+                "required": ["query_string"]
+            }
+        },
+        {
+            "name": "validate_and_redirect",
+            "description": "Validate a URL and perform the redirect, returning information about the redirect",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to validate and redirect to"
+                    }
+                },
+                "required": ["url"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Process this redirect request. The query string is: '{query_string}'. Extract the redirect_url parameter and perform the redirect."
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    if tool_name == "extract_redirect_url":
+                        result = get_redirect_url_from_query(tool_input["query_string"])
+                        tool_result = {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": str(result) if result else "No redirect_url found in query string"
+                        }
+                    elif tool_name == "validate_and_redirect":
+                        result = perform_redirect(tool_input["url"])
+                        tool_result = {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": str(result)
+                        }
+                    else:
+                        tool_result = {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": "Unknown tool"
+                        }
+                    
+                    tool_results.append(tool_result)
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            final_response = ""
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    final_response += content_block.text
+            return final_response
+        else:
+            return f"Unexpected stop reason: {response.stop_reason}"
+
+def main():
+    test_cases = [
+        "redirect_url=https://www.example.com",
+        "redirect_url=https://httpbin.org/get&source=test",
+        "redirect_url=https://www.python.org/",
+        "no_redirect_param=value",
+        "redirect_url=not-a-valid-url",
+    ]
+    
+    print("Testing redirect URL processor with Claude AI\n")
+    print("=" * 60)
+    
+    for query_string in test_cases:
+        print(f"\nQuery String: {query_string}")
+        print("-" * 40)
+        
+        result = process_with_claude(query_string)
+        print(f"Claude's Response:\n{result}")
+        print("=" * 60)
+
+if __name__ == "__main__":
+    main()
+```

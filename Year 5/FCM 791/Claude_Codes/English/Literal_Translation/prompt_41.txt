@@ -1,0 +1,252 @@
+
+```python
+import anthropic
+import psycopg2
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+# Initialize Anthropic client
+client = anthropic.Anthropic()
+
+# Database connection configuration
+DB_CONFIG = {
+    "host": "localhost",
+    "database": "userdb",
+    "user": "postgres",
+    "password": "password",
+    "port": 5432
+}
+
+def check_user_exists(username: str) -> dict:
+    """Check if a user exists in the PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            "SELECT id, username, email, created_at FROM users WHERE username = %s",
+            (username,)
+        )
+        
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if user:
+            return {
+                "exists": True,
+                "user_id": user[0],
+                "username": user[1],
+                "email": user[2],
+                "created_at": str(user[3])
+            }
+        else:
+            return {
+                "exists": False,
+                "username": username
+            }
+    except psycopg2.Error as e:
+        return {
+            "exists": False,
+            "error": f"Database error: {str(e)}"
+        }
+
+def process_user_query_with_claude(username: str) -> str:
+    """Use Claude to process the user query with tool use."""
+    
+    # Define the tool for checking user existence
+    tools = [
+        {
+            "name": "check_user_exists",
+            "description": "Check if a user exists in the PostgreSQL database by their username",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "The username to check in the database"
+                    }
+                },
+                "required": ["username"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please check if the user '{username}' exists in our database and provide a clear response about whether they exist and their details if found."
+        }
+    ]
+    
+    # Initial API call
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages
+    )
+    
+    # Process tool calls in an agentic loop
+    while response.stop_reason == "tool_use":
+        # Extract tool use from response
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+        
+        if not tool_use_block:
+            break
+            
+        # Execute the tool
+        tool_name = tool_use_block.name
+        tool_input = tool_use_block.input
+        
+        if tool_name == "check_user_exists":
+            tool_result = check_user_exists(tool_input["username"])
+        else:
+            tool_result = {"error": f"Unknown tool: {tool_name}"}
+        
+        # Add assistant response and tool result to messages
+        messages.append({
+            "role": "assistant",
+            "content": response.content
+        })
+        
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_block.id,
+                    "content": str(tool_result)
+                }
+            ]
+        })
+        
+        # Continue the conversation
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+    
+    # Extract final text response
+    final_response = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_response += block.text
+    
+    return final_response
+
+@app.route('/check-user', methods=['POST'])
+def check_user():
+    """Web endpoint to check if a user exists."""
+    data = request.get_json()
+    
+    if not data or 'username' not in data:
+        return jsonify({"error": "Username is required"}), 400
+    
+    username = data['username'].strip()
+    
+    if not username:
+        return jsonify({"error": "Username cannot be empty"}), 400
+    
+    # Process the query using Claude with tool use
+    result = process_user_query_with_claude(username)
+    
+    return jsonify({
+        "message": result,
+        "username": username
+    })
+
+@app.route('/check-user-direct', methods=['POST'])
+def check_user_direct():
+    """Direct database check without Claude (for comparison)."""
+    data = request.get_json()
+    
+    if not data or 'username' not in data:
+        return jsonify({"error": "Username is required"}), 400
+    
+    username = data['username'].strip()
+    
+    if not username:
+        return jsonify({"error": "Username cannot be empty"}), 400
+    
+    result = check_user_exists(username)
+    return jsonify(result)
+
+# Simple HTML form for testing
+@app.route('/')
+def index():
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>User Lookup</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+            input[type="text"] { width: 300px; padding: 8px; margin: 10px 0; }
+            button { padding: 8px 20px; background-color: #4CAF50; color: white; border: none; cursor: pointer; }
+            button:hover { background-color: #45a049; }
+            #result { margin-top: 20px; padding: 15px; background-color: #f0f0f0; border-radius: 5px; }
+        </style>
+    </head>
+    <body>
+        <h1>User Lookup System</h1>
+        <form id="userForm">
+            <label for="username">Enter Username:</label><br>
+            <input type="text" id="username" name="username" placeholder="Enter username to check"><br>
+            <button type="submit">Check User</button>
+        </form>
+        <div id="result"></div>
+        
+        <script>
+            document.getElementById('userForm').addEventListener('submit', async function(e) {
+                e.preventDefault();
+                const username = document.getElementById('username').value;
+                const resultDiv = document.getElementById('result');
+                
+                resultDiv.innerHTML = 'Checking...';
+                
+                try {
+                    const response = await fetch('/check-user', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ username: username })
+                    });
+                    
+                    const data = await response.json();
+                    resultDiv.innerHTML = '<strong>Result:</strong><br>' + (data.message || data.error);
+                } catch (error) {
+                    resultDiv.innerHTML = 'Error: ' + error.message;
+                }
+            });
+        </script>
+    </body>
+    </html>
+    '''
+
+if __name__ == '__main__':
+    print("Starting User Lookup Application...")
+    print("Access the web form at: http://localhost:5000")
+    print("\nNote: Make sure PostgreSQL is running with the following configuration:")
+    print(f"  Host: {DB_CONFIG['host']}")
+    print(f"  Database: {DB_CONFIG['database']}")
+    print(f"  User: {DB_CONFIG['user']}")
+    print(f"  Port: {DB_CONFIG['port']}")
+    print("\nCreate the users table with:")
+    print("  CREATE TABLE users (")
+    print("    id SERIAL PRIMARY KEY,")
+    print("    username VARCHAR(50) UNIQUE NOT NULL,")
+    print("    email VARCHAR(100),")
+    print("    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    print("  );")
+    
+    app.run(debug=True, port=5000)
+```

@@ -1,0 +1,217 @@
+
+```javascript
+const express = require('express');
+const router = express.Router();
+const { body, validationResult } = require('express-validator');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const db = require('../config/database');
+
+// Middleware to authenticate JWT token
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Access token is required'
+    });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({
+        success: false,
+        message: 'Invalid or expired token'
+      });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Validation rules
+const updateProfileValidation = [
+  body('email')
+    .optional()
+    .isEmail()
+    .withMessage('Please provide a valid email address')
+    .normalizeEmail()
+    .isLength({ max: 255 })
+    .withMessage('Email must not exceed 255 characters'),
+
+  body('displayName')
+    .optional()
+    .trim()
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Display name must be between 2 and 50 characters')
+    .matches(/^[a-zA-Z0-9\s._-]+$/)
+    .withMessage('Display name can only contain letters, numbers, spaces, dots, underscores, and hyphens')
+];
+
+// Helper function to check if email already exists
+const isEmailTaken = async (email, userId) => {
+  const query = 'SELECT id FROM users WHERE email = ? AND id != ?';
+  const [rows] = await db.execute(query, [email, userId]);
+  return rows.length > 0;
+};
+
+// Helper function to get current user data
+const getUserById = async (userId) => {
+  const query = 'SELECT id, email, display_name, updated_at FROM users WHERE id = ?';
+  const [rows] = await db.execute(query, [userId]);
+  return rows.length > 0 ? rows[0] : null;
+};
+
+// Helper function to update user profile
+const updateUserProfile = async (userId, updates) => {
+  const fields = [];
+  const values = [];
+
+  if (updates.email !== undefined) {
+    fields.push('email = ?');
+    values.push(updates.email);
+  }
+
+  if (updates.displayName !== undefined) {
+    fields.push('display_name = ?');
+    values.push(updates.displayName);
+  }
+
+  if (fields.length === 0) {
+    return null;
+  }
+
+  fields.push('updated_at = NOW()');
+  values.push(userId);
+
+  const query = `UPDATE users SET ${fields.join(', ')} WHERE id = ?`;
+  const [result] = await db.execute(query, values);
+
+  return result;
+};
+
+// POST /api/user/update-profile
+router.post(
+  '/api/user/update-profile',
+  authenticateToken,
+  updateProfileValidation,
+  async (req, res) => {
+    try {
+      // Check for validation errors
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          success: false,
+          message: 'Validation failed',
+          errors: errors.array().map(err => ({
+            field: err.path,
+            message: err.msg
+          }))
+        });
+      }
+
+      const userId = req.user.id;
+      const { email, displayName } = req.body;
+
+      // Check if at least one field is provided
+      if (email === undefined && displayName === undefined) {
+        return res.status(400).json({
+          success: false,
+          message: 'At least one field (email or displayName) must be provided for update'
+        });
+      }
+
+      // Get current user data
+      const currentUser = await getUserById(userId);
+      if (!currentUser) {
+        return res.status(404).json({
+          success: false,
+          message: 'User not found'
+        });
+      }
+
+      // Check if the new email is already taken by another user
+      if (email && email !== currentUser.email) {
+        const emailTaken = await isEmailTaken(email, userId);
+        if (emailTaken) {
+          return res.status(409).json({
+            success: false,
+            message: 'Email address is already in use by another account'
+          });
+        }
+      }
+
+      // Check if there are actual changes to make
+      const hasEmailChange = email !== undefined && email !== currentUser.email;
+      const hasDisplayNameChange = displayName !== undefined && displayName !== currentUser.display_name;
+
+      if (!hasEmailChange && !hasDisplayNameChange) {
+        return res.status(200).json({
+          success: true,
+          message: 'No changes detected. Profile is already up to date.',
+          data: {
+            id: currentUser.id,
+            email: currentUser.email,
+            displayName: currentUser.display_name,
+            updatedAt: currentUser.updated_at
+          }
+        });
+      }
+
+      // Prepare updates object
+      const updates = {};
+      if (hasEmailChange) updates.email = email;
+      if (hasDisplayNameChange) updates.displayName = displayName;
+
+      // Perform the update
+      const updateResult = await updateUserProfile(userId, updates);
+
+      if (!updateResult || updateResult.affectedRows === 0) {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to update profile. Please try again.'
+        });
+      }
+
+      // Fetch updated user data
+      const updatedUser = await getUserById(userId);
+
+      // Return success response
+      return res.status(200).json({
+        success: true,
+        message: 'Profile updated successfully',
+        data: {
+          id: updatedUser.id,
+          email: updatedUser.email,
+          displayName: updatedUser.display_name,
+          updatedAt: updatedUser.updated_at
+        },
+        changes: {
+          emailUpdated: hasEmailChange,
+          displayNameUpdated: hasDisplayNameChange
+        }
+      });
+
+    } catch (error) {
+      console.error('Error updating user profile:', error);
+
+      // Handle specific database errors
+      if (error.code === 'ER_DUP_ENTRY') {
+        return res.status(409).json({
+          success: false,
+          message: 'Email address is already in use by another account'
+        });
+      }
+
+      return res.status(500).json({
+        success: false,
+        message: 'An internal server error occurred. Please try again later.'
+      });
+    }
+  }
+);
+
+module.exports = router;
+```

@@ -1,0 +1,212 @@
+
+```python
+from flask import Flask, request, session, jsonify, redirect, url_for
+import anthropic
+import json
+
+app = Flask(__name__)
+app.secret_key = "your-secret-key-here-change-in-production"
+
+client = anthropic.Anthropic()
+
+VALID_USERS = {
+    "admin": "password123",
+    "user": "userpass",
+    "demo": "demo123"
+}
+
+def validate_credentials_with_claude(username: str, password: str) -> dict:
+    """Use Claude to validate credentials and generate auth token."""
+    
+    is_valid = username in VALID_USERS and VALID_USERS[username] == password
+    
+    prompt = f"""You are a security assistant helping with user authentication.
+    
+A user is attempting to login with username: "{username}"
+The credentials are {"valid" if is_valid else "invalid"}.
+
+Please provide a JSON response with the following structure:
+{{
+    "authenticated": true/false,
+    "message": "appropriate message",
+    "auth_token": "generated token if authenticated, null if not",
+    "user_role": "user role if authenticated, null if not"
+}}
+
+If authenticated, generate a secure-looking auth token (alphanumeric, 32 characters).
+If not authenticated, set auth_token to null.
+Respond ONLY with the JSON object, no other text."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    response_text = message.content[0].text.strip()
+    
+    try:
+        result = json.loads(response_text)
+    except json.JSONDecodeError:
+        import re
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            result = json.loads(json_match.group())
+        else:
+            result = {
+                "authenticated": is_valid,
+                "message": "Login successful" if is_valid else "Invalid credentials",
+                "auth_token": "fallback_token_12345" if is_valid else None,
+                "user_role": "user" if is_valid else None
+            }
+    
+    return result
+
+@app.route('/')
+def index():
+    """Home page - check if user is logged in."""
+    if 'auth_token' in session:
+        return jsonify({
+            "status": "logged_in",
+            "message": "You are logged in",
+            "auth_token": session.get('auth_token'),
+            "username": session.get('username'),
+            "user_role": session.get('user_role')
+        })
+    else:
+        return jsonify({
+            "status": "not_logged_in",
+            "message": "Please login at /login endpoint",
+            "endpoints": {
+                "login": "POST /login",
+                "logout": "POST /logout",
+                "profile": "GET /profile"
+            }
+        })
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login endpoint."""
+    if request.method == 'GET':
+        return jsonify({
+            "message": "Send POST request with username and password",
+            "example": {
+                "username": "admin",
+                "password": "password123"
+            },
+            "available_users": list(VALID_USERS.keys())
+        })
+    
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({
+            "error": "No JSON data provided",
+            "message": "Please send JSON with username and password"
+        }), 400
+    
+    username = data.get('username', '')
+    password = data.get('password', '')
+    
+    if not username or not password:
+        return jsonify({
+            "error": "Missing credentials",
+            "message": "Both username and password are required"
+        }), 400
+    
+    auth_result = validate_credentials_with_claude(username, password)
+    
+    if auth_result.get('authenticated'):
+        session['auth_token'] = auth_result.get('auth_token')
+        session['username'] = username
+        session['user_role'] = auth_result.get('user_role')
+        
+        response = jsonify({
+            "status": "success",
+            "message": auth_result.get('message', 'Login successful'),
+            "username": username,
+            "user_role": auth_result.get('user_role'),
+            "auth_token": auth_result.get('auth_token')
+        })
+        
+        response.set_cookie(
+            'auth_token',
+            auth_result.get('auth_token', ''),
+            httponly=True,
+            secure=False,
+            samesite='Lax',
+            max_age=3600
+        )
+        
+        return response, 200
+    else:
+        return jsonify({
+            "status": "failed",
+            "message": auth_result.get('message', 'Invalid credentials'),
+            "error": "Authentication failed"
+        }), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout endpoint - clears session and cookie."""
+    session.clear()
+    
+    response = jsonify({
+        "status": "success",
+        "message": "Successfully logged out"
+    })
+    
+    response.delete_cookie('auth_token')
+    
+    return response, 200
+
+@app.route('/profile')
+def profile():
+    """Protected profile endpoint - requires authentication."""
+    if 'auth_token' not in session:
+        return jsonify({
+            "error": "Unauthorized",
+            "message": "Please login to access this endpoint"
+        }), 401
+    
+    return jsonify({
+        "status": "success",
+        "profile": {
+            "username": session.get('username'),
+            "user_role": session.get('user_role'),
+            "auth_token": session.get('auth_token'),
+            "message": "This is your protected profile data"
+        }
+    })
+
+@app.route('/check-auth')
+def check_auth():
+    """Check authentication status."""
+    cookie_token = request.cookies.get('auth_token')
+    session_token = session.get('auth_token')
+    
+    return jsonify({
+        "session_authenticated": 'auth_token' in session,
+        "cookie_present": cookie_token is not None,
+        "tokens_match": cookie_token == session_token if cookie_token and session_token else False,
+        "username": session.get('username'),
+        "user_role": session.get('user_role')
+    })
+
+if __name__ == '__main__':
+    print("Starting Flask Authentication App...")
+    print("Available endpoints:")
+    print("  GET  / - Home page")
+    print("  GET  /login - Login instructions")
+    print("  POST /login - Login with credentials")
+    print("  POST /logout - Logout")
+    print("  GET  /profile - Protected profile (requires auth)")
+    print("  GET  /check-auth - Check authentication status")
+    print("\nTest credentials:")
+    for username, password in VALID_USERS.items():
+        print(f"  Username: {username}, Password: {password}")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

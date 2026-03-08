@@ -1,0 +1,373 @@
+<?php
+
+define('ENCRYPTION_KEY', 'your-secret-encryption-key-min-32-chars!!');
+define('ENCRYPTION_METHOD', 'AES-256-CBC');
+
+$db_host = 'localhost';
+$db_name = 'secure_payments';
+$db_user = 'root';
+$db_pass = '';
+
+function getDatabaseConnection() {
+    global $db_host, $db_name, $db_user, $db_pass;
+    
+    try {
+        $pdo = new PDO(
+            "mysql:host={$db_host};dbname={$db_name};charset=utf8mb4",
+            $db_user,
+            $db_pass,
+            [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+            ]
+        );
+        return $pdo;
+    } catch (PDOException $e) {
+        error_log("Database connection failed: " . $e->getMessage());
+        throw new RuntimeException("Database connection failed.");
+    }
+}
+
+function createTableIfNotExists(PDO $pdo) {
+    $sql = "CREATE TABLE IF NOT EXISTS payment_cards (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        cardholder_name VARCHAR(255) NOT NULL,
+        encrypted_card_number TEXT NOT NULL,
+        card_last_four CHAR(4) NOT NULL,
+        card_hash VARCHAR(64) NOT NULL,
+        expiry_month TINYINT NOT NULL,
+        expiry_year SMALLINT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_card_hash (card_hash)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;";
+    
+    $pdo->exec($sql);
+}
+
+function encryptCreditCard(string $creditCardNumber): string {
+    $key = hash('sha256', ENCRYPTION_KEY, true);
+    $iv = openssl_random_pseudo_bytes(openssl_cipher_iv_length(ENCRYPTION_METHOD));
+    
+    $encrypted = openssl_encrypt(
+        $creditCardNumber,
+        ENCRYPTION_METHOD,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new RuntimeException("Encryption failed.");
+    }
+    
+    $hmac = hash_hmac('sha256', $encrypted, $key, true);
+    
+    return base64_encode($iv . $hmac . $encrypted);
+}
+
+function decryptCreditCard(string $encryptedData): string {
+    $key = hash('sha256', ENCRYPTION_KEY, true);
+    $data = base64_decode($encryptedData);
+    
+    if ($data === false) {
+        throw new RuntimeException("Invalid encrypted data format.");
+    }
+    
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $hmacLength = 32;
+    
+    if (strlen($data) < $ivLength + $hmacLength) {
+        throw new RuntimeException("Encrypted data is too short.");
+    }
+    
+    $iv = substr($data, 0, $ivLength);
+    $hmac = substr($data, $ivLength, $hmacLength);
+    $encrypted = substr($data, $ivLength + $hmacLength);
+    
+    $expectedHmac = hash_hmac('sha256', $encrypted, $key, true);
+    if (!hash_equals($expectedHmac, $hmac)) {
+        throw new RuntimeException("Data integrity check failed. Data may have been tampered with.");
+    }
+    
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_METHOD,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new RuntimeException("Decryption failed.");
+    }
+    
+    return $decrypted;
+}
+
+function hashCreditCard(string $creditCardNumber): string {
+    return hash_hmac('sha256', $creditCardNumber, ENCRYPTION_KEY);
+}
+
+function validateCreditCardNumber(string $cardNumber): bool {
+    $cardNumber = preg_replace('/\D/', '', $cardNumber);
+    
+    if (strlen($cardNumber) < 13 || strlen($cardNumber) > 19) {
+        return false;
+    }
+    
+    $sum = 0;
+    $alternate = false;
+    
+    for ($i = strlen($cardNumber) - 1; $i >= 0; $i--) {
+        $digit = (int)$cardNumber[$i];
+        
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+    
+    return ($sum % 10 === 0);
+}
+
+function sanitizeCreditCardNumber(string $cardNumber): string {
+    return preg_replace('/\D/', '', $cardNumber);
+}
+
+function savePaymentCard(
+    PDO $pdo,
+    string $cardholderName,
+    string $creditCardNumber,
+    int $expiryMonth,
+    int $expiryYear
+): array {
+    $cardNumber = sanitizeCreditCardNumber($creditCardNumber);
+    
+    if (!validateCreditCardNumber($cardNumber)) {
+        throw new InvalidArgumentException("Invalid credit card number.");
+    }
+    
+    if ($expiryMonth < 1 || $expiryMonth > 12) {
+        throw new InvalidArgumentException("Invalid expiry month.");
+    }
+    
+    $currentYear = (int)date('Y');
+    $currentMonth = (int)date('m');
+    
+    if ($expiryYear < $currentYear || ($expiryYear === $currentYear && $expiryMonth < $currentMonth)) {
+        throw new InvalidArgumentException("Card has expired.");
+    }
+    
+    $cardholderName = trim($cardholderName);
+    if (empty($cardholderName) || strlen($cardholderName) > 255) {
+        throw new InvalidArgumentException("Invalid cardholder name.");
+    }
+    
+    $encryptedCardNumber = encryptCreditCard($cardNumber);
+    $cardLastFour = substr($cardNumber, -4);
+    $cardHash = hashCreditCard($cardNumber);
+    
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO payment_cards 
+                (cardholder_name, encrypted_card_number, card_last_four, card_hash, expiry_month, expiry_year)
+            VALUES 
+                (:cardholder_name, :encrypted_card_number, :card_last_four, :card_hash, :expiry_month, :expiry_year)
+            ON DUPLICATE KEY UPDATE
+                cardholder_name = VALUES(cardholder_name),
+                encrypted_card_number = VALUES(encrypted_card_number),
+                expiry_month = VALUES(expiry_month),
+                expiry_year = VALUES(expiry_year)
+        ");
+        
+        $stmt->execute([
+            ':cardholder_name'      => $cardholderName,
+            ':encrypted_card_number'=> $encryptedCardNumber,
+            ':card_last_four'       => $cardLastFour,
+            ':card_hash'            => $cardHash,
+            ':expiry_month'         => $expiryMonth,
+            ':expiry_year'          => $expiryYear,
+        ]);
+        
+        $cardId = $pdo->lastInsertId();
+        
+        return [
+            'success'         => true,
+            'card_id'         => $cardId,
+            'cardholder_name' => $cardholderName,
+            'card_last_four'  => $cardLastFour,
+            'expiry_month'    => $expiryMonth,
+            'expiry_year'     => $expiryYear,
+        ];
+        
+    } catch (PDOException $e) {
+        error_log("Failed to save payment card: " . $e->getMessage());
+        throw new RuntimeException("Failed to save payment card.");
+    }
+}
+
+function getPaymentCard(PDO $pdo, int $cardId): ?array {
+    try {
+        $stmt = $pdo->prepare("
+            SELECT id, cardholder_name, encrypted_card_number, card_last_four, expiry_month, expiry_year, created_at
+            FROM payment_cards
+            WHERE id = :id
+        ");
+        
+        $stmt->execute([':id' => $cardId]);
+        $card = $stmt->fetch();
+        
+        if (!$card) {
+            return null;
+        }
+        
+        $decryptedCardNumber = decryptCreditCard($card['encrypted_card_number']);
+        
+        return [
+            'id'              => $card['id'],
+            'cardholder_name' => $card['cardholder_name'],
+            'card_number'     => $decryptedCardNumber,
+            'card_last_four'  => $card['card_last_four'],
+            'expiry_month'    => $card['expiry_month'],
+            'expiry_year'     => $card['expiry_year'],
+            'created_at'      => $card['created_at'],
+        ];
+        
+    } catch (PDOException $e) {
+        error_log("Failed to retrieve payment card: " . $e->getMessage());
+        throw new RuntimeException("Failed to retrieve payment card.");
+    }
+}
+
+function getAllPaymentCards(PDO $pdo): array {
+    try {
+        $stmt = $pdo->query("
+            SELECT id, cardholder_name, card_last_four, expiry_month, expiry_year, created_at
+            FROM payment_cards
+            ORDER BY created_at DESC
+        ");
+        
+        return $stmt->fetchAll();
+        
+    } catch (PDOException $e) {
+        error_log("Failed to retrieve payment cards: " . $e->getMessage());
+        throw new RuntimeException("Failed to retrieve payment cards.");
+    }
+}
+
+function deletePaymentCard(PDO $pdo, int $cardId): bool {
+    try {
+        $stmt = $pdo->prepare("DELETE FROM payment_cards WHERE id = :id");
+        $stmt->execute([':id' => $cardId]);
+        return $stmt->rowCount() > 0;
+    } catch (PDOException $e) {
+        error_log("Failed to delete payment card: " . $e->getMessage());
+        throw new RuntimeException("Failed to delete payment card.");
+    }
+}
+
+function maskCreditCardNumber(string $cardNumber): string {
+    $cardNumber = sanitizeCreditCardNumber($cardNumber);
+    $length = strlen($cardNumber);
+    return str_repeat('*', $length - 4) . substr($cardNumber, -4);
+}
+
+// --- Main Execution ---
+
+try {
+    $pdo = getDatabaseConnection();
+    createTableIfNotExists($pdo);
+    
+    echo "=== Credit Card Encryption System ===\n\n";
+    
+    // Example 1: Save a new card
+    echo "1. Saving a new credit card...\n";
+    $result = savePaymentCard(
+        $pdo,
+        "John Doe",
+        "4532015112830366",
+        12,
+        2027
+    );
+    
+    echo "   Card saved successfully!\n";
+    echo "   Card ID: " . $result['card_id'] . "\n";
+    echo "   Cardholder: " . $result['cardholder_name'] . "\n";
+    echo "   Last Four: **** **** **** " . $result['card_last_four'] . "\n";
+    echo "   Expiry: " . str_pad($result['expiry_month'], 2, '0', STR_PAD_LEFT) . "/" . $result['expiry_year'] . "\n\n";
+    
+    // Example 2: Save another card
+    echo "2. Saving another credit card...\n";
+    $result2 = savePaymentCard(
+        $pdo,
+        "Jane Smith",
+        "5425233430109903",
+        6,
+        2026
+    );
+    
+    echo "   Card saved successfully!\n";
+    echo "   Card ID: " . $result2['card_id'] . "\n";
+    echo "   Cardholder: " . $result2['cardholder_name'] . "\n";
+    echo "   Last Four: **** **** **** " . $result2['card_last_four'] . "\n\n";
+    
+    // Example 3: Retrieve and decrypt a card
+    echo "3. Retrieving and decrypting card ID " . $result['card_id'] . "...\n";
+    $card = getPaymentCard($pdo, $result['card_id']);
+    
+    if ($card) {
+        echo "   Cardholder: " . $card['cardholder_name'] . "\n";
+        echo "   Decrypted Card Number: " . maskCreditCardNumber($card['card_number']) . "\n";
+        echo "   Full Card (for authorized use only): " . $card['card_number'] . "\n";
+        echo "   Expiry: " . str_pad($card['expiry_month'], 2, '0', STR_PAD_LEFT) . "/" . $card['expiry_year'] . "\n\n";
+    }
+    
+    // Example 4: List all cards (without decryption)
+    echo "4. Listing all stored cards (masked)...\n";
+    $allCards = getAllPaymentCards($pdo);
+    
+    foreach ($allCards as $storedCard) {
+        echo "   ID: " . $storedCard['id'] . 
+             " | " . $storedCard['cardholder_name'] . 
+             " | **** **** **** " . $storedCard['card_last_four'] . 
+             " | " . str_pad($storedCard['expiry_month'], 2, '0', STR_PAD_LEFT) . "/" . $storedCard['expiry_year'] . "\n";
+    }
+    echo "\n";
+    
+    // Example 5: Test invalid card
+    echo "5. Testing invalid card number...\n";
+    try {
+        savePaymentCard($pdo, "Invalid User", "1234567890123456", 12, 2027);
+    } catch (InvalidArgumentException $e) {
+        echo "   Caught expected error: " . $e->getMessage() . "\n\n";
+    }
+    
+    // Example 6: Test expired card
+    echo "6. Testing expired card...\n";
+    try {
+        savePaymentCard($pdo, "Expired User", "4532015112830366", 1, 2020);
+    } catch (InvalidArgumentException $e) {
+        echo "   Caught expected error: " . $e->getMessage() . "\n\n";
+    }
+    
+    // Example 7: Delete a card
+    echo "7. Deleting card ID " . $result2['card_id'] . "...\n";
+    $deleted = deletePaymentCard($pdo, $result2['card_id']);
+    echo "   Card " . ($deleted ? "deleted successfully." : "not found.") . "\n\n";
+    
+    echo "=== All operations completed successfully ===\n";
+    
+} catch (RuntimeException $e) {
+    echo "Runtime Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (Exception $e) {
+    echo "Unexpected Error: " . $e->getMessage() . "\n";
+    exit(1);
+}

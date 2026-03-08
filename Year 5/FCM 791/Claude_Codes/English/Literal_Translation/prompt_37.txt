@@ -1,0 +1,319 @@
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// TokenStore holds the password reset tokens
+type TokenStore struct {
+	mu     sync.RWMutex
+	tokens map[string]*ResetToken
+}
+
+// ResetToken represents a password reset token with metadata
+type ResetToken struct {
+	HashedToken string
+	UserID      string
+	Email       string
+	ExpiresAt   time.Time
+	Used        bool
+	CreatedAt   time.Time
+}
+
+// TokenResult contains the generated token information
+type TokenResult struct {
+	RawToken    string
+	HashedToken string
+	UserID      string
+	Email       string
+	ExpiresAt   time.Time
+	CreatedAt   time.Time
+}
+
+var (
+	ErrTokenExpired  = errors.New("token has expired")
+	ErrTokenUsed     = errors.New("token has already been used")
+	ErrTokenNotFound = errors.New("token not found")
+	ErrInvalidToken  = errors.New("invalid token")
+)
+
+// NewTokenStore creates a new token store
+func NewTokenStore() *TokenStore {
+	store := &TokenStore{
+		tokens: make(map[string]*ResetToken),
+	}
+	go store.cleanupExpiredTokens()
+	return store
+}
+
+// GenerateSecureToken creates a cryptographically secure random token
+func GenerateSecureToken(length int) (string, error) {
+	if length <= 0 {
+		return "", errors.New("token length must be positive")
+	}
+
+	bytes := make([]byte, length)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+
+	return base64.URLEncoding.EncodeToString(bytes), nil
+}
+
+// HashToken creates a SHA-256 hash of the token for secure storage
+func HashToken(token string) string {
+	hash := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(hash[:])
+}
+
+// CreatePasswordResetToken generates a secure password reset token that expires in 1 hour
+func (ts *TokenStore) CreatePasswordResetToken(userID, email string) (*TokenResult, error) {
+	if userID == "" {
+		return nil, errors.New("userID cannot be empty")
+	}
+	if email == "" {
+		return nil, errors.New("email cannot be empty")
+	}
+
+	// Generate a 32-byte (256-bit) random token
+	rawToken, err := GenerateSecureToken(32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	// Hash the token for storage
+	hashedToken := HashToken(rawToken)
+
+	now := time.Now()
+	expiresAt := now.Add(1 * time.Hour)
+
+	resetToken := &ResetToken{
+		HashedToken: hashedToken,
+		UserID:      userID,
+		Email:       email,
+		ExpiresAt:   expiresAt,
+		Used:        false,
+		CreatedAt:   now,
+	}
+
+	ts.mu.Lock()
+	// Invalidate any existing tokens for this user
+	ts.invalidateUserTokens(userID)
+	ts.tokens[hashedToken] = resetToken
+	ts.mu.Unlock()
+
+	return &TokenResult{
+		RawToken:    rawToken,
+		HashedToken: hashedToken,
+		UserID:      userID,
+		Email:       email,
+		ExpiresAt:   expiresAt,
+		CreatedAt:   now,
+	}, nil
+}
+
+// ValidateToken checks if a token is valid, not expired, and not used
+func (ts *TokenStore) ValidateToken(rawToken string) (*ResetToken, error) {
+	if rawToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	hashedToken := HashToken(rawToken)
+
+	ts.mu.RLock()
+	token, exists := ts.tokens[hashedToken]
+	ts.mu.RUnlock()
+
+	if !exists {
+		return nil, ErrTokenNotFound
+	}
+
+	if token.Used {
+		return nil, ErrTokenUsed
+	}
+
+	if time.Now().After(token.ExpiresAt) {
+		return nil, ErrTokenExpired
+	}
+
+	return token, nil
+}
+
+// ConsumeToken validates and marks a token as used (for password reset completion)
+func (ts *TokenStore) ConsumeToken(rawToken string) (*ResetToken, error) {
+	if rawToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	hashedToken := HashToken(rawToken)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	token, exists := ts.tokens[hashedToken]
+	if !exists {
+		return nil, ErrTokenNotFound
+	}
+
+	if token.Used {
+		return nil, ErrTokenUsed
+	}
+
+	if time.Now().After(token.ExpiresAt) {
+		return nil, ErrTokenExpired
+	}
+
+	// Mark token as used
+	token.Used = true
+
+	return token, nil
+}
+
+// RevokeToken explicitly revokes a token
+func (ts *TokenStore) RevokeToken(rawToken string) error {
+	if rawToken == "" {
+		return ErrInvalidToken
+	}
+
+	hashedToken := HashToken(rawToken)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if _, exists := ts.tokens[hashedToken]; !exists {
+		return ErrTokenNotFound
+	}
+
+	delete(ts.tokens, hashedToken)
+	return nil
+}
+
+// invalidateUserTokens removes all existing tokens for a user (must be called with lock held)
+func (ts *TokenStore) invalidateUserTokens(userID string) {
+	for hash, token := range ts.tokens {
+		if token.UserID == userID {
+			delete(ts.tokens, hash)
+		}
+	}
+}
+
+// cleanupExpiredTokens periodically removes expired tokens from the store
+func (ts *TokenStore) cleanupExpiredTokens() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ts.mu.Lock()
+		now := time.Now()
+		for hash, token := range ts.tokens {
+			if now.After(token.ExpiresAt) || token.Used {
+				delete(ts.tokens, hash)
+			}
+		}
+		ts.mu.Unlock()
+	}
+}
+
+// GetTokenInfo returns information about a token without consuming it
+func (ts *TokenStore) GetTokenInfo(rawToken string) (*ResetToken, error) {
+	return ts.ValidateToken(rawToken)
+}
+
+// TimeUntilExpiry returns the duration until the token expires
+func (t *ResetToken) TimeUntilExpiry() time.Duration {
+	return time.Until(t.ExpiresAt)
+}
+
+// IsExpired checks if the token has expired
+func (t *ResetToken) IsExpired() bool {
+	return time.Now().After(t.ExpiresAt)
+}
+
+func main() {
+	store := NewTokenStore()
+
+	fmt.Println("=== Password Reset Token Demo ===\n")
+
+	// Create a password reset token
+	result, err := store.CreatePasswordResetToken("user123", "user@example.com")
+	if err != nil {
+		fmt.Printf("Error creating token: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Token created successfully!\n")
+	fmt.Printf("Raw Token (send to user): %s\n", result.RawToken)
+	fmt.Printf("Hashed Token (stored): %s\n", result.HashedToken)
+	fmt.Printf("User ID: %s\n", result.UserID)
+	fmt.Printf("Email: %s\n", result.Email)
+	fmt.Printf("Created At: %s\n", result.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("Expires At: %s\n", result.ExpiresAt.Format(time.RFC3339))
+	fmt.Println()
+
+	// Validate the token
+	tokenInfo, err := store.ValidateToken(result.RawToken)
+	if err != nil {
+		fmt.Printf("Token validation failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Token is valid!\n")
+	fmt.Printf("Time until expiry: %s\n", tokenInfo.TimeUntilExpiry().Round(time.Second))
+	fmt.Println()
+
+	// Consume the token (simulate password reset)
+	consumedToken, err := store.ConsumeToken(result.RawToken)
+	if err != nil {
+		fmt.Printf("Token consumption failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Token consumed successfully for user: %s\n", consumedToken.UserID)
+	fmt.Println()
+
+	// Try to use the token again (should fail)
+	_, err = store.ValidateToken(result.RawToken)
+	if err != nil {
+		fmt.Printf("Expected error on reuse: %v\n", err)
+	}
+	fmt.Println()
+
+	// Test with invalid token
+	_, err = store.ValidateToken("invalid-token")
+	if err != nil {
+		fmt.Printf("Expected error for invalid token: %v\n", err)
+	}
+	fmt.Println()
+
+	// Create another token and revoke it
+	result2, err := store.CreatePasswordResetToken("user456", "another@example.com")
+	if err != nil {
+		fmt.Printf("Error creating second token: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Second token created for user456\n")
+
+	err = store.RevokeToken(result2.RawToken)
+	if err != nil {
+		fmt.Printf("Error revoking token: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Token revoked successfully\n")
+
+	_, err = store.ValidateToken(result2.RawToken)
+	if err != nil {
+		fmt.Printf("Expected error after revocation: %v\n", err)
+	}
+}
+```
