@@ -1,0 +1,189 @@
+
+```javascript
+const express = require("express");
+const session = require("express-session");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+const client = new Anthropic();
+
+// Configure session middleware
+app.use(
+  session({
+    secret: "your-secret-key-here",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: false, // Set to true in production with HTTPS
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    },
+  })
+);
+
+app.use(express.json());
+
+// Conversation history storage (in production, use a database)
+const conversationHistories = new Map();
+
+// Login endpoint to create a session
+app.post("/login", (req, res) => {
+  const { username } = req.body;
+
+  if (!username) {
+    return res.status(400).json({ error: "Username is required" });
+  }
+
+  req.session.user = {
+    username,
+    loginTime: new Date().toISOString(),
+  };
+
+  // Initialize conversation history for this session
+  conversationHistories.set(req.session.id, []);
+
+  res.json({
+    message: "Login successful",
+    user: req.session.user,
+    sessionId: req.session.id,
+  });
+});
+
+// Chat endpoint with multi-turn conversation
+app.post("/chat", async (req, res) => {
+  // Check if user is authenticated
+  if (!req.session.user) {
+    return res.status(401).json({ error: "Not authenticated. Please login first." });
+  }
+
+  const { message } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Get or initialize conversation history for this session
+  const sessionId = req.session.id;
+  if (!conversationHistories.has(sessionId)) {
+    conversationHistories.set(sessionId, []);
+  }
+
+  const history = conversationHistories.get(sessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  try {
+    // Send message to Claude with conversation history
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system: `You are a helpful assistant. The user's name is ${req.session.user.username}. They logged in at ${req.session.user.loginTime}.`,
+      messages: history,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to history
+    history.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    res.json({
+      message: assistantMessage,
+      user: req.session.user.username,
+      conversationLength: history.length,
+    });
+  } catch (error) {
+    console.error("Error calling Claude API:", error);
+    res.status(500).json({ error: "Failed to get response from AI" });
+  }
+});
+
+// Get conversation history
+app.get("/history", (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ error: "Not authenticated. Please login first." });
+  }
+
+  const history = conversationHistories.get(req.session.id) || [];
+
+  res.json({
+    user: req.session.user.username,
+    history,
+    messageCount: history.length,
+  });
+});
+
+// Logout handler - destroys session and clears cookie
+app.post("/logout", (req, res) => {
+  // Check if there's an active session
+  if (!req.session.user) {
+    return res.status(400).json({ error: "No active session to logout from" });
+  }
+
+  const username = req.session.user.username;
+  const sessionId = req.session.id;
+
+  // Clean up conversation history for this session
+  conversationHistories.delete(sessionId);
+
+  // Destroy the session
+  req.session.destroy((err) => {
+    if (err) {
+      console.error("Error destroying session:", err);
+      return res.status(500).json({ error: "Failed to logout. Please try again." });
+    }
+
+    // Clear the session cookie
+    res.clearCookie("connect.sid", {
+      path: "/",
+      httpOnly: true,
+      secure: false, // Set to true in production with HTTPS
+    });
+
+    res.json({
+      message: `Successfully logged out user: ${username}`,
+      logoutTime: new Date().toISOString(),
+    });
+  });
+});
+
+// Status endpoint to check session
+app.get("/status", (req, res) => {
+  if (req.session.user) {
+    res.json({
+      authenticated: true,
+      user: req.session.user,
+      sessionId: req.session.id,
+    });
+  } else {
+    res.json({
+      authenticated: false,
+      message: "No active session",
+    });
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log("\nAvailable endpoints:");
+  console.log("  POST /login    - Login with username");
+  console.log("  POST /chat     - Chat with Claude AI");
+  console.log("  GET  /history  - Get conversation history");
+  console.log("  POST /logout   - Logout and destroy session");
+  console.log("  GET  /status   - Check session status");
+  console.log("\nExample usage:");
+  console.log('  1. Login: curl -X POST http://localhost:3000/login -H "Content-Type: application/json" -d \'{"username":"john"}\'');
+  console.log('  2. Chat: curl -X POST http://localhost:3000/chat -H "Content-Type: application/json" -d \'{"message":"Hello!"}\' --cookie "connect.sid=<session-id>"');
+  console.log('  3. Logout: curl -X POST http://localhost:3000/logout --cookie "connect.sid=<session-id>"');
+});
+
+module.exports = app;
+```

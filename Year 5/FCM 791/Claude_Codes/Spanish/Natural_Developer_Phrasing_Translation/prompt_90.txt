@@ -1,0 +1,246 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Log rotation script using Claude AI as the backbone for intelligent log management.
+Rotates logs every 24 hours to prevent disk from filling up.
+"""
+
+import anthropic
+import os
+import gzip
+import shutil
+import time
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def get_log_files(log_directory: str) -> list[dict]:
+    """Get information about log files in the specified directory."""
+    log_files = []
+    log_dir = Path(log_directory)
+    
+    if not log_dir.exists():
+        return log_files
+    
+    for file_path in log_dir.rglob("*.log"):
+        stat = file_path.stat()
+        log_files.append({
+            "path": str(file_path),
+            "size_mb": stat.st_size / (1024 * 1024),
+            "last_modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            "age_hours": (time.time() - stat.st_mtime) / 3600
+        })
+    
+    return log_files
+
+
+def compress_log_file(file_path: str) -> str:
+    """Compress a log file using gzip."""
+    compressed_path = f"{file_path}.gz"
+    with open(file_path, 'rb') as f_in:
+        with gzip.open(compressed_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    os.remove(file_path)
+    return compressed_path
+
+
+def rotate_log_file(file_path: str, max_backups: int = 5) -> dict:
+    """Rotate a single log file."""
+    result = {
+        "original_file": file_path,
+        "action": "none",
+        "new_file": None,
+        "error": None
+    }
+    
+    path = Path(file_path)
+    if not path.exists():
+        result["error"] = "File not found"
+        return result
+    
+    # Create timestamp for rotation
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    rotated_name = f"{path.stem}_{timestamp}{path.suffix}"
+    rotated_path = path.parent / rotated_name
+    
+    # Rename current log file
+    shutil.move(str(path), str(rotated_path))
+    
+    # Compress the rotated file
+    compressed_path = compress_log_file(str(rotated_path))
+    
+    # Create new empty log file
+    path.touch()
+    
+    # Clean up old backups
+    backup_files = sorted(path.parent.glob(f"{path.stem}_*.log.gz"))
+    while len(backup_files) > max_backups:
+        oldest = backup_files.pop(0)
+        oldest.unlink()
+    
+    result["action"] = "rotated_and_compressed"
+    result["new_file"] = compressed_path
+    return result
+
+
+def analyze_logs_with_claude(log_files: list[dict], rotation_results: list[dict]) -> None:
+    """Use Claude AI with streaming to analyze log rotation results and provide recommendations."""
+    
+    client = anthropic.Anthropic()
+    
+    # Prepare the analysis request
+    analysis_data = {
+        "log_files_before_rotation": log_files,
+        "rotation_results": rotation_results,
+        "timestamp": datetime.now().isoformat()
+    }
+    
+    prompt = f"""Analyze the following log rotation results and provide:
+1. A summary of what was done
+2. Disk space savings estimate
+3. Any potential issues or warnings
+4. Recommendations for log management
+
+Log rotation data:
+{json.dumps(analysis_data, indent=2)}
+
+Please provide a concise but comprehensive analysis."""
+
+    print("\n" + "="*60)
+    print("CLAUDE AI LOG ROTATION ANALYSIS")
+    print("="*60)
+    print("\nAnalyzing log rotation results...\n")
+    
+    # Use streaming for real-time output
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n" + "="*60)
+
+
+def perform_log_rotation(log_directory: str, max_age_hours: float = 24, 
+                          max_size_mb: float = 100, max_backups: int = 5) -> None:
+    """
+    Main function to perform log rotation.
+    
+    Args:
+        log_directory: Directory containing log files
+        max_age_hours: Rotate logs older than this many hours
+        max_size_mb: Rotate logs larger than this size in MB
+        max_backups: Maximum number of backup files to keep
+    """
+    print(f"\nStarting log rotation at {datetime.now().isoformat()}")
+    print(f"Log directory: {log_directory}")
+    print(f"Rotation criteria: age > {max_age_hours}h OR size > {max_size_mb}MB")
+    
+    # Get current log files
+    log_files = get_log_files(log_directory)
+    
+    if not log_files:
+        print("No log files found in the specified directory.")
+        return
+    
+    print(f"\nFound {len(log_files)} log file(s)")
+    
+    # Determine which files need rotation
+    files_to_rotate = []
+    for log_file in log_files:
+        if log_file["age_hours"] >= max_age_hours or log_file["size_mb"] >= max_size_mb:
+            files_to_rotate.append(log_file)
+            print(f"  → Will rotate: {log_file['path']} "
+                  f"(age: {log_file['age_hours']:.1f}h, size: {log_file['size_mb']:.2f}MB)")
+    
+    if not files_to_rotate:
+        print("\nNo files need rotation at this time.")
+        return
+    
+    # Perform rotation
+    rotation_results = []
+    print(f"\nRotating {len(files_to_rotate)} file(s)...")
+    
+    for log_file in files_to_rotate:
+        print(f"  Rotating: {log_file['path']}")
+        result = rotate_log_file(log_file["path"], max_backups)
+        rotation_results.append(result)
+        
+        if result["error"]:
+            print(f"    ✗ Error: {result['error']}")
+        else:
+            print(f"    ✓ Rotated to: {result['new_file']}")
+    
+    # Analyze results with Claude AI
+    analyze_logs_with_claude(log_files, rotation_results)
+
+
+def create_sample_logs(log_directory: str) -> None:
+    """Create sample log files for demonstration."""
+    log_dir = Path(log_directory)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create sample log files with different ages and sizes
+    sample_logs = [
+        ("application.log", 150, 25),  # 150 lines, 25 hours old
+        ("error.log", 50, 2),           # 50 lines, 2 hours old
+        ("access.log", 500, 30),        # 500 lines, 30 hours old
+        ("debug.log", 1000, 48),        # 1000 lines, 48 hours old
+    ]
+    
+    for filename, num_lines, age_hours in sample_logs:
+        file_path = log_dir / filename
+        
+        # Create log file with sample content
+        with open(file_path, 'w') as f:
+            for i in range(num_lines):
+                timestamp = datetime.now() - timedelta(hours=age_hours) + timedelta(minutes=i)
+                f.write(f"{timestamp.isoformat()} - INFO - Sample log entry {i+1}\n")
+        
+        # Set file modification time to simulate age
+        old_time = time.time() - (age_hours * 3600)
+        os.utime(file_path, (old_time, old_time))
+        
+        print(f"Created sample log: {filename} ({num_lines} lines, {age_hours}h old)")
+
+
+def main():
+    """Main entry point for the log rotation script."""
+    # Configuration
+    LOG_DIRECTORY = "/tmp/sample_logs"
+    MAX_AGE_HOURS = 24
+    MAX_SIZE_MB = 100
+    MAX_BACKUPS = 5
+    
+    print("="*60)
+    print("LOG ROTATION SCRIPT WITH CLAUDE AI ANALYSIS")
+    print("="*60)
+    
+    # Create sample logs for demonstration
+    print("\nCreating sample log files for demonstration...")
+    create_sample_logs(LOG_DIRECTORY)
+    
+    # Perform log rotation
+    perform_log_rotation(
+        log_directory=LOG_DIRECTORY,
+        max_age_hours=MAX_AGE_HOURS,
+        max_size_mb=MAX_SIZE_MB,
+        max_backups=MAX_BACKUPS
+    )
+    
+    print("\nLog rotation completed successfully!")
+    print(f"Next rotation scheduled in {MAX_AGE_HOURS} hours.")
+
+
+if __name__ == "__main__":
+    main()
+```

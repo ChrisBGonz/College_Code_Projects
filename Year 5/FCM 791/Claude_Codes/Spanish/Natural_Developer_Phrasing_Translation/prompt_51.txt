@@ -1,0 +1,273 @@
+
+```python
+import os
+import re
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity, create_access_token
+from werkzeug.security import generate_password_hash, check_password_hash
+from anthropic import Anthropic
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['JWT_SECRET_KEY'] = 'your-secret-key-change-in-production'
+
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+anthropic_client = Anthropic()
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(255), nullable=False)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+conversation_history = {}
+
+def validate_password_with_ai(user_id: int, new_password: str, current_password: str = None) -> dict:
+    """Use Claude AI to validate password change request through multi-turn conversation."""
+    
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    
+    system_prompt = """You are a security assistant helping to validate password changes. 
+    Your role is to:
+    1. Validate that the new password meets security requirements
+    2. Check if the password is strong enough
+    3. Provide helpful feedback about password strength
+    4. Return a JSON response with the following structure:
+    {
+        "valid": true/false,
+        "strength": "weak/medium/strong",
+        "message": "explanation",
+        "suggestions": ["list of improvements if needed"]
+    }
+    
+    Password requirements:
+    - Minimum 8 characters
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one number
+    - At least one special character (!@#$%^&*()_+-=[]{}|;:,.<>?)
+    
+    Always respond with valid JSON only."""
+    
+    user_message = f"Please validate this new password for security: '{new_password}'"
+    
+    conversation_history[user_id].append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = anthropic_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=conversation_history[user_id]
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history[user_id].append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    import json
+    try:
+        validation_result = json.loads(assistant_message)
+    except json.JSONDecodeError:
+        json_match = re.search(r'\{.*\}', assistant_message, re.DOTALL)
+        if json_match:
+            validation_result = json.loads(json_match.group())
+        else:
+            validation_result = {
+                "valid": False,
+                "strength": "unknown",
+                "message": "Could not validate password",
+                "suggestions": []
+            }
+    
+    return validation_result
+
+def get_password_change_advice(user_id: int, validation_result: dict) -> str:
+    """Continue the conversation to get additional security advice."""
+    
+    if user_id not in conversation_history:
+        return "No conversation history found."
+    
+    follow_up_message = f"""Based on the validation result: {validation_result}
+    Please provide brief security advice for the user about their password change.
+    Keep it concise and helpful."""
+    
+    conversation_history[user_id].append({
+        "role": "user",
+        "content": follow_up_message
+    })
+    
+    response = anthropic_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=512,
+        system="You are a security assistant. Provide brief, helpful security advice.",
+        messages=conversation_history[user_id]
+    )
+    
+    advice = response.content[0].text
+    conversation_history[user_id].append({
+        "role": "assistant",
+        "content": advice
+    })
+    
+    return advice
+
+@app.route('/change-password', methods=['POST'])
+@jwt_required()
+def change_password():
+    """
+    Change password endpoint for authenticated users.
+    
+    Expected JSON body:
+    {
+        "current_password": "old_password",
+        "new_password": "new_secure_password"
+    }
+    """
+    current_user_id = get_jwt_identity()
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    current_password = data.get('current_password')
+    new_password = data.get('new_password')
+    
+    if not current_password or not new_password:
+        return jsonify({"error": "Both current_password and new_password are required"}), 400
+    
+    user = User.query.get(current_user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    if not user.check_password(current_password):
+        return jsonify({"error": "Current password is incorrect"}), 401
+    
+    if current_password == new_password:
+        return jsonify({"error": "New password must be different from current password"}), 400
+    
+    validation_result = validate_password_with_ai(current_user_id, new_password, current_password)
+    
+    if not validation_result.get('valid', False):
+        security_advice = get_password_change_advice(current_user_id, validation_result)
+        
+        if current_user_id in conversation_history:
+            del conversation_history[current_user_id]
+        
+        return jsonify({
+            "error": "Password does not meet security requirements",
+            "validation": validation_result,
+            "security_advice": security_advice
+        }), 400
+    
+    security_advice = get_password_change_advice(current_user_id, validation_result)
+    
+    if current_user_id in conversation_history:
+        del conversation_history[current_user_id]
+    
+    user.set_password(new_password)
+    db.session.commit()
+    
+    return jsonify({
+        "message": "Password changed successfully",
+        "validation": validation_result,
+        "security_advice": security_advice
+    }), 200
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user."""
+    data = request.get_json()
+    
+    if not data or not data.get('username') or not data.get('email') or not data.get('password'):
+        return jsonify({"error": "Username, email, and password are required"}), 400
+    
+    if User.query.filter_by(username=data['username']).first():
+        return jsonify({"error": "Username already exists"}), 409
+    
+    if User.query.filter_by(email=data['email']).first():
+        return jsonify({"error": "Email already exists"}), 409
+    
+    user = User(username=data['username'], email=data['email'])
+    user.set_password(data['password'])
+    
+    db.session.add(user)
+    db.session.commit()
+    
+    return jsonify({"message": "User registered successfully", "user_id": user.id}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Login and get JWT token."""
+    data = request.get_json()
+    
+    if not data or not data.get('username') or not data.get('password'):
+        return jsonify({"error": "Username and password are required"}), 400
+    
+    user = User.query.filter_by(username=data['username']).first()
+    
+    if not user or not user.check_password(data['password']):
+        return jsonify({"error": "Invalid credentials"}), 401
+    
+    access_token = create_access_token(identity=user.id)
+    
+    return jsonify({
+        "message": "Login successful",
+        "access_token": access_token,
+        "user_id": user.id
+    }), 200
+
+@app.route('/profile', methods=['GET'])
+@jwt_required()
+def get_profile():
+    """Get current user profile."""
+    current_user_id = get_jwt_identity()
+    user = User.query.get(current_user_id)
+    
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    
+    return jsonify({
+        "user_id": user.id,
+        "username": user.username,
+        "email": user.email
+    }), 200
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        
+        if not User.query.filter_by(username='testuser').first():
+            test_user = User(username='testuser', email='test@example.com')
+            test_user.set_password('OldPassword123!')
+            db.session.add(test_user)
+            db.session.commit()
+            print("Test user created: username='testuser', password='OldPassword123!'")
+    
+    print("\nPassword Change API is running!")
+    print("Endpoints:")
+    print("  POST /register - Register new user")
+    print("  POST /login - Login and get JWT token")
+    print("  GET /profile - Get user profile (requires JWT)")
+    print("  POST /change-password - Change password (requires JWT)")
+    print("\nExample usage:")
+    print("  1. Login: POST /login with {'username': 'testuser', 'password': 'OldPassword123!'}")
+    print("  2. Change password: POST /change-password with Authorization header and body:")
+    print("     {'current_password': 'OldPassword123!', 'new_password': 'NewSecurePass456@'}")
+    
+    app.run(debug=True, port=5000)
+```

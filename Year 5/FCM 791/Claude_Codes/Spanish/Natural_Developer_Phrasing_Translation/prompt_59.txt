@@ -1,0 +1,295 @@
+
+```python
+import anthropic
+import json
+import re
+import urllib.parse
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+client = anthropic.Anthropic()
+
+PAYMENT_GATEWAY_TOOL = {
+    "name": "create_payment_session",
+    "description": "Creates a payment session with the payment gateway and returns a success URL for the user to complete payment",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "amount": {
+                "type": "number",
+                "description": "The payment amount in cents (e.g., 1000 for $10.00)"
+            },
+            "currency": {
+                "type": "string",
+                "description": "The currency code (e.g., 'usd', 'eur')"
+            },
+            "description": {
+                "type": "string",
+                "description": "Description of the payment"
+            },
+            "customer_email": {
+                "type": "string",
+                "description": "Customer's email address"
+            }
+        },
+        "required": ["amount", "currency", "description"]
+    }
+}
+
+def simulate_payment_gateway(amount: int, currency: str, description: str, customer_email: str = None) -> dict:
+    """
+    Simulates a third-party payment gateway API call.
+    In a real scenario, this would make an HTTP request to Stripe, PayPal, etc.
+    """
+    session_id = f"sess_{amount}_{currency}_12345"
+    
+    params = {
+        "session_id": session_id,
+        "amount": amount,
+        "currency": currency,
+        "description": urllib.parse.quote(description)
+    }
+    if customer_email:
+        params["email"] = urllib.parse.quote(customer_email)
+    
+    query_string = "&".join([f"{k}={v}" for k, v in params.items()])
+    success_url = f"https://payment-gateway.example.com/checkout?{query_string}"
+    
+    return {
+        "session_id": session_id,
+        "success_url": success_url,
+        "status": "created",
+        "amount": amount,
+        "currency": currency,
+        "description": description,
+        "expires_at": "2024-12-31T23:59:59Z"
+    }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results"""
+    if tool_name == "create_payment_session":
+        result = simulate_payment_gateway(
+            amount=tool_input["amount"],
+            currency=tool_input["currency"],
+            description=tool_input["description"],
+            customer_email=tool_input.get("customer_email")
+        )
+        return json.dumps(result)
+    return json.dumps({"error": "Unknown tool"})
+
+def create_payment_with_claude(payment_details: dict) -> dict:
+    """
+    Uses Claude to process payment request and get the success URL from the payment gateway.
+    Returns the success URL for user redirection.
+    """
+    print(f"\n{'='*60}")
+    print("Processing payment request with Claude...")
+    print(f"Payment details: {json.dumps(payment_details, indent=2)}")
+    print('='*60)
+    
+    user_message = f"""
+    I need to create a payment session for the following:
+    - Amount: {payment_details['amount']} {payment_details['currency']}
+    - Description: {payment_details['description']}
+    - Customer email: {payment_details.get('customer_email', 'Not provided')}
+    
+    Please create a payment session using the payment gateway tool and provide me with the success URL 
+    where I should redirect the user to complete their payment.
+    """
+    
+    messages = [{"role": "user", "content": user_message}]
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=[PAYMENT_GATEWAY_TOOL],
+        messages=messages
+    )
+    
+    print(f"\nInitial Claude response:")
+    print(f"Stop reason: {response.stop_reason}")
+    
+    success_url = None
+    session_data = None
+    
+    while response.stop_reason == "tool_use":
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+        
+        if tool_use_block:
+            print(f"\nClaude is calling tool: {tool_use_block.name}")
+            print(f"Tool input: {json.dumps(tool_use_block.input, indent=2)}")
+            
+            tool_result = process_tool_call(tool_use_block.name, tool_use_block.input)
+            session_data = json.loads(tool_result)
+            
+            print(f"\nTool result from payment gateway:")
+            print(json.dumps(session_data, indent=2))
+            
+            if "success_url" in session_data:
+                success_url = session_data["success_url"]
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": tool_result
+                    }
+                ]
+            })
+            
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=1024,
+                tools=[PAYMENT_GATEWAY_TOOL],
+                messages=messages
+            )
+            
+            print(f"\nClaude's follow-up response:")
+            print(f"Stop reason: {response.stop_reason}")
+    
+    final_text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_text = block.text
+            break
+    
+    print(f"\nClaude's final message: {final_text}")
+    
+    if not success_url and session_data:
+        success_url = session_data.get("success_url")
+    
+    if not success_url and final_text:
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, final_text)
+        if urls:
+            success_url = urls[0]
+    
+    return {
+        "success_url": success_url,
+        "session_data": session_data,
+        "claude_message": final_text
+    }
+
+def redirect_user_to_payment(success_url: str):
+    """
+    Simulates redirecting the user to the payment URL.
+    In a real web application, this would be an HTTP redirect response.
+    """
+    print(f"\n{'='*60}")
+    print("REDIRECTING USER TO PAYMENT GATEWAY")
+    print('='*60)
+    print(f"\n✅ Payment session created successfully!")
+    print(f"\n🔗 Redirecting user to:")
+    print(f"   {success_url}")
+    print(f"\nIn a real web application, this would be:")
+    print(f"   HTTP 302 Redirect → {success_url}")
+    print(f"\nThe user will be taken to the payment gateway to complete their purchase.")
+
+class PaymentHandler(BaseHTTPRequestHandler):
+    """Simple HTTP handler to demonstrate the payment flow"""
+    
+    def do_GET(self):
+        if self.path == "/pay":
+            payment_details = {
+                "amount": 2999,
+                "currency": "usd",
+                "description": "Premium Subscription - Monthly Plan",
+                "customer_email": "customer@example.com"
+            }
+            
+            result = create_payment_with_claude(payment_details)
+            
+            if result["success_url"]:
+                self.send_response(302)
+                self.send_header("Location", result["success_url"])
+                self.end_headers()
+                
+                redirect_user_to_payment(result["success_url"])
+            else:
+                self.send_response(500)
+                self.send_header("Content-type", "text/html")
+                self.end_headers()
+                self.wfile.write(b"Error creating payment session")
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            html = b"""
+            <html>
+            <body>
+                <h1>Payment Demo</h1>
+                <p><a href="/pay">Click here to make a payment</a></p>
+            </body>
+            </html>
+            """
+            self.wfile.write(html)
+    
+    def log_message(self, format, *args):
+        pass
+
+def main():
+    """Main function to demonstrate the payment integration"""
+    print("🚀 Payment Gateway Integration with Claude")
+    print("="*60)
+    
+    print("\n📋 Example 1: E-commerce Purchase")
+    payment_details_1 = {
+        "amount": 4999,
+        "currency": "usd",
+        "description": "Wireless Headphones - Model XR500",
+        "customer_email": "john.doe@example.com"
+    }
+    
+    result_1 = create_payment_with_claude(payment_details_1)
+    
+    if result_1["success_url"]:
+        redirect_user_to_payment(result_1["success_url"])
+    else:
+        print("❌ Failed to get success URL from payment gateway")
+    
+    print("\n\n📋 Example 2: Subscription Service")
+    payment_details_2 = {
+        "amount": 999,
+        "currency": "eur",
+        "description": "Monthly Software License",
+        "customer_email": "user@company.com"
+    }
+    
+    result_2 = create_payment_with_claude(payment_details_2)
+    
+    if result_2["success_url"]:
+        redirect_user_to_payment(result_2["success_url"])
+    else:
+        print("❌ Failed to get success URL from payment gateway")
+    
+    print("\n\n📋 Example 3: Donation")
+    payment_details_3 = {
+        "amount": 2500,
+        "currency": "usd",
+        "description": "Charitable Donation - Education Fund"
+    }
+    
+    result_3 = create_payment_with_claude(payment_details_3)
+    
+    if result_3["success_url"]:
+        redirect_user_to_payment(result_3["success_url"])
+    else:
+        print("❌ Failed to get success URL from payment gateway")
+    
+    print("\n\n" + "="*60)
+    print("✅ Payment integration demonstration complete!")
+    print("\nIn a production environment:")
+    print("  1. The payment gateway tool would make real API calls to Stripe/PayPal/etc.")
+    print("  2. The success_url would be a real checkout page URL")
+    print("  3. The HTTP server would send a 302 redirect response")
+    print("  4. Users would be seamlessly redirected to complete payment")
+
+if __name__ == "__main__":
+    main()
+```

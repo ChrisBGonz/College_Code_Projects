@@ -1,0 +1,300 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+
+const client = new Anthropic();
+
+// Simulated user database
+const users = {
+  "token-user-123": {
+    id: 1,
+    username: "john_doe",
+    email: "john@example.com",
+    role: "admin",
+    createdAt: "2024-01-15",
+    privateData: {
+      phone: "+1-555-0123",
+      address: "123 Main St, New York, NY 10001",
+      ssn: "***-**-1234",
+      bankAccount: "****1234",
+    },
+  },
+  "token-user-456": {
+    id: 2,
+    username: "jane_smith",
+    email: "jane@example.com",
+    role: "user",
+    createdAt: "2024-02-20",
+    privateData: {
+      phone: "+1-555-0456",
+      address: "456 Oak Ave, Los Angeles, CA 90001",
+      ssn: "***-**-5678",
+      bankAccount: "****5678",
+    },
+  },
+};
+
+// Tool definitions for the API
+const tools = [
+  {
+    name: "validate_token",
+    description:
+      "Validates a Bearer token and returns user information if valid",
+    input_schema: {
+      type: "object",
+      properties: {
+        token: {
+          type: "string",
+          description: "The Bearer token to validate",
+        },
+      },
+      required: ["token"],
+    },
+  },
+  {
+    name: "get_user_data",
+    description: "Retrieves private user data for an authenticated user",
+    input_schema: {
+      type: "object",
+      properties: {
+        user_id: {
+          type: "number",
+          description: "The ID of the authenticated user",
+        },
+        data_type: {
+          type: "string",
+          enum: ["profile", "private", "all"],
+          description: "Type of data to retrieve",
+        },
+      },
+      required: ["user_id", "data_type"],
+    },
+  },
+  {
+    name: "log_access",
+    description: "Logs access attempts for security auditing",
+    input_schema: {
+      type: "object",
+      properties: {
+        user_id: {
+          type: "number",
+          description: "The user ID attempting access",
+        },
+        action: {
+          type: "string",
+          description: "The action being performed",
+        },
+        success: {
+          type: "boolean",
+          description: "Whether the access was successful",
+        },
+        timestamp: {
+          type: "string",
+          description: "ISO timestamp of the access attempt",
+        },
+      },
+      required: ["action", "success", "timestamp"],
+    },
+  },
+];
+
+// Tool execution functions
+function validateToken(token) {
+  const user = users[token];
+  if (user) {
+    return {
+      valid: true,
+      user_id: user.id,
+      username: user.username,
+      role: user.role,
+    };
+  }
+  return {
+    valid: false,
+    error: "Invalid or expired token",
+  };
+}
+
+function getUserData(userId, dataType) {
+  const user = Object.values(users).find((u) => u.id === userId);
+  if (!user) {
+    return { error: "User not found" };
+  }
+
+  if (dataType === "profile") {
+    return {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      createdAt: user.createdAt,
+    };
+  } else if (dataType === "private") {
+    return {
+      privateData: user.privateData,
+    };
+  } else if (dataType === "all") {
+    return {
+      id: user.id,
+      username: user.username,
+      email: user.email,
+      role: user.role,
+      createdAt: user.createdAt,
+      privateData: user.privateData,
+    };
+  }
+
+  return { error: "Invalid data type" };
+}
+
+function logAccess(userId, action, success, timestamp) {
+  const logEntry = {
+    userId: userId || "anonymous",
+    action,
+    success,
+    timestamp,
+    logged: true,
+  };
+  console.log("Access Log:", JSON.stringify(logEntry, null, 2));
+  return { logged: true, logId: `log-${Date.now()}` };
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "validate_token":
+      return validateToken(toolInput.token);
+    case "get_user_data":
+      return getUserData(toolInput.user_id, toolInput.data_type);
+    case "log_access":
+      return logAccess(
+        toolInput.user_id,
+        toolInput.action,
+        toolInput.success,
+        toolInput.timestamp
+      );
+    default:
+      return { error: "Unknown tool" };
+  }
+}
+
+// Main API handler using Claude with tool use
+async function handleAPIRequest(authorizationHeader, requestedData) {
+  console.log("\n" + "=".repeat(60));
+  console.log("Processing API Request");
+  console.log("=".repeat(60));
+
+  // Extract token from Authorization header
+  let token = null;
+  if (authorizationHeader && authorizationHeader.startsWith("Bearer ")) {
+    token = authorizationHeader.substring(7);
+  }
+
+  console.log(
+    `Authorization Header: ${authorizationHeader || "Not provided"}`
+  );
+  console.log(`Requested Data Type: ${requestedData}`);
+
+  const systemPrompt = `You are a secure API handler that processes authentication and data retrieval requests.
+Your job is to:
+1. Validate the provided Bearer token using the validate_token tool
+2. Log the access attempt using the log_access tool
+3. If the token is valid, retrieve the requested user data using the get_user_data tool
+4. Return a structured response with the results
+
+Always prioritize security and log all access attempts, whether successful or not.
+Current timestamp: ${new Date().toISOString()}`;
+
+  const userMessage = `Process this API request:
+- Authorization Header: ${authorizationHeader || "Not provided"}
+- Token: ${token || "No token provided"}
+- Requested Data: ${requestedData}
+
+Please validate the token, log the access attempt, and if valid, retrieve the ${requestedData} data for the user.`;
+
+  const messages = [{ role: "user", content: userMessage }];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    system: systemPrompt,
+    tools: tools,
+    messages: messages,
+  });
+
+  console.log("\nInitial Response:");
+  console.log(`Stop Reason: ${response.stop_reason}`);
+
+  // Agentic loop - continue until we get a final response
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlocks = response.content.filter(
+      (block) => block.type === "tool_use"
+    );
+
+    const toolResults = [];
+
+    for (const toolUse of toolUseBlocks) {
+      console.log(`\nTool Used: ${toolUse.name}`);
+      console.log("Tool Input:", JSON.stringify(toolUse.input, null, 2));
+
+      const toolResult = processToolCall(toolUse.name, toolUse.input);
+      console.log("Tool Result:", JSON.stringify(toolResult, null, 2));
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(toolResult),
+      });
+    }
+
+    // Continue the conversation with tool results
+    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "user", content: toolResults });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      system: systemPrompt,
+      tools: tools,
+      messages: messages,
+    });
+
+    console.log(`\nContinued Response Stop Reason: ${response.stop_reason}`);
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\nFinal API Response:");
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+// Simulate API requests
+async function simulateAPIRequests() {
+  console.log("Node.js API with Bearer Token Authentication");
+  console.log("Using Claude claude-opus-4-5 with Tool Use\n");
+
+  // Test Case 1: Valid token requesting all data
+  await handleAPIRequest("Bearer token-user-123", "all");
+
+  // Test Case 2: Valid token requesting only profile
+  await handleAPIRequest("Bearer token-user-456", "profile");
+
+  // Test Case 3: Invalid token
+  await handleAPIRequest("Bearer invalid-token-xyz", "all");
+
+  // Test Case 4: Missing authorization header
+  await handleAPIRequest(null, "private");
+
+  // Test Case 5: Malformed authorization header
+  await handleAPIRequest("Basic dXNlcjpwYXNz", "profile");
+}
+
+// Run the simulation
+simulateAPIRequests().catch(console.error);
+```

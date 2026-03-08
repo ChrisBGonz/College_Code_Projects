@@ -1,0 +1,596 @@
+```javascript
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 10000;
+    this.requestTimeout = options.requestTimeout || 5000;
+    this.monitorInterval = options.monitorInterval || 1000;
+
+    this.state = CircuitBreaker.STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+    this.listeners = {};
+    this.requestQueue = [];
+    this.stats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rejectedRequests: 0,
+      timeouts: 0,
+    };
+
+    this._startMonitor();
+  }
+
+  static get STATES() {
+    return {
+      CLOSED: "CLOSED",
+      OPEN: "OPEN",
+      HALF_OPEN: "HALF_OPEN",
+    };
+  }
+
+  on(event, callback) {
+    if (!this.listeners[event]) {
+      this.listeners[event] = [];
+    }
+    this.listeners[event].push(callback);
+    return this;
+  }
+
+  off(event, callback) {
+    if (this.listeners[event]) {
+      this.listeners[event] = this.listeners[event].filter(
+        (cb) => cb !== callback
+      );
+    }
+    return this;
+  }
+
+  _emit(event, data) {
+    if (this.listeners[event]) {
+      this.listeners[event].forEach((cb) => cb(data));
+    }
+  }
+
+  _setState(newState) {
+    const previousState = this.state;
+    this.state = newState;
+
+    if (previousState !== newState) {
+      this._emit("stateChange", {
+        from: previousState,
+        to: newState,
+        timestamp: new Date().toISOString(),
+        stats: this.getStats(),
+      });
+
+      console.log(
+        `[CircuitBreaker] State changed: ${previousState} → ${newState}`
+      );
+    }
+  }
+
+  _open() {
+    this.nextAttemptTime = Date.now() + this.timeout;
+    this._setState(CircuitBreaker.STATES.OPEN);
+    this._emit("open", {
+      failureCount: this.failureCount,
+      nextAttemptTime: new Date(this.nextAttemptTime).toISOString(),
+    });
+  }
+
+  _close() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+    this._setState(CircuitBreaker.STATES.CLOSED);
+    this._emit("close", { timestamp: new Date().toISOString() });
+    this._processQueue();
+  }
+
+  _halfOpen() {
+    this._setState(CircuitBreaker.STATES.HALF_OPEN);
+    this._emit("halfOpen", { timestamp: new Date().toISOString() });
+  }
+
+  _recordSuccess() {
+    this.stats.successfulRequests++;
+
+    if (this.state === CircuitBreaker.STATES.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this._close();
+      }
+    } else if (this.state === CircuitBreaker.STATES.CLOSED) {
+      this.failureCount = Math.max(0, this.failureCount - 1);
+    }
+  }
+
+  _recordFailure(error) {
+    this.stats.failedRequests++;
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    this._emit("failure", {
+      error: error.message,
+      failureCount: this.failureCount,
+      threshold: this.failureThreshold,
+    });
+
+    if (this.state === CircuitBreaker.STATES.HALF_OPEN) {
+      this.successCount = 0;
+      this._open();
+    } else if (
+      this.state === CircuitBreaker.STATES.CLOSED &&
+      this.failureCount >= this.failureThreshold
+    ) {
+      this._open();
+    }
+  }
+
+  _canAttempt() {
+    if (this.state === CircuitBreaker.STATES.CLOSED) {
+      return true;
+    }
+
+    if (this.state === CircuitBreaker.STATES.OPEN) {
+      if (Date.now() >= this.nextAttemptTime) {
+        this._halfOpen();
+        return true;
+      }
+      return false;
+    }
+
+    if (this.state === CircuitBreaker.STATES.HALF_OPEN) {
+      return true;
+    }
+
+    return false;
+  }
+
+  _withTimeout(promise, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.stats.timeouts++;
+        reject(new Error(`Request timed out after ${ms}ms`));
+      }, ms);
+
+      promise
+        .then((result) => {
+          clearTimeout(timer);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+  }
+
+  _processQueue() {
+    while (this.requestQueue.length > 0 && this._canAttempt()) {
+      const { fn, resolve, reject } = this.requestQueue.shift();
+      this.execute(fn).then(resolve).catch(reject);
+    }
+  }
+
+  async execute(fn) {
+    this.stats.totalRequests++;
+
+    if (!this._canAttempt()) {
+      this.stats.rejectedRequests++;
+      const error = new CircuitBreakerOpenError(
+        `Circuit breaker is OPEN. Next attempt at: ${new Date(this.nextAttemptTime).toISOString()}`,
+        this.nextAttemptTime
+      );
+      this._emit("rejected", { error: error.message });
+      throw error;
+    }
+
+    try {
+      const result = await this._withTimeout(
+        Promise.resolve().then(() => fn()),
+        this.requestTimeout
+      );
+      this._recordSuccess();
+      return result;
+    } catch (error) {
+      this._recordFailure(error);
+      throw error;
+    }
+  }
+
+  async executeWithQueue(fn) {
+    if (this._canAttempt()) {
+      return this.execute(fn);
+    }
+
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push({ fn, resolve, reject });
+      this._emit("queued", { queueLength: this.requestQueue.length });
+    });
+  }
+
+  getStats() {
+    return {
+      ...this.stats,
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      failureThreshold: this.failureThreshold,
+      successThreshold: this.successThreshold,
+      nextAttemptTime: this.nextAttemptTime
+        ? new Date(this.nextAttemptTime).toISOString()
+        : null,
+      queueLength: this.requestQueue.length,
+    };
+  }
+
+  reset() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+    this.requestQueue = [];
+    this.stats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rejectedRequests: 0,
+      timeouts: 0,
+    };
+    this._setState(CircuitBreaker.STATES.CLOSED);
+  }
+
+  _startMonitor() {
+    this._monitorTimer = setInterval(() => {
+      if (
+        this.state === CircuitBreaker.STATES.OPEN &&
+        Date.now() >= this.nextAttemptTime
+      ) {
+        this._halfOpen();
+      }
+    }, this.monitorInterval);
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("beforeunload", () => this.destroy());
+    }
+  }
+
+  destroy() {
+    if (this._monitorTimer) {
+      clearInterval(this._monitorTimer);
+      this._monitorTimer = null;
+    }
+    this.listeners = {};
+    this.requestQueue = [];
+  }
+}
+
+class CircuitBreakerOpenError extends Error {
+  constructor(message, nextAttemptTime) {
+    super(message);
+    this.name = "CircuitBreakerOpenError";
+    this.nextAttemptTime = nextAttemptTime;
+    this.isCircuitBreakerError = true;
+  }
+}
+
+class ApiClient {
+  constructor(baseUrl, circuitBreakerOptions = {}) {
+    this.baseUrl = baseUrl;
+    this.circuitBreaker = new CircuitBreaker(circuitBreakerOptions);
+    this._setupListeners();
+  }
+
+  _setupListeners() {
+    this.circuitBreaker
+      .on("stateChange", ({ from, to, timestamp }) => {
+        console.log(`[ApiClient] Circuit state: ${from} → ${to} at ${timestamp}`);
+        this._notifyUI(to);
+      })
+      .on("open", ({ failureCount, nextAttemptTime }) => {
+        console.warn(
+          `[ApiClient] Circuit OPEN after ${failureCount} failures. Retry at: ${nextAttemptTime}`
+        );
+      })
+      .on("halfOpen", () => {
+        console.info("[ApiClient] Circuit HALF-OPEN: testing connection...");
+      })
+      .on("close", () => {
+        console.info("[ApiClient] Circuit CLOSED: service recovered.");
+      })
+      .on("failure", ({ error, failureCount, threshold }) => {
+        console.error(
+          `[ApiClient] Failure ${failureCount}/${threshold}: ${error}`
+        );
+      })
+      .on("rejected", ({ error }) => {
+        console.warn(`[ApiClient] Request rejected: ${error}`);
+      });
+  }
+
+  _notifyUI(state) {
+    const event = new CustomEvent("circuitBreakerStateChange", {
+      detail: { state, stats: this.circuitBreaker.getStats() },
+    });
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(event);
+    }
+  }
+
+  async _fetch(endpoint, options = {}) {
+    const url = `${this.baseUrl}${endpoint}`;
+    const response = await fetch(url, {
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+      ...options,
+    });
+
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status}: ${response.statusText}`);
+      error.status = response.status;
+      error.response = response;
+      throw error;
+    }
+
+    return response.json();
+  }
+
+  async get(endpoint, options = {}) {
+    return this.circuitBreaker.execute(() =>
+      this._fetch(endpoint, { method: "GET", ...options })
+    );
+  }
+
+  async post(endpoint, data, options = {}) {
+    return this.circuitBreaker.execute(() =>
+      this._fetch(endpoint, {
+        method: "POST",
+        body: JSON.stringify(data),
+        ...options,
+      })
+    );
+  }
+
+  async put(endpoint, data, options = {}) {
+    return this.circuitBreaker.execute(() =>
+      this._fetch(endpoint, {
+        method: "PUT",
+        body: JSON.stringify(data),
+        ...options,
+      })
+    );
+  }
+
+  async delete(endpoint, options = {}) {
+    return this.circuitBreaker.execute(() =>
+      this._fetch(endpoint, { method: "DELETE", ...options })
+    );
+  }
+
+  getCircuitStats() {
+    return this.circuitBreaker.getStats();
+  }
+
+  resetCircuit() {
+    this.circuitBreaker.reset();
+  }
+
+  destroy() {
+    this.circuitBreaker.destroy();
+  }
+}
+
+class RetryWithCircuitBreaker {
+  constructor(circuitBreaker, retryOptions = {}) {
+    this.circuitBreaker = circuitBreaker;
+    this.maxRetries = retryOptions.maxRetries || 3;
+    this.retryDelay = retryOptions.retryDelay || 1000;
+    this.backoffMultiplier = retryOptions.backoffMultiplier || 2;
+    this.retryableErrors = retryOptions.retryableErrors || [408, 429, 500, 502, 503, 504];
+  }
+
+  _isRetryable(error) {
+    if (error.isCircuitBreakerError) return false;
+    if (error.status && this.retryableErrors.includes(error.status)) return true;
+    if (!error.status) return true;
+    return false;
+  }
+
+  _delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async execute(fn) {
+    let lastError;
+    let delay = this.retryDelay;
+
+    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      try {
+        return await this.circuitBreaker.execute(fn);
+      } catch (error) {
+        lastError = error;
+
+        if (error.isCircuitBreakerError) {
+          throw error;
+        }
+
+        if (attempt < this.maxRetries && this._isRetryable(error)) {
+          console.warn(
+            `[Retry] Attempt ${attempt + 1}/${this.maxRetries} failed. Retrying in ${delay}ms...`
+          );
+          await this._delay(delay);
+          delay *= this.backoffMultiplier;
+        } else {
+          break;
+        }
+      }
+    }
+
+    throw lastError;
+  }
+}
+
+function createCircuitBreakerUI(circuitBreaker, containerId) {
+  const container = document.getElementById(containerId);
+  if (!container) return;
+
+  const updateUI = () => {
+    const stats = circuitBreaker.getStats();
+    const stateColors = {
+      CLOSED: "#22c55e",
+      OPEN: "#ef4444",
+      HALF_OPEN: "#f59e0b",
+    };
+
+    container.innerHTML = `
+      <div style="
+        font-family: monospace;
+        padding: 16px;
+        border: 2px solid ${stateColors[stats.state]};
+        border-radius: 8px;
+        background: #1a1a2e;
+        color: #e2e8f0;
+        max-width: 400px;
+      ">
+        <h3 style="margin: 0 0 12px; color: ${stateColors[stats.state]}">
+          ⚡ Circuit Breaker: ${stats.state}
+        </h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px;">
+          <div>Total Requests: <strong>${stats.totalRequests}</strong></div>
+          <div>Successful: <strong style="color: #22c55e">${stats.successfulRequests}</strong></div>
+          <div>Failed: <strong style="color: #ef4444">${stats.failedRequests}</strong></div>
+          <div>Rejected: <strong style="color: #f59e0b">${stats.rejectedRequests}</strong></div>
+          <div>Timeouts: <strong style="color: #a78bfa">${stats.timeouts}</strong></div>
+          <div>Queue: <strong>${stats.queueLength}</strong></div>
+          <div>Failures: <strong>${stats.failureCount}/${stats.failureThreshold}</strong></div>
+          <div>Successes: <strong>${stats.successCount}/${stats.successThreshold}</strong></div>
+        </div>
+        ${
+          stats.nextAttemptTime
+            ? `<div style="margin-top: 8px; font-size: 12px; color: #94a3b8">
+            Next attempt: ${stats.nextAttemptTime}
+          </div>`
+            : ""
+        }
+      </div>
+    `;
+  };
+
+  circuitBreaker.on("stateChange", updateUI);
+  circuitBreaker.on("failure", updateUI);
+  circuitBreaker.on("close", updateUI);
+
+  updateUI();
+}
+
+async function runDemo() {
+  console.log("=== Circuit Breaker Demo ===\n");
+
+  const breaker = new CircuitBreaker({
+    failureThreshold: 3,
+    successThreshold: 2,
+    timeout: 5000,
+    requestTimeout: 3000,
+  });
+
+  let callCount = 0;
+
+  const mockApiCall = async () => {
+    callCount++;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    if (callCount <= 4) {
+      throw new Error(`Server error on call ${callCount}`);
+    }
+    return { data: `Success on call ${callCount}` };
+  };
+
+  console.log("--- Phase 1: Triggering failures to open circuit ---");
+  for (let i = 0; i < 5; i++) {
+    try {
+      const result = await breaker.execute(mockApiCall);
+      console.log("✅ Success:", result);
+    } catch (error) {
+      if (error.isCircuitBreakerError) {
+        console.log("🚫 Circuit OPEN - Request blocked:", error.message);
+      } else {
+        console.log("❌ Request failed:", error.message);
+      }
+    }
+    console.log("   Stats:", JSON.stringify(breaker.getStats(), null, 0));
+  }
+
+  console.log("\n--- Phase 2: Waiting for circuit to go HALF-OPEN ---");
+  await new Promise((resolve) => setTimeout(resolve, 5500));
+
+  console.log("\n--- Phase 3: Testing recovery ---");
+  for (let i = 0; i < 4; i++) {
+    try {
+      const result = await breaker.execute(mockApiCall);
+      console.log("✅ Success:", result);
+    } catch (error) {
+      console.log("❌ Error:", error.message);
+    }
+    console.log("   Stats:", JSON.stringify(breaker.getStats(), null, 0));
+  }
+
+  console.log("\n=== Final Stats ===");
+  console.log(breaker.getStats());
+
+  breaker.destroy();
+}
+
+const apiClient = new ApiClient("https://api.example.com", {
+  failureThreshold: 5,
+  successThreshold: 2,
+  timeout: 15000,
+  requestTimeout: 8000,
+});
+
+const retryBreaker = new RetryWithCircuitBreaker(
+  new CircuitBreaker({
+    failureThreshold: 5,
+    successThreshold: 2,
+    timeout: 10000,
+  }),
+  {
+    maxRetries: 3,
+    retryDelay: 1000,
+    backoffMultiplier: 2,
+  }
+);
+
+if (typeof window !== "undefined") {
+  window.addEventListener("circuitBreakerStateChange", (event) => {
+    const { state, stats } = event.detail;
+    console.log(`[UI Event] Circuit state changed to: ${state}`, stats);
+  });
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    CircuitBreaker,
+    CircuitBreakerOpenError,
+    ApiClient,
+    RetryWithCircuitBreaker,
+    createCircuitBreakerUI,
+  };
+} else {
+  window.CircuitBreaker = CircuitBreaker;
+  window.CircuitBreakerOpenError = CircuitBreakerOpenError;
+  window.ApiClient = ApiClient;
+  window.RetryWithCircuitBreaker = RetryWithCircuitBreaker;
+  window.createCircuitBreakerUI = createCircuitBreakerUI;
+}
+
+runDemo().catch(console.error);
+```

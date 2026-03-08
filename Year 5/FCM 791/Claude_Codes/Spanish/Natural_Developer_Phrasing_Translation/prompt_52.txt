@@ -1,0 +1,305 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ForgotPasswordApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ForgotPasswordApplication.class, args);
+    }
+}
+```
+
+```java
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.service.spring.AiService;
+
+@AiService
+public interface EmailAssistant {
+    
+    @SystemMessage("You are a helpful assistant that generates professional email content for password reset requests. " +
+                   "Always generate clear, concise, and professional email content.")
+    @UserMessage("Generate a professional password reset email body for user: {{userName}} with reset link: {{resetLink}}. " +
+                 "The email should be friendly, clear, and include security warnings. Return only the email body text.")
+    String generatePasswordResetEmail(String userName, String resetLink);
+}
+```
+
+```java
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+public class PasswordResetToken {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String userEmail;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDate;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, String userEmail, LocalDateTime expiryDate) {
+        this.token = token;
+        this.userEmail = userEmail;
+        this.expiryDate = expiryDate;
+    }
+    
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    
+    public String getToken() { return token; }
+    public void setToken(String token) { this.token = token; }
+    
+    public String getUserEmail() { return userEmail; }
+    public void setUserEmail(String userEmail) { this.userEmail = userEmail; }
+    
+    public LocalDateTime getExpiryDate() { return expiryDate; }
+    public void setExpiryDate(LocalDateTime expiryDate) { this.expiryDate = expiryDate; }
+    
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+    
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(this.expiryDate);
+    }
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByUserEmail(String userEmail);
+}
+```
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Service
+public class ForgotPasswordService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ForgotPasswordService.class);
+    private static final int TOKEN_EXPIRY_HOURS = 24;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    @Autowired
+    private EmailAssistant emailAssistant;
+    
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+    
+    @Value("${spring.mail.username:noreply@example.com}")
+    private String fromEmail;
+    
+    @Transactional
+    public ForgotPasswordResponse processForgotPassword(String email) {
+        logger.info("Processing forgot password request for email: {}", email);
+        
+        // Validate email format
+        if (email == null || !email.matches("^[A-Za-z0-9+_.-]+@(.+)$")) {
+            return new ForgotPasswordResponse(false, "Invalid email format");
+        }
+        
+        // Delete any existing tokens for this email
+        tokenRepository.deleteByUserEmail(email);
+        
+        // Generate unique token
+        String token = generateUniqueToken();
+        
+        // Create token with expiry
+        LocalDateTime expiryDate = LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS);
+        PasswordResetToken resetToken = new PasswordResetToken(token, email, expiryDate);
+        tokenRepository.save(resetToken);
+        
+        // Generate reset link
+        String resetLink = baseUrl + "/reset-password?token=" + token;
+        
+        // Extract username from email (before @)
+        String userName = email.split("@")[0];
+        
+        // Generate email content using AI
+        String emailBody = generateEmailContent(userName, resetLink);
+        
+        // Send email
+        boolean emailSent = sendPasswordResetEmail(email, emailBody);
+        
+        if (emailSent) {
+            logger.info("Password reset email sent successfully to: {}", email);
+            return new ForgotPasswordResponse(true, 
+                "Password reset instructions have been sent to your email address. " +
+                "The link will expire in " + TOKEN_EXPIRY_HOURS + " hours.");
+        } else {
+            logger.error("Failed to send password reset email to: {}", email);
+            return new ForgotPasswordResponse(false, "Failed to send email. Please try again later.");
+        }
+    }
+    
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString() + "-" + System.currentTimeMillis();
+    }
+    
+    private String generateEmailContent(String userName, String resetLink) {
+        try {
+            logger.info("Generating AI-powered email content for user: {}", userName);
+            return emailAssistant.generatePasswordResetEmail(userName, resetLink);
+        } catch (Exception e) {
+            logger.warn("Failed to generate AI email content, using default template: {}", e.getMessage());
+            return getDefaultEmailTemplate(userName, resetLink);
+        }
+    }
+    
+    private String getDefaultEmailTemplate(String userName, String resetLink) {
+        return String.format(
+            "Dear %s,\n\n" +
+            "We received a request to reset your password.\n\n" +
+            "Click the link below to reset your password:\n%s\n\n" +
+            "This link will expire in %d hours.\n\n" +
+            "If you did not request a password reset, please ignore this email.\n\n" +
+            "Best regards,\nThe Support Team",
+            userName, resetLink, TOKEN_EXPIRY_HOURS
+        );
+    }
+    
+    private boolean sendPasswordResetEmail(String toEmail, String emailBody) {
+        try {
+            SimpleMailMessage message = new SimpleMailMessage();
+            message.setFrom(fromEmail);
+            message.setTo(toEmail);
+            message.setSubject("Password Reset Request");
+            message.setText(emailBody);
+            
+            mailSender.send(message);
+            return true;
+        } catch (Exception e) {
+            logger.error("Error sending email to {}: {}", toEmail, e.getMessage());
+            return false;
+        }
+    }
+    
+    @Transactional
+    public TokenValidationResponse validateResetToken(String token) {
+        return tokenRepository.findByToken(token)
+            .map(resetToken -> {
+                if (resetToken.isUsed()) {
+                    return new TokenValidationResponse(false, "Token has already been used");
+                }
+                if (resetToken.isExpired()) {
+                    return new TokenValidationResponse(false, "Token has expired");
+                }
+                return new TokenValidationResponse(true, "Token is valid");
+            })
+            .orElse(new TokenValidationResponse(false, "Invalid token"));
+    }
+    
+    // Response classes
+    public static class ForgotPasswordResponse {
+        private boolean success;
+        private String message;
+        
+        public ForgotPasswordResponse(boolean success, String message) {
+            this.success = success;
+            this.message = message;
+        }
+        
+        public boolean isSuccess() { return success; }
+        public String getMessage() { return message; }
+    }
+    
+    public static class TokenValidationResponse {
+        private boolean valid;
+        private String message;
+        
+        public TokenValidationResponse(boolean valid, String message) {
+            this.valid = valid;
+            this.message = message;
+        }
+        
+        public boolean isValid() { return valid; }
+        public String getMessage() { return message; }
+    }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+public class ForgotPasswordController {
+    
+    @Autowired
+    private ForgotPasswordService forgotPasswordService;
+    
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ForgotPasswordService.ForgotPasswordResponse> forgotPassword(
+            @RequestBody ForgotPasswordRequest request) {
+        
+        ForgotPasswordService.ForgotPasswordResponse response = 
+            forgotPasswordService.processForgotPassword(request.getEmail());
+        
+        if (response.isSuccess()) {
+            return ResponseEntity.ok(response);
+        } else {
+            return ResponseEntity.badRequest().body(response);
+        }
+    }
+    
+    @GetMapping("/validate-token")
+    public ResponseEntity<ForgotPasswordService.TokenValidationResponse> validateToken(
+            @RequestParam String token) {
+        
+        ForgotPasswordService.TokenValidationResponse response = 
+            forgotPasswordService.validateResetToken(token);
+        
+        if (response.isValid()) {
+            return ResponseEntity.ok(response);
+        } else {
+            return ResponseEntity.badRequest().body(response);
+        }
+    }
+    
+    public static class ForgotPasswordRequest {
+        private String email;
+        
+        public String getEmail() { return email; }
+        public void setEmail(String email) { this.email = email; }
+    }
+}
+```

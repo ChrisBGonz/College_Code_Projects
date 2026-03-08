@@ -1,0 +1,249 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"net/http"
+	"os"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// MicroserviceCall simulates calling a microservice
+func callMicroservice(url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to call microservice: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("microservice returned status: %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// SimulatedMicroservice simulates a microservice that sometimes fails
+func simulatedMicroserviceCall(attemptNumber int) error {
+	// Simulate random failures (70% failure rate for first 5 attempts)
+	if attemptNumber <= 5 && rand.Float32() < 0.7 {
+		return fmt.Errorf("microservice temporarily unavailable (attempt %d)", attemptNumber)
+	}
+	return nil
+}
+
+// RetryUntilSuccess continuously retries a function until it succeeds
+func retryUntilSuccess(ctx context.Context, operation func(attempt int) error, operationName string) error {
+	attempt := 1
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("context cancelled after %d attempts: %w", attempt-1, ctx.Err())
+		default:
+		}
+
+		log.Printf("Attempting %s (attempt #%d)...", operationName, attempt)
+		err := operation(attempt)
+		if err == nil {
+			log.Printf("✓ %s succeeded on attempt #%d", operationName, attempt)
+			return nil
+		}
+
+		log.Printf("✗ %s failed on attempt #%d: %v. Retrying immediately...", operationName, attempt, err)
+		attempt++
+	}
+}
+
+// generateRetryCode uses Claude to generate retry logic code
+func generateRetryCode(client *anthropic.Client) (string, error) {
+	ctx := context.Background()
+
+	prompt := `Generate a Go function that implements retry logic for calling a microservice. 
+The function should:
+1. Accept a context for cancellation
+2. Retry immediately without any backoff
+3. Log each attempt
+4. Return success when the operation succeeds
+5. Include proper error handling
+
+Provide only the Go code without any explanation.`
+
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonnetLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude")
+	}
+
+	var responseText string
+	for _, block := range message.Content {
+		if block.Type == "text" {
+			responseText += block.Text
+		}
+	}
+
+	return responseText, nil
+}
+
+// demonstrateRetryWithClaude shows how to use Claude to analyze retry patterns
+func demonstrateRetryWithClaude(client *anthropic.Client, retryStats map[string]interface{}) error {
+	ctx := context.Background()
+
+	statsStr := fmt.Sprintf("Total attempts: %v, Successful: %v, Failed: %v, Duration: %v",
+		retryStats["total_attempts"],
+		retryStats["successful"],
+		retryStats["failed"],
+		retryStats["duration"])
+
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonnetLatest,
+		MaxTokens: 512,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(
+				fmt.Sprintf("Analyze these microservice retry statistics and provide a brief assessment: %s", statsStr),
+			)),
+		},
+	})
+
+	if err != nil {
+		return fmt.Errorf("failed to analyze stats with Claude: %w", err)
+	}
+
+	if len(message.Content) > 0 {
+		for _, block := range message.Content {
+			if block.Type == "text" {
+				fmt.Printf("\n📊 Claude's Analysis:\n%s\n", block.Text)
+			}
+		}
+	}
+
+	return nil
+}
+
+func main() {
+	// Initialize random seed
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Initialize Anthropic client
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if apiKey == "" {
+		log.Fatal("ANTHROPIC_API_KEY environment variable is required")
+	}
+
+	client := anthropic.NewClient(option.WithAPIKey(apiKey))
+
+	fmt.Println("=== Microservice Retry Demo with Claude AI ===\n")
+
+	// First, use Claude to generate retry code
+	fmt.Println("1. Asking Claude to generate retry logic code...")
+	generatedCode, err := generateRetryCode(client)
+	if err != nil {
+		log.Printf("Warning: Could not generate code with Claude: %v", err)
+	} else {
+		fmt.Printf("\nGenerated Code by Claude:\n%s\n\n", generatedCode)
+	}
+
+	// Now demonstrate the actual retry mechanism
+	fmt.Println("2. Demonstrating retry mechanism with simulated microservice...\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	startTime := time.Now()
+	totalAttempts := 0
+	failedAttempts := 0
+
+	// Track attempts for statistics
+	wrappedOperation := func(attempt int) error {
+		totalAttempts = attempt
+		err := simulatedMicroserviceCall(attempt)
+		if err != nil {
+			failedAttempts++
+		}
+		return err
+	}
+
+	// Run the retry loop
+	err = retryUntilSuccess(ctx, wrappedOperation, "microservice-call")
+	duration := time.Since(startTime)
+
+	if err != nil {
+		log.Printf("Operation failed: %v", err)
+	} else {
+		fmt.Printf("\n✅ Operation completed successfully!\n")
+		fmt.Printf("   Total attempts: %d\n", totalAttempts)
+		fmt.Printf("   Failed attempts: %d\n", failedAttempts)
+		fmt.Printf("   Duration: %v\n", duration)
+	}
+
+	// Use Claude to analyze the retry statistics
+	fmt.Println("\n3. Asking Claude to analyze retry statistics...")
+	stats := map[string]interface{}{
+		"total_attempts": totalAttempts,
+		"successful":     1,
+		"failed":         failedAttempts,
+		"duration":       duration.String(),
+	}
+
+	if err := demonstrateRetryWithClaude(client, stats); err != nil {
+		log.Printf("Warning: Could not analyze stats with Claude: %v", err)
+	}
+
+	// Demonstrate multiple retry scenarios
+	fmt.Println("\n4. Running multiple retry scenarios...\n")
+
+	scenarios := []struct {
+		name        string
+		maxAttempts int
+		failureRate float32
+	}{
+		{"High Availability Service", 3, 0.3},
+		{"Unstable Service", 8, 0.8},
+		{"Reliable Service", 1, 0.1},
+	}
+
+	for _, scenario := range scenarios {
+		fmt.Printf("\n--- Scenario: %s ---\n", scenario.name)
+		scenarioCtx, scenarioCancel := context.WithTimeout(context.Background(), 10*time.Second)
+
+		scenarioAttempts := 0
+		scenarioOperation := func(attempt int) error {
+			scenarioAttempts = attempt
+			if attempt <= scenario.maxAttempts && rand.Float32() < scenario.failureRate {
+				return fmt.Errorf("service unavailable")
+			}
+			return nil
+		}
+
+		scenarioStart := time.Now()
+		scenarioErr := retryUntilSuccess(scenarioCtx, scenarioOperation, scenario.name)
+		scenarioDuration := time.Since(scenarioStart)
+
+		if scenarioErr != nil {
+			fmt.Printf("  ❌ Failed after %d attempts in %v\n", scenarioAttempts, scenarioDuration)
+		} else {
+			fmt.Printf("  ✅ Succeeded after %d attempts in %v\n", scenarioAttempts, scenarioDuration)
+		}
+
+		scenarioCancel()
+	}
+
+	fmt.Println("\n=== Demo Complete ===")
+}
+```

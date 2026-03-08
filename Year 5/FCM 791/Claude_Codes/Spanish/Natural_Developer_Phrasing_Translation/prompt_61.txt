@@ -1,0 +1,441 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Flask Login Route with Database Validation, Password Hashing, and JWT Authentication
+"""
+
+import os
+import sqlite3
+import datetime
+from functools import wraps
+from flask import Flask, request, jsonify, session, g
+from werkzeug.security import generate_password_hash, check_password_hash
+import jwt
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'your-secret-key-change-in-production')
+app.config['JWT_EXPIRATION_HOURS'] = 24
+DATABASE = 'users.db'
+
+
+def get_db():
+    """Get database connection."""
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DATABASE)
+        db.row_factory = sqlite3.Row
+    return db
+
+
+@app.teardown_appcontext
+def close_connection(exception):
+    """Close database connection on teardown."""
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+
+def init_db():
+    """Initialize the database with users table."""
+    with app.app_context():
+        db = get_db()
+        db.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                is_active BOOLEAN DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            )
+        ''')
+        db.commit()
+
+
+def create_test_user():
+    """Create a test user for demonstration."""
+    with app.app_context():
+        db = get_db()
+        
+        # Check if test user already exists
+        existing = db.execute(
+            'SELECT id FROM users WHERE username = ?', 
+            ('testuser',)
+        ).fetchone()
+        
+        if not existing:
+            password_hash = generate_password_hash('testpassword123')
+            db.execute(
+                'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+                ('testuser', 'test@example.com', password_hash)
+            )
+            db.commit()
+            print("Test user created: username='testuser', password='testpassword123'")
+
+
+def generate_jwt_token(user_id: int, username: str) -> str:
+    """Generate JWT token for authenticated user."""
+    payload = {
+        'user_id': user_id,
+        'username': username,
+        'exp': datetime.datetime.utcnow() + datetime.timedelta(
+            hours=app.config['JWT_EXPIRATION_HOURS']
+        ),
+        'iat': datetime.datetime.utcnow()
+    }
+    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+
+
+def token_required(f):
+    """Decorator to protect routes that require authentication."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        
+        # Check for token in Authorization header
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+        
+        if not token:
+            return jsonify({
+                'success': False,
+                'message': 'Token de autenticación requerido',
+                'error': 'MISSING_TOKEN'
+            }), 401
+        
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            
+            # Verify user still exists and is active
+            db = get_db()
+            current_user = db.execute(
+                'SELECT id, username, email, is_active FROM users WHERE id = ?',
+                (data['user_id'],)
+            ).fetchone()
+            
+            if not current_user:
+                return jsonify({
+                    'success': False,
+                    'message': 'Usuario no encontrado',
+                    'error': 'USER_NOT_FOUND'
+                }), 401
+            
+            if not current_user['is_active']:
+                return jsonify({
+                    'success': False,
+                    'message': 'Cuenta de usuario desactivada',
+                    'error': 'ACCOUNT_DISABLED'
+                }), 403
+            
+            g.current_user = dict(current_user)
+            
+        except jwt.ExpiredSignatureError:
+            return jsonify({
+                'success': False,
+                'message': 'Token expirado',
+                'error': 'TOKEN_EXPIRED'
+            }), 401
+        except jwt.InvalidTokenError:
+            return jsonify({
+                'success': False,
+                'message': 'Token inválido',
+                'error': 'INVALID_TOKEN'
+            }), 401
+        
+        return f(*args, **kwargs)
+    
+    return decorated
+
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    """
+    Login endpoint that validates credentials against database.
+    
+    Expected JSON body:
+    {
+        "username": "string",
+        "password": "string"
+    }
+    
+    Returns:
+    - 200: Successful login with JWT token
+    - 400: Missing or invalid request data
+    - 401: Invalid credentials
+    - 403: Account disabled
+    - 500: Server error
+    """
+    # Validate Content-Type
+    if not request.is_json:
+        return jsonify({
+            'success': False,
+            'message': 'Content-Type debe ser application/json',
+            'error': 'INVALID_CONTENT_TYPE'
+        }), 400
+    
+    data = request.get_json()
+    
+    # Validate required fields
+    if not data:
+        return jsonify({
+            'success': False,
+            'message': 'Cuerpo de la solicitud vacío',
+            'error': 'EMPTY_BODY'
+        }), 400
+    
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    # Validate field presence
+    if not username:
+        return jsonify({
+            'success': False,
+            'message': 'El nombre de usuario es requerido',
+            'error': 'MISSING_USERNAME'
+        }), 400
+    
+    if not password:
+        return jsonify({
+            'success': False,
+            'message': 'La contraseña es requerida',
+            'error': 'MISSING_PASSWORD'
+        }), 400
+    
+    # Validate field lengths
+    if len(username) > 150:
+        return jsonify({
+            'success': False,
+            'message': 'Nombre de usuario demasiado largo',
+            'error': 'INVALID_USERNAME'
+        }), 400
+    
+    try:
+        db = get_db()
+        
+        # Query user from database
+        user = db.execute(
+            '''SELECT id, username, email, password_hash, is_active 
+               FROM users 
+               WHERE username = ? OR email = ?''',
+            (username, username)
+        ).fetchone()
+        
+        # User not found - return generic error to prevent user enumeration
+        if not user:
+            return jsonify({
+                'success': False,
+                'message': 'Credenciales inválidas',
+                'error': 'INVALID_CREDENTIALS'
+            }), 401
+        
+        # Check if account is active
+        if not user['is_active']:
+            return jsonify({
+                'success': False,
+                'message': 'Tu cuenta ha sido desactivada. Contacta al administrador.',
+                'error': 'ACCOUNT_DISABLED'
+            }), 403
+        
+        # Verify password hash using werkzeug
+        if not check_password_hash(user['password_hash'], password):
+            return jsonify({
+                'success': False,
+                'message': 'Credenciales inválidas',
+                'error': 'INVALID_CREDENTIALS'
+            }), 401
+        
+        # Update last login timestamp
+        db.execute(
+            'UPDATE users SET last_login = ? WHERE id = ?',
+            (datetime.datetime.utcnow(), user['id'])
+        )
+        db.commit()
+        
+        # Generate JWT token
+        token = generate_jwt_token(user['id'], user['username'])
+        
+        # Set session (optional, for server-side session management)
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login exitoso',
+            'data': {
+                'token': token,
+                'token_type': 'Bearer',
+                'expires_in': app.config['JWT_EXPIRATION_HOURS'] * 3600,
+                'user': {
+                    'id': user['id'],
+                    'username': user['username'],
+                    'email': user['email']
+                }
+            }
+        }), 200
+        
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error during login: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Error interno del servidor',
+            'error': 'DATABASE_ERROR'
+        }), 500
+    except Exception as e:
+        app.logger.error(f"Unexpected error during login: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Error interno del servidor',
+            'error': 'INTERNAL_ERROR'
+        }), 500
+
+
+@app.route('/api/logout', methods=['POST'])
+@token_required
+def logout():
+    """
+    Logout endpoint - clears session.
+    JWT tokens are stateless, so client should discard the token.
+    """
+    session.clear()
+    
+    return jsonify({
+        'success': True,
+        'message': 'Logout exitoso. Por favor, elimina el token del cliente.'
+    }), 200
+
+
+@app.route('/api/profile', methods=['GET'])
+@token_required
+def profile():
+    """Protected route example - returns current user profile."""
+    return jsonify({
+        'success': True,
+        'data': {
+            'user': g.current_user
+        }
+    }), 200
+
+
+@app.route('/api/register', methods=['POST'])
+def register():
+    """
+    Register endpoint to create new users.
+    
+    Expected JSON body:
+    {
+        "username": "string",
+        "email": "string",
+        "password": "string"
+    }
+    """
+    if not request.is_json:
+        return jsonify({
+            'success': False,
+            'message': 'Content-Type debe ser application/json',
+            'error': 'INVALID_CONTENT_TYPE'
+        }), 400
+    
+    data = request.get_json()
+    
+    username = data.get('username', '').strip()
+    email = data.get('email', '').strip().lower()
+    password = data.get('password', '')
+    
+    # Validate required fields
+    if not all([username, email, password]):
+        return jsonify({
+            'success': False,
+            'message': 'Todos los campos son requeridos: username, email, password',
+            'error': 'MISSING_FIELDS'
+        }), 400
+    
+    # Validate password strength
+    if len(password) < 8:
+        return jsonify({
+            'success': False,
+            'message': 'La contraseña debe tener al menos 8 caracteres',
+            'error': 'WEAK_PASSWORD'
+        }), 400
+    
+    try:
+        db = get_db()
+        
+        # Check if username or email already exists
+        existing = db.execute(
+            'SELECT id FROM users WHERE username = ? OR email = ?',
+            (username, email)
+        ).fetchone()
+        
+        if existing:
+            return jsonify({
+                'success': False,
+                'message': 'El nombre de usuario o email ya está en uso',
+                'error': 'USER_ALREADY_EXISTS'
+            }), 409
+        
+        # Hash password using werkzeug
+        password_hash = generate_password_hash(password)
+        
+        # Insert new user
+        cursor = db.execute(
+            'INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)',
+            (username, email, password_hash)
+        )
+        db.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'Usuario registrado exitosamente',
+            'data': {
+                'user_id': cursor.lastrowid,
+                'username': username,
+                'email': email
+            }
+        }), 201
+        
+    except sqlite3.Error as e:
+        app.logger.error(f"Database error during registration: {str(e)}")
+        return jsonify({
+            'success': False,
+            'message': 'Error interno del servidor',
+            'error': 'DATABASE_ERROR'
+        }), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        'status': 'healthy',
+        'timestamp': datetime.datetime.utcnow().isoformat()
+    }), 200
+
+
+if __name__ == '__main__':
+    # Initialize database
+    init_db()
+    
+    # Create test user
+    create_test_user()
+    
+    print("\n=== Flask Login API ===")
+    print("Endpoints disponibles:")
+    print("  POST /api/register - Registrar nuevo usuario")
+    print("  POST /api/login    - Iniciar sesión")
+    print("  POST /api/logout   - Cerrar sesión (requiere token)")
+    print("  GET  /api/profile  - Ver perfil (requiere token)")
+    print("  GET  /health       - Estado del servidor")
+    print("\nUsuario de prueba:")
+    print("  Username: testuser")
+    print("  Password: testpassword123")
+    print("\nEjemplo de login:")
+    print('  curl -X POST http://localhost:5000/api/login \\')
+    print('    -H "Content-Type: application/json" \\')
+    print('    -d \'{"username": "testuser", "password": "testpassword123"}\'')
+    print("=" * 40)
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

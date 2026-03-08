@@ -1,0 +1,385 @@
+```csharp
+using System;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+
+namespace ShoppingCart.Checkout
+{
+    // DTO para cada ítem del carrito enviado desde el frontend
+    public class CartItemDto
+    {
+        [Required(ErrorMessage = "El nombre del producto es obligatorio.")]
+        [StringLength(200, MinimumLength = 1, ErrorMessage = "El nombre debe tener entre 1 y 200 caracteres.")]
+        public string Name { get; set; }
+
+        [Required(ErrorMessage = "El precio es obligatorio.")]
+        [Range(0.01, double.MaxValue, ErrorMessage = "El precio debe ser mayor a 0.")]
+        public decimal Price { get; set; }
+
+        [Required(ErrorMessage = "La cantidad es obligatoria.")]
+        [Range(1, int.MaxValue, ErrorMessage = "La cantidad debe ser al menos 1.")]
+        public int Qty { get; set; }
+    }
+
+    // Payload completo del checkout enviado desde el frontend
+    public class CheckoutPayloadDto
+    {
+        [Required(ErrorMessage = "La lista de ítems es obligatoria.")]
+        public List<CartItemDto> Items { get; set; }
+
+        // Código de descuento opcional
+        public string DiscountCode { get; set; }
+
+        // Porcentaje de impuesto (ej: 16 para 16%)
+        [Range(0, 100, ErrorMessage = "El impuesto debe estar entre 0 y 100.")]
+        public decimal TaxPercentage { get; set; } = 0;
+    }
+
+    // Detalle de cada ítem en el resultado
+    public class CartItemResult
+    {
+        public string Name { get; set; }
+        public decimal Price { get; set; }
+        public int Qty { get; set; }
+        public decimal Subtotal { get; set; }
+    }
+
+    // Resultado final del checkout
+    public class CheckoutResult
+    {
+        public bool Success { get; set; }
+        public List<string> Errors { get; set; } = new List<string>();
+        public List<CartItemResult> Items { get; set; } = new List<CartItemResult>();
+        public decimal Subtotal { get; set; }
+        public decimal DiscountAmount { get; set; }
+        public decimal TaxAmount { get; set; }
+        public decimal Total { get; set; }
+        public string AppliedDiscountCode { get; set; }
+        public string Currency { get; set; } = "MXN";
+    }
+
+    // Excepción personalizada para errores de checkout
+    public class CheckoutException : Exception
+    {
+        public List<string> ValidationErrors { get; }
+
+        public CheckoutException(string message) : base(message)
+        {
+            ValidationErrors = new List<string> { message };
+        }
+
+        public CheckoutException(List<string> errors) : base("Error de validación en el checkout.")
+        {
+            ValidationErrors = errors;
+        }
+    }
+
+    // Servicio principal de Checkout
+    public class CheckoutService
+    {
+        // Descuentos disponibles (simulando una base de datos o configuración)
+        private readonly Dictionary<string, decimal> _discountCodes = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase)
+        {
+            { "DESCUENTO10", 10m },
+            { "DESCUENTO20", 20m },
+            { "BLACKFRIDAY", 30m },
+            { "PROMO5",       5m  }
+        };
+
+        private const int MaxItemsAllowed = 100;
+        private const decimal MaxPriceAllowed = 1_000_000m;
+        private const int MaxQtyAllowed = 9999;
+
+        /// <summary>
+        /// Procesa el checkout: valida el payload, calcula subtotales, descuentos, impuestos y total final.
+        /// </summary>
+        /// <param name="payload">Payload enviado desde el frontend.</param>
+        /// <returns>CheckoutResult con el desglose completo.</returns>
+        public CheckoutResult ProcessCheckout(CheckoutPayloadDto payload)
+        {
+            var result = new CheckoutResult();
+
+            // 1. Validar payload general
+            var validationErrors = ValidatePayload(payload);
+            if (validationErrors.Any())
+            {
+                result.Success = false;
+                result.Errors = validationErrors;
+                return result;
+            }
+
+            // 2. Calcular subtotales por ítem
+            var itemResults = CalculateItemSubtotals(payload.Items);
+
+            // 3. Calcular subtotal general
+            decimal subtotal = itemResults.Sum(i => i.Subtotal);
+
+            // 4. Aplicar descuento si existe
+            decimal discountAmount = 0m;
+            string appliedCode = null;
+
+            if (!string.IsNullOrWhiteSpace(payload.DiscountCode))
+            {
+                var discountResult = ApplyDiscount(payload.DiscountCode, subtotal);
+                discountAmount = discountResult.discountAmount;
+                appliedCode = discountResult.appliedCode;
+
+                if (discountResult.error != null)
+                {
+                    result.Success = false;
+                    result.Errors.Add(discountResult.error);
+                    return result;
+                }
+            }
+
+            // 5. Base imponible (subtotal menos descuento)
+            decimal taxableAmount = subtotal - discountAmount;
+
+            // 6. Calcular impuesto
+            decimal taxAmount = CalculateTax(taxableAmount, payload.TaxPercentage);
+
+            // 7. Total final
+            decimal total = taxableAmount + taxAmount;
+
+            // 8. Construir resultado exitoso
+            result.Success = true;
+            result.Items = itemResults;
+            result.Subtotal = Math.Round(subtotal, 2);
+            result.DiscountAmount = Math.Round(discountAmount, 2);
+            result.TaxAmount = Math.Round(taxAmount, 2);
+            result.Total = Math.Round(total, 2);
+            result.AppliedDiscountCode = appliedCode;
+
+            return result;
+        }
+
+        // Valida el payload completo y retorna lista de errores
+        private List<string> ValidatePayload(CheckoutPayloadDto payload)
+        {
+            var errors = new List<string>();
+
+            if (payload == null)
+            {
+                errors.Add("El payload no puede ser nulo.");
+                return errors;
+            }
+
+            if (payload.Items == null || !payload.Items.Any())
+            {
+                errors.Add("El carrito no puede estar vacío.");
+                return errors;
+            }
+
+            if (payload.Items.Count > MaxItemsAllowed)
+            {
+                errors.Add($"El carrito no puede contener más de {MaxItemsAllowed} ítems.");
+            }
+
+            if (payload.TaxPercentage < 0 || payload.TaxPercentage > 100)
+            {
+                errors.Add("El porcentaje de impuesto debe estar entre 0 y 100.");
+            }
+
+            // Validar cada ítem individualmente
+            for (int i = 0; i < payload.Items.Count; i++)
+            {
+                var item = payload.Items[i];
+                var itemErrors = ValidateItem(item, i + 1);
+                errors.AddRange(itemErrors);
+            }
+
+            return errors;
+        }
+
+        // Valida un ítem individual
+        private List<string> ValidateItem(CartItemDto item, int index)
+        {
+            var errors = new List<string>();
+
+            if (item == null)
+            {
+                errors.Add($"El ítem #{index} no puede ser nulo.");
+                return errors;
+            }
+
+            if (string.IsNullOrWhiteSpace(item.Name))
+            {
+                errors.Add($"El ítem #{index} debe tener un nombre válido.");
+            }
+            else if (item.Name.Length > 200)
+            {
+                errors.Add($"El ítem #{index} tiene un nombre demasiado largo (máximo 200 caracteres).");
+            }
+
+            if (item.Price <= 0)
+            {
+                errors.Add($"El ítem #{index} ({item.Name ?? "sin nombre"}) debe tener un precio mayor a 0.");
+            }
+            else if (item.Price > MaxPriceAllowed)
+            {
+                errors.Add($"El ítem #{index} ({item.Name}) supera el precio máximo permitido de {MaxPriceAllowed:C}.");
+            }
+
+            if (item.Qty <= 0)
+            {
+                errors.Add($"El ítem #{index} ({item.Name ?? "sin nombre"}) debe tener una cantidad mayor a 0.");
+            }
+            else if (item.Qty > MaxQtyAllowed)
+            {
+                errors.Add($"El ítem #{index} ({item.Name}) supera la cantidad máxima permitida de {MaxQtyAllowed}.");
+            }
+
+            return errors;
+        }
+
+        // Calcula el subtotal de cada ítem
+        private List<CartItemResult> CalculateItemSubtotals(List<CartItemDto> items)
+        {
+            return items.Select(item => new CartItemResult
+            {
+                Name = item.Name.Trim(),
+                Price = Math.Round(item.Price, 2),
+                Qty = item.Qty,
+                Subtotal = Math.Round(item.Price * item.Qty, 2)
+            }).ToList();
+        }
+
+        // Aplica el código de descuento y retorna el monto descontado
+        private (decimal discountAmount, string appliedCode, string error) ApplyDiscount(string discountCode, decimal subtotal)
+        {
+            string code = discountCode.Trim().ToUpperInvariant();
+
+            if (!_discountCodes.TryGetValue(code, out decimal discountPercentage))
+            {
+                return (0m, null, $"El código de descuento '{discountCode}' no es válido.");
+            }
+
+            decimal discountAmount = subtotal * (discountPercentage / 100m);
+            return (Math.Round(discountAmount, 2), code, null);
+        }
+
+        // Calcula el impuesto sobre la base imponible
+        private decimal CalculateTax(decimal taxableAmount, decimal taxPercentage)
+        {
+            if (taxPercentage <= 0) return 0m;
+            return Math.Round(taxableAmount * (taxPercentage / 100m), 2);
+        }
+    }
+
+    // Programa de demostración
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            var checkoutService = new CheckoutService();
+
+            Console.WriteLine("=== DEMO: Proceso de Checkout ===\n");
+
+            // --- Caso 1: Checkout exitoso con descuento e impuesto ---
+            Console.WriteLine("--- Caso 1: Checkout exitoso con descuento e impuesto ---");
+            var payload1 = new CheckoutPayloadDto
+            {
+                Items = new List<CartItemDto>
+                {
+                    new CartItemDto { Name = "Laptop Dell XPS",    Price = 25000.00m, Qty = 1 },
+                    new CartItemDto { Name = "Mouse Inalámbrico",  Price = 350.50m,   Qty = 2 },
+                    new CartItemDto { Name = "Teclado Mecánico",   Price = 1200.00m,  Qty = 1 },
+                    new CartItemDto { Name = "Monitor 27\"",       Price = 8500.00m,  Qty = 1 }
+                },
+                DiscountCode = "DESCUENTO10",
+                TaxPercentage = 16m
+            };
+
+            PrintResult(checkoutService.ProcessCheckout(payload1));
+
+            // --- Caso 2: Checkout sin descuento ni impuesto ---
+            Console.WriteLine("\n--- Caso 2: Checkout sin descuento ni impuesto ---");
+            var payload2 = new CheckoutPayloadDto
+            {
+                Items = new List<CartItemDto>
+                {
+                    new CartItemDto { Name = "Audífonos Sony",  Price = 2500.00m, Qty = 1 },
+                    new CartItemDto { Name = "Cable USB-C",     Price = 150.00m,  Qty = 3 }
+                }
+            };
+
+            PrintResult(checkoutService.ProcessCheckout(payload2));
+
+            // --- Caso 3: Payload con errores de validación ---
+            Console.WriteLine("\n--- Caso 3: Payload con errores de validación ---");
+            var payload3 = new CheckoutPayloadDto
+            {
+                Items = new List<CartItemDto>
+                {
+                    new CartItemDto { Name = "",               Price = -100m,  Qty = 0  },
+                    new CartItemDto { Name = "Producto válido", Price = 500m,  Qty = 2  },
+                    new CartItemDto { Name = "Precio cero",    Price = 0m,    Qty = 1  }
+                },
+                DiscountCode = "INVALIDO",
+                TaxPercentage = 16m
+            };
+
+            PrintResult(checkoutService.ProcessCheckout(payload3));
+
+            // --- Caso 4: Carrito vacío ---
+            Console.WriteLine("\n--- Caso 4: Carrito vacío ---");
+            var payload4 = new CheckoutPayloadDto
+            {
+                Items = new List<CartItemDto>()
+            };
+
+            PrintResult(checkoutService.ProcessCheckout(payload4));
+
+            // --- Caso 5: Código de descuento inválido ---
+            Console.WriteLine("\n--- Caso 5: Código de descuento inválido ---");
+            var payload5 = new CheckoutPayloadDto
+            {
+                Items = new List<CartItemDto>
+                {
+                    new CartItemDto { Name = "Silla Ergonómica", Price = 4500.00m, Qty = 1 }
+                },
+                DiscountCode = "CODIGOFAKE",
+                TaxPercentage = 8m
+            };
+
+            PrintResult(checkoutService.ProcessCheckout(payload5));
+
+            Console.WriteLine("\nPresiona cualquier tecla para salir...");
+            Console.ReadKey();
+        }
+
+        static void PrintResult(CheckoutResult result)
+        {
+            if (!result.Success)
+            {
+                Console.WriteLine("❌ Checkout FALLIDO:");
+                foreach (var error in result.Errors)
+                    Console.WriteLine($"   • {error}");
+                return;
+            }
+
+            Console.WriteLine("✅ Checkout EXITOSO:");
+            Console.WriteLine($"   {'Producto',-30} {'Precio',12} {'Qty',5} {'Subtotal',14}");
+            Console.WriteLine($"   {new string('-', 65)}");
+
+            foreach (var item in result.Items)
+            {
+                Console.WriteLine($"   {item.Name,-30} {item.Price,12:C} {item.Qty,5} {item.Subtotal,14:C}");
+            }
+
+            Console.WriteLine($"   {new string('-', 65)}");
+            Console.WriteLine($"   {"Subtotal:",-45} {result.Subtotal,14:C}");
+
+            if (result.DiscountAmount > 0)
+                Console.WriteLine($"   {"Descuento (" + result.AppliedDiscountCode + "):",-45} -{result.DiscountAmount,13:C}");
+
+            if (result.TaxAmount > 0)
+                Console.WriteLine($"   {"Impuesto:",-45} {result.TaxAmount,14:C}");
+
+            Console.WriteLine($"   {new string('=', 65)}");
+            Console.WriteLine($"   {"TOTAL FINAL:",-45} {result.Total,14:C} {result.Currency}");
+        }
+    }
+}
+```

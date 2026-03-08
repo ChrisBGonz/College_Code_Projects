@@ -1,0 +1,454 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// AppConfig represents the configuration structure
+type AppConfig struct {
+	Properties map[string]interface{} `json:"properties"`
+}
+
+// DynamicObject represents an object that can have dynamic properties
+type DynamicObject struct {
+	Name       string
+	Properties map[string]interface{}
+}
+
+// ConfigManager manages configuration and dynamic property assignment
+type ConfigManager struct {
+	config     *AppConfig
+	configPath string
+}
+
+// NewConfigManager creates a new ConfigManager
+func NewConfigManager(configPath string) *ConfigManager {
+	return &ConfigManager{
+		configPath: configPath,
+	}
+}
+
+// LoadConfig reads and parses the JSON configuration file
+func (cm *ConfigManager) LoadConfig() error {
+	data, err := os.ReadFile(cm.configPath)
+	if err != nil {
+		return fmt.Errorf("error reading config file: %w", err)
+	}
+
+	cm.config = &AppConfig{}
+	if err := json.Unmarshal(data, cm.config); err != nil {
+		return fmt.Errorf("error parsing config file: %w", err)
+	}
+
+	return nil
+}
+
+// AssignProperties dynamically assigns properties to a struct using reflection
+func (cm *ConfigManager) AssignProperties(target interface{}) error {
+	if cm.config == nil {
+		return fmt.Errorf("config not loaded")
+	}
+
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() != reflect.Ptr || targetValue.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer")
+	}
+
+	targetElem := targetValue.Elem()
+	if targetElem.Kind() != reflect.Struct {
+		return fmt.Errorf("target must point to a struct")
+	}
+
+	targetType := targetElem.Type()
+
+	for i := 0; i < targetElem.NumField(); i++ {
+		field := targetElem.Field(i)
+		fieldType := targetType.Field(i)
+
+		// Get the JSON tag or use field name
+		jsonTag := fieldType.Tag.Get("json")
+		fieldName := fieldType.Name
+		if jsonTag != "" {
+			parts := strings.Split(jsonTag, ",")
+			if parts[0] != "" && parts[0] != "-" {
+				fieldName = parts[0]
+			}
+		}
+
+		// Check if config has a value for this field
+		if value, ok := cm.config.Properties[fieldName]; ok {
+			if field.CanSet() {
+				if err := setFieldValue(field, value); err != nil {
+					log.Printf("Warning: could not set field %s: %v", fieldName, err)
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// setFieldValue sets a reflect.Value with the given interface value
+func setFieldValue(field reflect.Value, value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		if v, ok := value.(string); ok {
+			field.SetString(v)
+		} else {
+			field.SetString(fmt.Sprintf("%v", value))
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := value.(type) {
+		case float64:
+			field.SetInt(int64(v))
+		case int:
+			field.SetInt(int64(v))
+		case int64:
+			field.SetInt(v)
+		}
+	case reflect.Float32, reflect.Float64:
+		if v, ok := value.(float64); ok {
+			field.SetFloat(v)
+		}
+	case reflect.Bool:
+		if v, ok := value.(bool); ok {
+			field.SetBool(v)
+		}
+	case reflect.Slice:
+		if v, ok := value.([]interface{}); ok {
+			slice := reflect.MakeSlice(field.Type(), len(v), len(v))
+			for i, item := range v {
+				if err := setFieldValue(slice.Index(i), item); err != nil {
+					return err
+				}
+			}
+			field.Set(slice)
+		}
+	case reflect.Map:
+		if v, ok := value.(map[string]interface{}); ok {
+			mapValue := reflect.MakeMap(field.Type())
+			for k, val := range v {
+				mapValue.SetMapIndex(reflect.ValueOf(k), reflect.ValueOf(val))
+			}
+			field.Set(mapValue)
+		}
+	default:
+		return fmt.Errorf("unsupported field type: %v", field.Kind())
+	}
+
+	return nil
+}
+
+// GetProperty retrieves a property value from the config
+func (cm *ConfigManager) GetProperty(key string) (interface{}, bool) {
+	if cm.config == nil {
+		return nil, false
+	}
+	value, ok := cm.config.Properties[key]
+	return value, ok
+}
+
+// UpdateProperty updates a property in the config
+func (cm *ConfigManager) UpdateProperty(key string, value interface{}) {
+	if cm.config == nil {
+		cm.config = &AppConfig{
+			Properties: make(map[string]interface{}),
+		}
+	}
+	cm.config.Properties[key] = value
+}
+
+// SaveConfig saves the current configuration to the JSON file
+func (cm *ConfigManager) SaveConfig() error {
+	data, err := json.MarshalIndent(cm.config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("error marshaling config: %w", err)
+	}
+
+	if err := os.WriteFile(cm.configPath, data, 0644); err != nil {
+		return fmt.Errorf("error writing config file: %w", err)
+	}
+
+	return nil
+}
+
+// ServerConfig is an example struct that can be configured dynamically
+type ServerConfig struct {
+	Host        string            `json:"host"`
+	Port        int               `json:"port"`
+	Debug       bool              `json:"debug"`
+	MaxRetries  int               `json:"max_retries"`
+	Timeout     float64           `json:"timeout"`
+	Tags        []string          `json:"tags"`
+	Environment string            `json:"environment"`
+	Features    map[string]string `json:"features"`
+}
+
+// createSampleConfig creates a sample configuration file
+func createSampleConfig(path string) error {
+	config := map[string]interface{}{
+		"properties": map[string]interface{}{
+			"host":        "localhost",
+			"port":        8080,
+			"debug":       true,
+			"max_retries": 3,
+			"timeout":     30.5,
+			"tags":        []string{"production", "api", "v2"},
+			"environment": "development",
+			"features": map[string]string{
+				"auth":    "enabled",
+				"logging": "verbose",
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
+}
+
+// analyzeConfigWithClaude uses Claude to analyze and suggest improvements to the configuration
+func analyzeConfigWithClaude(client *anthropic.Client, config *AppConfig) (string, error) {
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("error marshaling config: %w", err)
+	}
+
+	prompt := fmt.Sprintf(`Analyze this application configuration and provide insights:
+
+Configuration:
+%s
+
+Please provide:
+1. A brief analysis of the configuration
+2. Any potential issues or improvements
+3. Suggestions for additional properties that might be useful
+4. Security considerations if applicable
+
+Keep the response concise and practical.`, string(configJSON))
+
+	message, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5HaikuLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("error calling Claude API: %w", err)
+	}
+
+	if len(message.Content) > 0 {
+		return message.Content[0].Text, nil
+	}
+
+	return "", fmt.Errorf("no response from Claude")
+}
+
+// generateConfigWithClaude uses Claude to generate a new configuration based on requirements
+func generateConfigWithClaude(client *anthropic.Client, requirements string) (map[string]interface{}, error) {
+	prompt := fmt.Sprintf(`Generate a JSON configuration for an application with the following requirements:
+
+%s
+
+Return ONLY a valid JSON object with a "properties" key containing the configuration properties.
+Do not include any explanation or markdown formatting, just the raw JSON.
+Example format:
+{
+  "properties": {
+    "key": "value",
+    "number": 42,
+    "flag": true
+  }
+}`, requirements)
+
+	message, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5HaikuLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error calling Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return nil, fmt.Errorf("no response from Claude")
+	}
+
+	responseText := message.Content[0].Text
+
+	// Try to extract JSON from the response
+	var config map[string]interface{}
+	if err := json.Unmarshal([]byte(responseText), &config); err != nil {
+		// Try to find JSON in the response
+		start := strings.Index(responseText, "{")
+		end := strings.LastIndex(responseText, "}")
+		if start != -1 && end != -1 && end > start {
+			jsonStr := responseText[start : end+1]
+			if err := json.Unmarshal([]byte(jsonStr), &config); err != nil {
+				return nil, fmt.Errorf("error parsing generated config: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("could not find valid JSON in response")
+		}
+	}
+
+	return config, nil
+}
+
+func main() {
+	// Initialize Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(os.Getenv("ANTHROPIC_API_KEY")),
+	)
+
+	// Create a sample configuration file
+	configPath := "config.json"
+	fmt.Println("Creating sample configuration file...")
+	if err := createSampleConfig(configPath); err != nil {
+		log.Fatalf("Error creating sample config: %v", err)
+	}
+
+	// Initialize ConfigManager
+	cm := NewConfigManager(configPath)
+
+	// Load configuration
+	fmt.Println("Loading configuration...")
+	if err := cm.LoadConfig(); err != nil {
+		log.Fatalf("Error loading config: %v", err)
+	}
+
+	// Create a ServerConfig and assign properties dynamically
+	serverConfig := &ServerConfig{}
+	fmt.Println("\nAssigning properties dynamically to ServerConfig...")
+	if err := cm.AssignProperties(serverConfig); err != nil {
+		log.Fatalf("Error assigning properties: %v", err)
+	}
+
+	// Display the configured object
+	fmt.Printf("\nConfigured ServerConfig:\n")
+	fmt.Printf("  Host: %s\n", serverConfig.Host)
+	fmt.Printf("  Port: %d\n", serverConfig.Port)
+	fmt.Printf("  Debug: %v\n", serverConfig.Debug)
+	fmt.Printf("  MaxRetries: %d\n", serverConfig.MaxRetries)
+	fmt.Printf("  Timeout: %.1f\n", serverConfig.Timeout)
+	fmt.Printf("  Tags: %v\n", serverConfig.Tags)
+	fmt.Printf("  Environment: %s\n", serverConfig.Environment)
+	fmt.Printf("  Features: %v\n", serverConfig.Features)
+
+	// Demonstrate dynamic property access
+	fmt.Println("\nDynamic property access:")
+	if host, ok := cm.GetProperty("host"); ok {
+		fmt.Printf("  host = %v\n", host)
+	}
+	if port, ok := cm.GetProperty("port"); ok {
+		fmt.Printf("  port = %v\n", port)
+	}
+
+	// Update a property dynamically
+	fmt.Println("\nUpdating properties dynamically...")
+	cm.UpdateProperty("host", "production.example.com")
+	cm.UpdateProperty("port", 443)
+	cm.UpdateProperty("environment", "production")
+
+	// Reassign properties to see the updates
+	serverConfig2 := &ServerConfig{}
+	if err := cm.AssignProperties(serverConfig2); err != nil {
+		log.Fatalf("Error assigning updated properties: %v", err)
+	}
+
+	fmt.Printf("\nUpdated ServerConfig:\n")
+	fmt.Printf("  Host: %s\n", serverConfig2.Host)
+	fmt.Printf("  Port: %d\n", serverConfig2.Port)
+	fmt.Printf("  Environment: %s\n", serverConfig2.Environment)
+
+	// Use Claude to analyze the configuration
+	fmt.Println("\n--- Claude Configuration Analysis ---")
+	analysis, err := analyzeConfigWithClaude(client, cm.config)
+	if err != nil {
+		log.Printf("Error analyzing config with Claude: %v", err)
+	} else {
+		fmt.Println(analysis)
+	}
+
+	// Use Claude to generate a new configuration
+	fmt.Println("\n--- Claude Configuration Generation ---")
+	requirements := "A microservice for handling user authentication with JWT tokens, rate limiting, and Redis caching"
+	fmt.Printf("Generating configuration for: %s\n\n", requirements)
+
+	generatedConfig, err := generateConfigWithClaude(client, requirements)
+	if err != nil {
+		log.Printf("Error generating config with Claude: %v", err)
+	} else {
+		generatedJSON, _ := json.MarshalIndent(generatedConfig, "", "  ")
+		fmt.Printf("Generated Configuration:\n%s\n", string(generatedJSON))
+
+		// Save the generated configuration
+		generatedConfigPath := "generated_config.json"
+		if err := os.WriteFile(generatedConfigPath, generatedJSON, 0644); err != nil {
+			log.Printf("Error saving generated config: %v", err)
+		} else {
+			fmt.Printf("\nGenerated configuration saved to: %s\n", generatedConfigPath)
+		}
+
+		// Load and apply the generated configuration
+		if properties, ok := generatedConfig["properties"].(map[string]interface{}); ok {
+			newCM := &ConfigManager{
+				config: &AppConfig{
+					Properties: properties,
+				},
+			}
+
+			// Create a dynamic object to hold the generated properties
+			dynamicObj := &DynamicObject{
+				Name:       "AuthService",
+				Properties: properties,
+			}
+
+			fmt.Printf("\nDynamic Object '%s' properties:\n", dynamicObj.Name)
+			for k, v := range dynamicObj.Properties {
+				fmt.Printf("  %s: %v\n", k, v)
+			}
+
+			// Try to assign to a generic struct if possible
+			_ = newCM
+		}
+	}
+
+	// Save the updated configuration
+	fmt.Println("\nSaving updated configuration...")
+	if err := cm.SaveConfig(); err != nil {
+		log.Printf("Error saving config: %v", err)
+	} else {
+		fmt.Println("Configuration saved successfully!")
+	}
+
+	// Clean up
+	defer func() {
+		os.Remove(configPath)
+		os.Remove("generated_config.json")
+	}()
+}
+```

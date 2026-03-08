@@ -1,0 +1,688 @@
+
+```python
+import http.cookies
+import json
+import uuid
+import hashlib
+import time
+from datetime import datetime, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+
+TRIAL_DURATION_DAYS = 14
+COOKIE_NAME = "has_used_trial"
+SESSION_COOKIE_NAME = "session_id"
+
+users_db = {}
+trials_db = {}
+sessions_db = {}
+
+
+def generate_session_id():
+    return str(uuid.uuid4())
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def create_trial_record(user_id, email):
+    trial_id = str(uuid.uuid4())
+    start_date = datetime.now()
+    end_date = start_date + timedelta(days=TRIAL_DURATION_DAYS)
+    
+    trial = {
+        "trial_id": trial_id,
+        "user_id": user_id,
+        "email": email,
+        "start_date": start_date.isoformat(),
+        "end_date": end_date.isoformat(),
+        "is_active": True,
+        "days_remaining": TRIAL_DURATION_DAYS
+    }
+    
+    trials_db[user_id] = trial
+    return trial
+
+
+def check_trial_cookie(cookie_header):
+    if not cookie_header:
+        return None
+    
+    try:
+        cookie = http.cookies.SimpleCookie()
+        cookie.load(cookie_header)
+        
+        if COOKIE_NAME in cookie:
+            cookie_value = cookie[COOKIE_NAME].value
+            try:
+                trial_data = json.loads(cookie_value)
+                return trial_data
+            except json.JSONDecodeError:
+                return {"raw_value": cookie_value, "has_used_trial": True}
+        
+        return None
+    except Exception:
+        return None
+
+
+def validate_trial_status(trial_data):
+    if not trial_data:
+        return {"valid": False, "reason": "No trial cookie found"}
+    
+    if "end_date" in trial_data:
+        try:
+            end_date = datetime.fromisoformat(trial_data["end_date"])
+            if datetime.now() > end_date:
+                return {
+                    "valid": False,
+                    "expired": True,
+                    "reason": "Trial period has expired",
+                    "end_date": trial_data["end_date"]
+                }
+            else:
+                days_remaining = (end_date - datetime.now()).days
+                return {
+                    "valid": True,
+                    "expired": False,
+                    "reason": "Trial is still active",
+                    "days_remaining": days_remaining,
+                    "end_date": trial_data["end_date"]
+                }
+        except ValueError:
+            pass
+    
+    return {
+        "valid": False,
+        "expired": True,
+        "reason": "User has already used their free trial"
+    }
+
+
+def build_trial_cookie(trial_data, max_age=None):
+    cookie = http.cookies.SimpleCookie()
+    cookie_value = json.dumps({
+        "has_used_trial": True,
+        "trial_id": trial_data.get("trial_id", ""),
+        "user_id": trial_data.get("user_id", ""),
+        "start_date": trial_data.get("start_date", ""),
+        "end_date": trial_data.get("end_date", ""),
+        "email": trial_data.get("email", "")
+    })
+    
+    cookie[COOKIE_NAME] = cookie_value
+    cookie[COOKIE_NAME]["path"] = "/"
+    cookie[COOKIE_NAME]["httponly"] = True
+    cookie[COOKIE_NAME]["samesite"] = "Strict"
+    
+    if max_age:
+        cookie[COOKIE_NAME]["max-age"] = max_age
+    else:
+        end_date = datetime.fromisoformat(trial_data["end_date"])
+        max_age_seconds = int((end_date - datetime.now()).total_seconds())
+        cookie[COOKIE_NAME]["max-age"] = max(0, max_age_seconds)
+    
+    return cookie.output(header="Set-Cookie")
+
+
+def build_session_cookie(session_id):
+    cookie = http.cookies.SimpleCookie()
+    cookie[SESSION_COOKIE_NAME] = session_id
+    cookie[SESSION_COOKIE_NAME]["path"] = "/"
+    cookie[SESSION_COOKIE_NAME]["httponly"] = True
+    cookie[SESSION_COOKIE_NAME]["max-age"] = 86400
+    return cookie.output(header="Set-Cookie")
+
+
+def get_html_response(title, content, status_class=""):
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{title}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+        .container {{ background: white; border-radius: 16px; padding: 40px; max-width: 500px; width: 90%; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }}
+        h1 {{ color: #333; margin-bottom: 10px; font-size: 28px; }}
+        h2 {{ color: #555; margin-bottom: 20px; font-size: 20px; }}
+        p {{ color: #666; margin-bottom: 15px; line-height: 1.6; }}
+        .form-group {{ margin-bottom: 20px; }}
+        label {{ display: block; color: #555; margin-bottom: 8px; font-weight: 600; }}
+        input {{ width: 100%; padding: 12px 16px; border: 2px solid #e1e5e9; border-radius: 8px; font-size: 16px; transition: border-color 0.3s; outline: none; }}
+        input:focus {{ border-color: #667eea; }}
+        .btn {{ width: 100%; padding: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: opacity 0.3s; }}
+        .btn:hover {{ opacity: 0.9; }}
+        .btn-secondary {{ background: #f0f0f0; color: #333; margin-top: 10px; }}
+        .alert {{ padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; font-weight: 500; }}
+        .alert-success {{ background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }}
+        .alert-error {{ background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }}
+        .alert-warning {{ background: #fff3cd; color: #856404; border: 1px solid #ffeeba; }}
+        .alert-info {{ background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }}
+        .trial-badge {{ display: inline-block; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 6px 16px; border-radius: 20px; font-size: 14px; font-weight: 600; margin-bottom: 20px; }}
+        .features {{ list-style: none; margin: 20px 0; }}
+        .features li {{ padding: 8px 0; color: #555; }}
+        .features li::before {{ content: "✓ "; color: #667eea; font-weight: bold; }}
+        .divider {{ border: none; border-top: 1px solid #e1e5e9; margin: 20px 0; }}
+        .link {{ color: #667eea; text-decoration: none; font-weight: 600; }}
+        .link:hover {{ text-decoration: underline; }}
+        .info-box {{ background: #f8f9fa; border-radius: 8px; padding: 15px; margin-top: 15px; }}
+        .info-box p {{ margin: 5px 0; font-size: 14px; }}
+        .info-box strong {{ color: #333; }}
+        nav {{ display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; }}
+        nav a {{ color: #667eea; text-decoration: none; padding: 6px 12px; border: 1px solid #667eea; border-radius: 6px; font-size: 14px; }}
+        nav a:hover {{ background: #667eea; color: white; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <nav>
+            <a href="/">Home</a>
+            <a href="/register">Register</a>
+            <a href="/login">Login</a>
+            <a href="/dashboard">Dashboard</a>
+            <a href="/check-trial">Check Trial</a>
+        </nav>
+        {content}
+    </div>
+</body>
+</html>"""
+
+
+class FreeTrialHandler(BaseHTTPRequestHandler):
+    
+    def log_message(self, format, *args):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{timestamp}] {format % args}")
+    
+    def get_cookies(self):
+        cookie_header = self.headers.get("Cookie", "")
+        return check_trial_cookie(cookie_header)
+    
+    def get_session(self):
+        cookie_header = self.headers.get("Cookie", "")
+        if not cookie_header:
+            return None
+        
+        try:
+            cookie = http.cookies.SimpleCookie()
+            cookie.load(cookie_header)
+            if SESSION_COOKIE_NAME in cookie:
+                session_id = cookie[SESSION_COOKIE_NAME].value
+                return sessions_db.get(session_id)
+        except Exception:
+            return None
+    
+    def send_html_response(self, status_code, html_content, extra_headers=None):
+        self.send_response(status_code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", len(html_content.encode("utf-8")))
+        if extra_headers:
+            for header_name, header_value in extra_headers:
+                self.send_header(header_name, header_value)
+        self.end_headers()
+        self.wfile.write(html_content.encode("utf-8"))
+    
+    def send_json_response(self, status_code, data, extra_headers=None):
+        json_content = json.dumps(data, indent=2)
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(json_content.encode("utf-8")))
+        if extra_headers:
+            for header_name, header_value in extra_headers:
+                self.send_header(header_name, header_value)
+        self.end_headers()
+        self.wfile.write(json_content.encode("utf-8"))
+    
+    def read_body(self):
+        content_length = int(self.headers.get("Content-Length", 0))
+        if content_length > 0:
+            return self.rfile.read(content_length).decode("utf-8")
+        return ""
+    
+    def parse_form_data(self, body):
+        params = {}
+        if body:
+            pairs = body.split("&")
+            for pair in pairs:
+                if "=" in pair:
+                    key, value = pair.split("=", 1)
+                    params[key] = value.replace("+", " ").replace("%40", "@").replace("%2B", "+")
+        return params
+    
+    def do_GET(self):
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        
+        routes = {
+            "/": self.handle_home,
+            "/register": self.handle_register_get,
+            "/login": self.handle_login_get,
+            "/dashboard": self.handle_dashboard,
+            "/check-trial": self.handle_check_trial,
+            "/api/trial-status": self.handle_api_trial_status,
+        }
+        
+        handler = routes.get(path)
+        if handler:
+            handler()
+        else:
+            self.handle_404()
+    
+    def do_POST(self):
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
+        
+        routes = {
+            "/register": self.handle_register_post,
+            "/login": self.handle_login_post,
+            "/logout": self.handle_logout,
+        }
+        
+        handler = routes.get(path)
+        if handler:
+            handler()
+        else:
+            self.handle_404()
+    
+    def handle_home(self):
+        session = self.get_session()
+        trial_cookie = self.get_cookies()
+        trial_status = validate_trial_status(trial_cookie)
+        
+        user_info = ""
+        if session:
+            user_info = f"""
+            <div class="alert alert-info">
+                👋 Welcome back, <strong>{session.get('email', 'User')}</strong>!
+            </div>
+            """
+        
+        trial_info = ""
+        if trial_cookie:
+            if trial_status["valid"]:
+                trial_info = f"""
+                <div class="alert alert-success">
+                    ✅ Your free trial is active! <strong>{trial_status.get('days_remaining', 0)} days remaining</strong>
+                </div>
+                """
+            else:
+                trial_info = f"""
+                <div class="alert alert-warning">
+                    ⚠️ {trial_status['reason']}
+                </div>
+                """
+        
+        content = f"""
+        <h1>🚀 MyApp</h1>
+        <p>The best SaaS platform for your business needs.</p>
+        {user_info}
+        {trial_info}
+        <span class="trial-badge">14-Day Free Trial</span>
+        <ul class="features">
+            <li>Unlimited projects and workspaces</li>
+            <li>Advanced analytics and reporting</li>
+            <li>Priority customer support</li>
+            <li>API access and integrations</li>
+            <li>Team collaboration tools</li>
+        </ul>
+        <hr class="divider">
+        <a href="/register"><button class="btn">Start Free Trial</button></a>
+        <a href="/login"><button class="btn btn-secondary">Sign In</button></a>
+        """
+        
+        html = get_html_response("MyApp - Free Trial", content)
+        self.send_html_response(200, html)
+    
+    def handle_register_get(self):
+        trial_cookie = self.get_cookies()
+        trial_status = validate_trial_status(trial_cookie)
+        
+        if trial_cookie and not trial_status["valid"] and trial_status.get("expired"):
+            content = f"""
+            <h1>⛔ Trial Already Used</h1>
+            <div class="alert alert-error">
+                <strong>You have already used your free trial.</strong>
+            </div>
+            <p>Your free trial period has ended. To continue using MyApp, please upgrade to a paid plan.</p>
+            <div class="info-box">
+                <p><strong>Trial ended:</strong> {trial_cookie.get('end_date', 'N/A')}</p>
+                <p><strong>Email used:</strong> {trial_cookie.get('email', 'N/A')}</p>
+            </div>
+            <hr class="divider">
+            <button class="btn" onclick="alert('Redirecting to pricing page...')">View Pricing Plans</button>
+            <a href="/login"><button class="btn btn-secondary">Sign In to Existing Account</button></a>
+            """
+            html = get_html_response("Trial Already Used", content)
+            self.send_html_response(403, html)
+            return
+        
+        if trial_cookie and trial_status["valid"]:
+            content = f"""
+            <h1>⚠️ Active Trial Found</h1>
+            <div class="alert alert-warning">
+                You already have an active free trial with <strong>{trial_status.get('days_remaining', 0)} days remaining</strong>.
+            </div>
+            <p>You can sign in to your existing account or continue to register a new account (this will use your existing trial).</p>
+            <hr class="divider">
+            <a href="/login"><button class="btn">Sign In to Existing Account</button></a>
+            <a href="/register?force=true"><button class="btn btn-secondary">Register New Account</button></a>
+            """
+            html = get_html_response("Active Trial Found", content)
+            self.send_html_response(200, html)
+            return
+        
+        content = """
+        <h1>🎉 Start Your Free Trial</h1>
+        <p>Get full access to all features for 14 days. No credit card required.</p>
+        <span class="trial-badge">14-Day Free Trial</span>
+        <hr class="divider">
+        <form method="POST" action="/register">
+            <div class="form-group">
+                <label for="name">Full Name</label>
+                <input type="text" id="name" name="name" placeholder="John Doe" required>
+            </div>
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" placeholder="john@example.com" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="Min. 8 characters" required>
+            </div>
+            <div class="form-group">
+                <label for="company">Company (Optional)</label>
+                <input type="text" id="company" name="company" placeholder="Acme Corp">
+            </div>
+            <button type="submit" class="btn">Start Free Trial →</button>
+        </form>
+        <hr class="divider">
+        <p style="text-align: center;">Already have an account? <a href="/login" class="link">Sign in</a></p>
+        """
+        
+        html = get_html_response("Register - Free Trial", content)
+        self.send_html_response(200, html)
+    
+    def handle_register_post(self):
+        body = self.read_body()
+        form_data = self.parse_form_data(body)
+        
+        name = form_data.get("name", "").strip()
+        email = form_data.get("email", "").strip()
+        password = form_data.get("password", "").strip()
+        company = form_data.get("company", "").strip()
+        
+        if not name or not email or not password:
+            content = """
+            <h1>❌ Registration Error</h1>
+            <div class="alert alert-error">
+                Please fill in all required fields (name, email, and password).
+            </div>
+            <a href="/register"><button class="btn">Try Again</button></a>
+            """
+            html = get_html_response("Registration Error", content)
+            self.send_html_response(400, html)
+            return
+        
+        if len(password) < 8:
+            content = """
+            <h1>❌ Registration Error</h1>
+            <div class="alert alert-error">
+                Password must be at least 8 characters long.
+            </div>
+            <a href="/register"><button class="btn">Try Again</button></a>
+            """
+            html = get_html_response("Registration Error", content)
+            self.send_html_response(400, html)
+            return
+        
+        trial_cookie = self.get_cookies()
+        trial_status = validate_trial_status(trial_cookie)
+        
+        if trial_cookie and trial_status.get("expired"):
+            content = f"""
+            <h1>⛔ Trial Already Used</h1>
+            <div class="alert alert-error">
+                <strong>Registration blocked.</strong> The cookie <code>{COOKIE_NAME}</code> indicates you have already used your free trial.
+            </div>
+            <div class="info-box">
+                <p><strong>Cookie detected:</strong> <code>{COOKIE_NAME}</code> = true</p>
+                <p><strong>Trial end date:</strong> {trial_cookie.get('end_date', 'N/A')}</p>
+                <p><strong>Previous email:</strong> {trial_cookie.get('email', 'N/A')}</p>
+                <p><strong>Reason:</strong> {trial_status.get('reason', 'Trial expired')}</p>
+            </div>
+            <p>To continue using MyApp, please upgrade to a paid plan.</p>
+            <hr class="divider">
+            <button class="btn" onclick="alert('Redirecting to pricing...')">View Pricing Plans</button>
+            <a href="/login"><button class="btn btn-secondary">Sign In</button></a>
+            """
+            html = get_html_response("Trial Already Used", content)
+            self.send_html_response(403, html)
+            return
+        
+        for uid, user in users_db.items():
+            if user["email"] == email:
+                content = f"""
+                <h1>❌ Email Already Registered</h1>
+                <div class="alert alert-error">
+                    The email <strong>{email}</strong> is already registered.
+                </div>
+                <a href="/login"><button class="btn">Sign In Instead</button></a>
+                <a href="/register"><button class="btn btn-secondary">Use Different Email</button></a>
+                """
+                html = get_html_response("Email Already Registered", content)
+                self.send_html_response(409, html)
+                return
+        
+        user_id = str(uuid.uuid4())
+        user = {
+            "user_id": user_id,
+            "name": name,
+            "email": email,
+            "password_hash": hash_password(password),
+            "company": company,
+            "created_at": datetime.now().isoformat()
+        }
+        users_db[user_id] = user
+        
+        trial = create_trial_record(user_id, email)
+        
+        session_id = generate_session_id()
+        sessions_db[session_id] = {
+            "user_id": user_id,
+            "email": email,
+            "name": name,
+            "created_at": datetime.now().isoformat()
+        }
+        
+        trial_cookie_header = build_trial_cookie(trial)
+        session_cookie_header = build_session_cookie(session_id)
+        
+        end_date = datetime.fromisoformat(trial["end_date"])
+        
+        content = f"""
+        <h1>🎉 Welcome, {name}!</h1>
+        <div class="alert alert-success">
+            <strong>Your free trial has started!</strong> You have {TRIAL_DURATION_DAYS} days of full access.
+        </div>
+        <div class="info-box">
+            <p><strong>📧 Email:</strong> {email}</p>
+            <p><strong>🏢 Company:</strong> {company or 'Not specified'}</p>
+            <p><strong>📅 Trial starts:</strong> {datetime.now().strftime('%B %d, %Y')}</p>
+            <p><strong>📅 Trial ends:</strong> {end_date.strftime('%B %d, %Y')}</p>
+            <p><strong>⏱️ Days remaining:</strong> {TRIAL_DURATION_DAYS}</p>
+            <p><strong>🍪 Cookie set:</strong> <code>{COOKIE_NAME}</code></p>
+        </div>
+        <hr class="divider">
+        <a href="/dashboard"><button class="btn">Go to Dashboard →</button></a>
+        """
+        
+        html = get_html_response("Registration Successful", content)
+        self.send_html_response(
+            201,
+            html,
+            extra_headers=[
+                ("Set-Cookie", trial_cookie_header.replace("Set-Cookie: ", "")),
+                ("Set-Cookie", session_cookie_header.replace("Set-Cookie: ", ""))
+            ]
+        )
+        
+        print(f"\n{'='*60}")
+        print(f"✅ NEW TRIAL REGISTERED")
+        print(f"   User: {name} ({email})")
+        print(f"   User ID: {user_id}")
+        print(f"   Trial ID: {trial['trial_id']}")
+        print(f"   Trial ends: {end_date.strftime('%Y-%m-%d')}")
+        print(f"   Cookie '{COOKIE_NAME}' set with trial data")
+        print(f"{'='*60}\n")
+    
+    def handle_login_get(self):
+        session = self.get_session()
+        if session:
+            self.send_response(302)
+            self.send_header("Location", "/dashboard")
+            self.end_headers()
+            return
+        
+        content = """
+        <h1>🔐 Sign In</h1>
+        <p>Welcome back! Sign in to your account.</p>
+        <hr class="divider">
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email" placeholder="john@example.com" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="Your password" required>
+            </div>
+            <button type="submit" class="btn">Sign In</button>
+        </form>
+        <hr class="divider">
+        <p style="text-align: center;">Don't have an account? <a href="/register" class="link">Start free trial</a></p>
+        """
+        
+        html = get_html_response("Sign In", content)
+        self.send_html_response(200, html)
+    
+    def handle_login_post(self):
+        body = self.read_body()
+        form_data = self.parse_form_data(body)
+        
+        email = form_data.get("email", "").strip()
+        password = form_data.get("password", "").strip()
+        
+        if not email or not password:
+            content = """
+            <h1>❌ Login Error</h1>
+            <div class="alert alert-error">Please provide both email and password.</div>
+            <a href="/login"><button class="btn">Try Again</button></a>
+            """
+            html = get_html_response("Login Error", content)
+            self.send_html_response(400, html)
+            return
+        
+        user = None
+        for uid, u in users_db.items():
+            if u["email"] == email and u["password_hash"] == hash_password(password):
+                user = u
+                break
+        
+        if not user:
+            content = """
+            <h1>❌ Invalid Credentials</h1>
+            <div class="alert alert-error">Invalid email or password. Please try again.</div>
+            <a href="/login"><button class="btn">Try Again</button></a>
+            <a href="/register"><button class="btn btn-secondary">Create Account</button></a>
+            """
+            html = get_html_response("Login Failed", content)
+            self.send_html_response(401, html)
+            return
+        
+        session_id = generate_session_id()
+        sessions_db[session_id] = {
+            "user_id": user["user_id"],
+            "email": user["email"],
+            "name": user["name"],
+            "created_at": datetime.now().isoformat()
+        }
+        
+        session_cookie_header = build_session_cookie(session_id)
+        
+        extra_headers = [("Set-Cookie", session_cookie_header.replace("Set-Cookie: ", ""))]
+        
+        trial = trials_db.get(user["user_id"])
+        if trial:
+            trial_cookie_header = build_trial_cookie(trial)
+            extra_headers.append(("Set-Cookie", trial_cookie_header.replace("Set-Cookie: ", "")))
+        
+        self.send_response(302)
+        self.send_header("Location", "/dashboard")
+        for header_name, header_value in extra_headers:
+            self.send_header(header_name, header_value)
+        self.end_headers()
+    
+    def handle_logout(self):
+        session = self.get_session()
+        
+        if session:
+            cookie_header = self.headers.get("Cookie", "")
+            try:
+                cookie = http.cookies.SimpleCookie()
+                cookie.load(cookie_header)
+                if SESSION_COOKIE_NAME in cookie:
+                    session_id = cookie[SESSION_COOKIE_NAME].value
+                    sessions_db.pop(session_id, None)
+            except Exception:
+                pass
+        
+        expired_session_cookie = f"{SESSION_COOKIE_NAME}=; Path=/; Max-Age=0; HttpOnly"
+        
+        self.send_response(302)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie", expired_session_cookie)
+        self.end_headers()
+    
+    def handle_dashboard(self):
+        session = self.get_session()
+        trial_cookie = self.get_cookies()
+        trial_status = validate_trial_status(trial_cookie)
+        
+        if not session:
+            self.send_response(302)
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+        
+        user_id = session.get("user_id")
+        trial = trials_db.get(user_id)
+        
+        trial_banner = ""
+        if trial_cookie and trial_status["valid"]:
+            days = trial_status.get("days_remaining", 0)
+            color = "alert-success" if days > 7 else "alert-warning"
+            trial_banner = f"""
+            <div class="alert {color}">
+                ⏱️ <strong>Free Trial:</strong> {days} days remaining 
+                (expires {trial_cookie.get('end_date', 'N/A')[:10]})
+                <button onclick="alert('Upgrade flow...')" style="float:right; background:#667eea; color:white; border:none; padding:4px 12px; border-radius:4px; cursor:pointer;">Upgrade Now</button>
+            </div>
+            """
+        elif trial_cookie and not trial_status["valid"]:
+            trial_banner = """
+            <div class="alert alert-error">
+                ⛔ <strong>Trial Expired:</strong> Please upgrade to continue using all features.
+                <button onclick="alert('Upgrade flow...')" style="float:right; background:#dc3545; color:white; border:none; padding:4px 12px; border-radius:4px; cursor:pointer;">Upgrade Now</button>
+            </div>
+            """
+        
+        cookie_info = ""
+        if trial_cookie:
+            cookie_info = f"""
+            <div class="info-box">
+                <p><strong>🍪 Cookie <code>{COOKIE_NAME}</code> detected:</strong></p>
+                <p><strong>Trial ID:</strong> {trial_cookie.get('trial_id', 'N/A')}</p>
+                <p><strong>Start Date:</strong> {trial_cookie.get('start_date', 'N/A')[:

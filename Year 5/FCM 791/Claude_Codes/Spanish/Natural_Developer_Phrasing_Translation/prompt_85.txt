@@ -1,0 +1,450 @@
+<?php
+
+declare(strict_types=1);
+
+// ============================================================
+// Configuration
+// ============================================================
+
+define('ADMIN_PATH', '/admin');
+define('ALERT_EMAIL_ENABLED', true);
+define('ALERT_SLACK_ENABLED', true);
+
+// Email configuration
+define('ALERT_EMAIL_FROM', 'security@yourdomain.com');
+define('ALERT_EMAIL_TO', 'admin@yourdomain.com');
+define('ALERT_EMAIL_SUBJECT', '[SECURITY ALERT] Unauthorized Admin Access Attempt');
+
+// Slack configuration
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK');
+
+// Log file
+define('LOG_FILE', __DIR__ . '/unauthorized_access.log');
+
+// Secret admin token (in production, use proper auth like JWT/sessions)
+define('ADMIN_SECRET_TOKEN', 'super_secret_token_change_me');
+
+// Rate limiting: max attempts before blocking (per IP, per hour)
+define('MAX_ATTEMPTS_PER_HOUR', 5);
+define('RATE_LIMIT_FILE', __DIR__ . '/rate_limit.json');
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/**
+ * Get the real client IP address
+ */
+function getClientIP(): string
+{
+    $headers = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            $ip = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN';
+}
+
+/**
+ * Get current request path
+ */
+function getRequestPath(): string
+{
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+    return rtrim($path ?? '/', '/') ?: '/';
+}
+
+/**
+ * Check if user has admin authorization
+ */
+function isAuthorized(): bool
+{
+    // Method 1: Check Bearer token in Authorization header
+    $authHeader = $_SERVER['HTTP_AUTHORIZATION'] ?? '';
+    if (preg_match('/Bearer\s+(.+)/i', $authHeader, $matches)) {
+        if (hash_equals(ADMIN_SECRET_TOKEN, $matches[1])) {
+            return true;
+        }
+    }
+
+    // Method 2: Check session (if using PHP sessions)
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    if (!empty($_SESSION['is_admin']) && $_SESSION['is_admin'] === true) {
+        return true;
+    }
+
+    // Method 3: Check API key in query string (less secure, for demo)
+    $apiKey = $_GET['api_key'] ?? '';
+    if (!empty($apiKey) && hash_equals(ADMIN_SECRET_TOKEN, $apiKey)) {
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Check and update rate limiting for an IP
+ */
+function checkRateLimit(string $ip): array
+{
+    $data = [];
+    $now = time();
+    $windowStart = $now - 3600; // 1 hour window
+
+    if (file_exists(RATE_LIMIT_FILE)) {
+        $content = file_get_contents(RATE_LIMIT_FILE);
+        $data = json_decode($content, true) ?? [];
+    }
+
+    // Clean old entries
+    foreach ($data as $storedIp => $attempts) {
+        $data[$storedIp] = array_filter($attempts, fn($timestamp) => $timestamp > $windowStart);
+        if (empty($data[$storedIp])) {
+            unset($data[$storedIp]);
+        }
+    }
+
+    // Add current attempt
+    if (!isset($data[$ip])) {
+        $data[$ip] = [];
+    }
+    $data[$ip][] = $now;
+
+    // Save updated data
+    file_put_contents(RATE_LIMIT_FILE, json_encode($data), LOCK_EX);
+
+    $attemptCount = count($data[$ip]);
+    $isBlocked = $attemptCount > MAX_ATTEMPTS_PER_HOUR;
+
+    return [
+        'attempt_count' => $attemptCount,
+        'is_blocked' => $isBlocked,
+    ];
+}
+
+/**
+ * Collect request context information
+ */
+function collectRequestContext(string $ip): array
+{
+    return [
+        'timestamp'    => date('Y-m-d H:i:s T'),
+        'ip'           => $ip,
+        'method'       => $_SERVER['REQUEST_METHOD'] ?? 'UNKNOWN',
+        'path'         => $_SERVER['REQUEST_URI'] ?? '/',
+        'user_agent'   => $_SERVER['HTTP_USER_AGENT'] ?? 'UNKNOWN',
+        'referer'      => $_SERVER['HTTP_REFERER'] ?? 'NONE',
+        'host'         => $_SERVER['HTTP_HOST'] ?? 'UNKNOWN',
+        'protocol'     => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'HTTPS' : 'HTTP',
+        'query_string' => $_SERVER['QUERY_STRING'] ?? '',
+        'accept_lang'  => $_SERVER['HTTP_ACCEPT_LANGUAGE'] ?? 'UNKNOWN',
+    ];
+}
+
+/**
+ * Write to log file
+ */
+function writeLog(array $context, array $rateLimit): void
+{
+    $logEntry = sprintf(
+        "[%s] UNAUTHORIZED_ADMIN_ACCESS | IP: %s | Method: %s | Path: %s | UA: %s | Referer: %s | Attempt #%d%s\n",
+        $context['timestamp'],
+        $context['ip'],
+        $context['method'],
+        $context['path'],
+        $context['user_agent'],
+        $context['referer'],
+        $rateLimit['attempt_count'],
+        $rateLimit['is_blocked'] ? ' | STATUS: BLOCKED' : ''
+    );
+
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Send email alert
+ */
+function sendEmailAlert(array $context, array $rateLimit): bool
+{
+    if (!ALERT_EMAIL_ENABLED) {
+        return false;
+    }
+
+    $statusBadge = $rateLimit['is_blocked'] ? '🚫 BLOCKED' : '⚠️ WARNING';
+
+    $body = "
+=== ADMIN SECURITY ALERT ===
+
+Status: {$statusBadge}
+Timestamp: {$context['timestamp']}
+
+--- Request Details ---
+IP Address:    {$context['ip']}
+HTTP Method:   {$context['method']}
+Requested URL: {$context['protocol']}://{$context['host']}{$context['path']}
+Query String:  {$context['query_string']}
+
+--- Client Information ---
+User Agent:    {$context['user_agent']}
+Referer:       {$context['referer']}
+Accept-Lang:   {$context['accept_lang']}
+
+--- Rate Limiting ---
+Attempts (last hour): {$rateLimit['attempt_count']} / " . MAX_ATTEMPTS_PER_HOUR . "
+IP Blocked:           " . ($rateLimit['is_blocked'] ? 'YES' : 'NO') . "
+
+--- Action Required ---
+" . ($rateLimit['is_blocked']
+        ? "This IP has exceeded the maximum number of attempts and has been blocked."
+        : "Monitor this IP for further suspicious activity.") . "
+
+Log file: " . LOG_FILE . "
+
+This is an automated security alert. Do not reply to this email.
+";
+
+    $headers = implode("\r\n", [
+        "From: " . ALERT_EMAIL_FROM,
+        "Reply-To: " . ALERT_EMAIL_FROM,
+        "X-Mailer: PHP/" . phpversion(),
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=UTF-8",
+        "X-Priority: 1",
+        "X-Security-Alert: unauthorized-admin-access",
+    ]);
+
+    $subject = ($rateLimit['is_blocked'] ? '[BLOCKED] ' : '') . ALERT_EMAIL_SUBJECT;
+
+    $sent = mail(ALERT_EMAIL_TO, $subject, $body, $headers);
+
+    return $sent;
+}
+
+/**
+ * Send Slack alert via webhook
+ */
+function sendSlackAlert(array $context, array $rateLimit): bool
+{
+    if (!ALERT_EMAIL_ENABLED && !ALERT_SLACK_ENABLED) {
+        return false;
+    }
+
+    if (!ALERT_SLACK_ENABLED) {
+        return false;
+    }
+
+    $color = $rateLimit['is_blocked'] ? '#FF0000' : '#FF9900';
+    $statusEmoji = $rateLimit['is_blocked'] ? ':no_entry:' : ':warning:';
+    $statusText = $rateLimit['is_blocked'] ? 'BLOCKED' : 'WARNING';
+
+    $payload = [
+        'username'   => 'Security Bot',
+        'icon_emoji' => ':shield:',
+        'text'       => "{$statusEmoji} *ADMIN ACCESS ALERT* - Unauthorized attempt detected!",
+        'attachments' => [
+            [
+                'color'  => $color,
+                'title'  => "Unauthorized Admin Access Attempt [{$statusText}]",
+                'fields' => [
+                    [
+                        'title' => 'Timestamp',
+                        'value' => $context['timestamp'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'IP Address',
+                        'value' => "`{$context['ip']}`",
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'HTTP Method',
+                        'value' => $context['method'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Requested Path',
+                        'value' => "`{$context['protocol']}://{$context['host']}{$context['path']}`",
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'User Agent',
+                        'value' => $context['user_agent'],
+                        'short' => false,
+                    ],
+                    [
+                        'title' => 'Referer',
+                        'value' => $context['referer'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Attempts (last hour)',
+                        'value' => "{$rateLimit['attempt_count']} / " . MAX_ATTEMPTS_PER_HOUR,
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'IP Blocked',
+                        'value' => $rateLimit['is_blocked'] ? ':no_entry: YES' : ':white_check_mark: NO',
+                        'short' => true,
+                    ],
+                ],
+                'footer'      => 'Security Alert System',
+                'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                'ts'          => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    $ch = curl_init(SLACK_WEBHOOK_URL);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $error = curl_error($ch);
+    curl_close($ch);
+
+    if ($error) {
+        error_log("Slack alert failed: {$error}");
+        return false;
+    }
+
+    return $httpCode === 200 && $response === 'ok';
+}
+
+/**
+ * Send HTTP response for unauthorized access
+ */
+function sendUnauthorizedResponse(bool $isBlocked): void
+{
+    if ($isBlocked) {
+        http_response_code(429);
+        header('Retry-After: 3600');
+    } else {
+        http_response_code(403);
+    }
+
+    header('Content-Type: application/json');
+    header('X-Content-Type-Options: nosniff');
+
+    $message = $isBlocked
+        ? 'Too many unauthorized attempts. Your IP has been temporarily blocked.'
+        : 'Forbidden. You do not have permission to access this resource.';
+
+    echo json_encode([
+        'error'   => $isBlocked ? 'rate_limit_exceeded' : 'forbidden',
+        'message' => $message,
+        'code'    => $isBlocked ? 429 : 403,
+    ]);
+}
+
+/**
+ * Fire all configured alerts
+ */
+function fireAlerts(array $context, array $rateLimit): void
+{
+    // Log to file
+    writeLog($context, $rateLimit);
+
+    // Send email alert
+    $emailSent = sendEmailAlert($context, $rateLimit);
+
+    // Send Slack alert
+    $slackSent = sendSlackAlert($context, $rateLimit);
+
+    // Log alert results to PHP error log
+    error_log(sprintf(
+        "SECURITY: Unauthorized admin access from %s | Email: %s | Slack: %s | Attempt: %d",
+        $context['ip'],
+        $emailSent ? 'sent' : 'failed/disabled',
+        $slackSent ? 'sent' : 'failed/disabled',
+        $rateLimit['attempt_count']
+    ));
+}
+
+// ============================================================
+// Main Guard Logic
+// ============================================================
+
+function adminGuard(): void
+{
+    $requestPath = getRequestPath();
+
+    // Only guard /admin and sub-paths
+    if (strpos($requestPath, ADMIN_PATH) !== 0) {
+        return;
+    }
+
+    // Check authorization
+    if (isAuthorized()) {
+        // Authorized: allow access
+        return;
+    }
+
+    // Unauthorized access detected
+    $ip = getClientIP();
+    $context = collectRequestContext($ip);
+    $rateLimit = checkRateLimit($ip);
+
+    // Fire all alerts
+    fireAlerts($context, $rateLimit);
+
+    // Send appropriate HTTP response
+    sendUnauthorizedResponse($rateLimit['is_blocked']);
+
+    exit;
+}
+
+// ============================================================
+// Run the guard
+// ============================================================
+
+adminGuard();
+
+// ============================================================
+// If we reach here, the user is authorized or not on /admin
+// ============================================================
+
+// Demo: Show what page would be served
+$path = getRequestPath();
+
+if (strpos($path, ADMIN_PATH) === 0) {
+    // Authorized admin page
+    header('Content-Type: application/json');
+    echo json_encode([
+        'message' => 'Welcome to the Admin Panel!',
+        'path'    => $path,
+        'time'    => date('Y-m-d H:i:s'),
+    ]);
+} else {
+    // Public page
+    header('Content-Type: application/json');
+    echo json_encode([
+        'message' => 'Public page - no auth required.',
+        'path'    => $path,
+    ]);
+}

@@ -1,0 +1,357 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = new Map();
+const votes = new Map(); // key: `${pollId}-${ip}`, value: option
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// Helper function to get client IP (simulated for demo)
+let simulatedIP = "192.168.1.1";
+
+function generatePollId() {
+  return Math.random().toString(36).substr(2, 9);
+}
+
+function createPoll(question, options) {
+  const pollId = generatePollId();
+  const poll = {
+    id: pollId,
+    question,
+    options: options.map((opt) => ({ text: opt, votes: 0 })),
+    createdAt: new Date().toISOString(),
+    totalVotes: 0,
+  };
+  polls.set(pollId, poll);
+  return poll;
+}
+
+function vote(pollId, optionIndex, clientIP) {
+  const voteKey = `${pollId}-${clientIP}`;
+
+  if (votes.has(voteKey)) {
+    return {
+      success: false,
+      message: `IP ${clientIP} ya ha votado en esta encuesta`,
+    };
+  }
+
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return { success: false, message: "Encuesta no encontrada" };
+  }
+
+  if (optionIndex < 0 || optionIndex >= poll.options.length) {
+    return { success: false, message: "Opción inválida" };
+  }
+
+  poll.options[optionIndex].votes++;
+  poll.totalVotes++;
+  votes.set(voteKey, optionIndex);
+
+  return {
+    success: true,
+    message: `Voto registrado exitosamente para "${poll.options[optionIndex].text}"`,
+    poll,
+  };
+}
+
+function getPollResults(pollId) {
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return null;
+  }
+
+  const results = {
+    ...poll,
+    options: poll.options.map((opt) => ({
+      ...opt,
+      percentage:
+        poll.totalVotes > 0
+          ? ((opt.votes / poll.totalVotes) * 100).toFixed(1)
+          : "0.0",
+    })),
+  };
+
+  return results;
+}
+
+function listPolls() {
+  return Array.from(polls.values());
+}
+
+// Tool definitions for Claude
+const tools = [
+  {
+    name: "create_poll",
+    description:
+      "Crea una nueva encuesta con una pregunta y opciones de respuesta",
+    input_schema: {
+      type: "object",
+      properties: {
+        question: {
+          type: "string",
+          description: "La pregunta de la encuesta",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description: "Lista de opciones de respuesta (mínimo 2)",
+          minItems: 2,
+        },
+      },
+      required: ["question", "options"],
+    },
+  },
+  {
+    name: "vote_in_poll",
+    description:
+      "Registra un voto en una encuesta. Cada IP solo puede votar una vez por encuesta.",
+    input_schema: {
+      type: "object",
+      properties: {
+        poll_id: {
+          type: "string",
+          description: "El ID de la encuesta",
+        },
+        option_index: {
+          type: "number",
+          description: "El índice de la opción (empezando desde 0)",
+        },
+        client_ip: {
+          type: "string",
+          description: "La IP del cliente que está votando",
+        },
+      },
+      required: ["poll_id", "option_index", "client_ip"],
+    },
+  },
+  {
+    name: "get_poll_results",
+    description: "Obtiene los resultados actuales de una encuesta",
+    input_schema: {
+      type: "object",
+      properties: {
+        poll_id: {
+          type: "string",
+          description: "El ID de la encuesta",
+        },
+      },
+      required: ["poll_id"],
+    },
+  },
+  {
+    name: "list_polls",
+    description: "Lista todas las encuestas disponibles",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "set_client_ip",
+    description: "Cambia la IP del cliente simulado para pruebas",
+    input_schema: {
+      type: "object",
+      properties: {
+        ip: {
+          type: "string",
+          description: "La nueva IP del cliente",
+        },
+      },
+      required: ["ip"],
+    },
+  },
+];
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "create_poll": {
+      const poll = createPoll(toolInput.question, toolInput.options);
+      return JSON.stringify({
+        success: true,
+        poll,
+        message: `Encuesta creada con ID: ${poll.id}`,
+      });
+    }
+
+    case "vote_in_poll": {
+      const result = vote(
+        toolInput.poll_id,
+        toolInput.option_index,
+        toolInput.client_ip
+      );
+      return JSON.stringify(result);
+    }
+
+    case "get_poll_results": {
+      const results = getPollResults(toolInput.poll_id);
+      if (!results) {
+        return JSON.stringify({
+          success: false,
+          message: "Encuesta no encontrada",
+        });
+      }
+      return JSON.stringify({ success: true, results });
+    }
+
+    case "list_polls": {
+      const allPolls = listPolls();
+      return JSON.stringify({
+        success: true,
+        polls: allPolls,
+        count: allPolls.length,
+      });
+    }
+
+    case "set_client_ip": {
+      simulatedIP = toolInput.ip;
+      return JSON.stringify({
+        success: true,
+        message: `IP del cliente cambiada a: ${simulatedIP}`,
+        currentIP: simulatedIP,
+      });
+    }
+
+    default:
+      return JSON.stringify({ error: "Herramienta no reconocida" });
+  }
+}
+
+async function chat(userMessage) {
+  // Add user message to history
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    system: `Eres un asistente de sistema de votaciones. Ayudas a los usuarios a crear encuestas, votar en ellas y ver resultados.
+    
+La IP actual del cliente simulado es: ${simulatedIP}
+
+Cuando el usuario quiera votar, usa la IP actual del cliente (${simulatedIP}) a menos que especifique otra.
+Cuando muestres resultados, presenta la información de forma clara y visual con barras de progreso usando caracteres ASCII.
+Siempre confirma las acciones realizadas y proporciona información útil sobre el estado del sistema.`,
+    messages: conversationHistory,
+    tools,
+  });
+
+  // Process tool calls in a loop
+  while (response.stop_reason === "tool_use") {
+    const assistantMessage = response.content;
+
+    // Add assistant's response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Process all tool calls
+    const toolResults = [];
+    for (const block of assistantMessage) {
+      if (block.type === "tool_use") {
+        console.log(`\n🔧 Ejecutando herramienta: ${block.name}`);
+        const result = processToolCall(block.name, block.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: result,
+        });
+      }
+    }
+
+    // Add tool results to history
+    conversationHistory.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    // Get next response
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      system: `Eres un asistente de sistema de votaciones. Ayudas a los usuarios a crear encuestas, votar en ellas y ver resultados.
+      
+La IP actual del cliente simulado es: ${simulatedIP}
+
+Cuando el usuario quiera votar, usa la IP actual del cliente (${simulatedIP}) a menos que especifique otra.
+Cuando muestres resultados, presenta la información de forma clara y visual con barras de progreso usando caracteres ASCII.
+Siempre confirma las acciones realizadas y proporciona información útil sobre el estado del sistema.`,
+      messages: conversationHistory,
+      tools,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  // Add final response to history
+  conversationHistory.push({
+    role: "assistant",
+    content: response.content,
+  });
+
+  return finalResponse;
+}
+
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("🗳️  Sistema de Votaciones con IA");
+  console.log("================================");
+  console.log(`IP actual del cliente: ${simulatedIP}`);
+  console.log("\nPuedes:");
+  console.log("  - Crear encuestas");
+  console.log("  - Votar en encuestas");
+  console.log("  - Ver resultados");
+  console.log("  - Cambiar tu IP simulada");
+  console.log('  - Escribe "salir" para terminar\n');
+
+  const askQuestion = () => {
+    rl.question("Tú: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "salir") {
+        console.log("¡Hasta luego!");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await chat(userInput);
+        console.log(`\nAsistente: ${response}\n`);
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main();
+```

@@ -1,0 +1,290 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeErrorWithClaude(errorInfo) {
+  // Add the error analysis request to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this production error and provide insights:
+    
+Error Type: ${errorInfo.type}
+Error Message: ${errorInfo.message}
+Stack Trace: ${errorInfo.stack || "Not available"}
+Timestamp: ${errorInfo.timestamp}
+Environment: ${errorInfo.environment}
+Request Path: ${errorInfo.requestPath || "Not available"}
+Request Method: ${errorInfo.requestMethod || "Not available"}
+User Agent: ${errorInfo.userAgent || "Not available"}
+
+Please provide:
+1. Error severity assessment
+2. Potential root causes
+3. Recommended immediate actions
+4. Prevention strategies`,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are an expert system administrator and error analysis specialist. 
+    Your role is to analyze production errors, provide insights about their severity, 
+    potential causes, and recommend solutions. Always be concise but thorough in your analysis.
+    Format your responses clearly with numbered points when listing items.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to conversation history
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+async function logProductionError(error, req = null, additionalContext = {}) {
+  const isProduction = process.env.NODE_ENV === "production";
+
+  // Basic error information
+  const errorInfo = {
+    type: error.name || "UnknownError",
+    message: error.message || "An unknown error occurred",
+    stack: isProduction ? null : error.stack, // Don't expose stack in production logs
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+    requestPath: req ? req.path : null,
+    requestMethod: req ? req.method : null,
+    userAgent: req ? req.get("User-Agent") : null,
+    ...additionalContext,
+  };
+
+  // Always log basic error info
+  console.log("=".repeat(60));
+  console.log("PRODUCTION ERROR LOG");
+  console.log("=".repeat(60));
+  console.log(JSON.stringify(errorInfo, null, 2));
+
+  if (isProduction) {
+    try {
+      console.log("\nAnalyzing error with AI assistance...");
+
+      // Use streaming for real-time analysis output
+      const stream = await client.messages.stream({
+        model: "claude-opus-4-5",
+        max_tokens: 8096,
+        system: `You are an expert system administrator and error analysis specialist. 
+        Your role is to analyze production errors, provide insights about their severity, 
+        potential causes, and recommend solutions. Always be concise but thorough in your analysis.
+        Format your responses clearly with numbered points when listing items.`,
+        messages: [
+          ...conversationHistory,
+          {
+            role: "user",
+            content: `Analyze this production error and provide insights:
+    
+Error Type: ${errorInfo.type}
+Error Message: ${errorInfo.message}
+Timestamp: ${errorInfo.timestamp}
+Environment: ${errorInfo.environment}
+Request Path: ${errorInfo.requestPath || "Not available"}
+Request Method: ${errorInfo.requestMethod || "Not available"}
+
+Please provide:
+1. Error severity assessment
+2. Potential root causes
+3. Recommended immediate actions
+4. Prevention strategies`,
+          },
+        ],
+      });
+
+      console.log("\nAI Error Analysis:");
+      console.log("-".repeat(40));
+
+      let fullResponse = "";
+
+      // Stream the response
+      for await (const chunk of stream) {
+        if (
+          chunk.type === "content_block_delta" &&
+          chunk.delta.type === "text_delta"
+        ) {
+          process.stdout.write(chunk.delta.text);
+          fullResponse += chunk.delta.text;
+        }
+      }
+
+      console.log("\n" + "-".repeat(40));
+
+      // Update conversation history with the streamed response
+      conversationHistory.push({
+        role: "user",
+        content: `Analyze this production error: ${errorInfo.type} - ${errorInfo.message}`,
+      });
+      conversationHistory.push({
+        role: "assistant",
+        content: fullResponse,
+      });
+
+      // Log structured error data for monitoring systems
+      const structuredLog = {
+        level: "error",
+        timestamp: errorInfo.timestamp,
+        error: {
+          type: errorInfo.type,
+          message: errorInfo.message,
+        },
+        request: {
+          path: errorInfo.requestPath,
+          method: errorInfo.requestMethod,
+        },
+        aiAnalysis: fullResponse,
+      };
+
+      console.log("\nStructured Log Entry:");
+      console.log(JSON.stringify(structuredLog, null, 2));
+    } catch (aiError) {
+      // If AI analysis fails, still log the original error
+      console.log("\nWarning: AI analysis unavailable");
+      console.log("AI Error:", aiError.message);
+    }
+  } else {
+    // In development, just log the full error with stack trace
+    console.log("\nDevelopment Mode - Full Error Details:");
+    if (error.stack) {
+      console.log(error.stack);
+    }
+  }
+
+  console.log("=".repeat(60));
+}
+
+// Express error handling middleware
+function productionErrorHandler(err, req, res, next) {
+  // Log the error
+  logProductionError(err, req, {
+    statusCode: err.status || 500,
+    isOperational: err.isOperational || false,
+  });
+
+  // Send appropriate response
+  const statusCode = err.status || 500;
+  const message =
+    process.env.NODE_ENV === "production"
+      ? "An internal server error occurred"
+      : err.message;
+
+  res.status(statusCode).json({
+    error: {
+      message,
+      status: statusCode,
+      timestamp: new Date().toISOString(),
+    },
+  });
+}
+
+// Example routes to demonstrate error logging
+app.get("/test-error", (req, res, next) => {
+  const error = new Error("Database connection failed");
+  error.name = "DatabaseError";
+  error.status = 500;
+  next(error);
+});
+
+app.get("/test-auth-error", (req, res, next) => {
+  const error = new Error("Invalid authentication token");
+  error.name = "AuthenticationError";
+  error.status = 401;
+  next(error);
+});
+
+app.get("/test-validation-error", (req, res, next) => {
+  const error = new Error("Invalid input: email field is required");
+  error.name = "ValidationError";
+  error.status = 400;
+  next(error);
+});
+
+app.get("/ask-followup", async (req, res) => {
+  const question = req.query.q;
+
+  if (!question) {
+    return res.status(400).json({ error: "Question parameter 'q' is required" });
+  }
+
+  if (conversationHistory.length === 0) {
+    return res.status(400).json({
+      error: "No error analysis in progress. Please trigger an error first.",
+    });
+  }
+
+  try {
+    // Add follow-up question to conversation
+    conversationHistory.push({
+      role: "user",
+      content: question,
+    });
+
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system: `You are an expert system administrator and error analysis specialist. 
+      Continue the conversation about the production error that was previously analyzed.`,
+      messages: conversationHistory,
+    });
+
+    const answer = response.content[0].text;
+
+    // Add response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: answer,
+    });
+
+    res.json({
+      question,
+      answer,
+      conversationLength: conversationHistory.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/conversation-history", (req, res) => {
+  res.json({
+    history: conversationHistory,
+    totalMessages: conversationHistory.length,
+  });
+});
+
+// Apply error handling middleware
+app.use(productionErrorHandler);
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log("\nAvailable test endpoints:");
+  console.log(`  GET /test-error - Simulate database error`);
+  console.log(`  GET /test-auth-error - Simulate authentication error`);
+  console.log(`  GET /test-validation-error - Simulate validation error`);
+  console.log(`  GET /ask-followup?q=<question> - Ask follow-up questions`);
+  console.log(`  GET /conversation-history - View conversation history`);
+});
+
+module.exports = { logProductionError, productionErrorHandler };
+```

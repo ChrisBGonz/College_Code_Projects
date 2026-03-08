@@ -1,0 +1,250 @@
+
+```python
+import anthropic
+import time
+import re
+from datetime import datetime, timedelta
+from collections import deque
+import threading
+import os
+import sys
+
+client = anthropic.Anthropic()
+
+failed_login_timestamps = deque()
+timestamps_lock = threading.Lock()
+warning_issued = False
+last_warning_time = None
+
+def analyze_log_with_claude(log_content: str, failed_count: int, time_window: int) -> str:
+    """Use Claude to analyze the security situation and provide recommendations."""
+    
+    prompt = f"""Analiza la siguiente situación de seguridad en un sistema:
+
+Se han detectado {failed_count} intentos fallidos de login en los últimos {time_window} segundos.
+
+Fragmento del log:
+{log_content}
+
+Por favor proporciona:
+1. Una evaluación del nivel de riesgo (BAJO/MEDIO/ALTO/CRÍTICO)
+2. Posibles causas del problema
+3. Recomendaciones inmediatas de seguridad
+4. Acciones preventivas a largo plazo
+
+Responde de forma concisa y directa."""
+
+    print("\n" + "="*60)
+    print("🤖 ANÁLISIS DE SEGURIDAD CON CLAUDE AI")
+    print("="*60)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "="*60 + "\n")
+    return full_response
+
+def check_failed_logins(log_line: str, current_time: datetime) -> bool:
+    """Check if a log line contains a failed login attempt."""
+    patterns = [
+        r'Failed Login',
+        r'Failed password',
+        r'authentication failure',
+        r'Invalid user',
+        r'FAILED LOGIN'
+    ]
+    
+    for pattern in patterns:
+        if re.search(pattern, log_line, re.IGNORECASE):
+            return True
+    return False
+
+def monitor_log_file(log_file_path: str, time_window_seconds: int = 60, max_failures: int = 10):
+    """Monitor a log file for failed login attempts."""
+    
+    print(f"🔍 Iniciando monitoreo del archivo: {log_file_path}")
+    print(f"⚙️  Configuración: Máximo {max_failures} fallos en {time_window_seconds} segundos")
+    print("-" * 60)
+    
+    if not os.path.exists(log_file_path):
+        print(f"⚠️  El archivo {log_file_path} no existe. Creando archivo de ejemplo...")
+        create_sample_log_file(log_file_path)
+    
+    global warning_issued, last_warning_time
+    recent_log_lines = deque(maxlen=50)
+    
+    try:
+        with open(log_file_path, 'r') as f:
+            f.seek(0, 2)
+            
+            print("✅ Monitoreo activo. Esperando nuevas entradas en el log...")
+            print("   (Presiona Ctrl+C para detener)\n")
+            
+            while True:
+                line = f.readline()
+                
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                current_time = datetime.now()
+                recent_log_lines.append(line)
+                
+                print(f"📝 [{current_time.strftime('%H:%M:%S')}] {line}")
+                
+                if check_failed_logins(line, current_time):
+                    with timestamps_lock:
+                        failed_login_timestamps.append(current_time)
+                        
+                        cutoff_time = current_time - timedelta(seconds=time_window_seconds)
+                        while failed_login_timestamps and failed_login_timestamps[0] < cutoff_time:
+                            failed_login_timestamps.popleft()
+                        
+                        current_count = len(failed_login_timestamps)
+                    
+                    print(f"⚠️  INTENTO FALLIDO DETECTADO - Total en ventana: {current_count}/{max_failures}")
+                    
+                    if current_count > max_failures:
+                        should_warn = True
+                        if last_warning_time:
+                            time_since_last_warning = (current_time - last_warning_time).total_seconds()
+                            if time_since_last_warning < 30:
+                                should_warn = False
+                        
+                        if should_warn:
+                            print(f"\n🚨 ALERTA DE SEGURIDAD: Se detectaron {current_count} intentos fallidos de login")
+                            print(f"   en los últimos {time_window_seconds} segundos!")
+                            
+                            last_warning_time = current_time
+                            
+                            log_context = "\n".join(list(recent_log_lines)[-20:])
+                            
+                            analysis_thread = threading.Thread(
+                                target=analyze_log_with_claude,
+                                args=(log_context, current_count, time_window_seconds)
+                            )
+                            analysis_thread.daemon = True
+                            analysis_thread.start()
+                
+    except KeyboardInterrupt:
+        print("\n\n🛑 Monitoreo detenido por el usuario.")
+        
+        with timestamps_lock:
+            total_failures = len(failed_login_timestamps)
+        
+        print(f"\n📊 Resumen final:")
+        print(f"   - Intentos fallidos en la última ventana: {total_failures}")
+        print(f"   - Archivo monitoreado: {log_file_path}")
+
+def create_sample_log_file(log_file_path: str):
+    """Create a sample log file for testing."""
+    sample_logs = [
+        "2024-01-15 10:00:01 INFO User admin logged in successfully",
+        "2024-01-15 10:00:05 INFO System startup complete",
+        "2024-01-15 10:00:10 INFO User john logged in successfully",
+    ]
+    
+    with open(log_file_path, 'w') as f:
+        for log in sample_logs:
+            f.write(log + "\n")
+    
+    print(f"✅ Archivo de log creado: {log_file_path}")
+
+def simulate_log_activity(log_file_path: str):
+    """Simulate log activity for testing purposes."""
+    print("\n🎭 Iniciando simulación de actividad en el log...")
+    print("   (Esta función simula entradas en el log para pruebas)\n")
+    
+    normal_events = [
+        "INFO User admin logged in successfully from 192.168.1.100",
+        "INFO Database connection established",
+        "INFO Backup completed successfully",
+        "INFO User john accessed /api/data",
+        "INFO System health check passed",
+    ]
+    
+    attack_events = [
+        "ERROR Failed Login attempt for user admin from 10.0.0.1",
+        "ERROR Failed Login attempt for user root from 10.0.0.1",
+        "ERROR Failed Login attempt for user administrator from 10.0.0.1",
+        "ERROR Failed password for user admin from 10.0.0.1 port 22",
+        "ERROR authentication failure for user root from 10.0.0.2",
+        "ERROR Invalid user hacker from 10.0.0.3",
+        "ERROR Failed Login attempt for user test from 10.0.0.1",
+        "ERROR Failed Login attempt for user guest from 10.0.0.4",
+        "ERROR Failed Login attempt for user oracle from 10.0.0.1",
+        "ERROR Failed Login attempt for user postgres from 10.0.0.5",
+        "ERROR Failed Login attempt for user mysql from 10.0.0.1",
+        "ERROR Failed Login attempt for user ftp from 10.0.0.6",
+    ]
+    
+    def write_logs():
+        with open(log_file_path, 'a') as f:
+            for i, event in enumerate(normal_events[:3]):
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"{timestamp} {event}\n")
+                f.flush()
+                time.sleep(1)
+            
+            print("⚡ Simulando ataque de fuerza bruta...")
+            for event in attack_events:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"{timestamp} {event}\n")
+                f.flush()
+                time.sleep(0.5)
+            
+            time.sleep(5)
+            
+            for event in normal_events[3:]:
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                f.write(f"{timestamp} {event}\n")
+                f.flush()
+                time.sleep(2)
+    
+    sim_thread = threading.Thread(target=write_logs)
+    sim_thread.daemon = True
+    sim_thread.start()
+    
+    return sim_thread
+
+def main():
+    log_file = "system.log"
+    time_window = 60
+    max_failures = 10
+    
+    if len(sys.argv) > 1:
+        log_file = sys.argv[1]
+    if len(sys.argv) > 2:
+        time_window = int(sys.argv[2])
+    if len(sys.argv) > 3:
+        max_failures = int(sys.argv[3])
+    
+    print("🔐 MONITOR DE SEGURIDAD - DETECTOR DE INTENTOS FALLIDOS DE LOGIN")
+    print("="*60)
+    
+    sim_thread = simulate_log_activity(log_file)
+    
+    time.sleep(0.5)
+    
+    monitor_log_file(log_file, time_window, max_failures)
+
+if __name__ == "__main__":
+    main()
+```

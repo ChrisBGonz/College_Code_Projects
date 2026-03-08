@@ -1,0 +1,316 @@
+
+```python
+import os
+import httpx
+from flask import Flask, request, render_template_string
+from anthropic import Anthropic
+
+app = Flask(__name__)
+client = Anthropic()
+
+# HTML templates
+MAIN_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URL Fetcher con IA</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        input[type="url"] { width: 70%; padding: 8px; font-size: 16px; }
+        button { padding: 8px 20px; font-size: 16px; background-color: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .content-box { border: 1px solid #ddd; padding: 15px; margin-top: 20px; border-radius: 5px; }
+        .error { color: red; background-color: #ffe0e0; padding: 10px; border-radius: 5px; }
+        .success { color: green; }
+        .chat-container { margin-top: 20px; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background-color: #e3f2fd; text-align: right; }
+        .assistant-message { background-color: #f5f5f5; }
+        .chat-input { width: 80%; padding: 8px; font-size: 14px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+        .url-info { color: #666; font-size: 14px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <h1>🌐 URL Fetcher con Análisis IA</h1>
+    
+    <form method="POST" action="/fetch">
+        <div class="form-group">
+            <label for="url"><strong>Ingresa una URL:</strong></label><br><br>
+            <input type="url" id="url" name="url" placeholder="https://ejemplo.com" required 
+                   value="{{ url if url else '' }}">
+            <button type="submit">Obtener Contenido</button>
+        </div>
+    </form>
+    
+    {% if error %}
+    <div class="error">
+        <h3>❌ Error</h3>
+        <p>{{ error }}</p>
+    </div>
+    {% endif %}
+    
+    {% if content %}
+    <div class="content-box">
+        <div class="url-info">
+            <strong>URL:</strong> {{ url }}<br>
+            <strong>Estado:</strong> <span class="success">✅ {{ status_code }}</span><br>
+            <strong>Tipo de contenido:</strong> {{ content_type }}
+        </div>
+        
+        <h3>📄 Contenido Obtenido:</h3>
+        <pre>{{ content[:2000] }}{% if content|length > 2000 %}... [contenido truncado]{% endif %}</pre>
+        
+        <div class="chat-container">
+            <h3>💬 Chat con IA sobre este contenido</h3>
+            <p>Puedes hacer preguntas sobre el contenido de la URL obtenida.</p>
+            
+            {% if conversation %}
+            <div id="chat-history">
+                {% for msg in conversation %}
+                <div class="message {{ 'user-message' if msg.role == 'user' else 'assistant-message' }}">
+                    <strong>{{ '👤 Tú' if msg.role == 'user' else '🤖 IA' }}:</strong>
+                    <p>{{ msg.content }}</p>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+            
+            <form method="POST" action="/chat">
+                <input type="hidden" name="url" value="{{ url }}">
+                <input type="hidden" name="content" value="{{ content }}">
+                <input type="hidden" name="conversation_json" value="{{ conversation_json }}">
+                <div class="form-group" style="margin-top: 15px;">
+                    <input type="text" name="question" class="chat-input" 
+                           placeholder="Pregunta algo sobre el contenido..." required>
+                    <button type="submit">Enviar</button>
+                </div>
+            </form>
+        </div>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+NOT_FOUND_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>404 - Página No Encontrada</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
+        .error-box { background-color: #ffe0e0; border: 2px solid #ff4444; padding: 30px; border-radius: 10px; }
+        h1 { color: #cc0000; font-size: 72px; margin: 0; }
+        h2 { color: #cc0000; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class="error-box">
+        <h1>404</h1>
+        <h2>Página No Encontrada</h2>
+        <p>La URL <strong>{{ url }}</strong> devolvió un error 404.</p>
+        <p>La página que intentas acceder no existe o ha sido movida.</p>
+        <br>
+        <a href="/">← Volver al inicio</a>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(MAIN_TEMPLATE)
+
+@app.route('/fetch', methods=['POST'])
+def fetch_url():
+    url = request.form.get('url', '').strip()
+    
+    if not url:
+        return render_template_string(MAIN_TEMPLATE, error="Por favor ingresa una URL válida.")
+    
+    # Add protocol if missing
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    try:
+        # Fetch the URL content
+        with httpx.Client(timeout=30.0, follow_redirects=True) as http_client:
+            response = http_client.get(url, headers={
+                'User-Agent': 'Mozilla/5.0 (compatible; URLFetcher/1.0)'
+            })
+        
+        # Handle 404 specifically
+        if response.status_code == 404:
+            return render_template_string(NOT_FOUND_TEMPLATE, url=url), 404
+        
+        # Handle other error status codes
+        if response.status_code >= 400:
+            error_msg = f"Error HTTP {response.status_code}: La URL devolvió un error."
+            if response.status_code == 403:
+                error_msg = f"Error 403: Acceso prohibido a {url}"
+            elif response.status_code == 500:
+                error_msg = f"Error 500: Error interno del servidor en {url}"
+            elif response.status_code == 503:
+                error_msg = f"Error 503: Servicio no disponible en {url}"
+            
+            return render_template_string(MAIN_TEMPLATE, error=error_msg, url=url)
+        
+        # Get content type
+        content_type = response.headers.get('content-type', 'unknown')
+        
+        # Get text content
+        try:
+            content = response.text
+        except Exception:
+            content = f"[Contenido binario - {len(response.content)} bytes]"
+        
+        return render_template_string(
+            MAIN_TEMPLATE,
+            url=url,
+            content=content,
+            status_code=response.status_code,
+            content_type=content_type,
+            conversation=[],
+            conversation_json='[]'
+        )
+        
+    except httpx.ConnectTimeout:
+        return render_template_string(MAIN_TEMPLATE, 
+                                     error=f"Tiempo de conexión agotado para {url}. El servidor tardó demasiado en responder.",
+                                     url=url)
+    except httpx.ConnectError:
+        return render_template_string(MAIN_TEMPLATE,
+                                     error=f"No se pudo conectar a {url}. Verifica que la URL sea correcta y el servidor esté disponible.",
+                                     url=url)
+    except httpx.InvalidURL:
+        return render_template_string(MAIN_TEMPLATE,
+                                     error=f"URL inválida: {url}. Por favor ingresa una URL válida.",
+                                     url=url)
+    except Exception as e:
+        return render_template_string(MAIN_TEMPLATE,
+                                     error=f"Error inesperado: {str(e)}",
+                                     url=url)
+
+@app.route('/chat', methods=['POST'])
+def chat_about_content():
+    import json
+    
+    url = request.form.get('url', '')
+    content = request.form.get('content', '')
+    question = request.form.get('question', '').strip()
+    conversation_json = request.form.get('conversation_json', '[]')
+    
+    if not question:
+        return render_template_string(MAIN_TEMPLATE,
+                                     error="Por favor ingresa una pregunta.",
+                                     url=url,
+                                     content=content)
+    
+    # Parse existing conversation
+    try:
+        conversation = json.loads(conversation_json)
+    except json.JSONDecodeError:
+        conversation = []
+    
+    # Add user message to conversation
+    conversation.append({
+        "role": "user",
+        "content": question
+    })
+    
+    # Prepare messages for Claude
+    # First message includes the URL content as context
+    messages_for_api = []
+    
+    if len(conversation) == 1:
+        # First question - include the URL content as context
+        messages_for_api.append({
+            "role": "user",
+            "content": f"""Analiza el siguiente contenido obtenido de la URL {url}:
+
+---CONTENIDO---
+{content[:5000]}
+---FIN DEL CONTENIDO---
+
+Pregunta del usuario: {question}"""
+        })
+    else:
+        # Subsequent questions - include context in system and conversation history
+        # Add context as first message
+        messages_for_api.append({
+            "role": "user",
+            "content": f"""Contexto: Estamos analizando el contenido de la URL {url}.
+El contenido (primeros 5000 caracteres) es:
+{content[:5000]}
+
+Primera pregunta: {conversation[0]['content']}"""
+        })
+        
+        # Add previous conversation
+        for i, msg in enumerate(conversation[:-1]):
+            if i == 0:
+                continue  # Skip first user message as it's already included
+            messages_for_api.append({
+                "role": msg["role"],
+                "content": msg["content"]
+            })
+        
+        # Add current question
+        messages_for_api.append({
+            "role": "user",
+            "content": question
+        })
+    
+    try:
+        # Call Claude API
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system="Eres un asistente útil que analiza contenido web. Responde en español de manera clara y concisa.",
+            messages=messages_for_api
+        )
+        
+        assistant_response = response.content[0].text
+        
+        # Add assistant response to conversation
+        conversation.append({
+            "role": "assistant",
+            "content": assistant_response
+        })
+        
+        # Get status code for display
+        try:
+            with httpx.Client(timeout=10.0) as http_client:
+                check_response = http_client.head(url, follow_redirects=True)
+                status_code = check_response.status_code
+        except Exception:
+            status_code = 200
+        
+        return render_template_string(
+            MAIN_TEMPLATE,
+            url=url,
+            content=content,
+            status_code=status_code,
+            content_type="text/html",
+            conversation=conversation,
+            conversation_json=json.dumps(conversation)
+        )
+        
+    except Exception as e:
+        return render_template_string(MAIN_TEMPLATE,
+                                     error=f"Error al consultar la IA: {str(e)}",
+                                     url=url,
+                                     content=content,
+                                     conversation=conversation,
+                                     conversation_json=json.dumps(conversation))
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

@@ -1,0 +1,681 @@
+
+```python
+import os
+import yaml
+import uuid
+from flask import Flask, request, jsonify, render_template_string
+from anthropic import Anthropic
+from werkzeug.utils import secure_filename
+
+app = Flask(__name__)
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+# Create uploads directory if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Store user profiles and conversation histories
+user_profiles = {}
+conversation_histories = {}
+
+client = Anthropic()
+
+ALLOWED_EXTENSIONS = {'yaml', 'yml'}
+
+def allowed_file(filename):
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def parse_yaml_config(file_path):
+    """Parse YAML configuration file and return profile data."""
+    with open(file_path, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+    return config
+
+def create_system_prompt(profile):
+    """Create a personalized system prompt based on user profile."""
+    profile_info = []
+    
+    if 'name' in profile:
+        profile_info.append(f"User's name: {profile['name']}")
+    
+    if 'role' in profile:
+        profile_info.append(f"User's role: {profile['role']}")
+    
+    if 'expertise' in profile:
+        if isinstance(profile['expertise'], list):
+            profile_info.append(f"Areas of expertise: {', '.join(profile['expertise'])}")
+        else:
+            profile_info.append(f"Area of expertise: {profile['expertise']}")
+    
+    if 'preferences' in profile:
+        prefs = profile['preferences']
+        if isinstance(prefs, dict):
+            for key, value in prefs.items():
+                profile_info.append(f"Preference - {key}: {value}")
+        else:
+            profile_info.append(f"Preferences: {prefs}")
+    
+    if 'language' in profile:
+        profile_info.append(f"Preferred language: {profile['language']}")
+    
+    if 'goals' in profile:
+        if isinstance(profile['goals'], list):
+            profile_info.append(f"Goals: {', '.join(profile['goals'])}")
+        else:
+            profile_info.append(f"Goals: {profile['goals']}")
+    
+    if 'context' in profile:
+        profile_info.append(f"Additional context: {profile['context']}")
+    
+    system_prompt = """You are a personalized AI assistant. You have been configured with the following user profile information:
+
+{}
+
+Based on this profile, please:
+1. Address the user by their name if provided
+2. Tailor your responses to their expertise level and role
+3. Focus on their goals and preferences
+4. Communicate in their preferred language if specified
+5. Provide relevant and personalized assistance
+
+Always be helpful, professional, and adapt your communication style to match the user's profile.""".format('\n'.join(profile_info) if profile_info else "No specific profile information provided.")
+    
+    return system_prompt
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Profile Configuration & AI Chat</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 900px;
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .upload-section {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 25px;
+            border: 2px dashed #dee2e6;
+            transition: border-color 0.3s;
+        }
+        
+        .upload-section:hover {
+            border-color: #667eea;
+        }
+        
+        .upload-section h2 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.3em;
+        }
+        
+        .file-input-wrapper {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .file-input {
+            flex: 1;
+            padding: 12px;
+            border: 2px solid #dee2e6;
+            border-radius: 10px;
+            font-size: 1em;
+            cursor: pointer;
+            background: white;
+        }
+        
+        .btn {
+            padding: 12px 25px;
+            border: none;
+            border-radius: 10px;
+            font-size: 1em;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            font-weight: 600;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.2);
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-secondary {
+            background: #6c757d;
+            color: white;
+        }
+        
+        .profile-display {
+            background: #e8f4f8;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 25px;
+            display: none;
+        }
+        
+        .profile-display h3 {
+            color: #333;
+            margin-bottom: 15px;
+            font-size: 1.2em;
+        }
+        
+        .profile-data {
+            background: white;
+            border-radius: 10px;
+            padding: 15px;
+            font-family: monospace;
+            font-size: 0.9em;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #dee2e6;
+        }
+        
+        .chat-section {
+            display: none;
+        }
+        
+        .chat-section h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.3em;
+        }
+        
+        .chat-messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 2px solid #dee2e6;
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            background: #f8f9fa;
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .message.user {
+            align-items: flex-end;
+        }
+        
+        .message.assistant {
+            align-items: flex-start;
+        }
+        
+        .message-bubble {
+            max-width: 75%;
+            padding: 12px 18px;
+            border-radius: 18px;
+            font-size: 0.95em;
+            line-height: 1.5;
+        }
+        
+        .message.user .message-bubble {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-bottom-right-radius: 5px;
+        }
+        
+        .message.assistant .message-bubble {
+            background: white;
+            color: #333;
+            border: 2px solid #dee2e6;
+            border-bottom-left-radius: 5px;
+        }
+        
+        .message-label {
+            font-size: 0.8em;
+            color: #666;
+            margin-bottom: 5px;
+            font-weight: 600;
+        }
+        
+        .chat-input-wrapper {
+            display: flex;
+            gap: 15px;
+        }
+        
+        .chat-input {
+            flex: 1;
+            padding: 15px;
+            border: 2px solid #dee2e6;
+            border-radius: 15px;
+            font-size: 1em;
+            resize: none;
+            height: 60px;
+            font-family: inherit;
+            transition: border-color 0.3s;
+        }
+        
+        .chat-input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .status-message {
+            padding: 12px 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            font-weight: 500;
+            display: none;
+        }
+        
+        .status-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .status-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        
+        .yaml-example {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-top: 15px;
+            font-family: monospace;
+            font-size: 0.85em;
+            border-left: 4px solid #667eea;
+        }
+        
+        .yaml-example h4 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid rgba(255,255,255,.3);
+            border-radius: 50%;
+            border-top-color: white;
+            animation: spin 1s ease-in-out infinite;
+        }
+        
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+        
+        .session-id {
+            font-size: 0.8em;
+            color: #666;
+            text-align: right;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🤖 AI Profile Assistant</h1>
+            <p>Upload your YAML configuration to personalize your AI experience</p>
+        </div>
+        
+        <div class="content">
+            <div id="statusMessage" class="status-message"></div>
+            
+            <div class="upload-section">
+                <h2>📁 Upload Profile Configuration</h2>
+                <div class="file-input-wrapper">
+                    <input type="file" id="yamlFile" class="file-input" accept=".yaml,.yml">
+                    <button class="btn btn-primary" onclick="uploadConfig()">
+                        Upload & Initialize
+                    </button>
+                </div>
+                
+                <div class="yaml-example">
+                    <h4>Example YAML Configuration:</h4>
+                    <pre>name: John Doe
+role: Software Engineer
+expertise:
+  - Python
+  - Machine Learning
+  - Cloud Architecture
+language: English
+preferences:
+  communication_style: technical
+  response_length: detailed
+  code_examples: true
+goals:
+  - Learn advanced AI techniques
+  - Improve system design skills
+context: Working on a large-scale ML platform</pre>
+                </div>
+            </div>
+            
+            <div id="profileDisplay" class="profile-display">
+                <h3>✅ Profile Loaded Successfully</h3>
+                <div id="profileData" class="profile-data"></div>
+            </div>
+            
+            <div id="chatSection" class="chat-section">
+                <h2>💬 Chat with Your Personalized AI</h2>
+                <div id="chatMessages" class="chat-messages">
+                    <div class="message assistant">
+                        <div class="message-label">AI Assistant</div>
+                        <div class="message-bubble">
+                            Hello! Your profile has been loaded. I'm ready to assist you with personalized responses based on your configuration. How can I help you today?
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-input-wrapper">
+                    <textarea 
+                        id="userMessage" 
+                        class="chat-input" 
+                        placeholder="Type your message here... (Press Enter to send)"
+                        onkeydown="handleKeyPress(event)"
+                    ></textarea>
+                    <button class="btn btn-primary" id="sendBtn" onclick="sendMessage()">
+                        Send
+                    </button>
+                </div>
+                <div id="sessionId" class="session-id"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let sessionId = null;
+        
+        function showStatus(message, type) {
+            const statusEl = document.getElementById('statusMessage');
+            statusEl.textContent = message;
+            statusEl.className = `status-message status-${type}`;
+            statusEl.style.display = 'block';
+            setTimeout(() => {
+                statusEl.style.display = 'none';
+            }, 5000);
+        }
+        
+        async function uploadConfig() {
+            const fileInput = document.getElementById('yamlFile');
+            const file = fileInput.files[0];
+            
+            if (!file) {
+                showStatus('Please select a YAML file first.', 'error');
+                return;
+            }
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    sessionId = data.session_id;
+                    
+                    // Display profile
+                    const profileDisplay = document.getElementById('profileDisplay');
+                    const profileData = document.getElementById('profileData');
+                    profileData.textContent = JSON.stringify(data.profile, null, 2);
+                    profileDisplay.style.display = 'block';
+                    
+                    // Show chat section
+                    document.getElementById('chatSection').style.display = 'block';
+                    document.getElementById('sessionId').textContent = `Session ID: ${sessionId}`;
+                    
+                    showStatus('Profile loaded successfully! You can now chat with your personalized AI.', 'success');
+                } else {
+                    showStatus(`Error: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`Upload failed: ${error.message}`, 'error');
+            }
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+        
+        function addMessage(role, content) {
+            const chatMessages = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            const label = role === 'user' ? 'You' : 'AI Assistant';
+            
+            messageDiv.innerHTML = `
+                <div class="message-label">${label}</div>
+                <div class="message-bubble">${content.replace(/\\n/g, '<br>')}</div>
+            `;
+            
+            chatMessages.appendChild(messageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+        
+        async function sendMessage() {
+            const messageInput = document.getElementById('userMessage');
+            const message = messageInput.value.trim();
+            
+            if (!message || !sessionId) return;
+            
+            const sendBtn = document.getElementById('sendBtn');
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<span class="loading"></span>';
+            
+            addMessage('user', message);
+            messageInput.value = '';
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        session_id: sessionId,
+                        message: message
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    addMessage('assistant', data.response);
+                } else {
+                    showStatus(`Error: ${data.error}`, 'error');
+                }
+            } catch (error) {
+                showStatus(`Failed to send message: ${error.message}`, 'error');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.textContent = 'Send';
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file provided'})
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No file selected'})
+    
+    if not allowed_file(file.filename):
+        return jsonify({'success': False, 'error': 'Invalid file type. Please upload a YAML file (.yaml or .yml)'})
+    
+    try:
+        # Save the file
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        # Parse YAML configuration
+        profile = parse_yaml_config(file_path)
+        
+        # Generate session ID
+        session_id = str(uuid.uuid4())
+        
+        # Store profile and initialize conversation history
+        user_profiles[session_id] = profile
+        conversation_histories[session_id] = []
+        
+        # Clean up uploaded file
+        os.remove(file_path)
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'profile': profile
+        })
+        
+    except yaml.YAMLError as e:
+        return jsonify({'success': False, 'error': f'Invalid YAML format: {str(e)}'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Error processing file: {str(e)}'})
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'success': False, 'error': 'No data provided'})
+    
+    session_id = data.get('session_id')
+    user_message = data.get('message')
+    
+    if not session_id or not user_message:
+        return jsonify({'success': False, 'error': 'Session ID and message are required'})
+    
+    if session_id not in user_profiles:
+        return jsonify({'success': False, 'error': 'Invalid session ID. Please upload your profile configuration first.'})
+    
+    try:
+        profile = user_profiles[session_id]
+        system_prompt = create_system_prompt(profile)
+        
+        # Add user message to conversation history
+        conversation_histories[session_id].append({
+            "role": "user",
+            "content": user_message
+        })
+        
+        # Send message to Claude with conversation history
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=8096,
+            system=system_prompt,
+            messages=conversation_histories[session_id]
+        )
+        
+        assistant_message = response.content[0].text
+        
+        # Add assistant response to conversation history
+        conversation_histories[session_id].append({
+            "role": "assistant",
+            "content": assistant_message
+        })
+        
+        return jsonify({
+            'success': True,
+            'response': assistant_message
+        })
+        
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Error generating response: {str(e)}'})
+
+@app.route('/profile/<session_id>', methods=['GET'])
+def get_profile(session_id):
+    if session_id not in user_profiles:
+        return jsonify({'success': False, 'error': 'Profile not found'})
+    
+    return jsonify({
+        'success': True,
+        'profile': user_profiles[session_id]
+    })
+
+@app.route('/reset/<session_id>', methods=['POST'])
+def reset_conversation(session_id):
+    if session_id not in conversation_histories:
+        return jsonify({'success': False, 'error': 'Session not found'})
+    
+    conversation_histories[session_id] = []
+    
+    return jsonify({
+        'success': True,
+        'message': 'Conversation history cleared'
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

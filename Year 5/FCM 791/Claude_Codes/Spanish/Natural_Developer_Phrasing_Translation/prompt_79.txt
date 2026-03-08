@@ -1,0 +1,363 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Project integrity validator using Claude AI for intelligent analysis.
+Reads hashes from a manifest file and validates project integrity.
+"""
+
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def calculate_file_hash(filepath: str, algorithm: str = "sha256", encoding: str = "hex") -> str | None:
+    """Calculate hash of a file using specified algorithm and encoding."""
+    try:
+        hash_func = hashlib.new(algorithm)
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_func.update(chunk)
+        
+        digest = hash_func.digest()
+        if encoding == "hex":
+            return hash_func.hexdigest()
+        elif encoding == "base64":
+            import base64
+            return base64.b64encode(digest).decode()
+        elif encoding == "base64url":
+            import base64
+            return base64.urlsafe_b64encode(digest).decode()
+        else:
+            return hash_func.hexdigest()
+    except (OSError, IOError, ValueError):
+        return None
+
+
+def load_manifest(manifest_path: str) -> dict:
+    """Load and parse the manifest file."""
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def get_project_files(project_dir: str, exclude_patterns: list = None) -> list:
+    """Get all files in the project directory."""
+    if exclude_patterns is None:
+        exclude_patterns = [".git", "__pycache__", ".pyc", "node_modules", ".DS_Store"]
+    
+    files = []
+    project_path = Path(project_dir)
+    
+    for filepath in project_path.rglob("*"):
+        if filepath.is_file():
+            # Check if file should be excluded
+            should_exclude = False
+            for pattern in exclude_patterns:
+                if pattern in str(filepath):
+                    should_exclude = True
+                    break
+            
+            if not should_exclude:
+                relative_path = str(filepath.relative_to(project_path))
+                files.append(relative_path)
+    
+    return sorted(files)
+
+
+def validate_integrity(manifest_path: str, project_dir: str) -> dict:
+    """Validate project integrity against manifest."""
+    # Load manifest
+    manifest = load_manifest(manifest_path)
+    
+    algorithm = manifest.get("algorithm", "sha256")
+    encoding = manifest.get("encoding", "hex")
+    manifest_files = manifest.get("files", {})
+    
+    # Get current project files
+    current_files = set(get_project_files(project_dir))
+    manifest_file_set = set(manifest_files.keys())
+    
+    results = {
+        "algorithm": algorithm,
+        "encoding": encoding,
+        "mismatches": [],
+        "missing_files": [],
+        "extra_files": [],
+        "valid_files": [],
+        "total_manifest_files": len(manifest_file_set),
+        "total_current_files": len(current_files)
+    }
+    
+    # Find missing files (in manifest but not in project)
+    missing = manifest_file_set - current_files
+    results["missing_files"] = sorted(list(missing))
+    
+    # Find extra files (in project but not in manifest)
+    extra = current_files - manifest_file_set
+    results["extra_files"] = sorted(list(extra))
+    
+    # Check hashes for files that exist in both
+    common_files = manifest_file_set & current_files
+    
+    for filename in sorted(common_files):
+        expected_hash = manifest_files[filename]
+        filepath = os.path.join(project_dir, filename)
+        actual_hash = calculate_file_hash(filepath, algorithm, encoding)
+        
+        if actual_hash is None:
+            results["missing_files"].append(filename)
+        elif actual_hash != expected_hash:
+            results["mismatches"].append({
+                "file": filename,
+                "expected": expected_hash,
+                "actual": actual_hash
+            })
+        else:
+            results["valid_files"].append(filename)
+    
+    return results
+
+
+def analyze_with_claude(validation_results: dict, manifest_path: str, project_dir: str) -> None:
+    """Use Claude to analyze validation results with streaming."""
+    client = anthropic.Anthropic()
+    
+    # Prepare the analysis prompt
+    analysis_data = {
+        "manifest_path": manifest_path,
+        "project_directory": project_dir,
+        "algorithm": validation_results["algorithm"],
+        "encoding": validation_results["encoding"],
+        "total_manifest_files": validation_results["total_manifest_files"],
+        "total_current_files": validation_results["total_current_files"],
+        "valid_files_count": len(validation_results["valid_files"]),
+        "mismatches_count": len(validation_results["mismatches"]),
+        "missing_files_count": len(validation_results["missing_files"]),
+        "extra_files_count": len(validation_results["extra_files"]),
+        "mismatches": validation_results["mismatches"][:10],  # Limit for prompt
+        "missing_files": validation_results["missing_files"][:10],
+        "extra_files": validation_results["extra_files"][:10]
+    }
+    
+    prompt = f"""Analyze the following project integrity validation results and provide a comprehensive security and integrity report:
+
+Validation Results:
+{json.dumps(analysis_data, indent=2)}
+
+Please provide:
+1. **Executive Summary**: Overall integrity status (PASS/FAIL/WARNING)
+2. **Critical Issues**: Any files with hash mismatches (potential tampering)
+3. **Missing Files Analysis**: Impact of missing files on project integrity
+4. **Extra Files Analysis**: Security implications of unexpected files
+5. **Risk Assessment**: Overall risk level (LOW/MEDIUM/HIGH/CRITICAL)
+6. **Recommendations**: Specific actions to resolve issues
+7. **Statistics Summary**: Key metrics in a clear format
+
+Format your response clearly with sections and use emojis for visual clarity where appropriate."""
+
+    print("\n" + "="*60)
+    print("🤖 CLAUDE AI INTEGRITY ANALYSIS")
+    print("="*60 + "\n")
+    
+    # Use streaming for real-time output
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n")
+
+
+def generate_manifest(project_dir: str, output_path: str, algorithm: str = "sha256", encoding: str = "hex") -> None:
+    """Generate a new manifest for a project directory."""
+    files = get_project_files(project_dir)
+    
+    manifest = {
+        "algorithm": algorithm,
+        "encoding": encoding,
+        "files": {}
+    }
+    
+    print(f"Generating manifest for {project_dir}...")
+    
+    for filename in files:
+        filepath = os.path.join(project_dir, filename)
+        file_hash = calculate_file_hash(filepath, algorithm, encoding)
+        if file_hash:
+            manifest["files"][filename] = file_hash
+            print(f"  ✓ {filename}")
+    
+    with open(output_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    print(f"\n✅ Manifest generated: {output_path}")
+    print(f"   Files indexed: {len(manifest['files'])}")
+    print(f"   Algorithm: {algorithm}")
+    print(f"   Encoding: {encoding}")
+
+
+def print_validation_report(results: dict) -> None:
+    """Print a formatted validation report."""
+    print("\n" + "="*60)
+    print("📋 INTEGRITY VALIDATION REPORT")
+    print("="*60)
+    
+    print(f"\n🔧 Configuration:")
+    print(f"   Algorithm: {results['algorithm']}")
+    print(f"   Encoding: {results['encoding']}")
+    
+    print(f"\n📊 Statistics:")
+    print(f"   Manifest files: {results['total_manifest_files']}")
+    print(f"   Current files: {results['total_current_files']}")
+    print(f"   Valid files: {len(results['valid_files'])}")
+    print(f"   Mismatches: {len(results['mismatches'])}")
+    print(f"   Missing files: {len(results['missing_files'])}")
+    print(f"   Extra files: {len(results['extra_files'])}")
+    
+    if results['mismatches']:
+        print(f"\n⚠️  HASH MISMATCHES ({len(results['mismatches'])} files):")
+        for mismatch in results['mismatches']:
+            print(f"   ❌ {mismatch['file']}")
+            print(f"      Expected: {mismatch['expected'][:32]}...")
+            print(f"      Actual:   {mismatch['actual'][:32]}...")
+    
+    if results['missing_files']:
+        print(f"\n🔍 MISSING FILES ({len(results['missing_files'])} files):")
+        for filename in results['missing_files']:
+            print(f"   ❌ {filename}")
+    
+    if results['extra_files']:
+        print(f"\n📁 EXTRA FILES ({len(results['extra_files'])} files):")
+        for filename in results['extra_files']:
+            print(f"   ⚠️  {filename}")
+    
+    # Overall status
+    print("\n" + "="*60)
+    if not results['mismatches'] and not results['missing_files']:
+        print("✅ INTEGRITY STATUS: PASS")
+    elif results['mismatches']:
+        print("🚨 INTEGRITY STATUS: FAIL (Hash mismatches detected)")
+    else:
+        print("⚠️  INTEGRITY STATUS: WARNING (Missing/extra files)")
+    print("="*60 + "\n")
+
+
+def create_sample_project() -> tuple[str, str]:
+    """Create a sample project for demonstration."""
+    import tempfile
+    
+    # Create temporary directory
+    project_dir = tempfile.mkdtemp(prefix="sample_project_")
+    
+    # Create sample files
+    files = {
+        "main.py": "#!/usr/bin/env python3\nprint('Hello, World!')\n",
+        "config.json": '{"version": "1.0.0", "debug": false}\n',
+        "README.md": "# Sample Project\n\nThis is a sample project for integrity testing.\n",
+        "src/utils.py": "def helper():\n    return 'helper function'\n",
+        "src/__init__.py": "# Package init\n",
+        "tests/test_main.py": "def test_hello():\n    assert True\n"
+    }
+    
+    for filepath, content in files.items():
+        full_path = os.path.join(project_dir, filepath)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        with open(full_path, "w") as f:
+            f.write(content)
+    
+    # Generate manifest
+    manifest_path = os.path.join(project_dir, "manifest.json")
+    generate_manifest(project_dir, manifest_path)
+    
+    return project_dir, manifest_path
+
+
+def main():
+    """Main function demonstrating the integrity validator."""
+    print("🔐 Project Integrity Validator with Claude AI")
+    print("=" * 60)
+    
+    # Check if arguments provided
+    if len(sys.argv) >= 3:
+        manifest_path = sys.argv[1]
+        project_dir = sys.argv[2]
+        
+        if not os.path.exists(manifest_path):
+            print(f"❌ Manifest not found: {manifest_path}")
+            sys.exit(1)
+        
+        if not os.path.exists(project_dir):
+            print(f"❌ Project directory not found: {project_dir}")
+            sys.exit(1)
+    else:
+        # Create sample project for demonstration
+        print("\n📁 Creating sample project for demonstration...")
+        project_dir, manifest_path = create_sample_project()
+        
+        print(f"\n✅ Sample project created at: {project_dir}")
+        print(f"✅ Manifest created at: {manifest_path}")
+        
+        # Simulate some changes to test detection
+        print("\n🔧 Simulating project changes for testing...")
+        
+        # Modify a file
+        modified_file = os.path.join(project_dir, "main.py")
+        with open(modified_file, "a") as f:
+            f.write("# This line was added after manifest creation\n")
+        print(f"   Modified: main.py")
+        
+        # Add an extra file
+        extra_file = os.path.join(project_dir, "unauthorized.py")
+        with open(extra_file, "w") as f:
+            f.write("# This file was not in the original manifest\n")
+        print(f"   Added: unauthorized.py")
+        
+        # Delete a file
+        deleted_file = os.path.join(project_dir, "src/__init__.py")
+        os.remove(deleted_file)
+        print(f"   Deleted: src/__init__.py")
+    
+    # Validate integrity
+    print(f"\n🔍 Validating project integrity...")
+    print(f"   Manifest: {manifest_path}")
+    print(f"   Project: {project_dir}")
+    
+    results = validate_integrity(manifest_path, project_dir)
+    
+    # Print detailed report
+    print_validation_report(results)
+    
+    # Analyze with Claude AI
+    print("🤖 Requesting AI analysis from Claude...")
+    analyze_with_claude(results, manifest_path, project_dir)
+    
+    # Cleanup if we created a sample project
+    if len(sys.argv) < 3:
+        import shutil
+        print(f"\n🧹 Cleaning up sample project: {project_dir}")
+        shutil.rmtree(project_dir)
+        print("✅ Cleanup complete")
+    
+    # Return exit code based on results
+    if results['mismatches']:
+        sys.exit(2)  # Critical: hash mismatches
+    elif results['missing_files']:
+        sys.exit(1)  # Warning: missing files
+    else:
+        sys.exit(0)  # Success
+
+
+if __name__ == "__main__":
+    main()
+```

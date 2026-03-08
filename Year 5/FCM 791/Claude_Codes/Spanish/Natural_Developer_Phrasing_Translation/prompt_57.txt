@@ -1,0 +1,929 @@
+<?php
+
+/**
+ * Corporate File Upload System
+ * Allows employees to upload PDF files to a shared corporate drive
+ */
+
+// Configuration
+define('UPLOAD_DIR', '/var/www/shared_drive/uploads/');
+define('MAX_FILE_SIZE', 10 * 1024 * 1024); // 10MB
+define('ALLOWED_MIME_TYPES', ['application/pdf']);
+define('ALLOWED_EXTENSIONS', ['pdf']);
+define('LOG_FILE', '/var/www/shared_drive/logs/upload_log.txt');
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'corporate_drive');
+define('DB_USER', 'db_user');
+define('DB_PASS', 'db_password');
+
+session_start();
+
+// Simulated authentication check
+function isAuthenticated(): bool {
+    return isset($_SESSION['employee_id']) && !empty($_SESSION['employee_id']);
+}
+
+function getEmployeeInfo(): array {
+    return [
+        'id'         => $_SESSION['employee_id'] ?? 0,
+        'name'       => $_SESSION['employee_name'] ?? 'Unknown',
+        'department' => $_SESSION['department'] ?? 'General',
+        'email'      => $_SESSION['email'] ?? ''
+    ];
+}
+
+// Database connection
+function getDatabaseConnection(): PDO {
+    try {
+        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        return new PDO($dsn, DB_USER, DB_PASS, $options);
+    } catch (PDOException $e) {
+        logError("Database connection failed: " . $e->getMessage());
+        throw new RuntimeException("Database connection failed.");
+    }
+}
+
+// Logging functions
+function logUpload(array $employee, string $filename, string $storedName, int $fileSize, bool $success, string $message = ''): void {
+    $timestamp = date('Y-m-d H:i:s');
+    $status    = $success ? 'SUCCESS' : 'FAILED';
+    $logEntry  = "[{$timestamp}] [{$status}] Employee: {$employee['name']} (ID: {$employee['id']}) | "
+                . "Department: {$employee['department']} | "
+                . "File: {$filename} | Stored as: {$storedName} | "
+                . "Size: {$fileSize} bytes | IP: " . getClientIP()
+                . ($message ? " | Note: {$message}" : '') . PHP_EOL;
+
+    if (!is_dir(dirname(LOG_FILE))) {
+        mkdir(dirname(LOG_FILE), 0750, true);
+    }
+
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+function logError(string $message): void {
+    $timestamp = date('Y-m-d H:i:s');
+    $logEntry  = "[{$timestamp}] [ERROR] {$message} | IP: " . getClientIP() . PHP_EOL;
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+function getClientIP(): string {
+    $ipKeys = ['HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'];
+    foreach ($ipKeys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ip = trim(explode(',', $_SERVER[$key])[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+    return 'UNKNOWN';
+}
+
+// File validation
+function validateFile(array $file): array {
+    $errors = [];
+
+    // Check for upload errors
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $uploadErrors = [
+            UPLOAD_ERR_INI_SIZE   => 'File exceeds server maximum size limit.',
+            UPLOAD_ERR_FORM_SIZE  => 'File exceeds form maximum size limit.',
+            UPLOAD_ERR_PARTIAL    => 'File was only partially uploaded.',
+            UPLOAD_ERR_NO_FILE    => 'No file was uploaded.',
+            UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder.',
+            UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk.',
+            UPLOAD_ERR_EXTENSION  => 'A PHP extension stopped the file upload.',
+        ];
+        $errors[] = $uploadErrors[$file['error']] ?? 'Unknown upload error.';
+        return $errors;
+    }
+
+    // Validate file size
+    if ($file['size'] > MAX_FILE_SIZE) {
+        $errors[] = 'File size exceeds the maximum allowed size of ' . (MAX_FILE_SIZE / 1024 / 1024) . 'MB.';
+    }
+
+    if ($file['size'] === 0) {
+        $errors[] = 'File is empty.';
+    }
+
+    // Validate file extension
+    $originalName = $file['name'];
+    $extension    = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+
+    if (!in_array($extension, ALLOWED_EXTENSIONS, true)) {
+        $errors[] = 'Invalid file extension. Only PDF files are allowed.';
+    }
+
+    // Validate MIME type using finfo
+    if (empty($errors)) {
+        $finfo    = new finfo(FILEINFO_MIME_TYPE);
+        $mimeType = $finfo->file($file['tmp_name']);
+
+        if (!in_array($mimeType, ALLOWED_MIME_TYPES, true)) {
+            $errors[] = 'Invalid file type. Only PDF files are allowed.';
+        }
+
+        // Additional PDF magic bytes check
+        $handle = fopen($file['tmp_name'], 'rb');
+        if ($handle) {
+            $header = fread($handle, 5);
+            fclose($handle);
+            if ($header !== '%PDF-') {
+                $errors[] = 'File does not appear to be a valid PDF document.';
+            }
+        }
+    }
+
+    // Validate filename
+    if (strlen($originalName) > 255) {
+        $errors[] = 'Filename is too long (maximum 255 characters).';
+    }
+
+    return $errors;
+}
+
+// Sanitize filename
+function sanitizeFilename(string $filename): string {
+    // Remove path components
+    $filename = basename($filename);
+
+    // Remove extension for processing
+    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    $name      = pathinfo($filename, PATHINFO_FILENAME);
+
+    // Remove dangerous characters, keep alphanumeric, spaces, hyphens, underscores, dots
+    $name = preg_replace('/[^a-zA-Z0-9\s\-_\.]/', '', $name);
+    $name = preg_replace('/\s+/', '_', trim($name));
+    $name = preg_replace('/_{2,}/', '_', $name);
+    $name = trim($name, '_.-');
+
+    if (empty($name)) {
+        $name = 'document';
+    }
+
+    // Limit name length
+    $name = substr($name, 0, 100);
+
+    return $name . '.' . $extension;
+}
+
+// Generate unique stored filename
+function generateStoredFilename(string $sanitizedName, int $employeeId): string {
+    $timestamp = date('Ymd_His');
+    $uniqueId  = bin2hex(random_bytes(8));
+    $extension = pathinfo($sanitizedName, PATHINFO_EXTENSION);
+    $baseName  = pathinfo($sanitizedName, PATHINFO_FILENAME);
+
+    return "emp{$employeeId}_{$timestamp}_{$uniqueId}_{$baseName}.{$extension}";
+}
+
+// Create department directory
+function getDepartmentUploadPath(string $department): string {
+    $safeDepartment = preg_replace('/[^a-zA-Z0-9_\-]/', '_', $department);
+    $yearMonth      = date('Y/m');
+    $path           = UPLOAD_DIR . $safeDepartment . '/' . $yearMonth . '/';
+
+    if (!is_dir($path)) {
+        if (!mkdir($path, 0750, true)) {
+            throw new RuntimeException("Failed to create upload directory.");
+        }
+    }
+
+    return $path;
+}
+
+// Save file record to database
+function saveFileRecord(PDO $pdo, array $employee, string $originalName, string $storedName, string $filePath, int $fileSize, string $description): int {
+    $sql = "INSERT INTO uploaded_files 
+            (employee_id, employee_name, department, original_filename, stored_filename, file_path, file_size, description, upload_ip, uploaded_at) 
+            VALUES 
+            (:employee_id, :employee_name, :department, :original_filename, :stored_filename, :file_path, :file_size, :description, :upload_ip, NOW())";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':employee_id'       => $employee['id'],
+        ':employee_name'     => $employee['name'],
+        ':department'        => $employee['department'],
+        ':original_filename' => $originalName,
+        ':stored_filename'   => $storedName,
+        ':file_path'         => $filePath,
+        ':file_size'         => $fileSize,
+        ':description'       => $description,
+        ':upload_ip'         => getClientIP(),
+    ]);
+
+    return (int) $pdo->lastInsertId();
+}
+
+// Get uploaded files for employee
+function getEmployeeFiles(PDO $pdo, int $employeeId): array {
+    $sql  = "SELECT id, original_filename, file_size, description, uploaded_at 
+             FROM uploaded_files 
+             WHERE employee_id = :employee_id 
+             ORDER BY uploaded_at DESC 
+             LIMIT 50";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':employee_id' => $employeeId]);
+    return $stmt->fetchAll();
+}
+
+// Format file size
+function formatFileSize(int $bytes): string {
+    if ($bytes >= 1048576) {
+        return round($bytes / 1048576, 2) . ' MB';
+    } elseif ($bytes >= 1024) {
+        return round($bytes / 1024, 2) . ' KB';
+    }
+    return $bytes . ' bytes';
+}
+
+// CSRF Token management
+function generateCSRFToken(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function validateCSRFToken(string $token): bool {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// Main upload handler
+function handleFileUpload(): array {
+    $result = [
+        'success' => false,
+        'message' => '',
+        'file_id' => null,
+    ];
+
+    // Authentication check
+    if (!isAuthenticated()) {
+        $result['message'] = 'Authentication required. Please log in.';
+        return $result;
+    }
+
+    $employee = getEmployeeInfo();
+
+    // CSRF validation
+    $csrfToken = $_POST['csrf_token'] ?? '';
+    if (!validateCSRFToken($csrfToken)) {
+        logError("CSRF token validation failed for employee ID: {$employee['id']}");
+        $result['message'] = 'Invalid security token. Please refresh the page and try again.';
+        return $result;
+    }
+
+    // Check if file was submitted
+    if (!isset($_FILES['pdf_file'])) {
+        $result['message'] = 'No file was submitted.';
+        return $result;
+    }
+
+    $file = $_FILES['pdf_file'];
+
+    // Validate file
+    $validationErrors = validateFile($file);
+    if (!empty($validationErrors)) {
+        $result['message'] = implode(' ', $validationErrors);
+        logUpload($employee, $file['name'], '', $file['size'] ?? 0, false, $result['message']);
+        return $result;
+    }
+
+    // Sanitize inputs
+    $sanitizedName = sanitizeFilename($file['name']);
+    $description   = isset($_POST['description'])
+        ? htmlspecialchars(strip_tags(trim($_POST['description'])), ENT_QUOTES, 'UTF-8')
+        : '';
+    $description   = substr($description, 0, 500);
+
+    // Generate stored filename
+    $storedFilename = generateStoredFilename($sanitizedName, $employee['id']);
+
+    try {
+        // Get upload path
+        $uploadPath = getDepartmentUploadPath($employee['department']);
+        $fullPath   = $uploadPath . $storedFilename;
+
+        // Move uploaded file
+        if (!move_uploaded_file($file['tmp_name'], $fullPath)) {
+            throw new RuntimeException("Failed to move uploaded file to destination.");
+        }
+
+        // Set secure file permissions
+        chmod($fullPath, 0640);
+
+        // Save record to database
+        $pdo    = getDatabaseConnection();
+        $fileId = saveFileRecord(
+            $pdo,
+            $employee,
+            $sanitizedName,
+            $storedFilename,
+            $fullPath,
+            $file['size'],
+            $description
+        );
+
+        // Log successful upload
+        logUpload($employee, $sanitizedName, $storedFilename, $file['size'], true);
+
+        // Regenerate CSRF token after successful upload
+        unset($_SESSION['csrf_token']);
+
+        $result['success'] = true;
+        $result['message'] = "File '{$sanitizedName}' uploaded successfully to the corporate shared drive.";
+        $result['file_id'] = $fileId;
+
+    } catch (RuntimeException $e) {
+        // Clean up file if it was moved but DB failed
+        if (isset($fullPath) && file_exists($fullPath)) {
+            unlink($fullPath);
+        }
+        logError("Upload failed for employee {$employee['id']}: " . $e->getMessage());
+        $result['message'] = 'Upload failed due to a server error. Please try again or contact IT support.';
+    }
+
+    return $result;
+}
+
+// Process upload request
+$uploadResult = null;
+$recentFiles  = [];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $uploadResult = handleFileUpload();
+}
+
+// Load recent files if authenticated
+if (isAuthenticated()) {
+    try {
+        $pdo         = getDatabaseConnection();
+        $employee    = getEmployeeInfo();
+        $recentFiles = getEmployeeFiles($pdo, $employee['id']);
+    } catch (RuntimeException $e) {
+        // Non-critical, continue without recent files
+    }
+}
+
+$csrfToken = generateCSRFToken();
+
+// Simulate session for demo (remove in production)
+if (!isset($_SESSION['employee_id'])) {
+    $_SESSION['employee_id']   = 1001;
+    $_SESSION['employee_name'] = 'John Doe';
+    $_SESSION['department']    = 'Engineering';
+    $_SESSION['email']         = 'john.doe@company.com';
+}
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Corporate File Upload - Shared Drive</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f0f2f5;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #1a237e, #283593);
+            color: white;
+            padding: 16px 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-brand .logo {
+            width: 40px;
+            height: 40px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 20px;
+        }
+
+        .header-brand h1 {
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .header-brand p {
+            font-size: 12px;
+            opacity: 0.8;
+        }
+
+        .employee-info {
+            text-align: right;
+            font-size: 13px;
+        }
+
+        .employee-info strong {
+            display: block;
+            font-size: 15px;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 32px auto;
+            padding: 0 16px;
+        }
+
+        .card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            overflow: hidden;
+            margin-bottom: 24px;
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, #1565c0, #1976d2);
+            color: white;
+            padding: 20px 28px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .card-header .icon {
+            font-size: 24px;
+        }
+
+        .card-header h2 {
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        .card-header p {
+            font-size: 13px;
+            opacity: 0.85;
+            margin-top: 2px;
+        }
+
+        .card-body {
+            padding: 28px;
+        }
+
+        .alert {
+            padding: 14px 18px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            font-size: 14px;
+        }
+
+        .alert-success {
+            background: #e8f5e9;
+            border: 1px solid #a5d6a7;
+            color: #2e7d32;
+        }
+
+        .alert-error {
+            background: #ffebee;
+            border: 1px solid #ef9a9a;
+            color: #c62828;
+        }
+
+        .alert-icon {
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            font-size: 14px;
+            font-weight: 600;
+            color: #444;
+            margin-bottom: 8px;
+        }
+
+        .form-group label .required {
+            color: #e53935;
+            margin-left: 3px;
+        }
+
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 14px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: vertical;
+            transition: border-color 0.2s;
+            min-height: 80px;
+        }
+
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #1976d2;
+        }
+
+        .drop-zone {
+            border: 3px dashed #90caf9;
+            border-radius: 12px;
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            background: #f8fbff;
+            position: relative;
+        }
+
+        .drop-zone:hover,
+        .drop-zone.drag-over {
+            border-color: #1976d2;
+            background: #e3f2fd;
+        }
+
+        .drop-zone input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+
+        .drop-zone .dz-icon {
+            font-size: 56px;
+            margin-bottom: 12px;
+            display: block;
+        }
+
+        .drop-zone .dz-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #1976d2;
+            margin-bottom: 6px;
+        }
+
+        .drop-zone .dz-subtitle {
+            font-size: 13px;
+            color: #888;
+        }
+
+        .drop-zone .dz-constraints {
+            margin-top: 12px;
+            font-size: 12px;
+            color: #aaa;
+        }
+
+        .file-preview {
+            display: none;
+            margin-top: 16px;
+            padding: 14px 18px;
+            background: #e8f5e9;
+            border: 1px solid #a5d6a7;
+            border-radius: 8px;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .file-preview.visible {
+            display: flex;
+        }
+
+        .file-preview .file-icon {
+            font-size: 28px;
+        }
+
+        .file-preview .file-details {
+            flex: 1;
+        }
+
+        .file-preview .file-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #2e7d32;
+        }
+
+        .file-preview .file-size {
+            font-size: 12px;
+            color: #666;
+            margin-top: 2px;
+        }
+
+        .file-preview .remove-file {
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            color: #e53935;
+            padding: 4px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 28px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #1565c0, #1976d2);
+            color: white;
+            width: 100%;
+            justify-content: center;
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #0d47a1, #1565c0);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(21, 101, 192, 0.4);
+        }
+
+        .btn-primary:disabled {
+            background: #b0bec5;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .progress-container {
+            display: none;
+            margin-top: 16px;
+        }
+
+        .progress-container.visible {
+            display: block;
+        }
+
+        .progress-label {
+            font-size: 13px;
+            color: #555;
+            margin-bottom: 6px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .progress-bar-wrapper {
+            background: #e0e0e0;
+            border-radius: 20px;
+            height: 10px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #1976d2, #42a5f5);
+            border-radius: 20px;
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+
+        .info-box {
+            background: #e3f2fd;
+            border: 1px solid #90caf9;
+            border-radius: 8px;
+            padding: 14px 18px;
+            margin-bottom: 20px;
+        }
+
+        .info-box h4 {
+            font-size: 13px;
+            font-weight: 700;
+            color: #1565c0;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .info-box ul {
+            list-style: none;
+            padding: 0;
+        }
+
+        .info-box ul li {
+            font-size: 12px;
+            color: #555;
+            padding: 2px 0;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .info-box ul li::before {
+            content: '✓';
+            color: #1976d2;
+            font-weight: bold;
+        }
+
+        .files-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+
+        .files-table th {
+            background: #f5f5f5;
+            padding: 10px 14px;
+            text-align: left;
+            font-weight: 600;
+            color: #555;
+            border-bottom: 2px solid #e0e0e0;
+        }
+
+        .files-table td {
+            padding: 10px 14px;
+            border-bottom: 1px solid #f0f0f0;
+            color: #444;
+        }
+
+        .files-table tr:hover td {
+            background: #fafafa;
+        }
+
+        .files-table .file-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            background: #ffebee;
+            color: #c62828;
+            padding: 3px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #aaa;
+        }
+
+        .empty-state .empty-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+
+        .empty-state p {
+            font-size: 14px;
+        }
+
+        @media (max-width: 600px) {
+            .header {
+                flex-direction: column;
+                gap: 12px;
+                text-align: center;
+            }
+            .employee-info {
+                text-align: center;
+            }
+            .card-body {
+                padding: 20px;
+            }
+        }
+    </style>
+</head>
+<body>
+
+<header class="header">
+    <div class="header-brand">
+        <div class="logo">🏢</div>
+        <div>
+            <h1>Corporate Shared Drive</h1>
+            <p>Document Management System</p>
+        </div>
+    </div>
+    <?php if (isAuthenticated()): $emp = getEmployeeInfo(); ?>
+    <div class="employee-info">
+        <strong>👤 <?= htmlspecialchars($emp['name']) ?></strong>
+        <span><?= htmlspecialchars($emp['department']) ?> Department</span>
+    </div>
+    <?php endif; ?>
+</header>
+
+<div class="container">
+
+    <?php if (!isAuthenticated()): ?>
+    <div class="card">
+        <div class="card-body">
+            <div class="alert alert-error">
+                <span class="alert-icon">🔒</span>
+                <div>
+                    <strong>Access Denied</strong><br>
+                    You must be logged in to upload files. Please contact IT support.
+                </div>
+            </div>
+        </div>
+    </div>
+    <?php else: ?>
+
+    <!-- Upload Card -->
+    <div class="card">
+        <div class="card-header">
+            <span class="icon">📤</span>
+            <div>
+                <h2>Upload PDF Document</h2>
+                <p>Upload PDF files to the corporate shared drive</p>
+            </div>
+        </div>
+        <div class="card-body">
+
+            <?php if ($uploadResult !== null): ?>
+                <?php if ($uploadResult['success']): ?>
+                <div class="alert alert-success">
+                    <span class="alert-icon">✅</span>
+                    <div>
+                        <strong>Upload Successful!</strong><br>
+                        <?= htmlspecialchars($uploadResult['message']) ?>
+                        <?php if ($uploadResult['file_id']): ?>
+                        <br><small>File ID: #<?= (int) $uploadResult['file_id'] ?></small>
+                        <?php endif; ?>
+                    </div>
+                </div>
+                <?php else: ?>
+                <div class="alert alert-error">
+                    <span class="alert-icon">❌</span>
+                    <div>
+                        <strong>Upload Failed</strong><br>
+                        <?= htmlspecialchars($uploadResult['message']) ?>
+                    </div>
+                </div>
+                <?php endif; ?>
+            <?php endif; ?>
+
+            <div class="info-box">
+                <h4>ℹ️ Upload Requirements</h4>
+                <ul>
+                    <li>Only PDF files are accepted</li>
+                    <li>Maximum file size: 10 MB</li>
+                    <li>Files are stored in your department folder</li>
+                    <li>All uploads are logged for audit purposes</li>
+                </ul>
+            </div>
+
+            <form method="POST" enctype="multipart/form-data" id="uploadForm" novalidate>
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
+                <input type="hidden" name="MAX_FILE_SIZE" value="<?= MAX_FILE_SIZE ?>">
+
+                <div class="form-group">
+                    <label>PDF Document <span class="required">*</span></label>
+                    <div class="drop-zone" id="dropZone">
+                        <input type="file"
+                               name="pdf_file"
+                               id="pdfFile"
+                               accept=".pdf,application/pdf"
+                               required>
+                        <span class="dz-icon">📄</span>
+                        <div class="dz-title">Click to browse or drag & drop</div>
+                        <div class="dz-subtitle">Select a PDF file from your computer</div>
+                        <div class="dz-constraints">Supported format: PDF | Max size: 10 MB</div>
+                    </div>
+
+                    <div class="file-preview" id="filePreview">
+                        <span class="file-icon">📋</span>
+                        <div class="file-details">
+                            <div class="file-name" id="previewName"></div>
+                            <div class="file-size" id="previewSize"></div>
+                        </div>
+                        <button type="button" class="remove-file" id="removeFile" title="Remove file">✕</button>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label for="description">Description <small style="font-weight:normal;color:#888;">(optional)</small></label>
+                    <textarea
+                        name

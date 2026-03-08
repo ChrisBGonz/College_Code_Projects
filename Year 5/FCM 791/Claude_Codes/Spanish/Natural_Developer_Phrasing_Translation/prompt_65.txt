@@ -1,0 +1,812 @@
+<?php
+
+declare(strict_types=1);
+
+// ============================================================
+// Configuration
+// ============================================================
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'account_recovery_db');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_CHARSET', 'utf8mb4');
+
+define('MAX_ATTEMPTS', 5);
+define('LOCKOUT_MINUTES', 30);
+define('TOKEN_EXPIRY_MINUTES', 60);
+define('MIN_PASSWORD_LENGTH', 8);
+
+session_start();
+
+// ============================================================
+// Database Connection
+// ============================================================
+function getDB(): PDO
+{
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = sprintf(
+            'mysql:host=%s;dbname=%s;charset=%s',
+            DB_HOST,
+            DB_NAME,
+            DB_CHARSET
+        );
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+    return $pdo;
+}
+
+// ============================================================
+// Database Schema (run once)
+// ============================================================
+function createSchema(): void
+{
+    $db = getDB();
+
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            username        VARCHAR(80)  NOT NULL UNIQUE,
+            email           VARCHAR(180) NOT NULL UNIQUE,
+            password_hash   VARCHAR(255) NOT NULL,
+            is_active       TINYINT(1)   NOT NULL DEFAULT 1,
+            created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS secret_questions (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            question    VARCHAR(255) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS user_security (
+            id                  INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id             INT UNSIGNED NOT NULL UNIQUE,
+            question_id         INT UNSIGNED NOT NULL,
+            answer_hash         VARCHAR(255) NOT NULL,
+            attempt_count       INT UNSIGNED NOT NULL DEFAULT 0,
+            locked_until        DATETIME     NULL,
+            created_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at          DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id)     REFERENCES users(id)             ON DELETE CASCADE,
+            FOREIGN KEY (question_id) REFERENCES secret_questions(id)  ON DELETE RESTRICT
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS recovery_tokens (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id     INT UNSIGNED NOT NULL,
+            token_hash  VARCHAR(255) NOT NULL UNIQUE,
+            expires_at  DATETIME     NOT NULL,
+            used        TINYINT(1)   NOT NULL DEFAULT 0,
+            created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $db->exec("
+        CREATE TABLE IF NOT EXISTS audit_log (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id     INT UNSIGNED NULL,
+            event       VARCHAR(100) NOT NULL,
+            ip_address  VARCHAR(45)  NOT NULL,
+            user_agent  VARCHAR(255) NOT NULL,
+            details     TEXT         NULL,
+            created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    // Seed default questions if table is empty
+    $count = (int) $db->query("SELECT COUNT(*) FROM secret_questions")->fetchColumn();
+    if ($count === 0) {
+        $questions = [
+            '¿Cuál es el apellido de soltera de tu madre?',
+            '¿Cuál es el nombre de tu primera mascota?',
+            '¿En qué ciudad naciste?',
+            '¿Cuál es el nombre de tu escuela primaria?',
+            '¿Cuál es el modelo de tu primer automóvil?',
+            '¿Cuál es el nombre de tu mejor amigo de la infancia?',
+            '¿Cuál es tu película favorita de la infancia?',
+            '¿Cuál es el segundo nombre de tu padre?',
+        ];
+        $stmt = $db->prepare("INSERT INTO secret_questions (question) VALUES (?)");
+        foreach ($questions as $q) {
+            $stmt->execute([$q]);
+        }
+    }
+}
+
+// ============================================================
+// Utility Functions
+// ============================================================
+function sanitize(string $value): string
+{
+    return trim(htmlspecialchars($value, ENT_QUOTES | ENT_HTML5, 'UTF-8'));
+}
+
+function getClientIP(): string
+{
+    $keys = ['HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'REMOTE_ADDR'];
+    foreach ($keys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ip = trim(explode(',', $_SERVER[$key])[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+    return '0.0.0.0';
+}
+
+function getUserAgent(): string
+{
+    return substr($_SERVER['HTTP_USER_AGENT'] ?? 'unknown', 0, 255);
+}
+
+function auditLog(int|null $userId, string $event, string $details = ''): void
+{
+    try {
+        $db = getDB();
+        $stmt = $db->prepare("
+            INSERT INTO audit_log (user_id, event, ip_address, user_agent, details)
+            VALUES (?, ?, ?, ?, ?)
+        ");
+        $stmt->execute([$userId, $event, getClientIP(), getUserAgent(), $details]);
+    } catch (Exception $e) {
+        // Silently fail to avoid breaking the main flow
+        error_log('Audit log error: ' . $e->getMessage());
+    }
+}
+
+function generateToken(): string
+{
+    return bin2hex(random_bytes(32));
+}
+
+function csrfToken(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $token): bool
+{
+    return isset($_SESSION['csrf_token']) &&
+           hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function regenerateCsrf(): void
+{
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+function redirect(string $url): never
+{
+    header('Location: ' . $url);
+    exit;
+}
+
+function normalizeAnswer(string $answer): string
+{
+    // Lowercase, remove extra spaces, remove accents for comparison
+    $answer = mb_strtolower(trim($answer), 'UTF-8');
+    $answer = preg_replace('/\s+/', ' ', $answer);
+    return $answer;
+}
+
+function validatePassword(string $password): array
+{
+    $errors = [];
+    if (strlen($password) < MIN_PASSWORD_LENGTH) {
+        $errors[] = 'La contraseña debe tener al menos ' . MIN_PASSWORD_LENGTH . ' caracteres.';
+    }
+    if (!preg_match('/[A-Z]/', $password)) {
+        $errors[] = 'La contraseña debe contener al menos una letra mayúscula.';
+    }
+    if (!preg_match('/[a-z]/', $password)) {
+        $errors[] = 'La contraseña debe contener al menos una letra minúscula.';
+    }
+    if (!preg_match('/[0-9]/', $password)) {
+        $errors[] = 'La contraseña debe contener al menos un número.';
+    }
+    return $errors;
+}
+
+// ============================================================
+// User Repository
+// ============================================================
+function findUserByEmail(string $email): array|false
+{
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM users WHERE email = ? AND is_active = 1 LIMIT 1");
+    $stmt->execute([$email]);
+    return $stmt->fetch();
+}
+
+function findUserById(int $id): array|false
+{
+    $db = getDB();
+    $stmt = $db->prepare("SELECT * FROM users WHERE id = ? AND is_active = 1 LIMIT 1");
+    $stmt->execute([$id]);
+    return $stmt->fetch();
+}
+
+function getUserSecurity(int $userId): array|false
+{
+    $db = getDB();
+    $stmt = $db->prepare("
+        SELECT us.*, sq.question
+        FROM user_security us
+        JOIN secret_questions sq ON sq.id = us.question_id
+        WHERE us.user_id = ?
+        LIMIT 1
+    ");
+    $stmt->execute([$userId]);
+    return $stmt->fetch();
+}
+
+function getAllQuestions(): array
+{
+    $db = getDB();
+    return $db->query("SELECT * FROM secret_questions ORDER BY id")->fetchAll();
+}
+
+function registerUser(
+    string $username,
+    string $email,
+    string $password,
+    int $questionId,
+    string $answer
+): array {
+    $errors = [];
+
+    if (empty($username) || strlen($username) < 3) {
+        $errors[] = 'El nombre de usuario debe tener al menos 3 caracteres.';
+    }
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        $errors[] = 'El correo electrónico no es válido.';
+    }
+    $passwordErrors = validatePassword($password);
+    if (!empty($passwordErrors)) {
+        $errors = array_merge($errors, $passwordErrors);
+    }
+    if (empty($answer)) {
+        $errors[] = 'La respuesta a la pregunta secreta no puede estar vacía.';
+    }
+
+    if (!empty($errors)) {
+        return ['success' => false, 'errors' => $errors];
+    }
+
+    $db = getDB();
+
+    // Check uniqueness
+    $stmt = $db->prepare("SELECT id FROM users WHERE email = ? OR username = ? LIMIT 1");
+    $stmt->execute([$email, $username]);
+    if ($stmt->fetch()) {
+        return ['success' => false, 'errors' => ['El correo o nombre de usuario ya está registrado.']];
+    }
+
+    // Validate question exists
+    $stmt = $db->prepare("SELECT id FROM secret_questions WHERE id = ? LIMIT 1");
+    $stmt->execute([$questionId]);
+    if (!$stmt->fetch()) {
+        return ['success' => false, 'errors' => ['Pregunta secreta no válida.']];
+    }
+
+    $db->beginTransaction();
+    try {
+        $passwordHash = password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
+        $stmt = $db->prepare("
+            INSERT INTO users (username, email, password_hash)
+            VALUES (?, ?, ?)
+        ");
+        $stmt->execute([$username, $email, $passwordHash]);
+        $userId = (int) $db->lastInsertId();
+
+        $answerHash = password_hash(normalizeAnswer($answer), PASSWORD_BCRYPT, ['cost' => 12]);
+        $stmt = $db->prepare("
+            INSERT INTO user_security (user_id, question_id, answer_hash)
+            VALUES (?, ?, ?)
+        ");
+        $stmt->execute([$userId, $questionId, $answerHash]);
+
+        $db->commit();
+        auditLog($userId, 'REGISTER', 'User registered successfully');
+        return ['success' => true, 'user_id' => $userId];
+    } catch (Exception $e) {
+        $db->rollBack();
+        error_log('Registration error: ' . $e->getMessage());
+        return ['success' => false, 'errors' => ['Error interno. Intenta de nuevo.']];
+    }
+}
+
+// ============================================================
+// Recovery Flow Functions
+// ============================================================
+function isAccountLocked(array $security): bool
+{
+    if ($security['locked_until'] === null) {
+        return false;
+    }
+    return new DateTime() < new DateTime($security['locked_until']);
+}
+
+function getLockoutRemainingMinutes(array $security): int
+{
+    if ($security['locked_until'] === null) {
+        return 0;
+    }
+    $now     = new DateTime();
+    $lockout = new DateTime($security['locked_until']);
+    if ($now >= $lockout) {
+        return 0;
+    }
+    return (int) ceil(($lockout->getTimestamp() - $now->getTimestamp()) / 60);
+}
+
+function incrementAttempt(int $userId): void
+{
+    $db = getDB();
+    $stmt = $db->prepare("
+        UPDATE user_security
+        SET attempt_count = attempt_count + 1,
+            locked_until  = CASE
+                WHEN attempt_count + 1 >= ? THEN DATE_ADD(NOW(), INTERVAL ? MINUTE)
+                ELSE locked_until
+            END
+        WHERE user_id = ?
+    ");
+    $stmt->execute([MAX_ATTEMPTS, LOCKOUT_MINUTES, $userId]);
+}
+
+function resetAttempts(int $userId): void
+{
+    $db = getDB();
+    $stmt = $db->prepare("
+        UPDATE user_security
+        SET attempt_count = 0, locked_until = NULL
+        WHERE user_id = ?
+    ");
+    $stmt->execute([$userId]);
+}
+
+function createRecoveryToken(int $userId): string
+{
+    $db    = getDB();
+    $token = generateToken();
+    $hash  = hash('sha256', $token);
+
+    // Invalidate previous tokens
+    $stmt = $db->prepare("UPDATE recovery_tokens SET used = 1 WHERE user_id = ? AND used = 0");
+    $stmt->execute([$userId]);
+
+    $expiresAt = (new DateTime())->modify('+' . TOKEN_EXPIRY_MINUTES . ' minutes')->format('Y-m-d H:i:s');
+    $stmt = $db->prepare("
+        INSERT INTO recovery_tokens (user_id, token_hash, expires_at)
+        VALUES (?, ?, ?)
+    ");
+    $stmt->execute([$userId, $hash, $expiresAt]);
+
+    return $token;
+}
+
+function validateRecoveryToken(string $token): array|false
+{
+    $db   = getDB();
+    $hash = hash('sha256', $token);
+    $stmt = $db->prepare("
+        SELECT rt.*, u.email, u.username
+        FROM recovery_tokens rt
+        JOIN users u ON u.id = rt.user_id
+        WHERE rt.token_hash = ?
+          AND rt.used = 0
+          AND rt.expires_at > NOW()
+        LIMIT 1
+    ");
+    $stmt->execute([$hash]);
+    return $stmt->fetch();
+}
+
+function consumeToken(int $tokenId): void
+{
+    $db   = getDB();
+    $stmt = $db->prepare("UPDATE recovery_tokens SET used = 1 WHERE id = ?");
+    $stmt->execute([$tokenId]);
+}
+
+function updatePassword(int $userId, string $newPassword): bool
+{
+    $db   = getDB();
+    $hash = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+    $stmt = $db->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
+    $stmt->execute([$hash, $userId]);
+    return $stmt->rowCount() > 0;
+}
+
+// ============================================================
+// HTML Helpers
+// ============================================================
+function renderLayout(string $title, string $content): string
+{
+    $csrfToken = csrfToken();
+    return <<<HTML
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{$title} — Recuperación de Cuenta</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .card {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 40px;
+            width: 100%;
+            max-width: 480px;
+        }
+        .card-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .card-header .icon {
+            font-size: 48px;
+            margin-bottom: 10px;
+        }
+        .card-header h1 {
+            font-size: 24px;
+            color: #333;
+            margin-bottom: 6px;
+        }
+        .card-header p {
+            color: #666;
+            font-size: 14px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 600;
+            color: #444;
+            margin-bottom: 6px;
+        }
+        input[type="text"],
+        input[type="email"],
+        input[type="password"],
+        select {
+            width: 100%;
+            padding: 12px 14px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 15px;
+            transition: border-color 0.2s;
+            outline: none;
+            color: #333;
+        }
+        input:focus, select:focus {
+            border-color: #667eea;
+        }
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 13px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-secondary {
+            background: #f0f0f0;
+            color: #555;
+            margin-top: 10px;
+        }
+        .btn-secondary:hover { background: #e0e0e0; }
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
+        .alert-error   { background: #fdecea; color: #c62828; border-left: 4px solid #c62828; }
+        .alert-success { background: #e8f5e9; color: #2e7d32; border-left: 4px solid #2e7d32; }
+        .alert-warning { background: #fff8e1; color: #f57f17; border-left: 4px solid #f57f17; }
+        .alert-info    { background: #e3f2fd; color: #1565c0; border-left: 4px solid #1565c0; }
+        .alert ul { margin-left: 18px; }
+        .steps {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            position: relative;
+        }
+        .steps::before {
+            content: '';
+            position: absolute;
+            top: 16px;
+            left: 10%;
+            right: 10%;
+            height: 2px;
+            background: #e0e0e0;
+            z-index: 0;
+        }
+        .step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 1;
+            flex: 1;
+        }
+        .step-circle {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #e0e0e0;
+            color: #999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 13px;
+            margin-bottom: 6px;
+        }
+        .step.active .step-circle   { background: #667eea; color: #fff; }
+        .step.done .step-circle     { background: #43a047; color: #fff; }
+        .step-label {
+            font-size: 11px;
+            color: #999;
+            text-align: center;
+        }
+        .step.active .step-label { color: #667eea; font-weight: 600; }
+        .step.done .step-label   { color: #43a047; }
+        .divider {
+            text-align: center;
+            margin: 20px 0;
+            color: #aaa;
+            font-size: 13px;
+        }
+        a { color: #667eea; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .hint { font-size: 12px; color: #888; margin-top: 4px; }
+        .password-strength { margin-top: 6px; }
+        .strength-bar {
+            height: 4px;
+            border-radius: 2px;
+            background: #e0e0e0;
+            margin-bottom: 4px;
+        }
+        .strength-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s, background 0.3s;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        {$content}
+    </div>
+    <script>
+        // Password strength indicator
+        const pwdInput = document.getElementById('new_password');
+        if (pwdInput) {
+            pwdInput.addEventListener('input', function() {
+                const val = this.value;
+                let score = 0;
+                if (val.length >= 8)  score++;
+                if (/[A-Z]/.test(val)) score++;
+                if (/[a-z]/.test(val)) score++;
+                if (/[0-9]/.test(val)) score++;
+                if (/[^A-Za-z0-9]/.test(val)) score++;
+                const fill = document.getElementById('strength-fill');
+                const text = document.getElementById('strength-text');
+                if (!fill) return;
+                const pct    = (score / 5) * 100;
+                const colors = ['#e53935','#fb8c00','#fdd835','#43a047','#1b5e20'];
+                const labels = ['Muy débil','Débil','Regular','Fuerte','Muy fuerte'];
+                fill.style.width      = pct + '%';
+                fill.style.background = colors[score - 1] || '#e0e0e0';
+                text.textContent      = score > 0 ? labels[score - 1] : '';
+            });
+        }
+    </script>
+</body>
+</html>
+HTML;
+}
+
+function renderSteps(int $current): string
+{
+    $steps = [
+        1 => 'Identificar',
+        2 => 'Verificar',
+        3 => 'Restablecer',
+    ];
+    $html = '<div class="steps">';
+    foreach ($steps as $num => $label) {
+        $class = '';
+        if ($num < $current) {
+            $class = 'done';
+        } elseif ($num === $current) {
+            $class = 'active';
+        }
+        $icon = $num < $current ? '✓' : $num;
+        $html .= <<<HTML
+            <div class="step {$class}">
+                <div class="step-circle">{$icon}</div>
+                <div class="step-label">{$label}</div>
+            </div>
+        HTML;
+    }
+    $html .= '</div>';
+    return $html;
+}
+
+function renderAlerts(array $errors = [], string $success = '', string $warning = '', string $info = ''): string
+{
+    $html = '';
+    if (!empty($errors)) {
+        $items = implode('', array_map(fn($e) => "<li>{$e}</li>", $errors));
+        $html .= "<div class='alert alert-error'><ul>{$items}</ul></div>";
+    }
+    if ($success) {
+        $html .= "<div class='alert alert-success'>{$success}</div>";
+    }
+    if ($warning) {
+        $html .= "<div class='alert alert-warning'>{$warning}</div>";
+    }
+    if ($info) {
+        $html .= "<div class='alert alert-info'>{$info}</div>";
+    }
+    return $html;
+}
+
+// ============================================================
+// Page Renderers
+// ============================================================
+function pageRegister(array $errors = [], array $old = []): string
+{
+    $questions = getAllQuestions();
+    $opts      = '';
+    foreach ($questions as $q) {
+        $sel   = (isset($old['question_id']) && (int)$old['question_id'] === $q['id']) ? 'selected' : '';
+        $opts .= "<option value='{$q['id']}' {$sel}>" . htmlspecialchars($q['question']) . "</option>";
+    }
+    $csrf    = csrfToken();
+    $alerts  = renderAlerts($errors);
+    $uname   = htmlspecialchars($old['username'] ?? '');
+    $email   = htmlspecialchars($old['email'] ?? '');
+
+    $content = <<<HTML
+        <div class="card-header">
+            <div class="icon">👤</div>
+            <h1>Crear Cuenta</h1>
+            <p>Regístrate y configura tu pregunta de seguridad</p>
+        </div>
+        {$alerts}
+        <form method="POST" action="?action=register" novalidate>
+            <input type="hidden" name="csrf_token" value="{$csrf}">
+            <div class="form-group">
+                <label for="username">Nombre de usuario</label>
+                <input type="text" id="username" name="username" value="{$uname}" required autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label for="email">Correo electrónico</label>
+                <input type="email" id="email" name="email" value="{$email}" required autocomplete="email">
+            </div>
+            <div class="form-group">
+                <label for="password">Contraseña</label>
+                <input type="password" id="new_password" name="password" required autocomplete="new-password">
+                <div class="password-strength">
+                    <div class="strength-bar"><div class="strength-fill" id="strength-fill" style="width:0"></div></div>
+                    <span class="hint" id="strength-text"></span>
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="question_id">Pregunta secreta</label>
+                <select id="question_id" name="question_id" required>
+                    <option value="">— Selecciona una pregunta —</option>
+                    {$opts}
+                </select>
+            </div>
+            <div class="form-group">
+                <label for="answer">Respuesta secreta</label>
+                <input type="text" id="answer" name="answer" required autocomplete="off">
+                <p class="hint">La respuesta no distingue mayúsculas/minúsculas.</p>
+            </div>
+            <button type="submit" class="btn">Registrarse</button>
+        </form>
+        <div class="divider">¿Ya tienes cuenta?</div>
+        <a href="?action=recover" style="display:block;text-align:center;">Recuperar contraseña</a>
+    HTML;
+
+    return renderLayout('Registro', $content);
+}
+
+function pageRecoverStep1(array $errors = [], string $info = ''): string
+{
+    $csrf    = csrfToken();
+    $alerts  = renderAlerts($errors, '', '', $info);
+    $steps   = renderSteps(1);
+
+    $content = <<<HTML
+        <div class="card-header">
+            <div class="icon">🔑</div>
+            <h1>Recuperar Contraseña</h1>
+            <p>Ingresa tu correo para comenzar</p>
+        </div>
+        {$steps}
+        {$alerts}
+        <form method="POST" action="?action=recover_step1" novalidate>
+            <input type="hidden" name="csrf_token" value="{$csrf}">
+            <div class="form-group">
+                <label for="email">Correo electrónico</label>
+                <input type="email" id="email" name="email" required autocomplete="email" placeholder="tu@correo.com">
+            </div>
+            <button type="submit" class="btn">Continuar</button>
+        </form>
+        <div class="divider">¿Recuerdas tu contraseña?</div>
+        <a href="?action=register" style="display:block;text-align:center;">Volver al registro</a>
+    HTML;
+
+    return renderLayout('Paso 1 — Identificar', $content);
+}
+
+function pageRecoverStep2(int $userId, string $question, array $errors = [], string $warning = ''): string
+{
+    $csrf    = csrfToken();
+    $alerts  = renderAlerts($errors, '', $warning);
+    $steps   = renderSteps(2);
+    $qEsc    = htmlspecialchars($question);
+
+    $content = <<<HTML
+        <div class="card-header">
+            <div class="icon">🛡️</div>
+            <h1>Verificar Identidad</h1>
+            <p>Responde tu pregunta de seguridad</p>
+        </div>
+        {$steps}
+        {$alerts}
+        <form method="POST" action="?action=recover_step2" novalidate>
+            <input type="hidden" name="csrf_token" value="{$csrf}">
+            <input type="hidden" name="user_id" value="{$userId}">
+            <div class="form-group">
+                <label>Pregunta de seguridad</label>
+                <p style="padding:12px 14px;background:#f5f5f5;border-radius:8px;font-size:15px;color:#333;">{$qEsc}</p>
+            </div>
+            <div class="form-group">
+                <label for="answer">Tu respuesta</label>
+                <input type="text" id="answer" name="answer" required autocomplete="off" placeholder="Escribe tu respuesta">
+            </div>
+            <button type="submit" class="btn">Verificar</button>
+        </form>
+        <div class="divider"></div>
+        <a href="?action=recover" style

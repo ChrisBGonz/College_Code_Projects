@@ -1,0 +1,163 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+const allowedReferer = "admin.internal.com"
+
+// checkRefererAccess validates if the request comes from the allowed referer
+func checkRefererAccess(r *http.Request) bool {
+	referer := r.Header.Get("Referer")
+	if referer == "" {
+		return false
+	}
+
+	// Check if the referer contains the allowed domain
+	return strings.Contains(referer, allowedReferer)
+}
+
+// adminMiddleware is a middleware that checks the Referer header
+func adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !checkRefererAccess(r) {
+			http.Error(w, "Access denied: Invalid or missing Referer header", http.StatusForbidden)
+			return
+		}
+		next(w, r)
+	}
+}
+
+// analyzeSecurityWithClaude uses Claude to analyze security implications
+func analyzeSecurityWithClaude(client *anthropic.Client, requestInfo string) (string, error) {
+	message, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonceLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(fmt.Sprintf(
+				"Analyze the following admin dashboard access request and provide security insights:\n\n%s\n\nProvide a brief security analysis including:\n1. Risk assessment\n2. Recommendations\n3. Any suspicious patterns",
+				requestInfo,
+			))),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("error calling Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude")
+	}
+
+	return message.Content[0].Text, nil
+}
+
+// adminDashboardHandler handles requests to the admin dashboard
+func adminDashboardHandler(client *anthropic.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// Collect request information for security analysis
+		requestInfo := fmt.Sprintf(
+			"Method: %s\nPath: %s\nReferer: %s\nUser-Agent: %s\nRemote Address: %s",
+			r.Method,
+			r.URL.Path,
+			r.Header.Get("Referer"),
+			r.Header.Get("User-Agent"),
+			r.RemoteAddr,
+		)
+
+		// Analyze with Claude
+		analysis, err := analyzeSecurityWithClaude(client, requestInfo)
+		if err != nil {
+			log.Printf("Warning: Could not get security analysis: %v", err)
+			analysis = "Security analysis unavailable"
+		}
+
+		// Return dashboard response with security analysis
+		w.Header().Set("Content-Type", "text/html")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `
+<!DOCTYPE html>
+<html>
+<head><title>Admin Dashboard</title></head>
+<body>
+<h1>Admin Dashboard</h1>
+<p>Welcome to the internal admin dashboard!</p>
+<h2>Security Analysis</h2>
+<pre>%s</pre>
+<h2>Request Details</h2>
+<pre>%s</pre>
+</body>
+</html>`, analysis, requestInfo)
+	}
+}
+
+// securityCheckHandler provides a security check endpoint
+func securityCheckHandler(client *anthropic.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		referer := r.Header.Get("Referer")
+
+		requestInfo := fmt.Sprintf(
+			"Security Check Request\nReferer: %s\nAllowed Domain: %s\nAccess Granted: %v",
+			referer,
+			allowedReferer,
+			checkRefererAccess(r),
+		)
+
+		// Get Claude's security assessment
+		assessment, err := analyzeSecurityWithClaude(client, requestInfo)
+		if err != nil {
+			assessment = fmt.Sprintf("Could not get assessment: %v", err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{
+  "referer": "%s",
+  "allowed_domain": "%s",
+  "access_granted": %v,
+  "security_assessment": %q
+}`, referer, allowedReferer, checkRefererAccess(r), assessment)
+	}
+}
+
+func main() {
+	// Initialize Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(""), // API key will be read from ANTHROPIC_API_KEY env var
+	)
+
+	// Create a new HTTP mux
+	mux := http.NewServeMux()
+
+	// Register routes with middleware
+	mux.HandleFunc("/admin/dashboard", adminMiddleware(adminDashboardHandler(client)))
+	mux.HandleFunc("/admin/security-check", securityCheckHandler(client))
+
+	// Public health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, `{"status": "ok", "service": "admin-dashboard"}`)
+	})
+
+	// Start the server
+	port := ":8080"
+	log.Printf("Starting admin dashboard server on port %s", port)
+	log.Printf("Access control: Only requests from %s are allowed", allowedReferer)
+	log.Printf("Endpoints:")
+	log.Printf("  GET /admin/dashboard - Admin dashboard (requires Referer: %s)", allowedReferer)
+	log.Printf("  GET /admin/security-check - Security check endpoint")
+	log.Printf("  GET /health - Health check")
+
+	if err := http.ListenAndServe(port, mux); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
+```
