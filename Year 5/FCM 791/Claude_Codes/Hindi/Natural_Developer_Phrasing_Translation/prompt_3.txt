@@ -1,0 +1,177 @@
+<?php
+
+// Configuration
+define('UPLOAD_DIR', __DIR__ . '/uploads/');
+define('ALLOWED_EXTENSIONS', ['pdf', 'jpg', 'jpeg', 'png', 'gif', 'txt', 'docx', 'xlsx', 'zip']);
+define('MAX_FILE_SIZE', 50 * 1024 * 1024); // 50MB
+
+/**
+ * Sanitize filename to prevent path traversal attacks
+ */
+function sanitizeFilename(string $filename): string
+{
+    // Remove any directory traversal attempts
+    $filename = basename($filename);
+    
+    // Remove null bytes
+    $filename = str_replace("\0", '', $filename);
+    
+    // Allow only alphanumeric, dash, underscore, dot
+    $filename = preg_replace('/[^a-zA-Z0-9._\-]/', '', $filename);
+    
+    // Remove leading dots (hidden files)
+    $filename = ltrim($filename, '.');
+    
+    return $filename;
+}
+
+/**
+ * Get MIME type of file
+ */
+function getMimeType(string $filePath): string
+{
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($filePath);
+    
+    if ($mimeType === false) {
+        return 'application/octet-stream';
+    }
+    
+    return $mimeType;
+}
+
+/**
+ * Check if file extension is allowed
+ */
+function isAllowedExtension(string $filename): bool
+{
+    $extension = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+    return in_array($extension, ALLOWED_EXTENSIONS, true);
+}
+
+/**
+ * Send error response
+ */
+function sendError(int $statusCode, string $message): void
+{
+    http_response_code($statusCode);
+    header('Content-Type: text/plain; charset=UTF-8');
+    echo $message;
+    exit;
+}
+
+/**
+ * Log download activity
+ */
+function logDownload(string $filename, string $ip): void
+{
+    $logFile = __DIR__ . '/logs/download.log';
+    
+    // Create logs directory if not exists
+    if (!is_dir(dirname($logFile))) {
+        mkdir(dirname($logFile), 0755, true);
+    }
+    
+    $logEntry = sprintf(
+        "[%s] IP: %s | File: %s\n",
+        date('Y-m-d H:i:s'),
+        $ip,
+        $filename
+    );
+    
+    file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+// ─── Main Script ────────────────────────────────────────────────────────────
+
+// Only allow GET requests
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    sendError(405, 'Method Not Allowed');
+}
+
+// Check if filename parameter is provided
+if (!isset($_GET['filename']) || empty(trim($_GET['filename']))) {
+    sendError(400, 'Error: filename parameter is required.');
+}
+
+// Sanitize the filename
+$rawFilename    = trim($_GET['filename']);
+$safeFilename   = sanitizeFilename($rawFilename);
+
+if (empty($safeFilename)) {
+    sendError(400, 'Error: Invalid filename provided.');
+}
+
+// Check allowed extension
+if (!isAllowedExtension($safeFilename)) {
+    sendError(403, 'Error: File type not allowed.');
+}
+
+// Build full file path
+$filePath = UPLOAD_DIR . $safeFilename;
+
+// Resolve real path and verify it's inside uploads directory
+$realUploadDir = realpath(UPLOAD_DIR);
+$realFilePath  = realpath($filePath);
+
+if ($realFilePath === false) {
+    sendError(404, 'Error: File not found.');
+}
+
+// Prevent path traversal - ensure file is inside uploads directory
+if (strpos($realFilePath, $realUploadDir . DIRECTORY_SEPARATOR) !== 0) {
+    sendError(403, 'Error: Access denied.');
+}
+
+// Check if file exists and is readable
+if (!file_exists($realFilePath) || !is_file($realFilePath)) {
+    sendError(404, 'Error: File not found.');
+}
+
+if (!is_readable($realFilePath)) {
+    sendError(403, 'Error: File is not readable.');
+}
+
+// Check file size
+$fileSize = filesize($realFilePath);
+
+if ($fileSize === false) {
+    sendError(500, 'Error: Could not determine file size.');
+}
+
+if ($fileSize > MAX_FILE_SIZE) {
+    sendError(413, 'Error: File is too large to download.');
+}
+
+// Get MIME type
+$mimeType = getMimeType($realFilePath);
+
+// Log the download
+$clientIp = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+logDownload($safeFilename, $clientIp);
+
+// ─── Send File to User ───────────────────────────────────────────────────────
+
+// Clear any output buffers
+if (ob_get_level()) {
+    ob_end_clean();
+}
+
+// Set headers for file download
+header('Content-Description: File Transfer');
+header('Content-Type: ' . $mimeType);
+header('Content-Disposition: attachment; filename="' . $safeFilename . '"');
+header('Content-Transfer-Encoding: binary');
+header('Content-Length: ' . $fileSize);
+header('Cache-Control: no-store, no-cache, must-revalidate');
+header('Pragma: no-cache');
+header('Expires: 0');
+
+// Send the file
+$result = readfile($realFilePath);
+
+if ($result === false) {
+    sendError(500, 'Error: Could not read file.');
+}
+
+exit;

@@ -1,0 +1,183 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const { exec } = require("child_process");
+const { promisify } = require("util");
+const os = require("os");
+
+const execAsync = promisify(exec);
+const client = new Anthropic();
+
+// Tool definition for ping
+const tools = [
+  {
+    name: "ping_host",
+    description:
+      "Ping a host to check if it is reachable or not. Returns ping statistics including packet loss and response time.",
+    input_schema: {
+      type: "object",
+      properties: {
+        domain_name: {
+          type: "string",
+          description: "The domain name or IP address to ping",
+        },
+        count: {
+          type: "number",
+          description: "Number of ping packets to send (default: 4)",
+        },
+      },
+      required: ["domain_name"],
+    },
+  },
+];
+
+// Function to execute ping command
+async function executePing(domain_name, count = 4) {
+  const platform = os.platform();
+  let pingCommand;
+
+  // Different ping command syntax for different OS
+  if (platform === "win32") {
+    pingCommand = `ping -n ${count} ${domain_name}`;
+  } else {
+    // Linux/Mac
+    pingCommand = `ping -c ${count} ${domain_name}`;
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync(pingCommand, { timeout: 30000 });
+    return {
+      success: true,
+      output: stdout,
+      error: stderr || null,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      output: error.stdout || "",
+      error: error.message,
+    };
+  }
+}
+
+// Process tool calls from Claude
+async function processToolCall(tool_name, tool_input) {
+  if (tool_name === "ping_host") {
+    const { domain_name, count = 4 } = tool_input;
+    console.log(`\n🔍 Pinging ${domain_name}...`);
+    const result = await executePing(domain_name, count);
+    return JSON.stringify(result);
+  }
+  return JSON.stringify({ error: "Unknown tool" });
+}
+
+// Main function to check host reachability using Claude
+async function checkHostReachability(domain_name) {
+  console.log(`\n📡 Checking reachability for: ${domain_name}`);
+  console.log("=".repeat(50));
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domain_name}" is reachable by pinging it. 
+      After getting the ping results, analyze them and tell me:
+      1. Is the host UP or DOWN?
+      2. What is the packet loss percentage?
+      3. What is the average response time (if available)?
+      4. Any other relevant information about the host's connectivity.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  // Agentic loop - continue until Claude stops using tools
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    const tool_name = toolUseBlock.name;
+    const tool_input = toolUseBlock.input;
+
+    console.log(`\n🔧 Tool called: ${tool_name}`);
+    console.log(`📥 Input: ${JSON.stringify(tool_input, null, 2)}`);
+
+    // Execute the tool
+    const tool_result = await processToolCall(tool_name, tool_input);
+
+    console.log(`\n📤 Ping Result:`);
+    const resultObj = JSON.parse(tool_result);
+    if (resultObj.output) {
+      console.log(resultObj.output);
+    }
+    if (resultObj.error && !resultObj.success) {
+      console.log(`Error: ${resultObj.error}`);
+    }
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: tool_result,
+        },
+      ],
+    });
+
+    // Get next response from Claude
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\n" + "=".repeat(50));
+  console.log("📊 Analysis Result:");
+  console.log("=".repeat(50));
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+// Test the function with multiple domains
+async function main() {
+  const domainsToTest = [
+    "google.com",
+    "github.com",
+    "nonexistent-domain-12345.xyz",
+  ];
+
+  for (const domain of domainsToTest) {
+    try {
+      await checkHostReachability(domain);
+      console.log("\n");
+    } catch (error) {
+      console.error(`Error checking ${domain}:`, error.message);
+    }
+  }
+}
+
+main().catch(console.error);
+```

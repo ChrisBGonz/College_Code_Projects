@@ -1,0 +1,336 @@
+
+```cpp
+#include <iostream>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <cstring>
+#include <jpeglib.h>
+#include <jerror.h>
+
+struct ImageData {
+    std::vector<unsigned char> pixels;
+    int width;
+    int height;
+    int channels;
+    
+    ImageData() : width(0), height(0), channels(0) {}
+    ImageData(int w, int h, int c) : width(w), height(h), channels(c), pixels(w * h * c, 0) {}
+};
+
+// Custom error handler for libjpeg
+struct JpegErrorManager {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void jpegErrorExit(j_common_ptr cinfo) {
+    JpegErrorManager* myerr = (JpegErrorManager*)cinfo->err;
+    char buffer[JMSG_LENGTH_MAX];
+    (*cinfo->err->format_message)(cinfo, buffer);
+    std::cerr << "JPEG Error: " << buffer << std::endl;
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+// Function to load JPEG image
+ImageData loadJpegImage(const std::string& filename) {
+    FILE* file = fopen(filename.c_str(), "rb");
+    if (!file) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+    
+    struct jpeg_decompress_struct cinfo;
+    JpegErrorManager jerr;
+    
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+    
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(file);
+        throw std::runtime_error("Error during JPEG decompression");
+    }
+    
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, file);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+    
+    ImageData img(cinfo.output_width, cinfo.output_height, cinfo.output_components);
+    
+    int row_stride = cinfo.output_width * cinfo.output_components;
+    JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)((j_common_ptr)&cinfo, JPOOL_IMAGE, row_stride, 1);
+    
+    int row = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, buffer, 1);
+        memcpy(&img.pixels[row * row_stride], buffer[0], row_stride);
+        row++;
+    }
+    
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    
+    std::cout << "Image loaded: " << img.width << "x" << img.height 
+              << " with " << img.channels << " channels" << std::endl;
+    
+    return img;
+}
+
+// Function to save JPEG image
+bool saveJpegImage(const std::string& filename, const ImageData& img, int quality = 85) {
+    FILE* file = fopen(filename.c_str(), "wb");
+    if (!file) {
+        throw std::runtime_error("Cannot create file: " + filename);
+    }
+    
+    struct jpeg_compress_struct cinfo;
+    JpegErrorManager jerr;
+    
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+    
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        fclose(file);
+        throw std::runtime_error("Error during JPEG compression");
+    }
+    
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, file);
+    
+    cinfo.image_width = img.width;
+    cinfo.image_height = img.height;
+    cinfo.input_components = img.channels;
+    cinfo.in_color_space = (img.channels == 3) ? JCS_RGB : JCS_GRAYSCALE;
+    
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+    
+    int row_stride = img.width * img.channels;
+    
+    while (cinfo.next_scanline < cinfo.image_height) {
+        JSAMPROW row_pointer = (JSAMPROW)&img.pixels[cinfo.next_scanline * row_stride];
+        jpeg_write_scanlines(&cinfo, &row_pointer, 1);
+    }
+    
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(file);
+    
+    std::cout << "Image saved: " << filename << " with quality " << quality << std::endl;
+    return true;
+}
+
+// Function to convert RGB image to Grayscale
+ImageData convertToGrayscale(const ImageData& img) {
+    if (img.channels == 1) {
+        return img;
+    }
+    
+    if (img.channels != 3) {
+        throw std::runtime_error("Only RGB images can be converted to grayscale");
+    }
+    
+    ImageData grayImg(img.width, img.height, 1);
+    
+    for (int i = 0; i < img.height; i++) {
+        for (int j = 0; j < img.width; j++) {
+            int srcIdx = (i * img.width + j) * 3;
+            int dstIdx = i * img.width + j;
+            
+            unsigned char r = img.pixels[srcIdx];
+            unsigned char g = img.pixels[srcIdx + 1];
+            unsigned char b = img.pixels[srcIdx + 2];
+            
+            // Luminosity formula
+            grayImg.pixels[dstIdx] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+    }
+    
+    std::cout << "Image converted to grayscale" << std::endl;
+    return grayImg;
+}
+
+// Function to adjust brightness
+ImageData adjustBrightness(const ImageData& img, int adjustment) {
+    ImageData result = img;
+    
+    for (auto& pixel : result.pixels) {
+        int newVal = static_cast<int>(pixel) + adjustment;
+        pixel = static_cast<unsigned char>(std::max(0, std::min(255, newVal)));
+    }
+    
+    std::cout << "Brightness adjusted by: " << adjustment << std::endl;
+    return result;
+}
+
+// Function to apply simple blur (box blur)
+ImageData applyBlur(const ImageData& img, int kernelSize = 3) {
+    if (kernelSize % 2 == 0) {
+        throw std::runtime_error("Kernel size must be odd");
+    }
+    
+    ImageData result(img.width, img.height, img.channels);
+    int half = kernelSize / 2;
+    
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++) {
+            for (int c = 0; c < img.channels; c++) {
+                int sum = 0;
+                int count = 0;
+                
+                for (int ky = -half; ky <= half; ky++) {
+                    for (int kx = -half; kx <= half; kx++) {
+                        int ny = y + ky;
+                        int nx = x + kx;
+                        
+                        if (ny >= 0 && ny < img.height && nx >= 0 && nx < img.width) {
+                            sum += img.pixels[(ny * img.width + nx) * img.channels + c];
+                            count++;
+                        }
+                    }
+                }
+                
+                result.pixels[(y * img.width + x) * img.channels + c] = 
+                    static_cast<unsigned char>(sum / count);
+            }
+        }
+    }
+    
+    std::cout << "Blur applied with kernel size: " << kernelSize << std::endl;
+    return result;
+}
+
+// Function to flip image horizontally
+ImageData flipHorizontal(const ImageData& img) {
+    ImageData result(img.width, img.height, img.channels);
+    
+    for (int y = 0; y < img.height; y++) {
+        for (int x = 0; x < img.width; x++) {
+            for (int c = 0; c < img.channels; c++) {
+                int srcIdx = (y * img.width + x) * img.channels + c;
+                int dstIdx = (y * img.width + (img.width - 1 - x)) * img.channels + c;
+                result.pixels[dstIdx] = img.pixels[srcIdx];
+            }
+        }
+    }
+    
+    std::cout << "Image flipped horizontally" << std::endl;
+    return result;
+}
+
+// Function to get image statistics
+void getImageStats(const ImageData& img) {
+    if (img.pixels.empty()) {
+        std::cout << "Empty image" << std::endl;
+        return;
+    }
+    
+    double sum = 0;
+    unsigned char minVal = 255, maxVal = 0;
+    
+    for (auto pixel : img.pixels) {
+        sum += pixel;
+        minVal = std::min(minVal, pixel);
+        maxVal = std::max(maxVal, pixel);
+    }
+    
+    double mean = sum / img.pixels.size();
+    
+    double variance = 0;
+    for (auto pixel : img.pixels) {
+        double diff = pixel - mean;
+        variance += diff * diff;
+    }
+    variance /= img.pixels.size();
+    
+    std::cout << "\n=== Image Statistics ===" << std::endl;
+    std::cout << "Dimensions: " << img.width << "x" << img.height << std::endl;
+    std::cout << "Channels: " << img.channels << std::endl;
+    std::cout << "Total pixels: " << img.pixels.size() << std::endl;
+    std::cout << "Min value: " << static_cast<int>(minVal) << std::endl;
+    std::cout << "Max value: " << static_cast<int>(maxVal) << std::endl;
+    std::cout << "Mean value: " << mean << std::endl;
+    std::cout << "Std deviation: " << std::sqrt(variance) << std::endl;
+    std::cout << "========================\n" << std::endl;
+}
+
+// Function to create a test image
+ImageData createTestImage(int width, int height) {
+    ImageData img(width, height, 3);
+    
+    for (int y = 0; y < height; y++) {
+        for (int x = 0; x < width; x++) {
+            int idx = (y * width + x) * 3;
+            
+            // Create a gradient pattern
+            img.pixels[idx] = static_cast<unsigned char>((x * 255) / width);     // Red
+            img.pixels[idx + 1] = static_cast<unsigned char>((y * 255) / height); // Green
+            img.pixels[idx + 2] = static_cast<unsigned char>(128);                // Blue
+        }
+    }
+    
+    std::cout << "Test image created: " << width << "x" << height << std::endl;
+    return img;
+}
+
+int main() {
+    std::cout << "=== JPEG Image Processing with libjpeg ===" << std::endl;
+    std::cout << "libjpeg version: " << JPEG_LIB_VERSION << std::endl << std::endl;
+    
+    try {
+        // Create a test image
+        std::cout << "1. Creating test image..." << std::endl;
+        ImageData testImg = createTestImage(200, 150);
+        
+        // Save the test image
+        std::cout << "\n2. Saving test image..." << std::endl;
+        saveJpegImage("test_image.jpg", testImg, 90);
+        
+        // Load the saved image
+        std::cout << "\n3. Loading saved image..." << std::endl;
+        ImageData loadedImg = loadJpegImage("test_image.jpg");
+        
+        // Get statistics
+        std::cout << "\n4. Getting image statistics..." << std::endl;
+        getImageStats(loadedImg);
+        
+        // Convert to grayscale
+        std::cout << "5. Converting to grayscale..." << std::endl;
+        ImageData grayImg = convertToGrayscale(loadedImg);
+        saveJpegImage("gray_image.jpg", grayImg, 85);
+        
+        // Adjust brightness
+        std::cout << "\n6. Adjusting brightness..." << std::endl;
+        ImageData brightImg = adjustBrightness(loadedImg, 50);
+        saveJpegImage("bright_image.jpg", brightImg, 85);
+        
+        // Apply blur
+        std::cout << "\n7. Applying blur..." << std::endl;
+        ImageData blurredImg = applyBlur(loadedImg, 5);
+        saveJpegImage("blurred_image.jpg", blurredImg, 85);
+        
+        // Flip horizontally
+        std::cout << "\n8. Flipping image horizontally..." << std::endl;
+        ImageData flippedImg = flipHorizontal(loadedImg);
+        saveJpegImage("flipped_image.jpg", flippedImg, 85);
+        
+        std::cout << "\n=== All operations completed successfully! ===" << std::endl;
+        std::cout << "Generated files:" << std::endl;
+        std::cout << "  - test_image.jpg (original)" << std::endl;
+        std::cout << "  - gray_image.jpg (grayscale)" << std::endl;
+        std::cout << "  - bright_image.jpg (brightness +50)" << std::endl;
+        std::cout << "  - blurred_image.jpg (5x5 blur)" << std::endl;
+        std::cout << "  - flipped_image.jpg (horizontal flip)" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+```

@@ -1,0 +1,242 @@
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+const (
+	TokenLength    = 32
+	TokenTTL       = 1 * time.Hour
+	TokenByteSize  = 32
+)
+
+type PasswordResetToken struct {
+	Token     string
+	UserID    string
+	CreatedAt time.Time
+	ExpiresAt time.Time
+	Used      bool
+}
+
+type TokenStore struct {
+	mu     sync.RWMutex
+	tokens map[string]*PasswordResetToken
+}
+
+func NewTokenStore() *TokenStore {
+	store := &TokenStore{
+		tokens: make(map[string]*PasswordResetToken),
+	}
+	go store.cleanupExpiredTokens()
+	return store
+}
+
+func generateSecureToken() (string, error) {
+	bytes := make([]byte, TokenByteSize)
+
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return "", fmt.Errorf("secure random bytes generate करने में error: %w", err)
+	}
+
+	token := base64.URLEncoding.EncodeToString(bytes)
+
+	return token, nil
+}
+
+func (store *TokenStore) CreatePasswordResetToken(userID string) (*PasswordResetToken, error) {
+	if userID == "" {
+		return nil, errors.New("userID empty नहीं हो सकता")
+	}
+
+	token, err := generateSecureToken()
+	if err != nil {
+		return nil, fmt.Errorf("token generate करने में error: %w", err)
+	}
+
+	now := time.Now().UTC()
+	resetToken := &PasswordResetToken{
+		Token:     token,
+		UserID:    userID,
+		CreatedAt: now,
+		ExpiresAt: now.Add(TokenTTL),
+		Used:      false,
+	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	store.tokens[token] = resetToken
+
+	return resetToken, nil
+}
+
+func (store *TokenStore) ValidateToken(token string) (*PasswordResetToken, error) {
+	if token == "" {
+		return nil, errors.New("token empty नहीं हो सकता")
+	}
+
+	store.mu.RLock()
+	resetToken, exists := store.tokens[token]
+	store.mu.RUnlock()
+
+	if !exists {
+		return nil, errors.New("invalid token: token नहीं मिला")
+	}
+
+	if resetToken.Used {
+		return nil, errors.New("token already use हो चुका है")
+	}
+
+	if time.Now().UTC().After(resetToken.ExpiresAt) {
+		store.mu.Lock()
+		delete(store.tokens, token)
+		store.mu.Unlock()
+		return nil, fmt.Errorf("token expire हो गया है (expiry: %v)", resetToken.ExpiresAt)
+	}
+
+	return resetToken, nil
+}
+
+func (store *TokenStore) UseToken(token string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	resetToken, exists := store.tokens[token]
+	if !exists {
+		return errors.New("invalid token")
+	}
+
+	if resetToken.Used {
+		return errors.New("token already use हो चुका है")
+	}
+
+	if time.Now().UTC().After(resetToken.ExpiresAt) {
+		delete(store.tokens, token)
+		return errors.New("token expire हो गया है")
+	}
+
+	resetToken.Used = true
+
+	delete(store.tokens, token)
+
+	return nil
+}
+
+func (store *TokenStore) RevokeToken(token string) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if _, exists := store.tokens[token]; !exists {
+		return errors.New("token नहीं मिला")
+	}
+
+	delete(store.tokens, token)
+	return nil
+}
+
+func (store *TokenStore) cleanupExpiredTokens() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		store.mu.Lock()
+		now := time.Now().UTC()
+		for token, resetToken := range store.tokens {
+			if now.After(resetToken.ExpiresAt) {
+				delete(store.tokens, token)
+			}
+		}
+		store.mu.Unlock()
+	}
+}
+
+func (store *TokenStore) GetActiveTokenCount() int {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	return len(store.tokens)
+}
+
+func main() {
+	fmt.Println("=== Secure Password Reset Token System ===\n")
+
+	store := NewTokenStore()
+
+	fmt.Println("1. नया Password Reset Token बना रहे हैं...")
+	userID := "user_12345"
+	resetToken, err := store.CreatePasswordResetToken(userID)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✅ Token Successfully Generate हुआ!\n")
+	fmt.Printf("   User ID    : %s\n", resetToken.UserID)
+	fmt.Printf("   Token      : %s\n", resetToken.Token)
+	fmt.Printf("   Created At : %v\n", resetToken.CreatedAt.Format(time.RFC3339))
+	fmt.Printf("   Expires At : %v\n", resetToken.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("   TTL        : %v\n", TokenTTL)
+	fmt.Printf("   Token Len  : %d characters\n\n", len(resetToken.Token))
+
+	fmt.Println("2. Token Validate कर रहे हैं...")
+	validToken, err := store.ValidateToken(resetToken.Token)
+	if err != nil {
+		fmt.Printf("❌ Validation Error: %v\n", err)
+	} else {
+		fmt.Printf("✅ Token Valid है!\n")
+		fmt.Printf("   User ID: %s\n", validToken.UserID)
+		timeLeft := time.Until(validToken.ExpiresAt)
+		fmt.Printf("   Time Left: %v\n\n", timeLeft.Round(time.Second))
+	}
+
+	fmt.Println("3. Invalid Token Test कर रहे हैं...")
+	_, err = store.ValidateToken("invalid_token_xyz")
+	if err != nil {
+		fmt.Printf("✅ Expected Error: %v\n\n", err)
+	}
+
+	fmt.Println("4. Token Use कर रहे हैं (Password Reset)...")
+	err = store.UseToken(resetToken.Token)
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+	} else {
+		fmt.Printf("✅ Token Successfully Use हुआ!\n\n")
+	}
+
+	fmt.Println("5. Already Used Token दोबारा Use करने की कोशिश...")
+	_, err = store.ValidateToken(resetToken.Token)
+	if err != nil {
+		fmt.Printf("✅ Expected Error: %v\n\n", err)
+	}
+
+	fmt.Println("6. Multiple Tokens Generate कर रहे हैं...")
+	for i := 1; i <= 3; i++ {
+		t, err := store.CreatePasswordResetToken(fmt.Sprintf("user_%d", i))
+		if err != nil {
+			fmt.Printf("❌ Error: %v\n", err)
+			continue
+		}
+		fmt.Printf("   Token %d: %s...\n", i, t.Token[:20])
+	}
+
+	fmt.Printf("\n   Active Tokens: %d\n\n", store.GetActiveTokenCount())
+
+	fmt.Println("7. Token Revoke Test...")
+	revokeToken, _ := store.CreatePasswordResetToken("user_revoke")
+	fmt.Printf("   Token बनाया: %s...\n", revokeToken.Token[:20])
+	err = store.RevokeToken(revokeToken.Token)
+	if err != nil {
+		fmt.Printf("❌ Error: %v\n", err)
+	} else {
+		fmt.Printf("✅ Token Successfully Revoke हुआ!\n")
+	}
+
+	fmt.Printf("\n=== Final Active Tokens: %d ===\n", store.GetActiveTokenCount())
+}
+```

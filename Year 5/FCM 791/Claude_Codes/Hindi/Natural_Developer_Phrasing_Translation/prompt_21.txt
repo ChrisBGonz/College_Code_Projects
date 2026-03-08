@@ -1,0 +1,817 @@
+```python
+#!/usr/bin/env python3
+"""
+Complex JWT Authentication & Decoding Handler
+Supports: HS256, RS256, ES256
+Features: Token verify/validate, claims parsing, JWK/JWKS key resolution
+Libraries: PyJWT, cryptography, requests
+"""
+
+import time
+import json
+import base64
+import hashlib
+import logging
+import requests
+from datetime import datetime, timezone
+from typing import Any, Optional, Union
+from dataclasses import dataclass, field
+from functools import lru_cache
+
+import jwt
+from jwt import PyJWKClient, PyJWK
+from jwt.exceptions import (
+    ExpiredSignatureError,
+    InvalidAudienceError,
+    InvalidIssuerError,
+    InvalidSignatureError,
+    DecodeError,
+    InvalidTokenError,
+    ImmatureSignatureError,
+)
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
+from cryptography.hazmat.backends import default_backend
+
+# ─── Logging Setup ────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s → %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("jwt_handler")
+
+
+# ─── Custom Exceptions ────────────────────────────────────────────────────────
+class JWTHandlerError(Exception):
+    """Base exception for JWT Handler"""
+    pass
+
+class TokenExpiredError(JWTHandlerError):
+    """Token has expired"""
+    pass
+
+class TokenNotYetValidError(JWTHandlerError):
+    """Token is not yet valid (nbf claim)"""
+    pass
+
+class InvalidClaimsError(JWTHandlerError):
+    """Invalid claims in token"""
+    pass
+
+class KeyResolutionError(JWTHandlerError):
+    """Failed to resolve signing key"""
+    pass
+
+class UnsupportedAlgorithmError(JWTHandlerError):
+    """Algorithm not supported"""
+    pass
+
+
+# ─── Data Classes ─────────────────────────────────────────────────────────────
+@dataclass
+class JWTConfig:
+    """JWT Verification Configuration"""
+    # Allowed algorithms
+    algorithms: list[str] = field(default_factory=lambda: ["HS256", "RS256", "ES256"])
+    
+    # Claims validation
+    expected_issuer: Optional[str] = None          # iss
+    expected_audience: Optional[Union[str, list]] = None  # aud
+    
+    # Time tolerances (seconds)
+    leeway: int = 10                               # Clock skew tolerance
+    
+    # JWKS settings
+    jwks_uri: Optional[str] = None                 # Remote JWKS endpoint
+    jwks_cache_ttl: int = 3600                     # Cache TTL in seconds
+    
+    # Secret key (for HMAC algorithms)
+    secret_key: Optional[str] = None
+    
+    # Public key (for RSA/EC algorithms)
+    public_key: Optional[str] = None
+    
+    # Options
+    verify_exp: bool = True
+    verify_nbf: bool = True
+    verify_iat: bool = True
+    verify_aud: bool = True
+    verify_iss: bool = True
+    require_claims: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ParsedToken:
+    """Parsed & Validated JWT Token"""
+    header: dict[str, Any]
+    payload: dict[str, Any]
+    raw_token: str
+    algorithm: str
+    key_id: Optional[str] = None
+    
+    # Extracted standard claims
+    subject: Optional[str] = None
+    issuer: Optional[str] = None
+    audience: Optional[Union[str, list]] = None
+    issued_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    not_before: Optional[datetime] = None
+    jwt_id: Optional[str] = None
+    
+    # Custom claims
+    custom_claims: dict[str, Any] = field(default_factory=dict)
+    
+    def __post_init__(self):
+        """Extract standard claims from payload"""
+        p = self.payload
+        
+        self.subject = p.get("sub")
+        self.issuer = p.get("iss")
+        self.audience = p.get("aud")
+        self.jwt_id = p.get("jti")
+        
+        # Convert timestamps to datetime
+        if "iat" in p:
+            self.issued_at = datetime.fromtimestamp(p["iat"], tz=timezone.utc)
+        if "exp" in p:
+            self.expires_at = datetime.fromtimestamp(p["exp"], tz=timezone.utc)
+        if "nbf" in p:
+            self.not_before = datetime.fromtimestamp(p["nbf"], tz=timezone.utc)
+        
+        # Extract custom claims (non-standard)
+        standard_claims = {"sub", "iss", "aud", "iat", "exp", "nbf", "jti"}
+        self.custom_claims = {
+            k: v for k, v in p.items() if k not in standard_claims
+        }
+    
+    def is_expired(self) -> bool:
+        """Check if token is expired"""
+        if self.expires_at is None:
+            return False
+        return datetime.now(tz=timezone.utc) > self.expires_at
+    
+    def time_until_expiry(self) -> Optional[float]:
+        """Seconds until token expires"""
+        if self.expires_at is None:
+            return None
+        delta = self.expires_at - datetime.now(tz=timezone.utc)
+        return delta.total_seconds()
+    
+    def get_claim(self, claim_name: str, default: Any = None) -> Any:
+        """Get any claim by name"""
+        return self.payload.get(claim_name, default)
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary representation"""
+        return {
+            "header": self.header,
+            "payload": self.payload,
+            "algorithm": self.algorithm,
+            "key_id": self.key_id,
+            "subject": self.subject,
+            "issuer": self.issuer,
+            "audience": self.audience,
+            "issued_at": self.issued_at.isoformat() if self.issued_at else None,
+            "expires_at": self.expires_at.isoformat() if self.expires_at else None,
+            "not_before": self.not_before.isoformat() if self.not_before else None,
+            "jwt_id": self.jwt_id,
+            "custom_claims": self.custom_claims,
+            "is_expired": self.is_expired(),
+            "time_until_expiry": self.time_until_expiry(),
+        }
+
+
+# ─── JWKS Cache ───────────────────────────────────────────────────────────────
+class JWKSCache:
+    """Thread-safe JWKS Cache with TTL"""
+    
+    def __init__(self, ttl: int = 3600):
+        self.ttl = ttl
+        self._cache: dict[str, tuple[dict, float]] = {}
+    
+    def get(self, uri: str) -> Optional[dict]:
+        """Get cached JWKS if not expired"""
+        if uri in self._cache:
+            data, timestamp = self._cache[uri]
+            if time.time() - timestamp < self.ttl:
+                logger.debug(f"JWKS cache HIT for: {uri}")
+                return data
+            else:
+                logger.debug(f"JWKS cache EXPIRED for: {uri}")
+                del self._cache[uri]
+        return None
+    
+    def set(self, uri: str, data: dict) -> None:
+        """Cache JWKS data"""
+        self._cache[uri] = (data, time.time())
+        logger.debug(f"JWKS cached for: {uri}")
+    
+    def invalidate(self, uri: str) -> None:
+        """Invalidate cache for URI"""
+        self._cache.pop(uri, None)
+
+
+# ─── Key Resolver ─────────────────────────────────────────────────────────────
+class KeyResolver:
+    """Resolves signing keys from various sources"""
+    
+    def __init__(self, config: JWTConfig):
+        self.config = config
+        self._jwks_cache = JWKSCache(ttl=config.jwks_cache_ttl)
+    
+    def resolve_key(self, token: str, algorithm: str) -> Any:
+        """
+        Resolve the appropriate key for token verification
+        
+        Priority:
+        1. JWKS URI (if configured) - uses kid from header
+        2. Public key (for RS256/ES256)
+        3. Secret key (for HS256)
+        """
+        # Decode header without verification to get kid/alg
+        try:
+            header = jwt.get_unverified_header(token)
+        except DecodeError as e:
+            raise KeyResolutionError(f"Cannot decode token header: {e}")
+        
+        kid = header.get("kid")
+        alg = header.get("alg", algorithm)
+        
+        logger.debug(f"Resolving key for alg={alg}, kid={kid}")
+        
+        # JWKS URI resolution
+        if self.config.jwks_uri:
+            return self._resolve_from_jwks(kid, alg)
+        
+        # Asymmetric algorithms
+        if alg in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512"):
+            if self.config.public_key:
+                return self._load_public_key(self.config.public_key, alg)
+            raise KeyResolutionError(
+                f"No public key or JWKS URI configured for algorithm {alg}"
+            )
+        
+        # HMAC algorithms
+        if alg in ("HS256", "HS384", "HS512"):
+            if self.config.secret_key:
+                return self.config.secret_key
+            raise KeyResolutionError(
+                f"No secret key configured for algorithm {alg}"
+            )
+        
+        raise UnsupportedAlgorithmError(f"Unsupported algorithm: {alg}")
+    
+    def _resolve_from_jwks(self, kid: Optional[str], alg: str) -> Any:
+        """Resolve key from JWKS endpoint"""
+        jwks_data = self._fetch_jwks(self.config.jwks_uri)
+        
+        keys = jwks_data.get("keys", [])
+        if not keys:
+            raise KeyResolutionError("No keys found in JWKS")
+        
+        # Find matching key
+        matching_key = None
+        
+        if kid:
+            # Match by kid
+            for key_data in keys:
+                if key_data.get("kid") == kid:
+                    matching_key = key_data
+                    break
+            
+            if not matching_key:
+                logger.warning(f"kid={kid} not found in JWKS, trying first key")
+        
+        if not matching_key:
+            # Use first key with matching algorithm
+            for key_data in keys:
+                key_alg = key_data.get("alg", "")
+                key_use = key_data.get("use", "sig")
+                if key_use == "sig" and (not key_alg or key_alg == alg):
+                    matching_key = key_data
+                    break
+        
+        if not matching_key:
+            raise KeyResolutionError(
+                f"No suitable key found in JWKS for kid={kid}, alg={alg}"
+            )
+        
+        return self._jwk_to_public_key(matching_key)
+    
+    def _fetch_jwks(self, uri: str) -> dict:
+        """Fetch JWKS from URI with caching"""
+        # Check cache
+        cached = self._jwks_cache.get(uri)
+        if cached:
+            return cached
+        
+        # Fetch from remote
+        try:
+            logger.info(f"Fetching JWKS from: {uri}")
+            response = requests.get(uri, timeout=10)
+            response.raise_for_status()
+            jwks_data = response.json()
+            
+            # Validate structure
+            if "keys" not in jwks_data:
+                raise KeyResolutionError("Invalid JWKS: missing 'keys' field")
+            
+            self._jwks_cache.set(uri, jwks_data)
+            return jwks_data
+            
+        except requests.RequestException as e:
+            raise KeyResolutionError(f"Failed to fetch JWKS from {uri}: {e}")
+        except json.JSONDecodeError as e:
+            raise KeyResolutionError(f"Invalid JSON in JWKS response: {e}")
+    
+    def _jwk_to_public_key(self, jwk_data: dict) -> Any:
+        """Convert JWK to cryptography public key object"""
+        kty = jwk_data.get("kty")
+        
+        if kty == "RSA":
+            return self._rsa_jwk_to_key(jwk_data)
+        elif kty == "EC":
+            return self._ec_jwk_to_key(jwk_data)
+        else:
+            raise KeyResolutionError(f"Unsupported key type: {kty}")
+    
+    def _rsa_jwk_to_key(self, jwk_data: dict) -> Any:
+        """Convert RSA JWK to public key"""
+        try:
+            # Use PyJWT's built-in JWK support
+            jwk = PyJWK(jwk_data)
+            return jwk.key
+        except Exception as e:
+            raise KeyResolutionError(f"Failed to parse RSA JWK: {e}")
+    
+    def _ec_jwk_to_key(self, jwk_data: dict) -> Any:
+        """Convert EC JWK to public key"""
+        try:
+            jwk = PyJWK(jwk_data)
+            return jwk.key
+        except Exception as e:
+            raise KeyResolutionError(f"Failed to parse EC JWK: {e}")
+    
+    def _load_public_key(self, key_data: str, alg: str) -> Any:
+        """Load public key from PEM string"""
+        try:
+            if isinstance(key_data, str):
+                key_bytes = key_data.encode("utf-8")
+            else:
+                key_bytes = key_data
+            
+            public_key = serialization.load_pem_public_key(
+                key_bytes,
+                backend=default_backend()
+            )
+            return public_key
+        except Exception as e:
+            raise KeyResolutionError(f"Failed to load public key: {e}")
+
+
+# ─── JWT Handler (Main Class) ─────────────────────────────────────────────────
+class JWTHandler:
+    """
+    Complete JWT Authentication & Decoding Handler
+    
+    Features:
+    - Token creation (HS256, RS256, ES256)
+    - Token verification & validation
+    - Claims parsing
+    - JWKS key resolution
+    - Detailed error reporting
+    """
+    
+    SUPPORTED_ALGORITHMS = {
+        "HS256", "HS384", "HS512",   # HMAC
+        "RS256", "RS384", "RS512",   # RSA
+        "ES256", "ES384", "ES512",   # ECDSA
+    }
+    
+    def __init__(self, config: JWTConfig):
+        self.config = config
+        self.key_resolver = KeyResolver(config)
+        
+        # Validate config
+        self._validate_config()
+        
+        logger.info(
+            f"JWTHandler initialized | "
+            f"algorithms={config.algorithms} | "
+            f"issuer={config.expected_issuer} | "
+            f"audience={config.expected_audience}"
+        )
+    
+    def _validate_config(self) -> None:
+        """Validate configuration"""
+        for alg in self.config.algorithms:
+            if alg not in self.SUPPORTED_ALGORITHMS:
+                raise UnsupportedAlgorithmError(f"Unsupported algorithm: {alg}")
+        
+        # Check key availability
+        has_hmac = any(a.startswith("HS") for a in self.config.algorithms)
+        has_asymmetric = any(
+            a.startswith(("RS", "ES")) for a in self.config.algorithms
+        )
+        
+        if has_hmac and not self.config.secret_key:
+            logger.warning("HMAC algorithms configured but no secret_key provided")
+        
+        if has_asymmetric and not self.config.public_key and not self.config.jwks_uri:
+            logger.warning(
+                "Asymmetric algorithms configured but no public_key or jwks_uri provided"
+            )
+    
+    # ── Token Creation ─────────────────────────────────────────────────────────
+    def create_token(
+        self,
+        payload: dict[str, Any],
+        algorithm: str = "HS256",
+        private_key: Optional[str] = None,
+        expires_in: int = 3600,
+        headers: Optional[dict] = None,
+    ) -> str:
+        """
+        Create a signed JWT token
+        
+        Args:
+            payload: Claims to include in token
+            algorithm: Signing algorithm
+            private_key: Private key for RS256/ES256 (PEM format)
+            expires_in: Token validity in seconds
+            headers: Additional headers
+        
+        Returns:
+            Signed JWT token string
+        """
+        if algorithm not in self.SUPPORTED_ALGORITHMS:
+            raise UnsupportedAlgorithmError(f"Unsupported algorithm: {algorithm}")
+        
+        now = int(time.time())
+        
+        # Build standard claims
+        token_payload = {
+            "iat": now,
+            "exp": now + expires_in,
+            "nbf": now,
+            **payload,
+        }
+        
+        # Add issuer/audience if configured
+        if self.config.expected_issuer and "iss" not in token_payload:
+            token_payload["iss"] = self.config.expected_issuer
+        
+        if self.config.expected_audience and "aud" not in token_payload:
+            token_payload["aud"] = self.config.expected_audience
+        
+        # Select signing key
+        if algorithm.startswith("HS"):
+            if not self.config.secret_key:
+                raise KeyResolutionError("Secret key required for HMAC algorithms")
+            signing_key = self.config.secret_key
+        else:
+            if not private_key:
+                raise KeyResolutionError(
+                    f"Private key required for {algorithm}"
+                )
+            signing_key = private_key
+        
+        # Create token
+        token = jwt.encode(
+            token_payload,
+            signing_key,
+            algorithm=algorithm,
+            headers=headers or {},
+        )
+        
+        logger.info(
+            f"Token created | alg={algorithm} | "
+            f"sub={token_payload.get('sub')} | "
+            f"exp={datetime.fromtimestamp(token_payload['exp'], tz=timezone.utc).isoformat()}"
+        )
+        
+        return token
+    
+    # ── Token Decoding (Without Verification) ─────────────────────────────────
+    def decode_unverified(self, token: str) -> tuple[dict, dict]:
+        """
+        Decode token WITHOUT verification (for inspection only)
+        
+        Returns:
+            Tuple of (header, payload)
+        
+        ⚠️  WARNING: Do NOT use for authentication!
+        """
+        try:
+            header = jwt.get_unverified_header(token)
+            payload = jwt.decode(
+                token,
+                options={
+                    "verify_signature": False,
+                    "verify_exp": False,
+                    "verify_nbf": False,
+                    "verify_iat": False,
+                    "verify_aud": False,
+                    "verify_iss": False,
+                },
+                algorithms=list(self.SUPPORTED_ALGORITHMS),
+            )
+            logger.warning("Token decoded WITHOUT verification - use only for inspection!")
+            return header, payload
+        except DecodeError as e:
+            raise JWTHandlerError(f"Failed to decode token: {e}")
+    
+    # ── Token Verification & Validation ───────────────────────────────────────
+    def verify_and_decode(self, token: str) -> ParsedToken:
+        """
+        Fully verify and decode a JWT token
+        
+        Validates:
+        - Signature
+        - exp (expiration)
+        - nbf (not before)
+        - iat (issued at)
+        - aud (audience)
+        - iss (issuer)
+        - Required claims
+        
+        Args:
+            token: JWT token string
+        
+        Returns:
+            ParsedToken with all claims
+        
+        Raises:
+            TokenExpiredError: Token has expired
+            TokenNotYetValidError: Token not yet valid
+            InvalidClaimsError: Invalid claims
+            KeyResolutionError: Cannot resolve signing key
+            JWTHandlerError: Other JWT errors
+        """
+        logger.debug(f"Verifying token: {token[:50]}...")
+        
+        # Step 1: Decode header (unverified)
+        try:
+            header = jwt.get_unverified_header(token)
+        except DecodeError as e:
+            raise JWTHandlerError(f"Malformed token header: {e}")
+        
+        algorithm = header.get("alg")
+        kid = header.get("kid")
+        
+        logger.debug(f"Token header: alg={algorithm}, kid={kid}")
+        
+        # Step 2: Validate algorithm
+        if algorithm not in self.config.algorithms:
+            raise UnsupportedAlgorithmError(
+                f"Algorithm '{algorithm}' not in allowed list: {self.config.algorithms}"
+            )
+        
+        # Step 3: Resolve signing key
+        try:
+            signing_key = self.key_resolver.resolve_key(token, algorithm)
+        except KeyResolutionError:
+            raise
+        except Exception as e:
+            raise KeyResolutionError(f"Key resolution failed: {e}")
+        
+        # Step 4: Build decode options
+        decode_options = {
+            "verify_signature": True,
+            "verify_exp": self.config.verify_exp,
+            "verify_nbf": self.config.verify_nbf,
+            "verify_iat": self.config.verify_iat,
+            "verify_aud": self.config.verify_aud and bool(self.config.expected_audience),
+            "verify_iss": self.config.verify_iss and bool(self.config.expected_issuer),
+            "require": self.config.require_claims,
+        }
+        
+        # Step 5: Decode & verify
+        try:
+            payload = jwt.decode(
+                token,
+                signing_key,
+                algorithms=[algorithm],
+                audience=self.config.expected_audience,
+                issuer=self.config.expected_issuer,
+                leeway=self.config.leeway,
+                options=decode_options,
+            )
+            
+        except ExpiredSignatureError as e:
+            logger.warning(f"Token expired: {e}")
+            raise TokenExpiredError(f"Token has expired: {e}")
+        
+        except ImmatureSignatureError as e:
+            logger.warning(f"Token not yet valid: {e}")
+            raise TokenNotYetValidError(f"Token is not yet valid (nbf): {e}")
+        
+        except InvalidAudienceError as e:
+            logger.warning(f"Invalid audience: {e}")
+            raise InvalidClaimsError(f"Invalid audience claim: {e}")
+        
+        except InvalidIssuerError as e:
+            logger.warning(f"Invalid issuer: {e}")
+            raise InvalidClaimsError(f"Invalid issuer claim: {e}")
+        
+        except InvalidSignatureError as e:
+            logger.error(f"Invalid signature: {e}")
+            raise JWTHandlerError(f"Token signature verification failed: {e}")
+        
+        except DecodeError as e:
+            logger.error(f"Token decode error: {e}")
+            raise JWTHandlerError(f"Failed to decode token: {e}")
+        
+        except InvalidTokenError as e:
+            logger.error(f"Invalid token: {e}")
+            raise JWTHandlerError(f"Invalid token: {e}")
+        
+        # Step 6: Additional custom validations
+        self._validate_custom_claims(payload)
+        
+        # Step 7: Build ParsedToken
+        parsed = ParsedToken(
+            header=header,
+            payload=payload,
+            raw_token=token,
+            algorithm=algorithm,
+            key_id=kid,
+        )
+        
+        logger.info(
+            f"Token verified successfully | "
+            f"sub={parsed.subject} | "
+            f"iss={parsed.issuer} | "
+            f"exp={parsed.expires_at}"
+        )
+        
+        return parsed
+    
+    def _validate_custom_claims(self, payload: dict) -> None:
+        """Additional custom claim validations"""
+        # Validate iat is not in the future (with leeway)
+        if "iat" in payload:
+            iat = payload["iat"]
+            now = time.time()
+            if iat > now + self.config.leeway:
+                raise InvalidClaimsError(
+                    f"Token 'iat' is in the future: {iat} > {now}"
+                )
+        
+        # Validate exp > iat
+        if "exp" in payload and "iat" in payload:
+            if payload["exp"] <= payload["iat"]:
+                raise InvalidClaimsError(
+                    "Token 'exp' must be after 'iat'"
+                )
+        
+        # Validate nbf <= exp
+        if "nbf" in payload and "exp" in payload:
+            if payload["nbf"] > payload["exp"]:
+                raise InvalidClaimsError(
+                    "Token 'nbf' must be before 'exp'"
+                )
+    
+    # ── JWKS Verification (using PyJWT's built-in JWKS client) ────────────────
+    def verify_with_jwks_client(self, token: str) -> ParsedToken:
+        """
+        Verify token using PyJWT's built-in JWKS client
+        
+        This is the recommended approach for production JWKS usage.
+        Requires config.jwks_uri to be set.
+        """
+        if not self.config.jwks_uri:
+            raise KeyResolutionError("jwks_uri not configured")
+        
+        try:
+            # PyJWT's JWKS client handles key rotation automatically
+            jwks_client = PyJWKClient(
+                self.config.jwks_uri,
+                cache_keys=True,
+                lifespan=self.config.jwks_cache_ttl,
+            )
+            
+            # Get signing key from JWKS
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            
+            # Decode header for algorithm
+            header = jwt.get_unverified_header(token)
+            algorithm = header.get("alg", "RS256")
+            
+            # Build options
+            decode_options = {
+                "verify_exp": self.config.verify_exp,
+                "verify_nbf": self.config.verify_nbf,
+                "verify_iat": self.config.verify_iat,
+                "verify_aud": self.config.verify_aud and bool(self.config.expected_audience),
+                "verify_iss": self.config.verify_iss and bool(self.config.expected_issuer),
+                "require": self.config.require_claims,
+            }
+            
+            payload = jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=self.config.algorithms,
+                audience=self.config.expected_audience,
+                issuer=self.config.expected_issuer,
+                leeway=self.config.leeway,
+                options=decode_options,
+            )
+            
+            self._validate_custom_claims(payload)
+            
+            parsed = ParsedToken(
+                header=header,
+                payload=payload,
+                raw_token=token,
+                algorithm=algorithm,
+                key_id=header.get("kid"),
+            )
+            
+            logger.info(f"Token verified via JWKS client | sub={parsed.subject}")
+            return parsed
+            
+        except ExpiredSignatureError as e:
+            raise TokenExpiredError(f"Token expired: {e}")
+        except ImmatureSignatureError as e:
+            raise TokenNotYetValidError(f"Token not yet valid: {e}")
+        except InvalidAudienceError as e:
+            raise InvalidClaimsError(f"Invalid audience: {e}")
+        except InvalidIssuerError as e:
+            raise InvalidClaimsError(f"Invalid issuer: {e}")
+        except Exception as e:
+            raise JWTHandlerError(f"JWKS verification failed: {e}")
+    
+    # ── Token Introspection ────────────────────────────────────────────────────
+    def introspect(self, token: str) -> dict:
+        """
+        Introspect token - returns detailed info without full verification
+        Useful for debugging
+        """
+        try:
+            header, payload = self.decode_unverified(token)
+        except Exception as e:
+            return {"error": str(e), "valid_format": False}
+        
+        now = time.time()
+        exp = payload.get("exp")
+        nbf = payload.get("nbf")
+        iat = payload.get("iat")
+        
+        return {
+            "valid_format": True,
+            "header": header,
+            "algorithm": header.get("alg"),
+            "key_id": header.get("kid"),
+            "subject": payload.get("sub"),
+            "issuer": payload.get("iss"),
+            "audience": payload.get("aud"),
+            "jwt_id": payload.get("jti"),
+            "issued_at": datetime.fromtimestamp(iat, tz=timezone.utc).isoformat() if iat else None,
+            "expires_at": datetime.fromtimestamp(exp, tz=timezone.utc).isoformat() if exp else None,
+            "not_before": datetime.fromtimestamp(nbf, tz=timezone.utc).isoformat() if nbf else None,
+            "is_expired": exp is not None and now > exp,
+            "is_active": (nbf is None or now >= nbf) and (exp is None or now < exp),
+            "seconds_until_expiry": (exp - now) if exp else None,
+            "all_claims": payload,
+        }
+
+
+# ─── Key Generation Utilities ─────────────────────────────────────────────────
+class KeyGenerator:
+    """Utility class for generating test keys"""
+    
+    @staticmethod
+    def generate_rsa_keypair(key_size: int = 2048) -> tuple[str, str]:
+        """Generate RSA key pair (private_pem, public_pem)"""
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=key_size,
+            backend=default_backend()
+        )
+        
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode("utf-8")
+        
+        public_pem = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        
+        return private_pem, public_pem
+    
+    @staticmethod
+    def generate_ec_keypair(curve: str = "P-256") -> tuple[str, str]:
+        """Generate EC key pair (private_pem, public_pem)"""
+        curve_map = {
+            "P-256": ec.SECP256R1(),
+            "P-384": ec.SECP384R1(),
+            "P-521": ec.SECP521R1(),
+        }
+        
+        if curve not in curve_map:
+            raise ValueError(f"Unsupported curve: {curve}. Use

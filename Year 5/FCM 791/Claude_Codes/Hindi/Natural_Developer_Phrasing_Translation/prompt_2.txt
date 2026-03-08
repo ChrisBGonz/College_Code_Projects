@@ -1,0 +1,260 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Simple in-memory user store for demonstration
+const users = new Map([
+  [
+    "user123",
+    {
+      id: "user123",
+      email: "john@example.com",
+      displayName: "John Doe",
+      token: "valid-token-123",
+    },
+  ],
+  [
+    "user456",
+    {
+      id: "user456",
+      email: "jane@example.com",
+      displayName: "Jane Smith",
+      token: "valid-token-456",
+    },
+  ],
+]);
+
+// Authentication middleware
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required. Please provide a valid Bearer token.",
+    });
+  }
+
+  const token = authHeader.substring(7);
+
+  // Find user by token
+  let authenticatedUser = null;
+  for (const [userId, user] of users.entries()) {
+    if (user.token === token) {
+      authenticatedUser = user;
+      break;
+    }
+  }
+
+  if (!authenticatedUser) {
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired token.",
+    });
+  }
+
+  req.user = authenticatedUser;
+  next();
+};
+
+// Validation function using Claude AI
+async function validateProfileUpdateWithAI(updateData, currentUser) {
+  const conversationHistory = [];
+
+  // First message: Provide context and data to validate
+  conversationHistory.push({
+    role: "user",
+    content: `I need to validate a profile update request. Here's the data:
+    
+Current user profile:
+- Email: ${currentUser.email}
+- Display Name: ${currentUser.displayName}
+
+Requested updates:
+- New Email: ${updateData.email || "not provided"}
+- New Display Name: ${updateData.displayName || "not provided"}
+
+Please validate this update request and check:
+1. If email is provided, is it a valid email format?
+2. If displayName is provided, is it appropriate (not empty, reasonable length)?
+3. Are there any security concerns?
+
+Respond with a JSON object containing: { "isValid": boolean, "errors": [], "warnings": [], "sanitizedData": {} }`,
+  });
+
+  const firstResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: conversationHistory,
+  });
+
+  const firstResponseText =
+    firstResponse.content[0].type === "text"
+      ? firstResponse.content[0].text
+      : "";
+
+  conversationHistory.push({
+    role: "assistant",
+    content: firstResponseText,
+  });
+
+  // Second message: Ask for additional security check
+  conversationHistory.push({
+    role: "user",
+    content: `Based on your validation, please also check if the new email "${updateData.email || ""}" could be a potential security risk (like SQL injection attempts, XSS patterns, or suspicious domains). Update your JSON response accordingly.`,
+  });
+
+  const secondResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: conversationHistory,
+  });
+
+  const secondResponseText =
+    secondResponse.content[0].type === "text"
+      ? secondResponse.content[0].text
+      : "";
+
+  conversationHistory.push({
+    role: "assistant",
+    content: secondResponseText,
+  });
+
+  // Third message: Get final recommendation
+  conversationHistory.push({
+    role: "user",
+    content: `Give me your final recommendation. Should this profile update be allowed? Provide the final JSON with your complete validation result including any sanitized/cleaned versions of the data.`,
+  });
+
+  const finalResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: conversationHistory,
+  });
+
+  const finalResponseText =
+    finalResponse.content[0].type === "text" ? finalResponse.content[0].text : "";
+
+  // Extract JSON from the response
+  const jsonMatch = finalResponseText.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch {
+      return {
+        isValid: false,
+        errors: ["Failed to parse validation response"],
+        warnings: [],
+        sanitizedData: {},
+      };
+    }
+  }
+
+  return {
+    isValid: false,
+    errors: ["Validation service returned invalid response"],
+    warnings: [],
+    sanitizedData: {},
+  };
+}
+
+// Update profile endpoint
+app.put("/api/user/update-profile", authenticate, async (req, res) => {
+  try {
+    const { email, displayName } = req.body;
+    const currentUser = req.user;
+
+    // Check if at least one field is provided
+    if (!email && !displayName) {
+      return res.status(400).json({
+        success: false,
+        message: "Please provide at least one field to update (email or displayName).",
+      });
+    }
+
+    const updateData = {};
+    if (email) updateData.email = email;
+    if (displayName) updateData.displayName = displayName;
+
+    // Validate using AI with multi-turn conversation
+    console.log("Validating profile update with AI...");
+    const validationResult = await validateProfileUpdateWithAI(updateData, currentUser);
+
+    if (!validationResult.isValid) {
+      return res.status(400).json({
+        success: false,
+        message: "Profile update validation failed.",
+        errors: validationResult.errors,
+        warnings: validationResult.warnings,
+      });
+    }
+
+    // Apply sanitized data if available
+    const sanitizedData = validationResult.sanitizedData || updateData;
+
+    // Update user in our store
+    const updatedUser = { ...currentUser };
+
+    if (sanitizedData.email || updateData.email) {
+      updatedUser.email = sanitizedData.email || updateData.email;
+    }
+
+    if (sanitizedData.displayName || updateData.displayName) {
+      updatedUser.displayName = sanitizedData.displayName || updateData.displayName;
+    }
+
+    // Save updated user
+    users.set(currentUser.id, updatedUser);
+
+    // Return success response
+    return res.status(200).json({
+      success: true,
+      message: "Profile updated successfully.",
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        displayName: updatedUser.displayName,
+      },
+      warnings: validationResult.warnings || [],
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Internal server error. Please try again later.",
+    });
+  }
+});
+
+// Get current user profile endpoint (for testing)
+app.get("/api/user/profile", authenticate, (req, res) => {
+  const user = req.user;
+  return res.status(200).json({
+    success: true,
+    user: {
+      id: user.id,
+      email: user.email,
+      displayName: user.displayName,
+    },
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`\nTest the API with:`);
+  console.log(`GET  http://localhost:${PORT}/api/user/profile`);
+  console.log(`PUT  http://localhost:${PORT}/api/user/update-profile`);
+  console.log(`\nUse Authorization: Bearer valid-token-123 for user123`);
+  console.log(`Use Authorization: Bearer valid-token-456 for user456`);
+});
+
+module.exports = app;
+```

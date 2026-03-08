@@ -1,0 +1,869 @@
+```php
+<?php
+
+/**
+ * Credit Card Encryption System
+ * Uses AES-256-GCM with per-record random IV/nonce
+ * Keys stored in environment variables (never hardcoded)
+ */
+
+declare(strict_types=1);
+
+// ============================================================
+// CONFIGURATION & ENVIRONMENT
+// ============================================================
+
+/**
+ * Load environment variables from .env file (for local dev only)
+ * In production, use proper secret manager (AWS Secrets Manager, Vault, etc.)
+ */
+function loadEnvFile(string $path = '.env'): void
+{
+    if (!file_exists($path)) {
+        return;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        if (str_starts_with(trim($line), '#')) {
+            continue;
+        }
+        if (str_contains($line, '=')) {
+            [$key, $value] = explode('=', $line, 2);
+            $key   = trim($key);
+            $value = trim($value, " \t\n\r\0\x0B\"'");
+            if (!array_key_exists($key, $_ENV)) {
+                $_ENV[$key]    = $value;
+                $_SERVER[$key] = $value;
+                putenv("$key=$value");
+            }
+        }
+    }
+}
+
+// ============================================================
+// ENCRYPTION SERVICE
+// ============================================================
+
+class EncryptionService
+{
+    private const CIPHER_ALGO    = 'aes-256-gcm';
+    private const IV_LENGTH      = 12;   // 96-bit nonce for GCM (NIST recommended)
+    private const TAG_LENGTH     = 16;   // 128-bit auth tag
+    private const KEY_LENGTH     = 32;   // 256-bit key
+    private const ENCODING       = 'base64';
+
+    private string $encryptionKey;
+    private string $keyVersion;
+
+    public function __construct()
+    {
+        $this->encryptionKey = $this->loadEncryptionKey();
+        $this->keyVersion    = $this->loadKeyVersion();
+    }
+
+    /**
+     * Load encryption key from environment/secret manager
+     * Key must be 32 bytes (256-bit), base64-encoded in env
+     */
+    private function loadEncryptionKey(): string
+    {
+        // In production: fetch from AWS Secrets Manager, HashiCorp Vault, etc.
+        // Example AWS: $key = $this->fetchFromAWSSecretsManager('prod/cc-encryption-key');
+
+        $encodedKey = getenv('CC_ENCRYPTION_KEY');
+
+        if (empty($encodedKey)) {
+            throw new RuntimeException(
+                'CC_ENCRYPTION_KEY environment variable is not set. ' .
+                'Set it via secret manager or environment configuration.'
+            );
+        }
+
+        $key = base64_decode($encodedKey, strict: true);
+
+        if ($key === false || strlen($key) !== self::KEY_LENGTH) {
+            throw new RuntimeException(
+                'CC_ENCRYPTION_KEY must be a valid base64-encoded 256-bit (32-byte) key.'
+            );
+        }
+
+        return $key;
+    }
+
+    private function loadKeyVersion(): string
+    {
+        $version = getenv('CC_ENCRYPTION_KEY_VERSION');
+        return !empty($version) ? $version : 'v1';
+    }
+
+    /**
+     * Encrypt credit card number using AES-256-GCM
+     * Returns structured payload: version:iv:tag:ciphertext (all base64)
+     */
+    public function encrypt(string $plaintext): string
+    {
+        if (empty(trim($plaintext))) {
+            throw new InvalidArgumentException('Plaintext cannot be empty.');
+        }
+
+        // Generate cryptographically secure random IV (nonce)
+        $iv = random_bytes(self::IV_LENGTH);
+
+        // Additional Authenticated Data (AAD) - binds ciphertext to context
+        $aad = $this->buildAAD();
+
+        // Encrypt with AES-256-GCM
+        $tag        = '';
+        $ciphertext = openssl_encrypt(
+            data:       $plaintext,
+            cipher_algo: self::CIPHER_ALGO,
+            passphrase:  $this->encryptionKey,
+            options:     OPENSSL_RAW_DATA,
+            iv:          $iv,
+            tag:         $tag,
+            aad:         $aad,
+            tag_length:  self::TAG_LENGTH
+        );
+
+        if ($ciphertext === false) {
+            throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+        }
+
+        // Verify tag was generated
+        if (strlen($tag) !== self::TAG_LENGTH) {
+            throw new RuntimeException('Authentication tag generation failed.');
+        }
+
+        // Pack: keyVersion:iv:tag:ciphertext (all base64-encoded)
+        return implode(':', [
+            $this->keyVersion,
+            base64_encode($iv),
+            base64_encode($tag),
+            base64_encode($ciphertext),
+        ]);
+    }
+
+    /**
+     * Decrypt credit card number - ONLY for authorized read paths
+     * Verifies authentication tag before returning plaintext
+     */
+    public function decrypt(string $encryptedPayload): string
+    {
+        $parts = explode(':', $encryptedPayload, 4);
+
+        if (count($parts) !== 4) {
+            throw new InvalidArgumentException('Invalid encrypted payload format.');
+        }
+
+        [$keyVersion, $encodedIv, $encodedTag, $encodedCiphertext] = $parts;
+
+        // Decode components
+        $iv         = base64_decode($encodedIv,         strict: true);
+        $tag        = base64_decode($encodedTag,        strict: true);
+        $ciphertext = base64_decode($encodedCiphertext, strict: true);
+
+        if ($iv === false || $tag === false || $ciphertext === false) {
+            throw new InvalidArgumentException('Corrupted encrypted payload: invalid base64.');
+        }
+
+        // Validate lengths
+        if (strlen($iv) !== self::IV_LENGTH) {
+            throw new InvalidArgumentException('Invalid IV length in payload.');
+        }
+
+        if (strlen($tag) !== self::TAG_LENGTH) {
+            throw new InvalidArgumentException('Invalid authentication tag length.');
+        }
+
+        // Handle key versioning (for key rotation support)
+        $decryptionKey = $this->getKeyForVersion($keyVersion);
+
+        // Additional Authenticated Data must match encryption context
+        $aad = $this->buildAAD();
+
+        // Decrypt - GCM automatically verifies auth tag
+        $plaintext = openssl_decrypt(
+            data:        $ciphertext,
+            cipher_algo: self::CIPHER_ALGO,
+            passphrase:  $decryptionKey,
+            options:     OPENSSL_RAW_DATA,
+            iv:          $iv,
+            tag:         $tag,
+            aad:         $aad
+        );
+
+        if ($plaintext === false) {
+            // Auth tag verification failed - data tampered or wrong key
+            throw new RuntimeException(
+                'Decryption failed: authentication tag verification failed. ' .
+                'Data may be corrupted or tampered.'
+            );
+        }
+
+        return $plaintext;
+    }
+
+    /**
+     * Build Additional Authenticated Data (AAD)
+     * Binds ciphertext to application context
+     */
+    private function buildAAD(): string
+    {
+        return hash('sha256', 'credit_card_encryption_v1_' . ($this->keyVersion), binary: true);
+    }
+
+    /**
+     * Support key versioning for rotation
+     * In production: fetch old keys from secret manager by version
+     */
+    private function getKeyForVersion(string $version): string
+    {
+        if ($version === $this->keyVersion) {
+            return $this->encryptionKey;
+        }
+
+        // For old key versions during rotation period
+        $oldKeyEnvVar = 'CC_ENCRYPTION_KEY_' . strtoupper($version);
+        $encodedOldKey = getenv($oldKeyEnvVar);
+
+        if (empty($encodedOldKey)) {
+            throw new RuntimeException(
+                "Encryption key for version '$version' not found. " .
+                "Set $oldKeyEnvVar environment variable."
+            );
+        }
+
+        $oldKey = base64_decode($encodedOldKey, strict: true);
+
+        if ($oldKey === false || strlen($oldKey) !== self::KEY_LENGTH) {
+            throw new RuntimeException("Invalid key for version '$version'.");
+        }
+
+        return $oldKey;
+    }
+
+    /**
+     * Generate a new secure encryption key (for initial setup)
+     * Run once: php -r "require 'script.php'; echo EncryptionService::generateKey();"
+     */
+    public static function generateKey(): string
+    {
+        return base64_encode(random_bytes(32));
+    }
+
+    /**
+     * Get masked version of card number for display/logging
+     * Never log or display full card numbers
+     */
+    public static function maskCardNumber(string $cardNumber): string
+    {
+        $cleaned = preg_replace('/\D/', '', $cardNumber);
+        $length  = strlen($cleaned);
+
+        if ($length < 4) {
+            return str_repeat('*', $length);
+        }
+
+        return str_repeat('*', $length - 4) . substr($cleaned, -4);
+    }
+}
+
+// ============================================================
+// DATABASE CONNECTION
+// ============================================================
+
+class DatabaseConnection
+{
+    private static ?PDO $instance = null;
+
+    public static function getInstance(): PDO
+    {
+        if (self::$instance === null) {
+            self::$instance = self::createConnection();
+        }
+        return self::$instance;
+    }
+
+    private static function createConnection(): PDO
+    {
+        $host     = getenv('DB_HOST')     ?: 'localhost';
+        $port     = getenv('DB_PORT')     ?: '3306';
+        $dbname   = getenv('DB_NAME')     ?: 'payment_db';
+        $username = getenv('DB_USERNAME') ?: '';
+        $password = getenv('DB_PASSWORD') ?: '';
+        $charset  = 'utf8mb4';
+
+        if (empty($username) || empty($password)) {
+            throw new RuntimeException('Database credentials not configured in environment.');
+        }
+
+        $dsn = "mysql:host=$host;port=$port;dbname=$dbname;charset=$charset";
+
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,  // Use real prepared statements
+            PDO::ATTR_PERSISTENT         => false,
+            PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT => true,
+        ];
+
+        // Enable SSL for DB connection in production
+        $sslCert = getenv('DB_SSL_CERT');
+        if (!empty($sslCert)) {
+            $options[PDO::MYSQL_ATTR_SSL_CA]   = getenv('DB_SSL_CA');
+            $options[PDO::MYSQL_ATTR_SSL_CERT] = $sslCert;
+            $options[PDO::MYSQL_ATTR_SSL_KEY]  = getenv('DB_SSL_KEY');
+        }
+
+        try {
+            $pdo = new PDO($dsn, $username, $password, $options);
+            return $pdo;
+        } catch (PDOException $e) {
+            // Never expose DB credentials in error messages
+            throw new RuntimeException('Database connection failed. Check configuration.');
+        }
+    }
+}
+
+// ============================================================
+// AUTHORIZATION SERVICE
+// ============================================================
+
+class AuthorizationService
+{
+    // Roles allowed to decrypt card numbers
+    private const AUTHORIZED_DECRYPT_ROLES = [
+        'payment_processor',
+        'fraud_analyst',
+        'compliance_officer',
+    ];
+
+    /**
+     * Check if current user/service is authorized to decrypt card data
+     * In production: integrate with your IAM/RBAC system
+     */
+    public static function canDecryptCardData(array $userContext): bool
+    {
+        if (empty($userContext['role']) || empty($userContext['user_id'])) {
+            return false;
+        }
+
+        $hasRole = in_array($userContext['role'], self::AUTHORIZED_DECRYPT_ROLES, strict: true);
+
+        // Additional checks: MFA verified, session not expired, IP allowlist, etc.
+        $mfaVerified    = $userContext['mfa_verified']    ?? false;
+        $sessionValid   = $userContext['session_valid']   ?? false;
+
+        return $hasRole && $mfaVerified && $sessionValid;
+    }
+
+    /**
+     * Log access to sensitive data for audit trail
+     */
+    public static function logDecryptionAccess(
+        int    $recordId,
+        array  $userContext,
+        string $action,
+        bool   $success
+    ): void {
+        // In production: write to immutable audit log (CloudTrail, Splunk, etc.)
+        $logEntry = [
+            'timestamp'   => date('c'),
+            'action'      => $action,
+            'record_id'   => $recordId,
+            'user_id'     => $userContext['user_id'] ?? 'unknown',
+            'role'        => $userContext['role']    ?? 'unknown',
+            'ip_address'  => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+            'success'     => $success,
+        ];
+
+        // Write to secure audit log (never to application log)
+        error_log('[AUDIT] ' . json_encode($logEntry));
+    }
+}
+
+// ============================================================
+// PAYMENT CARD REPOSITORY
+// ============================================================
+
+class PaymentCardRepository
+{
+    private PDO               $pdo;
+    private EncryptionService $encryption;
+
+    public function __construct(PDO $pdo, EncryptionService $encryption)
+    {
+        $this->pdo        = $pdo;
+        $this->encryption = $encryption;
+    }
+
+    /**
+     * Insert new payment card record
+     * Encrypts card number before storing
+     */
+    public function insert(array $cardData): int
+    {
+        $this->validateCardData($cardData);
+
+        // Encrypt the card number - never store plaintext
+        $encryptedCard = $this->encryption->encrypt($cardData['credit_card_number']);
+
+        // Store only masked version for display (never full number)
+        $maskedCard = EncryptionService::maskCardNumber($cardData['credit_card_number']);
+
+        // Prepared statement - prevents SQL injection
+        $sql = "
+            INSERT INTO payment_cards (
+                customer_id,
+                cardholder_name,
+                encrypted_card_number,
+                masked_card_number,
+                card_expiry_month,
+                card_expiry_year,
+                card_brand,
+                billing_address_hash,
+                created_at,
+                updated_at
+            ) VALUES (
+                :customer_id,
+                :cardholder_name,
+                :encrypted_card_number,
+                :masked_card_number,
+                :card_expiry_month,
+                :card_expiry_year,
+                :card_brand,
+                :billing_address_hash,
+                NOW(),
+                NOW()
+            )
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+
+        $stmt->execute([
+            ':customer_id'          => (int) $cardData['customer_id'],
+            ':cardholder_name'      => $cardData['cardholder_name'],
+            ':encrypted_card_number'=> $encryptedCard,
+            ':masked_card_number'   => $maskedCard,
+            ':card_expiry_month'    => (int) $cardData['expiry_month'],
+            ':card_expiry_year'     => (int) $cardData['expiry_year'],
+            ':card_brand'           => $cardData['card_brand'] ?? $this->detectCardBrand($cardData['credit_card_number']),
+            ':billing_address_hash' => $this->hashBillingAddress($cardData['billing_address'] ?? ''),
+        ]);
+
+        $insertedId = (int) $this->pdo->lastInsertId();
+
+        // Log the insert (without card data)
+        error_log("[INFO] Payment card inserted: record_id=$insertedId, customer_id={$cardData['customer_id']}");
+
+        return $insertedId;
+    }
+
+    /**
+     * Update existing payment card record
+     * Re-encrypts with new IV on every update
+     */
+    public function update(int $cardId, array $cardData, int $customerId): bool
+    {
+        $this->validateCardData($cardData);
+
+        // Re-encrypt with fresh IV on every update
+        $encryptedCard = $this->encryption->encrypt($cardData['credit_card_number']);
+        $maskedCard    = EncryptionService::maskCardNumber($cardData['credit_card_number']);
+
+        $sql = "
+            UPDATE payment_cards
+            SET
+                cardholder_name       = :cardholder_name,
+                encrypted_card_number = :encrypted_card_number,
+                masked_card_number    = :masked_card_number,
+                card_expiry_month     = :card_expiry_month,
+                card_expiry_year      = :card_expiry_year,
+                card_brand            = :card_brand,
+                updated_at            = NOW()
+            WHERE
+                id          = :card_id
+                AND customer_id = :customer_id
+                AND deleted_at IS NULL
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+
+        $stmt->execute([
+            ':cardholder_name'       => $cardData['cardholder_name'],
+            ':encrypted_card_number' => $encryptedCard,
+            ':masked_card_number'    => $maskedCard,
+            ':card_expiry_month'     => (int) $cardData['expiry_month'],
+            ':card_expiry_year'      => (int) $cardData['expiry_year'],
+            ':card_brand'            => $cardData['card_brand'] ?? $this->detectCardBrand($cardData['credit_card_number']),
+            ':card_id'               => $cardId,
+            ':customer_id'           => $customerId,
+        ]);
+
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Get card for display - returns masked number only (no decryption)
+     * Safe for general use
+     */
+    public function getCardForDisplay(int $cardId, int $customerId): ?array
+    {
+        $sql = "
+            SELECT
+                id,
+                customer_id,
+                cardholder_name,
+                masked_card_number,
+                card_expiry_month,
+                card_expiry_year,
+                card_brand,
+                created_at,
+                updated_at
+            FROM payment_cards
+            WHERE
+                id          = :card_id
+                AND customer_id = :customer_id
+                AND deleted_at IS NULL
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            ':card_id'     => $cardId,
+            ':customer_id' => $customerId,
+        ]);
+
+        $row = $stmt->fetch();
+        return $row ?: null;
+    }
+
+    /**
+     * Get decrypted card number - AUTHORIZED ACCESS ONLY
+     * Requires explicit authorization check
+     */
+    public function getDecryptedCardNumber(
+        int   $cardId,
+        int   $customerId,
+        array $userContext
+    ): ?string {
+        // Authorization check BEFORE any DB query
+        if (!AuthorizationService::canDecryptCardData($userContext)) {
+            AuthorizationService::logDecryptionAccess($cardId, $userContext, 'DECRYPT_CARD', false);
+            throw new RuntimeException('Unauthorized: insufficient permissions to decrypt card data.');
+        }
+
+        $sql = "
+            SELECT encrypted_card_number
+            FROM payment_cards
+            WHERE
+                id          = :card_id
+                AND customer_id = :customer_id
+                AND deleted_at IS NULL
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            ':card_id'     => $cardId,
+            ':customer_id' => $customerId,
+        ]);
+
+        $row = $stmt->fetch();
+
+        if (!$row) {
+            AuthorizationService::logDecryptionAccess($cardId, $userContext, 'DECRYPT_CARD', false);
+            return null;
+        }
+
+        // Decrypt only after authorization confirmed
+        $decryptedNumber = $this->encryption->decrypt($row['encrypted_card_number']);
+
+        // Audit log every decryption
+        AuthorizationService::logDecryptionAccess($cardId, $userContext, 'DECRYPT_CARD', true);
+
+        return $decryptedNumber;
+    }
+
+    /**
+     * Soft delete - never hard delete payment records (compliance)
+     */
+    public function softDelete(int $cardId, int $customerId): bool
+    {
+        $sql = "
+            UPDATE payment_cards
+            SET deleted_at = NOW()
+            WHERE
+                id          = :card_id
+                AND customer_id = :customer_id
+                AND deleted_at IS NULL
+        ";
+
+        $stmt = $this->pdo->prepare($sql);
+        $stmt->execute([
+            ':card_id'     => $cardId,
+            ':customer_id' => $customerId,
+        ]);
+
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Re-encrypt all cards with new key (for key rotation)
+     * Run in transaction with rollback support
+     */
+    public function rotateEncryptionKeys(
+        EncryptionService $oldEncryption,
+        EncryptionService $newEncryption,
+        int               $batchSize = 100
+    ): array {
+        $stats = ['processed' => 0, 'failed' => 0, 'errors' => []];
+
+        $countSql = "SELECT COUNT(*) as total FROM payment_cards WHERE deleted_at IS NULL";
+        $total    = (int) $this->pdo->query($countSql)->fetchColumn();
+
+        $offset = 0;
+
+        while ($offset < $total) {
+            $sql  = "SELECT id, encrypted_card_number FROM payment_cards WHERE deleted_at IS NULL LIMIT :limit OFFSET :offset";
+            $stmt = $this->pdo->prepare($sql);
+            $stmt->execute([':limit' => $batchSize, ':offset' => $offset]);
+            $rows = $stmt->fetchAll();
+
+            if (empty($rows)) {
+                break;
+            }
+
+            $this->pdo->beginTransaction();
+
+            try {
+                foreach ($rows as $row) {
+                    // Decrypt with old key, re-encrypt with new key
+                    $plaintext     = $oldEncryption->decrypt($row['encrypted_card_number']);
+                    $newEncrypted  = $newEncryption->encrypt($plaintext);
+
+                    $updateSql  = "UPDATE payment_cards SET encrypted_card_number = :enc, updated_at = NOW() WHERE id = :id";
+                    $updateStmt = $this->pdo->prepare($updateSql);
+                    $updateStmt->execute([':enc' => $newEncrypted, ':id' => $row['id']]);
+
+                    // Zero out plaintext from memory
+                    sodium_memzero($plaintext);
+
+                    $stats['processed']++;
+                }
+
+                $this->pdo->commit();
+            } catch (Throwable $e) {
+                $this->pdo->rollBack();
+                $stats['failed']  += count($rows);
+                $stats['errors'][] = "Batch at offset $offset: " . $e->getMessage();
+            }
+
+            $offset += $batchSize;
+        }
+
+        return $stats;
+    }
+
+    /**
+     * Validate card data before processing
+     */
+    private function validateCardData(array $data): void
+    {
+        $required = ['customer_id', 'credit_card_number', 'cardholder_name', 'expiry_month', 'expiry_year'];
+
+        foreach ($required as $field) {
+            if (empty($data[$field])) {
+                throw new InvalidArgumentException("Required field '$field' is missing.");
+            }
+        }
+
+        // Validate card number (Luhn algorithm)
+        if (!$this->luhnCheck($data['credit_card_number'])) {
+            throw new InvalidArgumentException('Invalid credit card number (Luhn check failed).');
+        }
+
+        // Validate expiry
+        $month = (int) $data['expiry_month'];
+        $year  = (int) $data['expiry_year'];
+
+        if ($month < 1 || $month > 12) {
+            throw new InvalidArgumentException('Invalid expiry month.');
+        }
+
+        $currentYear  = (int) date('Y');
+        $currentMonth = (int) date('n');
+
+        if ($year < $currentYear || ($year === $currentYear && $month < $currentMonth)) {
+            throw new InvalidArgumentException('Card has expired.');
+        }
+    }
+
+    /**
+     * Luhn algorithm for card number validation
+     */
+    private function luhnCheck(string $number): bool
+    {
+        $number  = preg_replace('/\D/', '', $number);
+        $length  = strlen($number);
+        $sum     = 0;
+        $isEven  = false;
+
+        for ($i = $length - 1; $i >= 0; $i--) {
+            $digit = (int) $number[$i];
+
+            if ($isEven) {
+                $digit *= 2;
+                if ($digit > 9) {
+                    $digit -= 9;
+                }
+            }
+
+            $sum   += $digit;
+            $isEven = !$isEven;
+        }
+
+        return $sum % 10 === 0;
+    }
+
+    /**
+     * Detect card brand from number prefix
+     */
+    private function detectCardBrand(string $number): string
+    {
+        $number = preg_replace('/\D/', '', $number);
+
+        $patterns = [
+            'visa'       => '/^4/',
+            'mastercard' => '/^5[1-5]|^2[2-7]/',
+            'amex'       => '/^3[47]/',
+            'discover'   => '/^6(?:011|5)/',
+            'rupay'      => '/^6[0-9]{15}/',
+        ];
+
+        foreach ($patterns as $brand => $pattern) {
+            if (preg_match($pattern, $number)) {
+                return $brand;
+            }
+        }
+
+        return 'unknown';
+    }
+
+    /**
+     * Hash billing address for comparison without storing plaintext
+     */
+    private function hashBillingAddress(string $address): string
+    {
+        if (empty($address)) {
+            return '';
+        }
+        // Use HMAC with app secret for billing address hash
+        $secret = getenv('APP_HMAC_SECRET') ?: '';
+        return hash_hmac('sha256', strtolower(trim($address)), $secret);
+    }
+}
+
+// ============================================================
+// DATABASE SCHEMA (MySQL)
+// ============================================================
+
+function getCreateTableSQL(): string
+{
+    return "
+        CREATE TABLE IF NOT EXISTS payment_cards (
+            id                    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            customer_id           BIGINT UNSIGNED NOT NULL,
+            cardholder_name       VARCHAR(255) NOT NULL,
+            encrypted_card_number TEXT NOT NULL COMMENT 'AES-256-GCM encrypted: version:iv:tag:ciphertext',
+            masked_card_number    VARCHAR(20) NOT NULL COMMENT 'e.g. ************1234',
+            card_expiry_month     TINYINT UNSIGNED NOT NULL,
+            card_expiry_year      SMALLINT UNSIGNED NOT NULL,
+            card_brand            VARCHAR(20) NOT NULL DEFAULT 'unknown',
+            billing_address_hash  VARCHAR(64) DEFAULT NULL COMMENT 'HMAC-SHA256 of billing address',
+            created_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at            DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            deleted_at            DATETIME DEFAULT NULL,
+
+            INDEX idx_customer_id  (customer_id),
+            INDEX idx_masked_card  (masked_card_number),
+            INDEX idx_deleted_at   (deleted_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+          COMMENT='Payment card data - encrypted at application layer';
+    ";
+}
+
+// ============================================================
+// EXAMPLE USAGE & DEMO
+// ============================================================
+
+function runDemo(): void
+{
+    echo "=== Credit Card Encryption System Demo ===\n\n";
+
+    // Load environment
+    loadEnvFile('.env');
+
+    // Check if we have required env vars (for demo, generate if missing)
+    if (!getenv('CC_ENCRYPTION_KEY')) {
+        $generatedKey = EncryptionService::generateKey();
+        putenv("CC_ENCRYPTION_KEY=$generatedKey");
+        $_ENV['CC_ENCRYPTION_KEY'] = $generatedKey;
+        echo "[SETUP] Generated demo encryption key: $generatedKey\n";
+        echo "[SETUP] In production, store this in your secret manager!\n\n";
+    }
+
+    // Initialize encryption service
+    $encryption = new EncryptionService();
+
+    // Demo 1: Encrypt and decrypt
+    echo "--- Demo 1: Encrypt/Decrypt ---\n";
+    $testCardNumber = '4532015112830366'; // Valid Visa test number
+
+    $encrypted = $encryption->encrypt($testCardNumber);
+    echo "Original:  $testCardNumber\n";
+    echo "Encrypted: $encrypted\n";
+    echo "Masked:    " . EncryptionService::maskCardNumber($testCardNumber) . "\n";
+
+    $decrypted = $encryption->decrypt($encrypted);
+    echo "Decrypted: $decrypted\n";
+    echo "Match:     " . ($testCardNumber === $decrypted ? 'YES ✓' : 'NO ✗') . "\n\n";
+
+    // Demo 2: Each encryption produces unique ciphertext (different IV)
+    echo "--- Demo 2: Unique IV per encryption ---\n";
+    $enc1 = $encryption->encrypt($testCardNumber);
+    $enc2 = $encryption->encrypt($testCardNumber);
+    echo "Enc 1: $enc1\n";
+    echo "Enc 2: $enc2\n";
+    echo "Different (unique IV): " . ($enc1 !== $enc2 ? 'YES ✓' : 'NO ✗') . "\n\n";
+
+    // Demo 3: Tamper detection
+    echo "--- Demo 3: Tamper Detection ---\n";
+    $tampered = $encrypted . 'TAMPERED';
+    try {
+        $encryption->decrypt($tampered);
+        echo "ERROR: Should have thrown exception!\n";
+    } catch (Exception $e) {
+        echo "Tamper detected: " . $e->getMessage() . " ✓\n\n";
+    }
+
+    // Demo 4: Authorization check
+    echo "--- Demo 4: Authorization Check ---\n";
+    $unauthorizedUser = ['user_id' => 123, 'role' => 'customer', 'mfa_verified' => true, 'session_valid' => true];
+    $authorizedUser   = ['user_id' => 456, 'role' => 'payment_processor', 'mfa_verified' => true, 'session_valid' => true];
+
+    echo "Unauthorized user can decrypt: " . (AuthorizationService::canDecryptCardData($unauthorizedUser) ? 'YES' : 'NO ✓') . "\n";
+    echo "Authorized user can decrypt:   " . (AuthorizationService::canDecryptCardData($authorizedUser)   ? 'YES ✓' : 'NO') . "\n\n";
+
+    // Demo 5: Database operations (if DB configured)
+    if (getenv('DB_HOST') && getenv('DB_USERNAME') && getenv('DB_PASSWORD')) {
+        echo "--- Demo 5: Database Operations ---\n";
+        try {
+            $pdo        = DatabaseConnection::getInstance();
+            $repository = new PaymentCardRepository($pdo, $encryption);
+
+            // Create table
+            $pdo->exec(getCreateTableSQL());
+            echo "Table created/verified ✓\n";
+
+            // Insert card
+            $card

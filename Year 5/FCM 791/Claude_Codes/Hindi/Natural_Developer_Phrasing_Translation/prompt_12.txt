@@ -1,0 +1,705 @@
+```javascript
+// ============================================================
+// Production Express.js Server Configuration
+// ============================================================
+
+import express from "express";
+import helmet from "helmet";
+import cors from "cors";
+import compression from "compression";
+import rateLimit from "express-rate-limit";
+import morgan from "morgan";
+import { v4 as uuidv4 } from "uuid";
+
+// ============================================================
+// Environment Configuration
+// ============================================================
+
+const NODE_ENV = process.env.NODE_ENV || "development";
+const PORT = parseInt(process.env.PORT || "3000", 10);
+const API_VERSION = process.env.API_VERSION || "v1";
+
+const isProduction = NODE_ENV === "production";
+const isDevelopment = NODE_ENV === "development";
+
+// ============================================================
+// Custom Error Classes
+// ============================================================
+
+class AppError extends Error {
+  statusCode;
+  status;
+  isOperational;
+  errorCode;
+
+  constructor(message, statusCode, errorCode = "GENERIC_ERROR") {
+    super(message);
+    this.statusCode = statusCode;
+    this.status = `${statusCode}`.startsWith("4") ? "fail" : "error";
+    this.isOperational = true;
+    this.errorCode = errorCode;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+class ValidationError extends AppError {
+  errors;
+
+  constructor(message, errors = []) {
+    super(message, 400, "VALIDATION_ERROR");
+    this.errors = errors;
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(resource = "Resource") {
+    super(`${resource} नहीं मिला`, 404, "NOT_FOUND");
+  }
+}
+
+class UnauthorizedError extends AppError {
+  constructor(message = "अनधिकृत पहुँच") {
+    super(message, 401, "UNAUTHORIZED");
+  }
+}
+
+class ForbiddenError extends AppError {
+  constructor(message = "पहुँच निषिद्ध है") {
+    super(message, 403, "FORBIDDEN");
+  }
+}
+
+// ============================================================
+// Logger Utility
+// ============================================================
+
+const logger = {
+  info: (message, meta = {}) => {
+    const log = {
+      level: "info",
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta,
+    };
+    console.log(JSON.stringify(log));
+  },
+
+  error: (message, meta = {}) => {
+    const log = {
+      level: "error",
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta,
+    };
+    console.error(JSON.stringify(log));
+  },
+
+  warn: (message, meta = {}) => {
+    const log = {
+      level: "warn",
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta,
+    };
+    console.warn(JSON.stringify(log));
+  },
+
+  debug: (message, meta = {}) => {
+    if (isDevelopment) {
+      const log = {
+        level: "debug",
+        timestamp: new Date().toISOString(),
+        message,
+        ...meta,
+      };
+      console.debug(JSON.stringify(log));
+    }
+  },
+};
+
+// ============================================================
+// Middleware Configurations
+// ============================================================
+
+// --- Security Headers (Helmet) ---
+const helmetConfig = helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'"],
+      fontSrc: ["'self'"],
+      objectSrc: ["'none'"],
+      mediaSrc: ["'self'"],
+      frameSrc: ["'none'"],
+    },
+  },
+  crossOriginEmbedderPolicy: isProduction,
+  crossOriginOpenerPolicy: { policy: "same-origin" },
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+  dnsPrefetchControl: { allow: false },
+  frameguard: { action: "deny" },
+  hidePoweredBy: true,
+  hsts: {
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
+  },
+  ieNoOpen: true,
+  noSniff: true,
+  originAgentCluster: true,
+  permittedCrossDomainPolicies: false,
+  referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  xssFilter: true,
+});
+
+// --- CORS Configuration ---
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || "http://localhost:3000")
+  .split(",")
+  .map((origin) => origin.trim());
+
+const corsConfig = cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+
+    if (allowedOrigins.includes(origin) || !isProduction) {
+      callback(null, true);
+    } else {
+      callback(new AppError(`CORS: ${origin} की अनुमति नहीं है`, 403, "CORS_ERROR"));
+    }
+  },
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: [
+    "Content-Type",
+    "Authorization",
+    "X-Requested-With",
+    "X-Request-ID",
+    "Accept",
+    "Accept-Language",
+  ],
+  exposedHeaders: ["X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining"],
+  credentials: true,
+  maxAge: 86400, // 24 hours preflight cache
+  optionsSuccessStatus: 204,
+});
+
+// --- Rate Limiting ---
+const globalRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: isProduction ? 100 : 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => {
+    return req.headers["x-forwarded-for"]?.toString().split(",")[0] || req.ip || "unknown";
+  },
+  handler: (req, res) => {
+    logger.warn("Rate limit exceeded", {
+      ip: req.ip,
+      path: req.path,
+      requestId: req.requestId,
+    });
+
+    res.status(429).json({
+      success: false,
+      error: {
+        code: "RATE_LIMIT_EXCEEDED",
+        message: "बहुत अधिक अनुरोध। कृपया बाद में पुनः प्रयास करें।",
+        retryAfter: Math.ceil(15 * 60),
+      },
+    });
+  },
+  skip: (req) => {
+    // Health check endpoint को rate limit से बाहर रखें
+    return req.path === "/health" || req.path === "/ping";
+  },
+});
+
+// Strict rate limiter for auth endpoints
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    error: {
+      code: "AUTH_RATE_LIMIT_EXCEEDED",
+      message: "बहुत अधिक लॉगिन प्रयास। 15 मिनट बाद पुनः प्रयास करें।",
+    },
+  },
+});
+
+// --- Compression ---
+const compressionConfig = compression({
+  filter: (req, res) => {
+    if (req.headers["x-no-compression"]) return false;
+    return compression.filter(req, res);
+  },
+  level: 6, // Balance between speed and compression ratio
+  threshold: 1024, // Only compress responses > 1KB
+});
+
+// ============================================================
+// Custom Middleware Functions
+// ============================================================
+
+// Request ID Middleware
+const requestIdMiddleware = (req, res, next) => {
+  const requestId = req.headers["x-request-id"] || uuidv4();
+  req.requestId = requestId;
+  res.setHeader("X-Request-ID", requestId);
+  next();
+};
+
+// Request Timing Middleware
+const requestTimingMiddleware = (req, res, next) => {
+  req.startTime = Date.now();
+
+  res.on("finish", () => {
+    const duration = Date.now() - req.startTime;
+    const logData = {
+      requestId: req.requestId,
+      method: req.method,
+      path: req.path,
+      statusCode: res.statusCode,
+      duration: `${duration}ms`,
+      userAgent: req.headers["user-agent"],
+      ip: req.ip,
+    };
+
+    if (res.statusCode >= 400) {
+      logger.warn("Request completed with error", logData);
+    } else {
+      logger.info("Request completed", logData);
+    }
+  });
+
+  next();
+};
+
+// Security Headers Middleware
+const additionalSecurityHeaders = (req, res, next) => {
+  // Cache control for API responses
+  if (req.path.startsWith(`/api/`)) {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    res.setHeader("Surrogate-Control", "no-store");
+  }
+
+  // Remove server information
+  res.removeHeader("X-Powered-By");
+  res.removeHeader("Server");
+
+  next();
+};
+
+// Request Sanitization Middleware
+const sanitizeRequest = (req, res, next) => {
+  // Query parameters sanitize करें
+  if (req.query) {
+    for (const key in req.query) {
+      if (typeof req.query[key] === "string") {
+        req.query[key] = req.query[key].trim();
+      }
+    }
+  }
+
+  // Content-Type validation for POST/PUT/PATCH
+  if (["POST", "PUT", "PATCH"].includes(req.method)) {
+    const contentType = req.headers["content-type"];
+    if (contentType && !contentType.includes("application/json") && !contentType.includes("multipart/form-data") && !contentType.includes("application/x-www-form-urlencoded")) {
+      return next(new AppError("अमान्य Content-Type", 415, "UNSUPPORTED_MEDIA_TYPE"));
+    }
+  }
+
+  next();
+};
+
+// ============================================================
+// Morgan HTTP Logger Configuration
+// ============================================================
+
+const morganFormat = isProduction
+  ? ":remote-addr :method :url :status :res[content-length] - :response-time ms"
+  : "dev";
+
+const httpLogger = morgan(morganFormat, {
+  stream: {
+    write: (message) => {
+      logger.info(message.trim(), { type: "http" });
+    },
+  },
+  skip: (req) => req.path === "/health" || req.path === "/ping",
+});
+
+// ============================================================
+// Error Handling Middleware
+// ============================================================
+
+// 404 Handler - सभी unmatched routes के लिए
+const notFoundHandler = (req, res, next) => {
+  const error = new NotFoundError(`Route: ${req.method} ${req.originalUrl}`);
+
+  logger.warn("Route not found", {
+    requestId: req.requestId,
+    method: req.method,
+    path: req.originalUrl,
+    ip: req.ip,
+  });
+
+  next(error);
+};
+
+// Error Response Formatter
+const formatErrorResponse = (err, req) => {
+  const baseResponse = {
+    success: false,
+    error: {
+      code: err.errorCode || "INTERNAL_ERROR",
+      message: err.message || "कुछ गलत हो गया",
+      requestId: req.requestId,
+      timestamp: new Date().toISOString(),
+    },
+  };
+
+  // Validation errors के लिए extra details
+  if (err instanceof ValidationError && err.errors.length > 0) {
+    baseResponse.error.details = err.errors;
+  }
+
+  // Development में stack trace दिखाएं
+  if (isDevelopment && err.stack) {
+    baseResponse.error.stack = err.stack;
+    baseResponse.error.originalError = err.message;
+  }
+
+  return baseResponse;
+};
+
+// Handle specific error types
+const handleSpecificErrors = (err) => {
+  // JSON Parse Error
+  if (err.type === "entity.parse.failed") {
+    return new AppError("अमान्य JSON फॉर्मेट", 400, "INVALID_JSON");
+  }
+
+  // Payload Too Large
+  if (err.type === "entity.too.large") {
+    return new AppError("Request body बहुत बड़ा है", 413, "PAYLOAD_TOO_LARGE");
+  }
+
+  // JWT Errors
+  if (err.name === "JsonWebTokenError") {
+    return new UnauthorizedError("अमान्य टोकन");
+  }
+
+  if (err.name === "TokenExpiredError") {
+    return new UnauthorizedError("टोकन की समय सीमा समाप्त हो गई");
+  }
+
+  // MongoDB Errors
+  if (err.name === "CastError") {
+    return new AppError(`अमान्य ${err.path}: ${err.value}`, 400, "INVALID_ID");
+  }
+
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyValue || {})[0] || "field";
+    return new AppError(`${field} पहले से मौजूद है`, 409, "DUPLICATE_KEY");
+  }
+
+  if (err.name === "ValidationError" && err.errors) {
+    const errors = Object.values(err.errors).map((e) => ({
+      field: e.path,
+      message: e.message,
+    }));
+    return new ValidationError("Validation विफल", errors);
+  }
+
+  return null;
+};
+
+// Global Error Handler
+const globalErrorHandler = (err, req, res, next) => {
+  // Specific errors को handle करें
+  const handledError = handleSpecificErrors(err);
+  const error = handledError || err;
+
+  // Default values set करें
+  error.statusCode = error.statusCode || 500;
+  error.status = error.status || "error";
+  error.errorCode = error.errorCode || "INTERNAL_ERROR";
+
+  // Non-operational errors को log करें (programming errors)
+  if (!error.isOperational) {
+    logger.error("Non-operational error occurred", {
+      requestId: req.requestId,
+      error: error.message,
+      stack: error.stack,
+      method: req.method,
+      path: req.originalUrl,
+      body: isProduction ? "[REDACTED]" : req.body,
+    });
+  } else {
+    logger.warn("Operational error occurred", {
+      requestId: req.requestId,
+      errorCode: error.errorCode,
+      statusCode: error.statusCode,
+      message: error.message,
+      method: req.method,
+      path: req.originalUrl,
+    });
+  }
+
+  // Production में internal errors को hide करें
+  if (isProduction && !error.isOperational) {
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: "INTERNAL_SERVER_ERROR",
+        message: "Internal server error। कृपया बाद में पुनः प्रयास करें।",
+        requestId: req.requestId,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  }
+
+  const errorResponse = formatErrorResponse(error, req);
+  res.status(error.statusCode).json(errorResponse);
+};
+
+// ============================================================
+// App Factory Function
+// ============================================================
+
+const createApp = () => {
+  const app = express();
+
+  // ---- Trust Proxy (Load Balancer के पीछे) ----
+  if (isProduction) {
+    app.set("trust proxy", 1);
+  }
+
+  // ---- Disable X-Powered-By ----
+  app.disable("x-powered-by");
+
+  // ---- Security Middleware ----
+  app.use(helmetConfig);
+  app.use(corsConfig);
+  app.use(additionalSecurityHeaders);
+
+  // ---- Performance Middleware ----
+  app.use(compressionConfig);
+
+  // ---- Request Tracking ----
+  app.use(requestIdMiddleware);
+  app.use(requestTimingMiddleware);
+
+  // ---- HTTP Logging ----
+  app.use(httpLogger);
+
+  // ---- Rate Limiting ----
+  app.use(globalRateLimiter);
+
+  // ---- Body Parsing ----
+  app.use(
+    express.json({
+      limit: "10mb",
+      strict: true,
+      type: ["application/json", "application/json; charset=utf-8"],
+    })
+  );
+
+  app.use(
+    express.urlencoded({
+      extended: true,
+      limit: "10mb",
+      parameterLimit: 1000,
+    })
+  );
+
+  // ---- Request Sanitization ----
+  app.use(sanitizeRequest);
+
+  // ============================================================
+  // Health Check Routes (Rate Limit से पहले)
+  // ============================================================
+
+  app.get("/health", (req, res) => {
+    res.status(200).json({
+      success: true,
+      status: "healthy",
+      environment: NODE_ENV,
+      timestamp: new Date().toISOString(),
+      uptime: process.uptime(),
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024),
+        unit: "MB",
+      },
+    });
+  });
+
+  app.get("/ping", (req, res) => {
+    res.status(200).json({ pong: true, timestamp: Date.now() });
+  });
+
+  // ============================================================
+  // API Routes
+  // ============================================================
+
+  const apiRouter = express.Router();
+
+  // Auth routes (strict rate limiting)
+  apiRouter.use("/auth", authRateLimiter);
+
+  // Example routes
+  apiRouter.get("/", (req, res) => {
+    res.status(200).json({
+      success: true,
+      message: "API सफलतापूर्वक चल रहा है",
+      version: API_VERSION,
+      environment: NODE_ENV,
+      requestId: req.requestId,
+    });
+  });
+
+  // Test error handling
+  apiRouter.get("/test-error", (req, res, next) => {
+    next(new AppError("यह एक test error है", 400, "TEST_ERROR"));
+  });
+
+  apiRouter.get("/test-async-error", async (req, res, next) => {
+    try {
+      throw new Error("Async error test");
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  // Mount API router
+  app.use(`/api/${API_VERSION}`, apiRouter);
+
+  // ============================================================
+  // Error Handling (सबसे अंत में)
+  // ============================================================
+
+  // 404 Handler
+  app.use(notFoundHandler);
+
+  // Global Error Handler
+  app.use(globalErrorHandler);
+
+  return app;
+};
+
+// ============================================================
+// Server Startup
+// ============================================================
+
+const startServer = async () => {
+  try {
+    const app = createApp();
+
+    const server = app.listen(PORT, () => {
+      logger.info("Server सफलतापूर्वक शुरू हुआ", {
+        port: PORT,
+        environment: NODE_ENV,
+        apiVersion: API_VERSION,
+        pid: process.pid,
+      });
+    });
+
+    // Server timeout configuration
+    server.timeout = 30000; // 30 seconds
+    server.keepAliveTimeout = 65000; // 65 seconds
+    server.headersTimeout = 66000; // 66 seconds
+
+    // ============================================================
+    // Graceful Shutdown
+    // ============================================================
+
+    const gracefulShutdown = (signal) => {
+      logger.info(`${signal} signal प्राप्त हुआ। Graceful shutdown शुरू...`);
+
+      server.close(async (err) => {
+        if (err) {
+          logger.error("Server बंद करने में त्रुटि", { error: err.message });
+          process.exit(1);
+        }
+
+        logger.info("HTTP server बंद हो गया");
+
+        // Database connections बंद करें
+        // await db.disconnect();
+
+        logger.info("Graceful shutdown पूर्ण");
+        process.exit(0);
+      });
+
+      // Force shutdown after 30 seconds
+      setTimeout(() => {
+        logger.error("Force shutdown: 30 seconds timeout");
+        process.exit(1);
+      }, 30000);
+    };
+
+    process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+    process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+
+    // ============================================================
+    // Unhandled Errors
+    // ============================================================
+
+    process.on("uncaughtException", (err) => {
+      logger.error("Uncaught Exception - Server बंद हो रहा है", {
+        error: err.message,
+        stack: err.stack,
+      });
+      process.exit(1);
+    });
+
+    process.on("unhandledRejection", (reason, promise) => {
+      logger.error("Unhandled Promise Rejection", {
+        reason: reason instanceof Error ? reason.message : String(reason),
+        stack: reason instanceof Error ? reason.stack : undefined,
+      });
+
+      server.close(() => {
+        process.exit(1);
+      });
+    });
+
+    return server;
+  } catch (error) {
+    logger.error("Server शुरू करने में विफल", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exit(1);
+  }
+};
+
+// ============================================================
+// Start Application
+// ============================================================
+
+startServer();
+
+// ============================================================
+// Exports (Testing के लिए)
+// ============================================================
+
+export {
+  createApp,
+  AppError,
+  ValidationError,
+  NotFoundError,
+  UnauthorizedError,
+  ForbiddenError,
+  logger,
+  authRateLimiter,
+};
+```

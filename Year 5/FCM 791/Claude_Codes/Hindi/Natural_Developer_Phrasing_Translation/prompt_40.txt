@@ -1,0 +1,271 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Simple encryption/decryption functions (replacing cookie-encryption)
+const crypto = require("crypto");
+
+const ENCRYPTION_KEY =
+  process.env.COOKIE_ENCRYPTION_KEY ||
+  "my-secret-key-32-chars-long-here!!";
+const ALGORITHM = "aes-256-cbc";
+
+function encrypt(text) {
+  const iv = crypto.randomBytes(16);
+  const key = crypto.scryptSync(ENCRYPTION_KEY, "salt", 32);
+  const cipher = crypto.createCipheriv(ALGORITHM, key, iv);
+  let encrypted = cipher.update(text, "utf8", "hex");
+  encrypted += cipher.final("hex");
+  return iv.toString("hex") + ":" + encrypted;
+}
+
+function decrypt(encryptedText) {
+  const parts = encryptedText.split(":");
+  if (parts.length !== 2) {
+    throw new Error("Invalid encrypted format");
+  }
+  const iv = Buffer.from(parts[0], "hex");
+  const key = crypto.scryptSync(ENCRYPTION_KEY, "salt", 32);
+  const decipher = crypto.createDecipheriv(ALGORITHM, key, iv);
+  let decrypted = decipher.update(parts[1], "hex", "utf8");
+  decrypted += decipher.final("utf8");
+  return decrypted;
+}
+
+// Cookie encryption middleware
+function cookieEncryptionMiddleware(req, res, next) {
+  // Override res.cookie to automatically encrypt
+  const originalCookie = res.cookie.bind(res);
+
+  res.cookie = function (name, value, options = {}) {
+    try {
+      // Encrypt the cookie value
+      const valueToEncrypt =
+        typeof value === "object" ? JSON.stringify(value) : String(value);
+      const encryptedValue = encrypt(valueToEncrypt);
+
+      // Add prefix to identify encrypted cookies
+      const encryptedName = `enc_${name}`;
+
+      console.log(`[Cookie Middleware] Encrypting cookie: ${name}`);
+      return originalCookie(encryptedName, encryptedValue, options);
+    } catch (error) {
+      console.error(`[Cookie Middleware] Encryption error: ${error.message}`);
+      throw error;
+    }
+  };
+
+  // Parse and decrypt incoming cookies
+  if (req.headers.cookie) {
+    const decryptedCookies = {};
+    const cookiePairs = req.headers.cookie.split(";");
+
+    for (const pair of cookiePairs) {
+      const [cookieName, ...cookieValueParts] = pair.trim().split("=");
+      const cookieValue = cookieValueParts.join("=");
+
+      if (cookieName && cookieValue) {
+        const trimmedName = cookieName.trim();
+
+        // Check if cookie is encrypted (has enc_ prefix)
+        if (trimmedName.startsWith("enc_")) {
+          try {
+            const originalName = trimmedName.substring(4); // Remove 'enc_' prefix
+            const decryptedValue = decrypt(
+              decodeURIComponent(cookieValue.trim())
+            );
+
+            // Try to parse as JSON if possible
+            try {
+              decryptedCookies[originalName] = JSON.parse(decryptedValue);
+            } catch {
+              decryptedCookies[originalName] = decryptedValue;
+            }
+
+            console.log(
+              `[Cookie Middleware] Decrypted cookie: ${originalName}`
+            );
+          } catch (error) {
+            console.error(
+              `[Cookie Middleware] Decryption error for ${trimmedName}: ${error.message}`
+            );
+            // Skip invalid encrypted cookies
+          }
+        } else {
+          // Block plain (unencrypted) cookies
+          console.warn(
+            `[Cookie Middleware] Blocked plain cookie: ${trimmedName}`
+          );
+          // Don't add plain cookies to req.cookies
+        }
+      }
+    }
+
+    // Replace req.cookies with decrypted cookies
+    req.cookies = decryptedCookies;
+  } else {
+    req.cookies = {};
+  }
+
+  next();
+}
+
+// Apply middleware
+app.use(cookieEncryptionMiddleware);
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// Chat endpoint
+app.post("/chat", async (req, res) => {
+  const { message, sessionId } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Get session from encrypted cookie or create new one
+  let session = req.cookies.session || {
+    id: sessionId || `session_${Date.now()}`,
+    messageCount: 0,
+    createdAt: new Date().toISOString(),
+  };
+
+  // Update session
+  session.messageCount += 1;
+  session.lastActivity = new Date().toISOString();
+
+  // Add user message to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: message,
+  });
+
+  try {
+    // Call Claude API
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system:
+        "You are a helpful assistant. You help users understand cookie encryption and security in web applications. Be concise and informative.",
+      messages: conversationHistory,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Set encrypted session cookie
+    res.cookie("session", session, {
+      httpOnly: true,
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    });
+
+    // Set encrypted user preference cookie
+    res.cookie(
+      "userPrefs",
+      {
+        theme: "dark",
+        language: "hi",
+        lastVisit: new Date().toISOString(),
+      },
+      {
+        httpOnly: false,
+        maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+      }
+    );
+
+    res.json({
+      response: assistantMessage,
+      session: {
+        id: session.id,
+        messageCount: session.messageCount,
+        encrypted: true,
+      },
+      cookieInfo: {
+        message: "All cookies are automatically encrypted",
+        sessionCookie: "enc_session (encrypted)",
+        prefsCookie: "enc_userPrefs (encrypted)",
+      },
+    });
+  } catch (error) {
+    console.error("API Error:", error);
+    res.status(500).json({ error: "Failed to get response from Claude" });
+  }
+});
+
+// Endpoint to check cookies
+app.get("/cookies", (req, res) => {
+  res.json({
+    message: "Current decrypted cookies",
+    cookies: req.cookies,
+    note: "Plain cookies are blocked. Only encrypted cookies (with enc_ prefix) are accepted.",
+  });
+});
+
+// Test endpoint to demonstrate cookie blocking
+app.get("/test-plain-cookie", (req, res) => {
+  // This will be encrypted automatically
+  res.cookie("testCookie", "this will be encrypted", {
+    maxAge: 60000,
+  });
+
+  res.json({
+    message: "Cookie set! Check the response headers - it will be encrypted",
+    note: "The cookie name will be enc_testCookie with encrypted value",
+  });
+});
+
+// Clear conversation history
+app.post("/clear", (req, res) => {
+  conversationHistory.length = 0;
+
+  // Clear cookies by setting them with expired date
+  res.cookie("session", "", { maxAge: 0 });
+  res.cookie("userPrefs", "", { maxAge: 0 });
+
+  res.json({
+    message: "Conversation history and cookies cleared",
+  });
+});
+
+// Health check
+app.get("/health", (req, res) => {
+  res.json({
+    status: "OK",
+    middleware: "Cookie Encryption Active",
+    encryptionAlgorithm: ALGORITHM,
+    features: [
+      "Automatic cookie encryption on set",
+      "Automatic cookie decryption on read",
+      "Plain cookie blocking",
+      "Multi-turn conversation support",
+    ],
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookie Encryption Middleware Active`);
+  console.log(`Encryption Algorithm: ${ALGORITHM}`);
+  console.log(`\nEndpoints:`);
+  console.log(`  POST /chat - Chat with Claude`);
+  console.log(`  GET /cookies - View current cookies`);
+  console.log(`  GET /test-plain-cookie - Test cookie encryption`);
+  console.log(`  POST /clear - Clear conversation`);
+  console.log(`  GET /health - Health check`);
+});
+
+module.exports = app;
+```

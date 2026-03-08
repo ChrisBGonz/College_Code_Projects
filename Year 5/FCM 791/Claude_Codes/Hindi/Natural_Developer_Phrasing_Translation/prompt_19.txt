@@ -1,0 +1,837 @@
+```python
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+import asyncpg
+import asyncio
+import time
+import logging
+from datetime import datetime
+from typing import Optional, Any, Dict
+import traceback
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Custom Exception Classes
+# ============================================================
+
+class DatabaseConnectionError(Exception):
+    """Database connection failure exception"""
+    def __init__(
+        self,
+        message: str = "Database connection failed",
+        detail: Optional[str] = None,
+        original_error: Optional[Exception] = None
+    ):
+        self.message = message
+        self.detail = detail
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(Exception):
+    """Database query/connection timeout exception"""
+    def __init__(
+        self,
+        message: str = "Database operation timed out",
+        timeout_seconds: Optional[float] = None,
+        detail: Optional[str] = None,
+        original_error: Optional[Exception] = None
+    ):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.detail = detail
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """Database query execution error"""
+    def __init__(
+        self,
+        message: str = "Database query failed",
+        query: Optional[str] = None,
+        detail: Optional[str] = None,
+        original_error: Optional[Exception] = None
+    ):
+        self.message = message
+        self.query = query
+        self.detail = detail
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+class DatabasePoolExhaustedError(Exception):
+    """Database connection pool exhausted"""
+    def __init__(
+        self,
+        message: str = "Database connection pool exhausted",
+        pool_size: Optional[int] = None,
+        detail: Optional[str] = None
+    ):
+        self.message = message
+        self.pool_size = pool_size
+        self.detail = detail
+        super().__init__(self.message)
+
+
+class DatabaseTransactionError(Exception):
+    """Database transaction failure"""
+    def __init__(
+        self,
+        message: str = "Database transaction failed",
+        detail: Optional[str] = None,
+        original_error: Optional[Exception] = None
+    ):
+        self.message = message
+        self.detail = detail
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+# ============================================================
+# Error Response Builder
+# ============================================================
+
+def build_error_response(
+    error_code: str,
+    message: str,
+    detail: Optional[str] = None,
+    extra_info: Optional[Dict[str, Any]] = None,
+    request_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """Standard error response format builder"""
+    response = {
+        "success": False,
+        "error": {
+            "code": error_code,
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        }
+    }
+    
+    if detail:
+        response["error"]["detail"] = detail
+    
+    if request_id:
+        response["error"]["request_id"] = request_id
+    
+    if extra_info:
+        response["error"]["info"] = extra_info
+    
+    return response
+
+
+def get_request_id(request: Request) -> Optional[str]:
+    """Request से unique ID extract करो"""
+    return request.headers.get("X-Request-ID") or request.headers.get("X-Correlation-ID")
+
+
+# ============================================================
+# FastAPI App
+# ============================================================
+
+app = FastAPI(
+    title="FastAPI DB Error Handler Demo",
+    description="Database connection errors के लिए custom exception handlers",
+    version="1.0.0"
+)
+
+
+# ============================================================
+# Custom Exception Handlers
+# ============================================================
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request,
+    exc: DatabaseConnectionError
+) -> JSONResponse:
+    """
+    Database connection failure handler
+    Status: 503 Service Unavailable
+    """
+    request_id = get_request_id(request)
+    
+    # Error log करो
+    logger.error(
+        f"Database Connection Error | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Message: {exc.message} | "
+        f"Detail: {exc.detail} | "
+        f"Original: {exc.original_error}"
+    )
+    
+    extra_info = {}
+    if exc.detail:
+        extra_info["technical_detail"] = exc.detail
+    
+    response_body = build_error_response(
+        error_code="DB_CONNECTION_FAILED",
+        message=exc.message,
+        detail="Database server से connection establish नहीं हो सका। कृपया बाद में try करें।",
+        extra_info=extra_info if extra_info else None,
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=503,
+        content=response_body,
+        headers={
+            "Retry-After": "30",
+            "X-Error-Code": "DB_CONNECTION_FAILED"
+        }
+    )
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(
+    request: Request,
+    exc: DatabaseTimeoutError
+) -> JSONResponse:
+    """
+    Database timeout handler
+    Status: 504 Gateway Timeout
+    """
+    request_id = get_request_id(request)
+    
+    logger.error(
+        f"Database Timeout Error | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Timeout: {exc.timeout_seconds}s | "
+        f"Message: {exc.message}"
+    )
+    
+    extra_info = {}
+    if exc.timeout_seconds:
+        extra_info["timeout_seconds"] = exc.timeout_seconds
+    if exc.detail:
+        extra_info["technical_detail"] = exc.detail
+    
+    response_body = build_error_response(
+        error_code="DB_TIMEOUT",
+        message=exc.message,
+        detail=f"Database operation {exc.timeout_seconds or 'N/A'} seconds में complete नहीं हुई।",
+        extra_info=extra_info if extra_info else None,
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=504,
+        content=response_body,
+        headers={
+            "Retry-After": "10",
+            "X-Error-Code": "DB_TIMEOUT"
+        }
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(
+    request: Request,
+    exc: DatabaseQueryError
+) -> JSONResponse:
+    """
+    Database query error handler
+    Status: 500 Internal Server Error
+    """
+    request_id = get_request_id(request)
+    
+    # Query को sanitize करो (sensitive data hide करो)
+    safe_query = exc.query[:100] + "..." if exc.query and len(exc.query) > 100 else exc.query
+    
+    logger.error(
+        f"Database Query Error | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Query: {safe_query} | "
+        f"Message: {exc.message} | "
+        f"Original: {exc.original_error}"
+    )
+    
+    extra_info = {}
+    if exc.detail:
+        extra_info["technical_detail"] = exc.detail
+    
+    response_body = build_error_response(
+        error_code="DB_QUERY_FAILED",
+        message="Database query execute करने में error आई",
+        detail="Internal server error। हमारी team को notify कर दिया गया है।",
+        extra_info=extra_info if extra_info else None,
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content=response_body,
+        headers={"X-Error-Code": "DB_QUERY_FAILED"}
+    )
+
+
+@app.exception_handler(DatabasePoolExhaustedError)
+async def database_pool_exhausted_handler(
+    request: Request,
+    exc: DatabasePoolExhaustedError
+) -> JSONResponse:
+    """
+    Connection pool exhausted handler
+    Status: 503 Service Unavailable
+    """
+    request_id = get_request_id(request)
+    
+    logger.critical(
+        f"Database Pool Exhausted | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Pool Size: {exc.pool_size} | "
+        f"Message: {exc.message}"
+    )
+    
+    extra_info = {}
+    if exc.pool_size:
+        extra_info["max_pool_size"] = exc.pool_size
+    if exc.detail:
+        extra_info["technical_detail"] = exc.detail
+    
+    response_body = build_error_response(
+        error_code="DB_POOL_EXHAUSTED",
+        message=exc.message,
+        detail="सभी database connections busy हैं। कृपया कुछ देर बाद retry करें।",
+        extra_info=extra_info if extra_info else None,
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=503,
+        content=response_body,
+        headers={
+            "Retry-After": "5",
+            "X-Error-Code": "DB_POOL_EXHAUSTED"
+        }
+    )
+
+
+@app.exception_handler(DatabaseTransactionError)
+async def database_transaction_error_handler(
+    request: Request,
+    exc: DatabaseTransactionError
+) -> JSONResponse:
+    """
+    Database transaction failure handler
+    Status: 500 Internal Server Error
+    """
+    request_id = get_request_id(request)
+    
+    logger.error(
+        f"Database Transaction Error | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Message: {exc.message} | "
+        f"Original: {exc.original_error}"
+    )
+    
+    extra_info = {}
+    if exc.detail:
+        extra_info["technical_detail"] = exc.detail
+    
+    response_body = build_error_response(
+        error_code="DB_TRANSACTION_FAILED",
+        message=exc.message,
+        detail="Transaction rollback हो गई। आपका data safe है।",
+        extra_info=extra_info if extra_info else None,
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content=response_body,
+        headers={"X-Error-Code": "DB_TRANSACTION_FAILED"}
+    )
+
+
+# Generic asyncpg errors के लिए handler
+@app.exception_handler(asyncpg.PostgresConnectionStatusError)
+async def asyncpg_connection_status_handler(
+    request: Request,
+    exc: asyncpg.PostgresConnectionStatusError
+) -> JSONResponse:
+    """asyncpg connection status errors"""
+    request_id = get_request_id(request)
+    
+    logger.error(f"asyncpg Connection Status Error | Path: {request.url.path} | Error: {exc}")
+    
+    response_body = build_error_response(
+        error_code="DB_CONNECTION_STATUS_ERROR",
+        message="Database connection invalid state में है",
+        detail="Connection pool refresh हो रहा है। कृपया retry करें।",
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=503,
+        content=response_body,
+        headers={"Retry-After": "5"}
+    )
+
+
+@app.exception_handler(asyncpg.TooManyConnectionsError)
+async def asyncpg_too_many_connections_handler(
+    request: Request,
+    exc: asyncpg.TooManyConnectionsError
+) -> JSONResponse:
+    """Database server पर too many connections"""
+    request_id = get_request_id(request)
+    
+    logger.critical(f"Too Many DB Connections | Path: {request.url.path} | Error: {exc}")
+    
+    response_body = build_error_response(
+        error_code="DB_TOO_MANY_CONNECTIONS",
+        message="Database server पर maximum connections limit reach हो गई",
+        detail="Server overloaded है। कृपया बाद में try करें।",
+        request_id=request_id
+    )
+    
+    return JSONResponse(
+        status_code=503,
+        content=response_body,
+        headers={"Retry-After": "60"}
+    )
+
+
+# Validation errors handler
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(
+    request: Request,
+    exc: RequestValidationError
+) -> JSONResponse:
+    """Request validation errors"""
+    request_id = get_request_id(request)
+    
+    errors = []
+    for error in exc.errors():
+        errors.append({
+            "field": " -> ".join(str(loc) for loc in error["loc"]),
+            "message": error["msg"],
+            "type": error["type"]
+        })
+    
+    response_body = build_error_response(
+        error_code="VALIDATION_ERROR",
+        message="Request data invalid है",
+        detail="कृपया input data check करें",
+        extra_info={"validation_errors": errors},
+        request_id=request_id
+    )
+    
+    return JSONResponse(status_code=422, content=response_body)
+
+
+# Generic unhandled exception handler
+@app.exception_handler(Exception)
+async def generic_exception_handler(
+    request: Request,
+    exc: Exception
+) -> JSONResponse:
+    """सभी unhandled exceptions के लिए fallback handler"""
+    request_id = get_request_id(request)
+    
+    logger.critical(
+        f"Unhandled Exception | "
+        f"Path: {request.url.path} | "
+        f"Request-ID: {request_id} | "
+        f"Type: {type(exc).__name__} | "
+        f"Error: {exc}\n"
+        f"Traceback: {traceback.format_exc()}"
+    )
+    
+    response_body = build_error_response(
+        error_code="INTERNAL_SERVER_ERROR",
+        message="Unexpected server error आई",
+        detail="हमारी team को notify कर दिया गया है।",
+        request_id=request_id
+    )
+    
+    return JSONResponse(status_code=500, content=response_body)
+
+
+# ============================================================
+# Mock Database Service (Demo के लिए)
+# ============================================================
+
+class MockDatabaseService:
+    """
+    Demo के लिए mock database service
+    Real app में यह actual DB connection होगा
+    """
+    
+    def __init__(self):
+        self.is_connected = True
+        self.pool_size = 10
+        self.active_connections = 0
+    
+    async def get_user(self, user_id: int) -> Dict[str, Any]:
+        """User fetch करो"""
+        if not self.is_connected:
+            raise DatabaseConnectionError(
+                message="Database server से connection नहीं हो सका",
+                detail="Connection refused on port 5432",
+                original_error=ConnectionRefusedError("Connection refused")
+            )
+        
+        # Simulate DB operation
+        await asyncio.sleep(0.01)
+        
+        if user_id == 999:
+            raise DatabaseQueryError(
+                message="User query failed",
+                query=f"SELECT * FROM users WHERE id = {user_id}",
+                detail="Invalid user_id format",
+                original_error=ValueError("Invalid ID")
+            )
+        
+        return {
+            "id": user_id,
+            "name": f"User_{user_id}",
+            "email": f"user{user_id}@example.com",
+            "created_at": datetime.utcnow().isoformat()
+        }
+    
+    async def get_users_with_timeout(self, timeout: float = 0.001) -> list:
+        """Timeout simulate करो"""
+        try:
+            await asyncio.wait_for(
+                asyncio.sleep(5),  # Long operation
+                timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            raise DatabaseTimeoutError(
+                message="Database query timeout हो गई",
+                timeout_seconds=timeout,
+                detail="Query execution time limit exceed हो गई",
+                original_error=asyncio.TimeoutError()
+            )
+        return []
+    
+    async def create_user_transaction(self, user_data: Dict) -> Dict[str, Any]:
+        """Transaction simulate करो"""
+        if user_data.get("force_transaction_error"):
+            raise DatabaseTransactionError(
+                message="User creation transaction fail हो गई",
+                detail="Constraint violation: duplicate email",
+                original_error=Exception("UNIQUE constraint failed")
+            )
+        
+        return {
+            "id": 101,
+            "name": user_data.get("name"),
+            "email": user_data.get("email"),
+            "created_at": datetime.utcnow().isoformat()
+        }
+    
+    async def check_pool(self) -> Dict[str, Any]:
+        """Connection pool check करो"""
+        if self.active_connections >= self.pool_size:
+            raise DatabasePoolExhaustedError(
+                message="Database connection pool full है",
+                pool_size=self.pool_size,
+                detail=f"All {self.pool_size} connections in use"
+            )
+        
+        return {
+            "pool_size": self.pool_size,
+            "active_connections": self.active_connections,
+            "available": self.pool_size - self.active_connections
+        }
+
+
+# Global DB service instance
+db_service = MockDatabaseService()
+
+
+# ============================================================
+# API Routes
+# ============================================================
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "success": True,
+        "message": "FastAPI DB Error Handler Demo",
+        "version": "1.0.0",
+        "endpoints": {
+            "GET /users/{user_id}": "User fetch करो",
+            "GET /users": "सभी users (timeout demo)",
+            "POST /users": "User create करो (transaction demo)",
+            "GET /db/pool": "Connection pool status",
+            "GET /db/connection-error": "Connection error demo",
+            "GET /db/timeout-error": "Timeout error demo",
+            "GET /db/pool-exhausted": "Pool exhausted demo",
+            "GET /db/transaction-error": "Transaction error demo",
+            "GET /db/health": "Database health check"
+        }
+    }
+
+
+@app.get("/users/{user_id}")
+async def get_user(user_id: int):
+    """
+    User fetch करो
+    - user_id=999 -> DatabaseQueryError trigger होगी
+    """
+    user = await db_service.get_user(user_id)
+    return {
+        "success": True,
+        "data": user
+    }
+
+
+@app.get("/users")
+async def get_all_users(timeout: float = 0.001):
+    """
+    Users fetch करो (timeout demo)
+    Default timeout बहुत कम है जिससे timeout error आएगी
+    """
+    users = await db_service.get_users_with_timeout(timeout=timeout)
+    return {
+        "success": True,
+        "data": users,
+        "count": len(users)
+    }
+
+
+@app.post("/users")
+async def create_user(user_data: dict):
+    """
+    User create करो
+    - force_transaction_error=true -> DatabaseTransactionError
+    """
+    user = await db_service.create_user_transaction(user_data)
+    return {
+        "success": True,
+        "message": "User successfully create हो गया",
+        "data": user
+    }
+
+
+@app.get("/db/pool")
+async def get_pool_status():
+    """Database connection pool status"""
+    pool_info = await db_service.check_pool()
+    return {
+        "success": True,
+        "data": pool_info
+    }
+
+
+# ============================================================
+# Error Demo Endpoints
+# ============================================================
+
+@app.get("/db/connection-error")
+async def demo_connection_error():
+    """DatabaseConnectionError demo"""
+    db_service.is_connected = False
+    try:
+        result = await db_service.get_user(1)
+        return result
+    finally:
+        db_service.is_connected = True  # Reset
+
+
+@app.get("/db/timeout-error")
+async def demo_timeout_error(timeout_seconds: float = 0.001):
+    """DatabaseTimeoutError demo"""
+    await db_service.get_users_with_timeout(timeout=timeout_seconds)
+    return {"success": True, "message": "Query completed"}
+
+
+@app.get("/db/pool-exhausted")
+async def demo_pool_exhausted():
+    """DatabasePoolExhaustedError demo"""
+    db_service.active_connections = db_service.pool_size  # Pool full करो
+    try:
+        result = await db_service.check_pool()
+        return result
+    finally:
+        db_service.active_connections = 0  # Reset
+
+
+@app.get("/db/transaction-error")
+async def demo_transaction_error():
+    """DatabaseTransactionError demo"""
+    await db_service.create_user_transaction({
+        "name": "Test User",
+        "email": "test@example.com",
+        "force_transaction_error": True
+    })
+    return {"success": True}
+
+
+@app.get("/db/query-error")
+async def demo_query_error():
+    """DatabaseQueryError demo"""
+    await db_service.get_user(999)  # 999 = query error trigger
+    return {"success": True}
+
+
+@app.get("/db/health")
+async def database_health_check():
+    """Database health check"""
+    start_time = time.time()
+    
+    try:
+        # Simple connectivity test
+        await asyncio.wait_for(
+            db_service.get_user(1),
+            timeout=5.0
+        )
+        response_time = (time.time() - start_time) * 1000
+        
+        return {
+            "success": True,
+            "status": "healthy",
+            "database": {
+                "connected": db_service.is_connected,
+                "response_time_ms": round(response_time, 2),
+                "pool_size": db_service.pool_size,
+                "active_connections": db_service.active_connections
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+    
+    except DatabaseConnectionError as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "status": "unhealthy",
+                "database": {
+                    "connected": False,
+                    "error": e.message
+                },
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+    
+    except DatabaseTimeoutError as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "success": False,
+                "status": "degraded",
+                "database": {
+                    "connected": True,
+                    "error": e.message,
+                    "timeout_seconds": e.timeout_seconds
+                },
+                "timestamp": datetime.utcnow().isoformat() + "Z"
+            }
+        )
+
+
+# ============================================================
+# Middleware - Request Logging
+# ============================================================
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    """सभी requests को log करो"""
+    start_time = time.time()
+    request_id = get_request_id(request) or f"req_{int(time.time() * 1000)}"
+    
+    logger.info(
+        f"Request Start | "
+        f"ID: {request_id} | "
+        f"Method: {request.method} | "
+        f"Path: {request.url.path}"
+    )
+    
+    response = await call_next(request)
+    
+    process_time = (time.time() - start_time) * 1000
+    
+    logger.info(
+        f"Request End | "
+        f"ID: {request_id} | "
+        f"Status: {response.status_code} | "
+        f"Time: {process_time:.2f}ms"
+    )
+    
+    response.headers["X-Process-Time"] = f"{process_time:.2f}ms"
+    response.headers["X-Request-ID"] = request_id
+    
+    return response
+
+
+# ============================================================
+# App Startup/Shutdown Events
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """App startup पर DB connection initialize करो"""
+    logger.info("=" * 50)
+    logger.info("FastAPI DB Error Handler App Starting...")
+    logger.info("Database connection pool initialize हो रहा है...")
+    
+    # Real app में यहाँ actual DB pool create होगा
+    # db_service.pool = await asyncpg.create_pool(DATABASE_URL)
+    
+    logger.info("App successfully start हो गया!")
+    logger.info("=" * 50)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """App shutdown पर DB connections close करो"""
+    logger.info("App shutdown हो रहा है...")
+    
+    # Real app में यहाँ pool close होगा
+    # await db_service.pool.close()
+    
+    logger.info("Database connections closed। Goodbye!")
+
+
+# ============================================================
+# Main Entry Point
+# ============================================================
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    print("\n" + "=" * 60)
+    print("FastAPI DB Error Handler Demo")
+    print("=" * 60)
+    print("\nTest करने के लिए इन URLs को try करें:")
+    print("\n✅ Normal Endpoints:")
+    print("  GET  http://localhost:8000/")
+    print("  GET  http://localhost:8000/users/1")
+    print("  GET  http://localhost:8000/db/health")
+    print("  GET  http://localhost:8000/db/pool")
+    print("\n❌ Error Demo Endpoints:")
+    print("  GET  http://localhost:8000/db/connection-error  -> 503")
+    print("  GET  http://localhost:8000/db/timeout-error     -> 504")
+    print("  GET  http://localhost:8000/db/pool-exhausted    -> 503")
+    print("  GET  http://localhost:8000/db/transaction-error -> 500")
+    print("  GET  http://localhost:8000/db/query-error       -> 500")
+    print("  GET  http://localhost:8000/users/999            -> 500")
+    print("\n📚 API Docs: http://localhost:8000/docs")
+    print("=" * 60 + "\n")
+    
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+```

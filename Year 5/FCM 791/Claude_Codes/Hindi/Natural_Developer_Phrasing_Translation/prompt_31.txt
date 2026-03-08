@@ -1,0 +1,641 @@
+```python
+import bcrypt
+import secrets
+import hashlib
+import hmac
+import os
+import re
+from argon2 import PasswordHasher
+from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+from typing import Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+import logging
+
+# Logging setup - production में sensitive info log नहीं होगी
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class HashAlgorithm(Enum):
+    """Supported password hashing algorithms"""
+    BCRYPT = "bcrypt"
+    ARGON2 = "argon2"
+
+
+@dataclass
+class HashResult:
+    """Password hashing का result"""
+    hash_value: str
+    algorithm: str
+    # Note: Argon2 में salt hash के अंदर embedded होता है
+    # bcrypt में भी salt hash में included होता है
+    # Plain-text password कभी यहाँ store नहीं होगा
+
+
+@dataclass
+class PasswordPolicy:
+    """Password strength requirements"""
+    min_length: int = 8
+    max_length: int = 128
+    require_uppercase: bool = True
+    require_lowercase: bool = True
+    require_digits: bool = True
+    require_special: bool = True
+    min_special_chars: int = 1
+
+
+class PasswordSecurityError(Exception):
+    """Password security related errors"""
+    pass
+
+
+class WeakPasswordError(PasswordSecurityError):
+    """Password policy violation"""
+    pass
+
+
+class PasswordHasher_Service:
+    """
+    Secure Password Hashing Service
+    
+    Features:
+    - Argon2id (recommended) और bcrypt support
+    - Per-user automatic salt generation
+    - Password strength validation
+    - Timing-safe comparison
+    - Plain-text password कभी store/log नहीं होता
+    """
+    
+    def __init__(
+        self,
+        algorithm: HashAlgorithm = HashAlgorithm.ARGON2,
+        policy: Optional[PasswordPolicy] = None
+    ):
+        self.algorithm = algorithm
+        self.policy = policy or PasswordPolicy()
+        
+        # Argon2id configuration (OWASP recommended settings)
+        self._argon2_hasher = PasswordHasher(
+            time_cost=3,        # Iterations
+            memory_cost=65536,  # 64 MB memory
+            parallelism=4,      # Parallel threads
+            hash_len=32,        # Hash length in bytes
+            salt_len=16,        # Salt length in bytes
+            encoding='utf-8'
+        )
+        
+        # bcrypt cost factor (12-14 recommended for production)
+        self._bcrypt_rounds = 12
+    
+    def validate_password_strength(self, password: str) -> Tuple[bool, list]:
+        """
+        Password strength check करता है
+        
+        Returns:
+            (is_valid, list_of_violations)
+        """
+        violations = []
+        
+        if not isinstance(password, str):
+            violations.append("Password string होना चाहिए")
+            return False, violations
+        
+        # Length checks
+        if len(password) < self.policy.min_length:
+            violations.append(
+                f"Password कम से कम {self.policy.min_length} characters का होना चाहिए"
+            )
+        
+        if len(password) > self.policy.max_length:
+            violations.append(
+                f"Password {self.policy.max_length} characters से ज़्यादा नहीं होना चाहिए"
+            )
+        
+        # Character type checks
+        if self.policy.require_uppercase and not re.search(r'[A-Z]', password):
+            violations.append("Password में कम से कम एक uppercase letter होना चाहिए")
+        
+        if self.policy.require_lowercase and not re.search(r'[a-z]', password):
+            violations.append("Password में कम से कम एक lowercase letter होना चाहिए")
+        
+        if self.policy.require_digits and not re.search(r'\d', password):
+            violations.append("Password में कम से कम एक digit होना चाहिए")
+        
+        if self.policy.require_special:
+            special_chars = re.findall(r'[!@#$%^&*(),.?":{}|<>_\-+=\[\]\\;\'`~/]', password)
+            if len(special_chars) < self.policy.min_special_chars:
+                violations.append(
+                    f"Password में कम से कम {self.policy.min_special_chars} special character होना चाहिए"
+                )
+        
+        # Common weak passwords check
+        common_patterns = [
+            r'^(.)\1+$',           # सभी same characters
+            r'^(012|123|234|345|456|567|678|789|890)',  # Sequential numbers
+            r'^(abc|bcd|cde|def)',  # Sequential letters
+        ]
+        
+        for pattern in common_patterns:
+            if re.search(pattern, password.lower()):
+                violations.append("Password बहुत predictable है, कुछ unique try करें")
+                break
+        
+        return len(violations) == 0, violations
+    
+    def hash_password(self, plain_password: str) -> HashResult:
+        """
+        Password को securely hash करता है
+        
+        Args:
+            plain_password: User का plain-text password
+            
+        Returns:
+            HashResult object (plain password कभी include नहीं होता)
+            
+        Raises:
+            WeakPasswordError: अगर password policy violate हो
+            PasswordSecurityError: Hashing में कोई error हो
+        """
+        # Input validation
+        if not plain_password:
+            raise PasswordSecurityError("Password empty नहीं हो सकता")
+        
+        # Password strength validation
+        is_valid, violations = self.validate_password_strength(plain_password)
+        if not is_valid:
+            raise WeakPasswordError(
+                f"Password requirements पूरे नहीं हुए:\n" + 
+                "\n".join(f"  • {v}" for v in violations)
+            )
+        
+        try:
+            if self.algorithm == HashAlgorithm.ARGON2:
+                return self._hash_with_argon2(plain_password)
+            elif self.algorithm == HashAlgorithm.BCRYPT:
+                return self._hash_with_bcrypt(plain_password)
+            else:
+                raise PasswordSecurityError(f"Unsupported algorithm: {self.algorithm}")
+                
+        except WeakPasswordError:
+            raise
+        except Exception as e:
+            logger.error(f"Password hashing failed: {type(e).__name__}")
+            raise PasswordSecurityError("Password hashing में error आई") from e
+        finally:
+            # Memory में plain password को clear करने की कोशिश
+            # Python में guaranteed नहीं है, लेकिन best practice है
+            del plain_password
+    
+    def _hash_with_argon2(self, password: str) -> HashResult:
+        """
+        Argon2id से hash करता है
+        Salt automatically generate और hash में embed होता है
+        """
+        # Argon2 automatically per-user salt generate करता है
+        hash_value = self._argon2_hasher.hash(password)
+        
+        logger.info("Password successfully hashed with Argon2id")
+        
+        return HashResult(
+            hash_value=hash_value,
+            algorithm=HashAlgorithm.ARGON2.value
+        )
+    
+    def _hash_with_bcrypt(self, password: str) -> HashResult:
+        """
+        bcrypt से hash करता है
+        Salt automatically generate और hash में embed होता है
+        """
+        # bcrypt automatically per-user salt generate करता है
+        # gensalt() में rounds parameter work factor define करता है
+        salt = bcrypt.gensalt(rounds=self._bcrypt_rounds)
+        
+        # Password को bytes में convert करना
+        password_bytes = password.encode('utf-8')
+        
+        # bcrypt 72 bytes से ज़्यादा process नहीं करता
+        # Long passwords के लिए pre-hashing (with caution)
+        if len(password_bytes) > 72:
+            logger.warning("Password 72 bytes से बड़ा है, bcrypt truncation हो सकता है")
+        
+        hash_bytes = bcrypt.hashpw(password_bytes, salt)
+        hash_value = hash_bytes.decode('utf-8')
+        
+        logger.info("Password successfully hashed with bcrypt")
+        
+        return HashResult(
+            hash_value=hash_value,
+            algorithm=HashAlgorithm.BCRYPT.value
+        )
+    
+    def verify_password(
+        self, 
+        plain_password: str, 
+        stored_hash: str,
+        algorithm: Optional[str] = None
+    ) -> bool:
+        """
+        Password verify करता है - timing-safe comparison के साथ
+        
+        Args:
+            plain_password: User का entered password
+            stored_hash: Database में stored hash
+            algorithm: Hash algorithm (auto-detect होता है)
+            
+        Returns:
+            True अगर password match करे, False otherwise
+        """
+        if not plain_password or not stored_hash:
+            return False
+        
+        try:
+            # Algorithm auto-detect
+            detected_algorithm = algorithm or self._detect_algorithm(stored_hash)
+            
+            if detected_algorithm == HashAlgorithm.ARGON2.value:
+                return self._verify_argon2(plain_password, stored_hash)
+            elif detected_algorithm == HashAlgorithm.BCRYPT.value:
+                return self._verify_bcrypt(plain_password, stored_hash)
+            else:
+                logger.error(f"Unknown algorithm: {detected_algorithm}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Password verification error: {type(e).__name__}")
+            return False
+        finally:
+            del plain_password
+    
+    def _verify_argon2(self, password: str, stored_hash: str) -> bool:
+        """Argon2 hash verify करता है"""
+        try:
+            result = self._argon2_hasher.verify(stored_hash, password)
+            
+            # Hash rehash की ज़रूरत check करें (parameters update हुए हों तो)
+            if result and self._argon2_hasher.check_needs_rehash(stored_hash):
+                logger.info("Password hash को rehash करने की ज़रूरत है (parameters updated)")
+                # Application layer में rehash trigger करें
+            
+            return result
+            
+        except VerifyMismatchError:
+            return False
+        except (VerificationError, InvalidHashError) as e:
+            logger.error(f"Argon2 verification error: {type(e).__name__}")
+            return False
+    
+    def _verify_bcrypt(self, password: str, stored_hash: str) -> bool:
+        """bcrypt hash verify करता है - timing-safe"""
+        try:
+            password_bytes = password.encode('utf-8')
+            stored_hash_bytes = stored_hash.encode('utf-8')
+            
+            # bcrypt.checkpw internally timing-safe comparison करता है
+            return bcrypt.checkpw(password_bytes, stored_hash_bytes)
+            
+        except Exception as e:
+            logger.error(f"bcrypt verification error: {type(e).__name__}")
+            return False
+    
+    def _detect_algorithm(self, hash_value: str) -> str:
+        """Hash string से algorithm detect करता है"""
+        if hash_value.startswith('$argon2'):
+            return HashAlgorithm.ARGON2.value
+        elif hash_value.startswith('$2b$') or hash_value.startswith('$2a$'):
+            return HashAlgorithm.BCRYPT.value
+        else:
+            raise PasswordSecurityError("Unknown hash format")
+    
+    def needs_rehash(self, stored_hash: str) -> bool:
+        """
+        Check करता है कि hash को update करने की ज़रूरत है
+        (जब security parameters change हों)
+        """
+        try:
+            algorithm = self._detect_algorithm(stored_hash)
+            
+            if algorithm == HashAlgorithm.ARGON2.value:
+                return self._argon2_hasher.check_needs_rehash(stored_hash)
+            elif algorithm == HashAlgorithm.BCRYPT.value:
+                # bcrypt rounds check
+                import re
+                match = re.search(r'\$2[ab]\$(\d+)\$', stored_hash)
+                if match:
+                    stored_rounds = int(match.group(1))
+                    return stored_rounds < self._bcrypt_rounds
+            
+            return False
+            
+        except Exception:
+            return True  # Error पर rehash safe है
+
+
+class UserAuthService:
+    """
+    Complete User Authentication Service
+    Database integration के साथ
+    """
+    
+    def __init__(self, hasher: Optional[PasswordHasher_Service] = None):
+        self.hasher = hasher or PasswordHasher_Service(
+            algorithm=HashAlgorithm.ARGON2
+        )
+        # Simulated database (production में actual DB use करें)
+        self._user_store = {}
+    
+    def register_user(self, username: str, plain_password: str) -> dict:
+        """
+        नया user register करता है
+        
+        Returns:
+            User record (password hash के साथ, plain text के बिना)
+        """
+        # Username validation
+        if not username or len(username) < 3:
+            raise ValueError("Username कम से कम 3 characters का होना चाहिए")
+        
+        if username in self._user_store:
+            raise ValueError(f"Username '{username}' already exists")
+        
+        # Password hash करें
+        hash_result = self.hasher.hash_password(plain_password)
+        
+        # User record बनाएं - plain password कभी store नहीं होता
+        user_record = {
+            "username": username,
+            "password_hash": hash_result.hash_value,
+            "hash_algorithm": hash_result.algorithm,
+            "created_at": self._get_timestamp(),
+            "last_login": None,
+            "login_attempts": 0,
+            "is_locked": False
+        }
+        
+        # Database में store करें
+        self._user_store[username] = user_record
+        
+        logger.info(f"User '{username}' successfully registered")
+        
+        # Return करते समय sensitive data exclude करें
+        return {
+            "username": username,
+            "created_at": user_record["created_at"],
+            "status": "registered"
+        }
+    
+    def login_user(self, username: str, plain_password: str) -> dict:
+        """
+        User login verify करता है
+        
+        Returns:
+            Login result with status
+        """
+        # Account lockout check
+        if username in self._user_store:
+            user = self._user_store[username]
+            
+            if user.get("is_locked"):
+                logger.warning(f"Locked account login attempt: {username}")
+                return {"success": False, "message": "Account locked है"}
+        
+        # User existence check (timing attack prevent करने के लिए)
+        # हमेशा verification run करें, चाहे user exist करे या न करे
+        if username not in self._user_store:
+            # Dummy hash verify करें ताकि timing attack न हो
+            self._dummy_verification()
+            logger.warning(f"Login attempt for non-existent user: {username}")
+            return {"success": False, "message": "Invalid credentials"}
+        
+        user = self._user_store[username]
+        
+        # Password verify करें
+        is_valid = self.hasher.verify_password(
+            plain_password,
+            user["password_hash"],
+            user["hash_algorithm"]
+        )
+        
+        if is_valid:
+            # Successful login
+            user["login_attempts"] = 0
+            user["last_login"] = self._get_timestamp()
+            
+            # Hash rehash check (security parameters update हुए हों)
+            if self.hasher.needs_rehash(user["password_hash"]):
+                logger.info(f"Rehashing password for user: {username}")
+                new_hash = self.hasher.hash_password(plain_password)
+                user["password_hash"] = new_hash.hash_value
+                user["hash_algorithm"] = new_hash.algorithm
+            
+            logger.info(f"Successful login: {username}")
+            return {
+                "success": True,
+                "username": username,
+                "last_login": user["last_login"],
+                "message": "Login successful"
+            }
+        else:
+            # Failed login
+            user["login_attempts"] = user.get("login_attempts", 0) + 1
+            
+            # 5 failed attempts पर account lock
+            if user["login_attempts"] >= 5:
+                user["is_locked"] = True
+                logger.warning(f"Account locked after failed attempts: {username}")
+            
+            logger.warning(f"Failed login attempt for: {username}")
+            return {
+                "success": False,
+                "message": "Invalid credentials",
+                "attempts_remaining": max(0, 5 - user["login_attempts"])
+            }
+    
+    def change_password(
+        self, 
+        username: str, 
+        old_password: str, 
+        new_password: str
+    ) -> bool:
+        """
+        Password change करता है - old password verify करके
+        """
+        if username not in self._user_store:
+            return False
+        
+        user = self._user_store[username]
+        
+        # Old password verify करें
+        if not self.hasher.verify_password(old_password, user["password_hash"]):
+            logger.warning(f"Password change failed - wrong old password: {username}")
+            return False
+        
+        # New password hash करें
+        new_hash = self.hasher.hash_password(new_password)
+        user["password_hash"] = new_hash.hash_value
+        user["hash_algorithm"] = new_hash.algorithm
+        
+        logger.info(f"Password changed successfully: {username}")
+        return True
+    
+    def _dummy_verification(self):
+        """
+        Timing attack prevent करने के लिए dummy verification
+        Non-existent users के लिए same time लेता है
+        """
+        dummy_hash = "$argon2id$v=19$m=65536,t=3,p=4$dummysalt$dummyhash"
+        try:
+            self.hasher.verify_password("dummy_password", dummy_hash)
+        except Exception:
+            pass
+    
+    def _get_timestamp(self) -> str:
+        """Current timestamp"""
+        from datetime import datetime
+        return datetime.now().isoformat()
+
+
+# ============================================================
+# Demonstration और Testing
+# ============================================================
+
+def demonstrate_password_security():
+    """Password security system का demonstration"""
+    
+    print("=" * 60)
+    print("🔐 Secure Password Hashing System - Demonstration")
+    print("=" * 60)
+    
+    # ---- Argon2 Demonstration ----
+    print("\n📌 1. Argon2id Hashing (Recommended)")
+    print("-" * 40)
+    
+    argon2_hasher = PasswordHasher_Service(algorithm=HashAlgorithm.ARGON2)
+    
+    test_password = "MySecure@Pass123"
+    
+    print(f"Original Password: {test_password}")
+    print(f"Password Length: {len(test_password)} chars")
+    
+    # Hash करें
+    hash_result = argon2_hasher.hash_password(test_password)
+    print(f"\nGenerated Hash: {hash_result.hash_value[:50]}...")
+    print(f"Algorithm: {hash_result.algorithm}")
+    print(f"Hash Length: {len(hash_result.hash_value)} chars")
+    
+    # Verify करें
+    is_correct = argon2_hasher.verify_password(test_password, hash_result.hash_value)
+    is_wrong = argon2_hasher.verify_password("WrongPassword123!", hash_result.hash_value)
+    
+    print(f"\nCorrect Password Verification: {'✅ Pass' if is_correct else '❌ Fail'}")
+    print(f"Wrong Password Verification: {'❌ Should be False' if is_wrong else '✅ Correctly Rejected'}")
+    
+    # ---- bcrypt Demonstration ----
+    print("\n📌 2. bcrypt Hashing")
+    print("-" * 40)
+    
+    bcrypt_hasher = PasswordHasher_Service(algorithm=HashAlgorithm.BCRYPT)
+    
+    bcrypt_hash = bcrypt_hasher.hash_password(test_password)
+    print(f"bcrypt Hash: {bcrypt_hash.hash_value}")
+    print(f"Algorithm: {bcrypt_hash.algorithm}")
+    
+    bcrypt_verify = bcrypt_hasher.verify_password(test_password, bcrypt_hash.hash_value)
+    print(f"Verification: {'✅ Pass' if bcrypt_verify else '❌ Fail'}")
+    
+    # ---- Same Password, Different Hashes ----
+    print("\n📌 3. Per-User Salt Demonstration")
+    print("-" * 40)
+    print("Same password को दो बार hash करने पर अलग-अलग hash मिलते हैं:")
+    
+    hash1 = argon2_hasher.hash_password(test_password)
+    hash2 = argon2_hasher.hash_password(test_password)
+    
+    print(f"Hash 1: {hash1.hash_value[:40]}...")
+    print(f"Hash 2: {hash2.hash_value[:40]}...")
+    print(f"Hashes Same? {'Yes ❌' if hash1.hash_value == hash2.hash_value else 'No ✅ (Per-user salt काम कर रहा है)'}")
+    
+    # दोनों verify होने चाहिए
+    verify1 = argon2_hasher.verify_password(test_password, hash1.hash_value)
+    verify2 = argon2_hasher.verify_password(test_password, hash2.hash_value)
+    print(f"Hash 1 Verifies: {'✅' if verify1 else '❌'}")
+    print(f"Hash 2 Verifies: {'✅' if verify2 else '❌'}")
+    
+    # ---- Password Policy Validation ----
+    print("\n📌 4. Password Policy Validation")
+    print("-" * 40)
+    
+    weak_passwords = [
+        "short",
+        "alllowercase123!",
+        "ALLUPPERCASE123!",
+        "NoSpecialChar123",
+        "NoDigit@Pass",
+    ]
+    
+    for weak_pass in weak_passwords:
+        is_valid, violations = argon2_hasher.validate_password_strength(weak_pass)
+        status = "✅ Valid" if is_valid else "❌ Invalid"
+        print(f"\nPassword: '{weak_pass}' → {status}")
+        if violations:
+            for v in violations:
+                print(f"  • {v}")
+    
+    # ---- Full Authentication Flow ----
+    print("\n📌 5. Complete Authentication Flow")
+    print("-" * 40)
+    
+    auth_service = UserAuthService()
+    
+    # Registration
+    print("\n[Registration]")
+    try:
+        result = auth_service.register_user("rahul_sharma", "Secure@Pass2024")
+        print(f"✅ Registration: {result}")
+    except WeakPasswordError as e:
+        print(f"❌ Weak Password: {e}")
+    
+    # Login attempts
+    print("\n[Login Attempts]")
+    
+    # Correct login
+    login_result = auth_service.login_user("rahul_sharma", "Secure@Pass2024")
+    print(f"Correct Password: {'✅ ' + login_result['message'] if login_result['success'] else '❌ ' + login_result['message']}")
+    
+    # Wrong password
+    wrong_result = auth_service.login_user("rahul_sharma", "WrongPassword123!")
+    print(f"Wrong Password: {'✅' if not wrong_result['success'] else '❌'} {wrong_result['message']}")
+    
+    # Non-existent user
+    fake_result = auth_service.login_user("fake_user", "AnyPassword123!")
+    print(f"Non-existent User: {'✅' if not fake_result['success'] else '❌'} {fake_result['message']}")
+    
+    # Password Change
+    print("\n[Password Change]")
+    changed = auth_service.change_password(
+        "rahul_sharma", 
+        "Secure@Pass2024", 
+        "NewSecure@Pass2024"
+    )
+    print(f"Password Change: {'✅ Success' if changed else '❌ Failed'}")
+    
+    # Old password should not work
+    old_login = auth_service.login_user("rahul_sharma", "Secure@Pass2024")
+    new_login = auth_service.login_user("rahul_sharma", "NewSecure@Pass2024")
+    print(f"Old Password After Change: {'✅ Correctly Rejected' if not old_login['success'] else '❌ Should be rejected'}")
+    print(f"New Password After Change: {'✅ Works' if new_login['success'] else '❌ Should work'}")
+    
+    print("\n" + "=" * 60)
+    print("✅ Security Summary:")
+    print("  • Plain-text passwords कभी store नहीं होते")
+    print("  • हर user का unique salt automatically generate होता है")
+    print("  • Argon2id memory-hard algorithm use होता है")
+    print("  • Timing-safe comparison से timing attacks prevent होते हैं")
+    print("  • Password policy weak passwords को reject करती है")
+    print("  • Failed login attempts track होते हैं")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    demonstrate_password_security()
+```

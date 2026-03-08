@@ -1,0 +1,408 @@
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// CORSConfig CORS configuration structure
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+// Response standard API response structure
+type Response struct {
+	Success   bool        `json:"success"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp string      `json:"timestamp"`
+}
+
+// Logger custom logger
+type Logger struct {
+	logger *log.Logger
+}
+
+func NewLogger() *Logger {
+	return &Logger{
+		logger: log.New(os.Stdout, "", 0),
+	}
+}
+
+func (l *Logger) Log(method, path, origin string, status int, duration time.Duration) {
+	l.logger.Printf(
+		"[%s] Method: %-7s | Path: %-20s | Origin: %-30s | Status: %d | Duration: %v",
+		time.Now().Format("2006-01-02 15:04:05"),
+		method,
+		path,
+		origin,
+		status,
+		duration,
+	)
+}
+
+// DefaultCORSConfig default CORS configuration
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+			"https://www.myapp.com",
+		},
+		AllowedMethods: []string{
+			"GET",
+			"POST",
+			"PUT",
+			"PATCH",
+			"DELETE",
+			"OPTIONS",
+			"HEAD",
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Requested-With",
+			"Origin",
+			"X-Api-Key",
+		},
+		ExposedHeaders: []string{
+			"Content-Length",
+			"X-Request-Id",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 hours
+	}
+}
+
+// isOriginAllowed check if origin is allowed
+func isOriginAllowed(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		// Exact match
+		if allowed == origin {
+			return true
+		}
+		// Wildcard match
+		if allowed == "*" {
+			return true
+		}
+		// Subdomain wildcard match (e.g., *.myapp.com)
+		if strings.HasPrefix(allowed, "*.") {
+			domain := allowed[2:]
+			if strings.HasSuffix(origin, "."+domain) || origin == domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// CORSMiddleware CORS middleware
+func CORSMiddleware(config CORSConfig, logger *Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			origin := r.Header.Get("Origin")
+
+			// Check if origin is allowed
+			if origin != "" && isOriginAllowed(origin, config.AllowedOrigins) {
+				// Set CORS headers
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+
+				if config.AllowCredentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
+
+				// Expose headers
+				if len(config.ExposedHeaders) > 0 {
+					w.Header().Set("Access-Control-Expose-Headers",
+						strings.Join(config.ExposedHeaders, ", "))
+				}
+
+				// Handle preflight request
+				if r.Method == http.MethodOptions {
+					// Set preflight headers
+					w.Header().Set("Access-Control-Allow-Methods",
+						strings.Join(config.AllowedMethods, ", "))
+					w.Header().Set("Access-Control-Allow-Headers",
+						strings.Join(config.AllowedHeaders, ", "))
+
+					if config.MaxAge > 0 {
+						w.Header().Set("Access-Control-Max-Age",
+							fmt.Sprintf("%d", config.MaxAge))
+					}
+
+					// Vary header for caching
+					w.Header().Set("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers")
+
+					logger.Log(r.Method, r.URL.Path, origin, http.StatusNoContent, time.Since(start))
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			} else if origin != "" {
+				// Origin not allowed - log it
+				logger.Log(r.Method, r.URL.Path, "BLOCKED: "+origin, http.StatusForbidden, time.Since(start))
+
+				// For non-preflight requests from disallowed origins
+				if r.Method != http.MethodOptions {
+					sendJSONResponse(w, http.StatusForbidden, Response{
+						Success:   false,
+						Message:   "CORS: Origin not allowed",
+						Timestamp: time.Now().UTC().Format(time.RFC3339),
+					})
+					return
+				}
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+
+			// Vary header for proper caching
+			w.Header().Set("Vary", "Origin")
+
+			// Create response writer wrapper to capture status code
+			rw := &responseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+			next.ServeHTTP(rw, r)
+
+			logger.Log(r.Method, r.URL.Path, origin, rw.statusCode, time.Since(start))
+		})
+	}
+}
+
+// responseWriter wrapper to capture status code
+type responseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// sendJSONResponse helper function to send JSON response
+func sendJSONResponse(w http.ResponseWriter, statusCode int, response Response) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(response)
+}
+
+// SecurityMiddleware adds security headers
+func SecurityMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Handlers
+
+// homeHandler home endpoint
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	sendJSONResponse(w, http.StatusOK, Response{
+		Success: true,
+		Message: "Welcome to CORS-enabled Go Server!",
+		Data: map[string]interface{}{
+			"version":     "1.0.0",
+			"environment": "production",
+		},
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// usersHandler users endpoint
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		users := []map[string]interface{}{
+			{"id": 1, "name": "Rahul Sharma", "email": "rahul@myapp.com", "role": "admin"},
+			{"id": 2, "name": "Priya Singh", "email": "priya@myapp.com", "role": "user"},
+			{"id": 3, "name": "Amit Kumar", "email": "amit@myapp.com", "role": "user"},
+		}
+		sendJSONResponse(w, http.StatusOK, Response{
+			Success:   true,
+			Message:   "Users fetched successfully",
+			Data:      users,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+
+	case http.MethodPost:
+		var user map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+			sendJSONResponse(w, http.StatusBadRequest, Response{
+				Success:   false,
+				Message:   "Invalid request body: " + err.Error(),
+				Timestamp: time.Now().UTC().Format(time.RFC3339),
+			})
+			return
+		}
+		user["id"] = 4
+		user["created_at"] = time.Now().UTC().Format(time.RFC3339)
+		sendJSONResponse(w, http.StatusCreated, Response{
+			Success:   true,
+			Message:   "User created successfully",
+			Data:      user,
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+
+	default:
+		sendJSONResponse(w, http.StatusMethodNotAllowed, Response{
+			Success:   false,
+			Message:   "Method not allowed",
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+}
+
+// productsHandler products endpoint
+func productsHandler(w http.ResponseWriter, r *http.Request) {
+	products := []map[string]interface{}{
+		{"id": 1, "name": "Laptop", "price": 75000, "category": "Electronics"},
+		{"id": 2, "name": "Mobile", "price": 25000, "category": "Electronics"},
+		{"id": 3, "name": "Headphones", "price": 5000, "category": "Accessories"},
+	}
+	sendJSONResponse(w, http.StatusOK, Response{
+		Success:   true,
+		Message:   "Products fetched successfully",
+		Data:      products,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// healthHandler health check endpoint
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	sendJSONResponse(w, http.StatusOK, Response{
+		Success: true,
+		Message: "Server is healthy",
+		Data: map[string]interface{}{
+			"status":    "UP",
+			"uptime":    time.Since(serverStartTime).String(),
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+		},
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// corsInfoHandler CORS info endpoint
+func corsInfoHandler(config CORSConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sendJSONResponse(w, http.StatusOK, Response{
+			Success: true,
+			Message: "CORS Configuration",
+			Data: map[string]interface{}{
+				"allowed_origins":   config.AllowedOrigins,
+				"allowed_methods":   config.AllowedMethods,
+				"allowed_headers":   config.AllowedHeaders,
+				"exposed_headers":   config.ExposedHeaders,
+				"allow_credentials": config.AllowCredentials,
+				"max_age_seconds":   config.MaxAge,
+			},
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+		})
+	}
+}
+
+var serverStartTime = time.Now()
+
+// chainMiddleware chain multiple middlewares
+func chainMiddleware(h http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}
+
+func main() {
+	// Initialize logger
+	logger := NewLogger()
+
+	// CORS configuration
+	corsConfig := DefaultCORSConfig()
+
+	// Development mode - add localhost origins
+	isDevelopment := os.Getenv("ENV") == "development"
+	if isDevelopment {
+		corsConfig.AllowedOrigins = append(corsConfig.AllowedOrigins,
+			"http://localhost:3000",
+			"http://localhost:8080",
+			"http://127.0.0.1:3000",
+		)
+		log.Println("Development mode: localhost origins added")
+	}
+
+	// Create router
+	mux := http.NewServeMux()
+
+	// Register routes
+	mux.HandleFunc("/", homeHandler)
+	mux.HandleFunc("/api/users", usersHandler)
+	mux.HandleFunc("/api/products", productsHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/api/cors-info", corsInfoHandler(corsConfig))
+
+	// Apply middlewares
+	handler := chainMiddleware(
+		mux,
+		SecurityMiddleware,
+		CORSMiddleware(corsConfig, logger),
+	)
+
+	// Server configuration
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	server := &http.Server{
+		Addr:         ":" + port,
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Print startup information
+	fmt.Println("╔════════════════════════════════════════════════╗")
+	fmt.Println("║         Go CORS Web Server Starting...         ║")
+	fmt.Println("╚════════════════════════════════════════════════╝")
+	fmt.Printf("\n Server URL    : http://localhost:%s\n", port)
+	fmt.Printf(" Environment   : %s\n", func() string {
+		if isDevelopment {
+			return "Development"
+		}
+		return "Production"
+	}())
+	fmt.Println("\n Allowed Origins:")
+	for _, origin := range corsConfig.AllowedOrigins {
+		fmt.Printf("   ✓ %s\n", origin)
+	}
+	fmt.Println("\n Available Endpoints:")
+	fmt.Printf("   GET  http://localhost:%s/\n", port)
+	fmt.Printf("   GET  http://localhost:%s/health\n", port)
+	fmt.Printf("   GET  http://localhost:%s/api/users\n", port)
+	fmt.Printf("   POST http://localhost:%s/api/users\n", port)
+	fmt.Printf("   GET  http://localhost:%s/api/products\n", port)
+	fmt.Printf("   GET  http://localhost:%s/api/cors-info\n", port)
+	fmt.Println("\n════════════════════════════════════════════════════")
+	fmt.Println(" Server is ready to accept connections!")
+	fmt.Println("════════════════════════════════════════════════════\n")
+
+	// Start server
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
+```

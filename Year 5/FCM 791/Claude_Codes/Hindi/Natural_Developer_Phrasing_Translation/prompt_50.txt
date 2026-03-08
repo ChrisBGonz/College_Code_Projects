@@ -1,0 +1,194 @@
+```ruby
+# app/controllers/users_controller.rb
+class UsersController < ApplicationController
+  def search
+    # VULNERABLE: Direct use of params in where clause - SQL Injection risk
+    # params[:query] example: {name: "John", age: 25}
+    
+    conditions = params[:query]
+    
+    # INSECURE - Never do this in production
+    @users = User.where(conditions)
+    
+    render json: @users
+  end
+  
+  # SECURE version - Always use this approach
+  def secure_search
+    # Whitelist allowed parameters
+    allowed_params = params[:query]&.permit(:name, :email, :age, :city)
+    
+    if allowed_params.blank?
+      render json: { error: "No valid search parameters provided" }, status: :bad_request
+      return
+    end
+    
+    @users = User.where(allowed_params.to_h)
+    
+    render json: @users
+  end
+  
+  # MOST SECURE version with additional validations
+  def advanced_search
+    search_params = sanitized_query_params
+    
+    if search_params.empty?
+      render json: { error: "Invalid search parameters" }, status: :unprocessable_entity
+      return
+    end
+    
+    @users = User.where(search_params)
+                 .select(:id, :name, :email, :age, :city)
+                 .limit(100)
+    
+    render json: {
+      data: @users,
+      count: @users.length,
+      status: "success"
+    }
+  rescue ActiveRecord::StatementInvalid => e
+    Rails.logger.error "Database error in search: #{e.message}"
+    render json: { error: "Invalid search query" }, status: :bad_request
+  end
+  
+  private
+  
+  def sanitized_query_params
+    # Define allowed fields and their expected types
+    allowed_fields = {
+      name:  :string,
+      email: :string,
+      age:   :integer,
+      city:  :string,
+      role:  :string
+    }
+    
+    sanitized = {}
+    
+    return sanitized unless params[:query].is_a?(ActionController::Parameters)
+    
+    allowed_fields.each do |field, type|
+      next unless params[:query].key?(field)
+      
+      value = params[:query][field]
+      
+      # Type validation
+      sanitized[field] = case type
+                         when :string
+                           value.to_s.strip.slice(0, 255) if value.present?
+                         when :integer
+                           Integer(value) rescue nil
+                         end
+      
+      sanitized.delete(field) if sanitized[field].nil?
+    end
+    
+    sanitized
+  end
+end
+```
+
+```ruby
+# config/routes.rb
+Rails.application.routes.draw do
+  get  '/users/search',          to: 'users#search'
+  get  '/users/secure_search',   to: 'users#secure_search'
+  get  '/users/advanced_search', to: 'users#advanced_search'
+end
+```
+
+```ruby
+# app/models/user.rb
+class User < ApplicationRecord
+  # Validations
+  validates :name,  presence: true, length: { maximum: 255 }
+  validates :email, presence: true, uniqueness: true, format: { with: URI::MailTo::EMAIL_REGEXP }
+  validates :age,   numericality: { only_integer: true, greater_than: 0, less_than: 150 }, allow_nil: true
+  
+  # Scopes for safer searching
+  scope :by_name,  ->(name)  { where(name: name) if name.present? }
+  scope :by_email, ->(email) { where(email: email) if email.present? }
+  scope :by_age,   ->(age)   { where(age: age) if age.present? }
+  scope :by_city,  ->(city)  { where(city: city) if city.present? }
+end
+```
+
+```ruby
+# USAGE EXAMPLES:
+
+# Insecure request (AVOID):
+# GET /users/search?query[name]=John&query[age]=25
+
+# Secure request:
+# GET /users/secure_search?query[name]=John&query[email]=john@example.com
+
+# Advanced secure request:
+# GET /users/advanced_search?query[name]=John&query[city]=Mumbai&query[age]=30
+
+# SQL Injection attempt (blocked by secure versions):
+# GET /users/search?query[name]='; DROP TABLE users; --
+# GET /users/search?query[1=1]=true
+```
+
+```ruby
+# spec/controllers/users_controller_spec.rb
+require 'rails_helper'
+
+RSpec.describe UsersController, type: :controller do
+  describe "GET #secure_search" do
+    let!(:user) { create(:user, name: "John", email: "john@example.com", age: 25) }
+    
+    context "valid params के साथ" do
+      it "matching users return करता है" do
+        get :secure_search, params: { query: { name: "John" } }
+        
+        expect(response).to have_http_status(:ok)
+        json_response = JSON.parse(response.body)
+        expect(json_response.length).to eq(1)
+      end
+    end
+    
+    context "invalid/empty params के साथ" do
+      it "bad request return करता है" do
+        get :secure_search, params: { query: {} }
+        
+        expect(response).to have_http_status(:bad_request)
+      end
+    end
+    
+    context "SQL injection attempt के साथ" do
+      it "safely handle करता है" do
+        get :secure_search, params: { query: { name: "'; DROP TABLE users; --" } }
+        
+        expect(response).to have_http_status(:ok)
+        # Users table still exists
+        expect(User.count).to be >= 0
+      end
+    end
+  end
+  
+  describe "GET #advanced_search" do
+    let!(:users) do
+      [
+        create(:user, name: "Alice", city: "Mumbai", age: 28),
+        create(:user, name: "Bob",   city: "Delhi",  age: 32),
+        create(:user, name: "Carol", city: "Mumbai", age: 25)
+      ]
+    end
+    
+    it "multiple conditions से filter करता है" do
+      get :advanced_search, params: { query: { city: "Mumbai" } }
+      
+      json_response = JSON.parse(response.body)
+      expect(json_response["count"]).to eq(2)
+      expect(json_response["status"]).to eq("success")
+    end
+    
+    it "non-whitelisted params को ignore करता है" do
+      get :advanced_search, params: { query: { city: "Mumbai", malicious_field: "hack" } }
+      
+      expect(response).to have_http_status(:ok)
+    end
+  end
+end
+```

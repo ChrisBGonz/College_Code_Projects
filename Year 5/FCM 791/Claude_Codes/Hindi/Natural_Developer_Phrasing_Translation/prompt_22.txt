@@ -1,0 +1,740 @@
+```bash
+#!/usr/bin/env bash
+
+# =============================================================================
+# Security Tool Auto-Downloader & Installer
+# =============================================================================
+# Usage: ./install_security_tool.sh [OPTIONS]
+# Options:
+#   -t, --tool      Tool name (nmap, nuclei, ffuf, gobuster, etc.)
+#   -u, --url       Custom download URL (optional)
+#   -d, --dir       Install directory (default: /usr/local/bin)
+#   -v, --version   Specific version (default: latest)
+#   -s, --skip-verify  Skip checksum verification
+#   -h, --help      Show this help
+# =============================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COLORS & FORMATTING
+# ─────────────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING FUNCTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+log_info()    { echo -e "${BLUE}[INFO]${RESET}  $*"; }
+log_success() { echo -e "${GREEN}[OK]${RESET}    $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
+log_error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${RESET}"; }
+log_debug()   { [[ "${DEBUG:-0}" == "1" ]] && echo -e "${DIM}[DEBUG] $*${RESET}"; }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GLOBAL VARIABLES
+# ─────────────────────────────────────────────────────────────────────────────
+TOOL_NAME=""
+CUSTOM_URL=""
+INSTALL_DIR="/usr/local/bin"
+TARGET_VERSION="latest"
+SKIP_VERIFY=false
+TEMP_DIR=""
+DETECTED_OS=""
+DETECTED_ARCH=""
+DETECTED_VERSION=""
+DOWNLOAD_URL=""
+CHECKSUM_URL=""
+SIGNATURE_URL=""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUPPORTED TOOLS DATABASE
+# ─────────────────────────────────────────────────────────────────────────────
+declare -A TOOL_GITHUB_REPO=(
+    ["nmap"]=""
+    ["nuclei"]="projectdiscovery/nuclei"
+    ["ffuf"]="ffuf/ffuf"
+    ["gobuster"]="OJ/gobuster"
+    ["httpx"]="projectdiscovery/httpx"
+    ["subfinder"]="projectdiscovery/subfinder"
+    ["naabu"]="projectdiscovery/naabu"
+    ["katana"]="projectdiscovery/katana"
+    ["dnsx"]="projectdiscovery/dnsx"
+    ["amass"]="owasp-amass/amass"
+    ["feroxbuster"]="epi052/feroxbuster"
+    ["rustscan"]="RustScan/RustScan"
+    ["trivy"]="aquasecurity/trivy"
+    ["grype"]="anchore/grype"
+    ["syft"]="anchore/syft"
+    ["trufflehog"]="trufflesecurity/trufflehog"
+    ["gitleaks"]="gitleaks/gitleaks"
+    ["semgrep"]=""
+    ["nikto"]=""
+    ["sqlmap"]=""
+)
+
+declare -A TOOL_VERSION_CMD=(
+    ["nuclei"]="nuclei -version"
+    ["ffuf"]="ffuf -V"
+    ["gobuster"]="gobuster version"
+    ["httpx"]="httpx -version"
+    ["subfinder"]="subfinder -version"
+    ["naabu"]="naabu -version"
+    ["katana"]="katana -version"
+    ["dnsx"]="dnsx -version"
+    ["amass"]="amass -version"
+    ["feroxbuster"]="feroxbuster --version"
+    ["rustscan"]="rustscan --version"
+    ["trivy"]="trivy --version"
+    ["grype"]="grype version"
+    ["syft"]="syft version"
+    ["trufflehog"]="trufflehog --version"
+    ["gitleaks"]="gitleaks version"
+    ["nmap"]="nmap --version"
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HELP MESSAGE
+# ─────────────────────────────────────────────────────────────────────────────
+show_help() {
+    cat << EOF
+${BOLD}${CYAN}
+╔══════════════════════════════════════════════════════════════╗
+║         Security Tool Auto-Installer v2.0                    ║
+║         Auto-detect, Download, Verify & Install              ║
+╚══════════════════════════════════════════════════════════════╝
+${RESET}
+${BOLD}USAGE:${RESET}
+    $(basename "$0") [OPTIONS]
+
+${BOLD}OPTIONS:${RESET}
+    ${GREEN}-t, --tool${RESET}          Tool name to install
+    ${GREEN}-u, --url${RESET}           Custom download URL
+    ${GREEN}-d, --dir${RESET}           Install directory (default: /usr/local/bin)
+    ${GREEN}-v, --version${RESET}       Specific version (default: latest)
+    ${GREEN}-s, --skip-verify${RESET}   Skip checksum/signature verification
+    ${GREEN}-h, --help${RESET}          Show this help message
+
+${BOLD}SUPPORTED TOOLS:${RESET}
+    nuclei, ffuf, gobuster, httpx, subfinder, naabu, katana,
+    dnsx, amass, feroxbuster, rustscan, trivy, grype, syft,
+    trufflehog, gitleaks, nmap
+
+${BOLD}EXAMPLES:${RESET}
+    $(basename "$0") --tool nuclei
+    $(basename "$0") --tool ffuf --version v2.1.0
+    $(basename "$0") --tool trivy --dir /opt/tools
+    $(basename "$0") --url https://example.com/tool.tar.gz --tool mytool
+    $(basename "$0") --tool gobuster --skip-verify
+
+${BOLD}ENVIRONMENT VARIABLES:${RESET}
+    ${YELLOW}GITHUB_TOKEN${RESET}    GitHub API token (increases rate limit)
+    ${YELLOW}DEBUG${RESET}           Set to 1 for verbose output
+    ${YELLOW}PROXY${RESET}           HTTP proxy URL
+
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ARGUMENT PARSING
+# ─────────────────────────────────────────────────────────────────────────────
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t|--tool)
+                TOOL_NAME="${2:-}"
+                shift 2
+                ;;
+            -u|--url)
+                CUSTOM_URL="${2:-}"
+                shift 2
+                ;;
+            -d|--dir)
+                INSTALL_DIR="${2:-/usr/local/bin}"
+                shift 2
+                ;;
+            -v|--version)
+                TARGET_VERSION="${2:-latest}"
+                shift 2
+                ;;
+            -s|--skip-verify)
+                SKIP_VERIFY=true
+                shift
+                ;;
+            -h|--help)
+                show_help
+                exit 0
+                ;;
+            *)
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
+                ;;
+        esac
+    done
+
+    # Interactive mode अगर कोई argument नहीं दिया
+    if [[ -z "$TOOL_NAME" && -z "$CUSTOM_URL" ]]; then
+        interactive_mode
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTERACTIVE MODE
+# ─────────────────────────────────────────────────────────────────────────────
+interactive_mode() {
+    echo -e "${BOLD}${CYAN}"
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║         Security Tool Auto-Installer                        ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+
+    echo -e "${BOLD}Available Tools:${RESET}"
+    local i=1
+    local tools_list=()
+    for tool in "${!TOOL_GITHUB_REPO[@]}"; do
+        tools_list+=("$tool")
+        printf "  ${GREEN}%2d)${RESET} %s\n" "$i" "$tool"
+        ((i++))
+    done
+
+    echo ""
+    read -rp "$(echo -e "${YELLOW}Tool name या number enter करें: ${RESET}")" user_input
+
+    # Number या name check
+    if [[ "$user_input" =~ ^[0-9]+$ ]]; then
+        local idx=$((user_input - 1))
+        TOOL_NAME="${tools_list[$idx]:-}"
+    else
+        TOOL_NAME="$user_input"
+    fi
+
+    if [[ -z "$TOOL_NAME" ]]; then
+        log_error "कोई tool select नहीं किया"
+        exit 1
+    fi
+
+    read -rp "$(echo -e "${YELLOW}Version (Enter = latest): ${RESET}")" ver_input
+    TARGET_VERSION="${ver_input:-latest}"
+
+    read -rp "$(echo -e "${YELLOW}Install directory (Enter = /usr/local/bin): ${RESET}")" dir_input
+    INSTALL_DIR="${dir_input:-/usr/local/bin}"
+
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEM DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+detect_system() {
+    log_step "System Detection"
+
+    # OS Detection
+    case "$(uname -s)" in
+        Linux*)
+            DETECTED_OS="linux"
+            # Distribution detect
+            if [[ -f /etc/os-release ]]; then
+                source /etc/os-release
+                log_info "Distribution: ${NAME:-Unknown} ${VERSION_ID:-}"
+            fi
+            ;;
+        Darwin*)
+            DETECTED_OS="darwin"
+            log_info "macOS $(sw_vers -productVersion 2>/dev/null || echo 'Unknown')"
+            ;;
+        MINGW*|CYGWIN*|MSYS*)
+            DETECTED_OS="windows"
+            log_warn "Windows detected - limited support"
+            ;;
+        *)
+            log_error "Unsupported OS: $(uname -s)"
+            exit 1
+            ;;
+    esac
+
+    # Architecture Detection
+    case "$(uname -m)" in
+        x86_64|amd64)
+            DETECTED_ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            DETECTED_ARCH="arm64"
+            ;;
+        armv7l|armv6l)
+            DETECTED_ARCH="arm"
+            ;;
+        i386|i686)
+            DETECTED_ARCH="386"
+            ;;
+        *)
+            DETECTED_ARCH="$(uname -m)"
+            log_warn "Unknown architecture: $DETECTED_ARCH"
+            ;;
+    esac
+
+    log_success "OS: ${DETECTED_OS} | Arch: ${DETECTED_ARCH}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCY CHECK
+# ─────────────────────────────────────────────────────────────────────────────
+check_dependencies() {
+    log_step "Dependency Check"
+
+    local required_tools=("curl" "tar" "grep" "awk" "sed" "file")
+    local optional_tools=("wget" "sha256sum" "sha512sum" "md5sum" "gpg" "unzip" "jq")
+    local missing_required=()
+    local missing_optional=()
+
+    # Required tools check
+    for tool in "${required_tools[@]}"; do
+        if command -v "$tool" &>/dev/null; then
+            log_success "Required: $tool ✓"
+        else
+            missing_required+=("$tool")
+            log_error "Required: $tool ✗ (MISSING)"
+        fi
+    done
+
+    # Optional tools check
+    for tool in "${optional_tools[@]}"; do
+        if command -v "$tool" &>/dev/null; then
+            log_debug "Optional: $tool ✓"
+        else
+            missing_optional+=("$tool")
+            log_warn "Optional: $tool ✗ (not available)"
+        fi
+    done
+
+    # Missing required tools install करने की कोशिश
+    if [[ ${#missing_required[@]} -gt 0 ]]; then
+        log_warn "Missing required tools: ${missing_required[*]}"
+        install_system_deps "${missing_required[@]}"
+    fi
+
+    # sudo availability check
+    if [[ "$EUID" -ne 0 ]]; then
+        if ! command -v sudo &>/dev/null; then
+            log_error "sudo नहीं मिला और root नहीं हैं"
+            log_info "INSTALL_DIR को writable path पर set करें: --dir ~/.local/bin"
+            exit 1
+        fi
+        log_info "sudo available ✓"
+    else
+        log_info "Running as root ✓"
+    fi
+
+    log_success "Dependency check complete"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SYSTEM PACKAGE INSTALL
+# ─────────────────────────────────────────────────────────────────────────────
+install_system_deps() {
+    local deps=("$@")
+    log_info "System dependencies install करने की कोशिश: ${deps[*]}"
+
+    if command -v apt-get &>/dev/null; then
+        sudo apt-get update -qq
+        sudo apt-get install -y "${deps[@]}" 2>/dev/null || true
+    elif command -v yum &>/dev/null; then
+        sudo yum install -y "${deps[@]}" 2>/dev/null || true
+    elif command -v dnf &>/dev/null; then
+        sudo dnf install -y "${deps[@]}" 2>/dev/null || true
+    elif command -v pacman &>/dev/null; then
+        sudo pacman -S --noconfirm "${deps[@]}" 2>/dev/null || true
+    elif command -v brew &>/dev/null; then
+        brew install "${deps[@]}" 2>/dev/null || true
+    elif command -v apk &>/dev/null; then
+        sudo apk add --no-cache "${deps[@]}" 2>/dev/null || true
+    else
+        log_error "Package manager नहीं मिला। Manual install करें: ${deps[*]}"
+        exit 1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GITHUB API HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+github_api_call() {
+    local endpoint="$1"
+    local headers=(-H "Accept: application/vnd.github.v3+json")
+
+    if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+        headers+=(-H "Authorization: token $GITHUB_TOKEN")
+    fi
+
+    local proxy_args=()
+    if [[ -n "${PROXY:-}" ]]; then
+        proxy_args=(--proxy "$PROXY")
+    fi
+
+    curl -fsSL \
+        "${headers[@]}" \
+        "${proxy_args[@]}" \
+        --retry 3 \
+        --retry-delay 2 \
+        --connect-timeout 30 \
+        "https://api.github.com/${endpoint}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VERSION DETECTION
+# ─────────────────────────────────────────────────────────────────────────────
+detect_latest_version() {
+    local repo="${TOOL_GITHUB_REPO[$TOOL_NAME]:-}"
+
+    log_step "Version Detection"
+
+    if [[ "$TARGET_VERSION" != "latest" ]]; then
+        DETECTED_VERSION="$TARGET_VERSION"
+        log_info "Specified version: $DETECTED_VERSION"
+        return 0
+    fi
+
+    if [[ -z "$repo" ]]; then
+        log_warn "GitHub repo नहीं मिला $TOOL_NAME के लिए"
+        DETECTED_VERSION="latest"
+        return 0
+    fi
+
+    log_info "GitHub API से latest version fetch कर रहे हैं: $repo"
+
+    # Method 1: GitHub Releases API
+    local api_response
+    if api_response=$(github_api_call "repos/${repo}/releases/latest" 2>/dev/null); then
+        if command -v jq &>/dev/null; then
+            DETECTED_VERSION=$(echo "$api_response" | jq -r '.tag_name // empty')
+        else
+            DETECTED_VERSION=$(echo "$api_response" | grep -o '"tag_name":"[^"]*"' | head -1 | cut -d'"' -f4)
+        fi
+    fi
+
+    # Method 2: Redirect follow करके
+    if [[ -z "$DETECTED_VERSION" ]]; then
+        log_info "Redirect method try कर रहे हैं..."
+        DETECTED_VERSION=$(curl -fsSL \
+            --max-redirs 5 \
+            -o /dev/null \
+            -w '%{url_effective}' \
+            "https://github.com/${repo}/releases/latest" 2>/dev/null | \
+            grep -oP 'tag/\K[^/]+' || echo "")
+    fi
+
+    # Method 3: Tags API
+    if [[ -z "$DETECTED_VERSION" ]]; then
+        log_info "Tags API try कर रहे हैं..."
+        if api_response=$(github_api_call "repos/${repo}/tags" 2>/dev/null); then
+            if command -v jq &>/dev/null; then
+                DETECTED_VERSION=$(echo "$api_response" | jq -r '.[0].name // empty')
+            else
+                DETECTED_VERSION=$(echo "$api_response" | grep -o '"name":"[^"]*"' | head -1 | cut -d'"' -f4)
+            fi
+        fi
+    fi
+
+    if [[ -z "$DETECTED_VERSION" ]]; then
+        log_error "Version detect नहीं हो सका"
+        log_info "Manual version specify करें: --version v1.0.0"
+        exit 1
+    fi
+
+    log_success "Latest version: ${BOLD}$DETECTED_VERSION${RESET}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOWNLOAD URL BUILDER
+# ─────────────────────────────────────────────────────────────────────────────
+build_download_url() {
+    log_step "Download URL Resolution"
+
+    if [[ -n "$CUSTOM_URL" ]]; then
+        DOWNLOAD_URL="$CUSTOM_URL"
+        log_info "Custom URL: $DOWNLOAD_URL"
+        return 0
+    fi
+
+    local repo="${TOOL_GITHUB_REPO[$TOOL_NAME]:-}"
+    local version="$DETECTED_VERSION"
+    local version_clean="${version#v}"  # v prefix हटाएं
+
+    if [[ -z "$repo" ]]; then
+        log_error "Download URL build नहीं हो सका"
+        exit 1
+    fi
+
+    local base_url="https://github.com/${repo}/releases/download/${version}"
+
+    # Tool-specific URL patterns
+    case "$TOOL_NAME" in
+        nuclei|httpx|subfinder|naabu|katana|dnsx)
+            local tool_cap="${TOOL_NAME^}"
+            DOWNLOAD_URL="${base_url}/${TOOL_NAME}_${DETECTED_OS}_${DETECTED_ARCH}.zip"
+            CHECKSUM_URL="${base_url}/${TOOL_NAME}_${DETECTED_OS}_${DETECTED_ARCH}.zip.sha256"
+            ;;
+
+        ffuf)
+            DOWNLOAD_URL="${base_url}/ffuf_${version_clean}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/ffuf_${version_clean}_checksums.txt"
+            ;;
+
+        gobuster)
+            DOWNLOAD_URL="${base_url}/gobuster_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/gobuster_checksums.txt"
+            ;;
+
+        amass)
+            DOWNLOAD_URL="${base_url}/amass_${DETECTED_OS}_${DETECTED_ARCH}.zip"
+            CHECKSUM_URL="${base_url}/amass_checksums.txt"
+            ;;
+
+        feroxbuster)
+            if [[ "$DETECTED_OS" == "linux" ]]; then
+                DOWNLOAD_URL="${base_url}/feroxbuster_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            else
+                DOWNLOAD_URL="${base_url}/feroxbuster_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            fi
+            CHECKSUM_URL="${base_url}/feroxbuster_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz.sha256"
+            ;;
+
+        rustscan)
+            DOWNLOAD_URL="${base_url}/rustscan_${version_clean}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            ;;
+
+        trivy)
+            local arch_trivy="$DETECTED_ARCH"
+            [[ "$arch_trivy" == "amd64" ]] && arch_trivy="64bit"
+            [[ "$arch_trivy" == "arm64" ]] && arch_trivy="ARM64"
+            DOWNLOAD_URL="${base_url}/trivy_${version_clean}_${DETECTED_OS^}-${arch_trivy}.tar.gz"
+            CHECKSUM_URL="${base_url}/trivy_${version_clean}_checksums.txt"
+            SIGNATURE_URL="${base_url}/trivy_${version_clean}_checksums.txt.sig"
+            ;;
+
+        grype)
+            DOWNLOAD_URL="${base_url}/grype_${version_clean}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/grype_${version_clean}_checksums.txt"
+            ;;
+
+        syft)
+            DOWNLOAD_URL="${base_url}/syft_${version_clean}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/syft_${version_clean}_checksums.txt"
+            ;;
+
+        trufflehog)
+            DOWNLOAD_URL="${base_url}/trufflehog_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/trufflehog_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz.sha256"
+            ;;
+
+        gitleaks)
+            DOWNLOAD_URL="${base_url}/gitleaks_${version_clean}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            CHECKSUM_URL="${base_url}/gitleaks_${version_clean}_checksums.txt"
+            SIGNATURE_URL="${base_url}/gitleaks_${version_clean}_checksums.txt.sig"
+            ;;
+
+        *)
+            # Generic pattern try करें
+            DOWNLOAD_URL="${base_url}/${TOOL_NAME}_${DETECTED_OS}_${DETECTED_ARCH}.tar.gz"
+            log_warn "Generic URL pattern use हो रहा है"
+            ;;
+    esac
+
+    log_success "Download URL: $DOWNLOAD_URL"
+    [[ -n "$CHECKSUM_URL" ]] && log_info "Checksum URL: $CHECKSUM_URL"
+    [[ -n "$SIGNATURE_URL" ]] && log_info "Signature URL: $SIGNATURE_URL"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# URL VALIDATION
+# ─────────────────────────────────────────────────────────────────────────────
+validate_url() {
+    local url="$1"
+    local description="${2:-URL}"
+
+    log_info "$description validate कर रहे हैं..."
+
+    local http_code
+    http_code=$(curl -fsSL \
+        --head \
+        --max-redirs 5 \
+        --connect-timeout 15 \
+        -o /dev/null \
+        -w '%{http_code}' \
+        "$url" 2>/dev/null || echo "000")
+
+    if [[ "$http_code" == "200" ]]; then
+        log_success "$description accessible ✓ (HTTP $http_code)"
+        return 0
+    elif [[ "$http_code" == "302" || "$http_code" == "301" ]]; then
+        log_info "$description redirect मिला (HTTP $http_code)"
+        return 0
+    else
+        log_warn "$description accessible नहीं (HTTP $http_code)"
+        return 1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DOWNLOAD WITH PROGRESS
+# ─────────────────────────────────────────────────────────────────────────────
+download_file() {
+    local url="$1"
+    local output="$2"
+    local description="${3:-File}"
+
+    log_info "$description download हो रहा है..."
+    log_debug "URL: $url"
+    log_debug "Output: $output"
+
+    local proxy_args=()
+    if [[ -n "${PROXY:-}" ]]; then
+        proxy_args=(--proxy "$PROXY")
+    fi
+
+    # Download with retry और progress
+    if curl -fL \
+        --progress-bar \
+        --retry 3 \
+        --retry-delay 3 \
+        --retry-max-time 120 \
+        --connect-timeout 30 \
+        --max-time 600 \
+        "${proxy_args[@]}" \
+        -o "$output" \
+        "$url"; then
+        local file_size
+        file_size=$(du -sh "$output" 2>/dev/null | cut -f1)
+        log_success "$description downloaded ✓ (Size: $file_size)"
+        return 0
+    else
+        log_error "$description download failed"
+        return 1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECKSUM VERIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+verify_checksum() {
+    local file="$1"
+    local checksum_file="$2"
+
+    log_step "Checksum Verification"
+
+    if [[ "$SKIP_VERIFY" == "true" ]]; then
+        log_warn "Checksum verification skip की गई (--skip-verify)"
+        return 0
+    fi
+
+    if [[ ! -f "$checksum_file" ]]; then
+        log_warn "Checksum file नहीं मिली: $checksum_file"
+        return 1
+    fi
+
+    local filename
+    filename=$(basename "$file")
+
+    # SHA256 verification
+    if command -v sha256sum &>/dev/null; then
+        log_info "SHA256 checksum verify कर रहे हैं..."
+
+        # Checksum file में filename ढूंढें
+        local expected_hash
+        expected_hash=$(grep -i "$filename" "$checksum_file" 2>/dev/null | awk '{print $1}' | head -1)
+
+        if [[ -z "$expected_hash" ]]; then
+            # सिर्फ hash हो सकता है (single line)
+            expected_hash=$(cat "$checksum_file" | awk '{print $1}' | head -1)
+        fi
+
+        if [[ -z "$expected_hash" ]]; then
+            log_warn "Expected hash नहीं मिला checksum file में"
+            return 1
+        fi
+
+        local actual_hash
+        actual_hash=$(sha256sum "$file" | awk '{print $1}')
+
+        log_debug "Expected: $expected_hash"
+        log_debug "Actual:   $actual_hash"
+
+        if [[ "$expected_hash" == "$actual_hash" ]]; then
+            log_success "SHA256 checksum verified ✓"
+            log_info "Hash: ${actual_hash:0:16}...${actual_hash: -8}"
+            return 0
+        else
+            log_error "SHA256 checksum MISMATCH!"
+            log_error "Expected: $expected_hash"
+            log_error "Actual:   $actual_hash"
+            return 1
+        fi
+
+    elif command -v sha512sum &>/dev/null; then
+        log_info "SHA512 checksum verify कर रहे हैं..."
+        if sha512sum -c "$checksum_file" 2>/dev/null; then
+            log_success "SHA512 checksum verified ✓"
+            return 0
+        else
+            log_error "SHA512 checksum MISMATCH!"
+            return 1
+        fi
+
+    elif command -v md5sum &>/dev/null; then
+        log_warn "MD5 use हो रहा है (SHA256 preferred)"
+        if md5sum -c "$checksum_file" 2>/dev/null; then
+            log_success "MD5 checksum verified ✓"
+            return 0
+        fi
+    fi
+
+    log_warn "कोई checksum tool नहीं मिला"
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PGP/GPG SIGNATURE VERIFICATION
+# ─────────────────────────────────────────────────────────────────────────────
+verify_signature() {
+    local file="$1"
+    local sig_file="$2"
+
+    log_step "PGP Signature Verification"
+
+    if [[ "$SKIP_VERIFY" == "true" ]]; then
+        log_warn "Signature verification skip की गई"
+        return 0
+    fi
+
+    if ! command -v gpg &>/dev/null; then
+        log_warn "GPG नहीं मिला - signature verify नहीं होगी"
+        return 1
+    fi
+
+    if [[ ! -f "$sig_file" ]]; then
+        log_warn "Signature file नहीं मिली"
+        return 1
+    fi
+
+    log_info "GPG signature verify कर रहे हैं..."
+
+    # Tool-specific GPG keys import
+    case "$TOOL_NAME" in
+        trivy)
+            # Aqua Security public key
+            local key_url="https://aquasecurity.github.io/trivy-repo/deb/public.key"
+            if curl -fsSL "$key_url" | gpg --import 2>/dev/null; then
+                log_info "Aqua Security GPG key imported"
+            fi
+            ;;
+        gitleaks)
+            # Gitleaks signing key
+            log_info "Gitleaks GPG key fetch कर रहे

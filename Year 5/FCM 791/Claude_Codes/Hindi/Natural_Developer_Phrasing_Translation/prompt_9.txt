@@ -1,0 +1,254 @@
+```ruby
+# app/controllers/promotions_controller.rb
+
+class PromotionsController < ApplicationController
+  before_action :authenticate_user!
+  before_action :authorize_manager!
+  before_action :find_staff_user, only: [:create]
+
+  def create
+    if @staff_user.manager?
+      render json: {
+        success: false,
+        message: "यह यूज़र पहले से ही Manager है।"
+      }, status: :unprocessable_entity
+      return
+    end
+
+    unless @staff_user.staff?
+      render json: {
+        success: false,
+        message: "केवल Staff यूज़र को ही Manager बनाया जा सकता है।"
+      }, status: :unprocessable_entity
+      return
+    end
+
+    ActiveRecord::Base.transaction do
+      @staff_user.update!(role: :manager)
+
+      PromotionLog.create!(
+        promoted_by: current_user,
+        promoted_user: @staff_user,
+        previous_role: "staff",
+        new_role: "manager",
+        promoted_at: Time.current
+      )
+
+      UserMailer.promotion_notification(@staff_user, current_user).deliver_later
+    end
+
+    render json: {
+      success: true,
+      message: "#{@staff_user.full_name} को सफलतापूर्वक Manager बना दिया गया है।",
+      user: {
+        id: @staff_user.id,
+        name: @staff_user.full_name,
+        email: @staff_user.email,
+        role: @staff_user.role,
+        promoted_at: Time.current
+      }
+    }, status: :ok
+
+  rescue ActiveRecord::RecordInvalid => e
+    render json: {
+      success: false,
+      message: "Promotion विफल रही: #{e.message}"
+    }, status: :unprocessable_entity
+
+  rescue StandardError => e
+    Rails.logger.error "Promotion Error: #{e.message}"
+    render json: {
+      success: false,
+      message: "कुछ गलत हो गया। कृपया दोबारा कोशिश करें।"
+    }, status: :internal_server_error
+  end
+
+  private
+
+  def authorize_manager!
+    unless current_user.manager?
+      render json: {
+        success: false,
+        message: "आपके पास यह कार्य करने की अनुमति नहीं है। केवल Manager ही Staff को Promote कर सकते हैं।"
+      }, status: :forbidden
+    end
+  end
+
+  def find_staff_user
+    @staff_user = User.find_by(id: params[:user_id])
+
+    unless @staff_user
+      render json: {
+        success: false,
+        message: "यूज़र नहीं मिला।"
+      }, status: :not_found
+    end
+  end
+end
+```
+
+```ruby
+# app/models/user.rb
+
+class User < ApplicationRecord
+  enum role: {
+    staff: 0,
+    manager: 1,
+    admin: 2
+  }
+
+  validates :name, presence: true
+  validates :email, presence: true, uniqueness: true
+  validates :role, presence: true
+
+  def full_name
+    name
+  end
+end
+```
+
+```ruby
+# app/models/promotion_log.rb
+
+class PromotionLog < ApplicationRecord
+  belongs_to :promoted_by, class_name: "User"
+  belongs_to :promoted_user, class_name: "User"
+
+  validates :previous_role, presence: true
+  validates :new_role, presence: true
+  validates :promoted_at, presence: true
+end
+```
+
+```ruby
+# app/mailers/user_mailer.rb
+
+class UserMailer < ApplicationMailer
+  def promotion_notification(promoted_user, promoted_by)
+    @promoted_user = promoted_user
+    @promoted_by = promoted_by
+
+    mail(
+      to: @promoted_user.email,
+      subject: "बधाई हो! आपको Manager बना दिया गया है।"
+    )
+  end
+end
+```
+
+```erb
+<%# app/views/user_mailer/promotion_notification.html.erb %>
+
+<h2>बधाई हो, <%= @promoted_user.full_name %>!</h2>
+
+<p>
+  आपको <strong><%= @promoted_by.full_name %></strong> द्वारा
+  <strong>Manager</strong> के पद पर Promote किया गया है।
+</p>
+
+<p>Promotion की तारीख: <%= Time.current.strftime("%d/%m/%Y %H:%M") %></p>
+
+<p>धन्यवाद!</p>
+```
+
+```ruby
+# config/routes.rb
+
+Rails.application.routes.draw do
+  resources :promotions, only: [:create]
+
+  # या specific route:
+  # post '/users/:user_id/promote', to: 'promotions#create', as: :promote_user
+end
+```
+
+```ruby
+# db/migrate/XXXXXX_create_promotion_logs.rb
+
+class CreatePromotionLogs < ActiveRecord::Migration[7.0]
+  def change
+    create_table :promotion_logs do |t|
+      t.references :promoted_by, null: false, foreign_key: { to_table: :users }
+      t.references :promoted_user, null: false, foreign_key: { to_table: :users }
+      t.string :previous_role, null: false
+      t.string :new_role, null: false
+      t.datetime :promoted_at, null: false
+
+      t.timestamps
+    end
+  end
+end
+```
+
+```ruby
+# db/migrate/XXXXXX_add_role_to_users.rb
+
+class AddRoleToUsers < ActiveRecord::Migration[7.0]
+  def change
+    add_column :users, :role, :integer, default: 0, null: false
+    add_index :users, :role
+  end
+end
+```
+
+```ruby
+# spec/controllers/promotions_controller_spec.rb
+
+require 'rails_helper'
+
+RSpec.describe PromotionsController, type: :controller do
+  let(:manager_user) { create(:user, role: :manager) }
+  let(:staff_user) { create(:user, role: :staff) }
+
+  before { sign_in manager_user }
+
+  describe "POST #create" do
+    context "जब Manager किसी Staff को Promote करे" do
+      it "Staff को Manager बना देता है" do
+        post :create, params: { user_id: staff_user.id }
+
+        expect(response).to have_http_status(:ok)
+        expect(staff_user.reload.role).to eq("manager")
+
+        json_response = JSON.parse(response.body)
+        expect(json_response["success"]).to be true
+        expect(json_response["message"]).to include("Manager")
+      end
+
+      it "Promotion Log बनाता है" do
+        expect {
+          post :create, params: { user_id: staff_user.id }
+        }.to change(PromotionLog, :count).by(1)
+      end
+    end
+
+    context "जब कोई Staff यूज़र Promote करने की कोशिश करे" do
+      before { sign_in staff_user }
+
+      it "403 Forbidden देता है" do
+        post :create, params: { user_id: create(:user, role: :staff).id }
+
+        expect(response).to have_http_status(:forbidden)
+      end
+    end
+
+    context "जब यूज़र पहले से Manager हो" do
+      let(:another_manager) { create(:user, role: :manager) }
+
+      it "422 Unprocessable Entity देता है" do
+        post :create, params: { user_id: another_manager.id }
+
+        expect(response).to have_http_status(:unprocessable_entity)
+      end
+    end
+
+    context "जब यूज़र मौजूद न हो" do
+      it "404 Not Found देता है" do
+        post :create, params: { user_id: 99999 }
+
+        expect(response).to have_http_status(:not_found)
+      end
+    end
+  end
+end
+```

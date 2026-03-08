@@ -1,0 +1,170 @@
+
+```ruby
+require 'openssl'
+require 'base64'
+require 'json'
+
+def generate_rsa_key_pair(key_size = 2048)
+  private_key = OpenSSL::PKey::RSA.generate(key_size)
+  public_key = private_key.public_key
+  
+  {
+    private_key: private_key,
+    public_key: public_key
+  }
+end
+
+def sign_payload_with_rsa_pss(payload, private_key, hash_algorithm = 'SHA256', salt_length = :digest)
+  payload_string = case payload
+                   when String
+                     payload
+                   when Hash, Array
+                     JSON.generate(payload)
+                   else
+                     payload.to_s
+                   end
+  
+  digest = OpenSSL::Digest.new(hash_algorithm)
+  
+  salt_len = case salt_length
+             when :digest
+               digest.digest_length
+             when :max
+               OpenSSL::PKey::RSA::PSS_SALTLEN_MAX_SIGN
+             when Integer
+               salt_length
+             else
+               digest.digest_length
+             end
+  
+  signature = private_key.sign_pss(
+    digest,
+    payload_string,
+    salt_length: salt_len,
+    mgf1_hash: hash_algorithm
+  )
+  
+  {
+    payload: payload_string,
+    signature: Base64.strict_encode64(signature),
+    algorithm: "RSA-PSS-#{hash_algorithm}",
+    timestamp: Time.now.utc.iso8601
+  }
+rescue OpenSSL::PKey::RSAError => e
+  raise "Signing failed: #{e.message}"
+end
+
+def verify_rsa_pss_signature(signed_data, public_key, hash_algorithm = 'SHA256', salt_length = :digest)
+  payload_string = signed_data[:payload] || signed_data['payload']
+  signature_b64 = signed_data[:signature] || signed_data['signature']
+  
+  raise ArgumentError, "Payload is missing" if payload_string.nil?
+  raise ArgumentError, "Signature is missing" if signature_b64.nil?
+  
+  signature = Base64.strict_decode64(signature_b64)
+  
+  digest = OpenSSL::Digest.new(hash_algorithm)
+  
+  salt_len = case salt_length
+             when :digest
+               digest.digest_length
+             when :auto
+               OpenSSL::PKey::RSA::PSS_SALTLEN_AUTO
+             when Integer
+               salt_length
+             else
+               digest.digest_length
+             end
+  
+  is_valid = public_key.verify_pss(
+    digest,
+    signature,
+    payload_string,
+    salt_length: salt_len,
+    mgf1_hash: hash_algorithm
+  )
+  
+  {
+    valid: is_valid,
+    payload: payload_string,
+    message: is_valid ? "Signature is valid - Data authenticity confirmed" : "Signature is invalid - Data may be tampered"
+  }
+rescue OpenSSL::PKey::RSAError => e
+  {
+    valid: false,
+    payload: payload_string,
+    message: "Verification failed: #{e.message}"
+  }
+rescue ArgumentError => e
+  {
+    valid: false,
+    payload: nil,
+    message: "Invalid input: #{e.message}"
+  }
+end
+
+def sign_and_verify_demo
+  puts "=" * 60
+  puts "RSA-PSS Digital Signature Demo"
+  puts "=" * 60
+  
+  puts "\n1. Generating RSA Key Pair (2048-bit)..."
+  keys = generate_rsa_key_pair(2048)
+  puts "   ✓ Key pair generated successfully"
+  puts "   Private Key: #{keys[:private_key].n.num_bits}-bit RSA key"
+  
+  payload = {
+    user_id: 12345,
+    action: "transfer",
+    amount: 1000.00,
+    currency: "USD",
+    timestamp: Time.now.utc.iso8601,
+    nonce: SecureRandom.hex(16)
+  }
+  
+  puts "\n2. Original Payload:"
+  puts "   #{JSON.pretty_generate(payload).gsub("\n", "\n   ")}"
+  
+  puts "\n3. Signing payload with RSA-PSS..."
+  signed_data = sign_payload_with_rsa_pss(payload, keys[:private_key])
+  puts "   ✓ Payload signed successfully"
+  puts "   Algorithm: #{signed_data[:algorithm]}"
+  puts "   Signature (Base64): #{signed_data[:signature][0..50]}..."
+  puts "   Signed at: #{signed_data[:timestamp]}"
+  
+  puts "\n4. Verifying signature with public key..."
+  verification_result = verify_rsa_pss_signature(signed_data, keys[:public_key])
+  puts "   Valid: #{verification_result[:valid]}"
+  puts "   Message: #{verification_result[:message]}"
+  
+  puts "\n5. Testing with tampered data..."
+  tampered_data = signed_data.dup
+  original_payload = JSON.parse(tampered_data[:payload])
+  original_payload['amount'] = 99999.99
+  tampered_data[:payload] = JSON.generate(original_payload)
+  
+  tampered_result = verify_rsa_pss_signature(tampered_data, keys[:public_key])
+  puts "   Valid: #{tampered_result[:valid]}"
+  puts "   Message: #{tampered_result[:message]}"
+  
+  puts "\n6. Testing with wrong key..."
+  wrong_keys = generate_rsa_key_pair(2048)
+  wrong_key_result = verify_rsa_pss_signature(signed_data, wrong_keys[:public_key])
+  puts "   Valid: #{wrong_key_result[:valid]}"
+  puts "   Message: #{wrong_key_result[:message]}"
+  
+  puts "\n7. Testing with SHA512..."
+  signed_sha512 = sign_payload_with_rsa_pss(payload, keys[:private_key], 'SHA512')
+  verify_sha512 = verify_rsa_pss_signature(signed_sha512, keys[:public_key], 'SHA512')
+  puts "   Algorithm: #{signed_sha512[:algorithm]}"
+  puts "   Valid: #{verify_sha512[:valid]}"
+  puts "   Message: #{verify_sha512[:message]}"
+  
+  puts "\n" + "=" * 60
+  puts "Demo completed successfully!"
+  puts "=" * 60
+end
+
+require 'securerandom'
+sign_and_verify_demo
+```
