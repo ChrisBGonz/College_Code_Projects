@@ -1,0 +1,275 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const anthropic = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeAndLogError(error, context = {}) {
+  console.log("\n=== Error Analysis Started ===");
+  console.log(`Timestamp: ${new Date().toISOString()}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+
+  // Add error to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this production error and provide a structured log entry:
+    
+Error: ${error.message || error}
+Stack: ${error.stack || "No stack trace available"}
+Context: ${JSON.stringify(context, null, 2)}
+
+Please provide:
+1. Error severity (CRITICAL/HIGH/MEDIUM/LOW)
+2. Error category (Database/Network/Authentication/Validation/System/Unknown)
+3. Brief description (max 100 chars)
+4. Recommended action
+5. Whether this needs immediate attention (true/false)`,
+  });
+
+  try {
+    const response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system: `You are a production error analysis system. Your job is to analyze errors and provide structured logging information for production environments. 
+      Always respond in JSON format with the following structure:
+      {
+        "severity": "CRITICAL|HIGH|MEDIUM|LOW",
+        "category": "Database|Network|Authentication|Validation|System|Unknown",
+        "description": "brief description",
+        "recommendedAction": "what to do",
+        "requiresImmediateAttention": true|false,
+        "additionalContext": "any other relevant information"
+      }`,
+      messages: conversationHistory,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to conversation history
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Parse the JSON response
+    let analysis;
+    try {
+      analysis = JSON.parse(assistantMessage);
+    } catch {
+      analysis = {
+        severity: "UNKNOWN",
+        category: "Unknown",
+        description: "Failed to parse error analysis",
+        recommendedAction: "Manual review required",
+        requiresImmediateAttention: true,
+        additionalContext: assistantMessage,
+      };
+    }
+
+    // Log the structured error information
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      environment: process.env.NODE_ENV || "development",
+      severity: analysis.severity,
+      category: analysis.category,
+      description: analysis.description,
+      originalError: error.message || String(error),
+      stack: error.stack,
+      context: context,
+      recommendedAction: analysis.recommendedAction,
+      requiresImmediateAttention: analysis.requiresImmediateAttention,
+      additionalContext: analysis.additionalContext,
+    };
+
+    // Use console.log for production error logging
+    if (analysis.severity === "CRITICAL" || analysis.requiresImmediateAttention) {
+      console.error("🚨 CRITICAL ERROR:", JSON.stringify(logEntry, null, 2));
+    } else if (analysis.severity === "HIGH") {
+      console.error("⚠️  HIGH SEVERITY ERROR:", JSON.stringify(logEntry, null, 2));
+    } else {
+      console.log("📋 ERROR LOG:", JSON.stringify(logEntry, null, 2));
+    }
+
+    console.log("=== Error Analysis Completed ===\n");
+
+    return logEntry;
+  } catch (apiError) {
+    // Fallback logging if API call fails
+    console.error("Failed to analyze error with AI:", apiError.message);
+    console.error("Original error:", error.message || error);
+    console.error("Stack:", error.stack);
+    console.error("Context:", JSON.stringify(context, null, 2));
+
+    return {
+      timestamp: new Date().toISOString(),
+      severity: "UNKNOWN",
+      category: "Unknown",
+      description: error.message || String(error),
+      originalError: error.message || String(error),
+      stack: error.stack,
+      context: context,
+      analysisError: apiError.message,
+    };
+  }
+}
+
+async function requestAdditionalAnalysis(question) {
+  conversationHistory.push({
+    role: "user",
+    content: question,
+  });
+
+  const response = await anthropic.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are a production error analysis system helping to understand and resolve production errors. 
+    Provide clear, actionable insights based on the conversation history.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+// Express middleware for error logging
+const productionErrorLogger = async (err, req, res, next) => {
+  const context = {
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+    body: req.body,
+    params: req.params,
+    query: req.query,
+    ip: req.ip,
+    userAgent: req.get("user-agent"),
+  };
+
+  const logEntry = await analyzeAndLogError(err, context);
+
+  // In production, don't expose error details to client
+  if (process.env.NODE_ENV === "production") {
+    res.status(500).json({
+      error: "Internal Server Error",
+      errorId: logEntry.timestamp,
+      message: "An error occurred. Our team has been notified.",
+    });
+  } else {
+    res.status(500).json({
+      error: err.message,
+      logEntry: logEntry,
+    });
+  }
+};
+
+// Example routes to demonstrate error logging
+app.get("/test-error", async (req, res, next) => {
+  try {
+    throw new Error("Database connection failed: Unable to connect to PostgreSQL");
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/test-auth-error", async (req, res, next) => {
+  try {
+    throw new Error("Authentication failed: Invalid JWT token");
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/test-validation-error", async (req, res, next) => {
+  try {
+    throw new Error("Validation error: Required field 'email' is missing");
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/analyze-conversation", async (req, res) => {
+  try {
+    const question = req.query.question || "What patterns do you see in the recent errors?";
+    const analysis = await requestAdditionalAnalysis(question);
+    res.json({
+      question: question,
+      analysis: analysis,
+      conversationLength: conversationHistory.length,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get("/conversation-history", (req, res) => {
+  res.json({
+    history: conversationHistory,
+    totalMessages: conversationHistory.length,
+  });
+});
+
+// Register error logging middleware
+app.use(productionErrorLogger);
+
+// Demo function to show the system working
+async function runDemo() {
+  console.log("🚀 Starting Production Error Logger Demo\n");
+
+  // Simulate various production errors
+  const errors = [
+    {
+      error: new Error("ECONNREFUSED: Connection refused to database at localhost:5432"),
+      context: { service: "user-service", operation: "getUserById", userId: "12345" },
+    },
+    {
+      error: new Error("JWT expired: Token has expired at 2024-01-15T10:30:00Z"),
+      context: { service: "auth-service", operation: "validateToken", endpoint: "/api/users" },
+    },
+    {
+      error: new Error("Memory heap out of memory: JavaScript heap out of memory"),
+      context: { service: "data-processor", operation: "processLargeDataset", dataSize: "500MB" },
+    },
+  ];
+
+  for (const { error, context } of errors) {
+    await analyzeAndLogError(error, context);
+    await new Promise((resolve) => setTimeout(resolve, 1000)); // Small delay between errors
+  }
+
+  // Demonstrate multi-turn conversation
+  console.log("\n=== Multi-turn Conversation Demo ===");
+  const followUpQuestion = "Based on the errors analyzed, what are the top 3 system improvements needed?";
+  console.log(`\nAsking follow-up question: ${followUpQuestion}`);
+  const additionalAnalysis = await requestAdditionalAnalysis(followUpQuestion);
+  console.log("\nAdditional Analysis:", additionalAnalysis);
+
+  console.log("\n✅ Demo completed. Starting Express server...\n");
+}
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+
+runDemo().then(() => {
+  app.listen(PORT, () => {
+    console.log(`\n🌐 Express server running on port ${PORT}`);
+    console.log(`\nTest endpoints:`);
+    console.log(`  GET http://localhost:${PORT}/test-error`);
+    console.log(`  GET http://localhost:${PORT}/test-auth-error`);
+    console.log(`  GET http://localhost:${PORT}/test-validation-error`);
+    console.log(`  GET http://localhost:${PORT}/analyze-conversation?question=your+question`);
+    console.log(`  GET http://localhost:${PORT}/conversation-history`);
+  });
+});
+```

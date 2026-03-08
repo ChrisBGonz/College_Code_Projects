@@ -1,0 +1,741 @@
+<?php
+
+class UserPreferences
+{
+    public string $theme = 'light';
+    public string $language = 'pt-BR';
+    public int $itemsPerPage = 10;
+    public bool $notifications = true;
+    public array $favoriteCategories = [];
+    public string $timezone = 'America/Sao_Paulo';
+
+    public function __construct(
+        string $theme = 'light',
+        string $language = 'pt-BR',
+        int $itemsPerPage = 10,
+        bool $notifications = true,
+        array $favoriteCategories = [],
+        string $timezone = 'America/Sao_Paulo'
+    ) {
+        $this->theme = $theme;
+        $this->language = $language;
+        $this->itemsPerPage = $itemsPerPage;
+        $this->notifications = $notifications;
+        $this->favoriteCategories = $favoriteCategories;
+        $this->timezone = $timezone;
+    }
+}
+
+class PreferencesManager
+{
+    private const COOKIE_NAME = 'user_preferences';
+    private const COOKIE_EXPIRY = 86400 * 30;
+    private const ALLOWED_CLASSES = [UserPreferences::class];
+    private const SECRET_KEY = 'minha_chave_secreta_muito_segura_2024';
+
+    private array $validThemes = ['light', 'dark', 'system'];
+    private array $validLanguages = ['pt-BR', 'en-US', 'es-ES', 'fr-FR'];
+    private array $validItemsPerPage = [5, 10, 25, 50, 100];
+    private array $validTimezones = [
+        'America/Sao_Paulo',
+        'America/New_York',
+        'Europe/London',
+        'Asia/Tokyo',
+        'UTC'
+    ];
+
+    public function loadPreferences(): UserPreferences
+    {
+        if (!isset($_COOKIE[self::COOKIE_NAME])) {
+            return new UserPreferences();
+        }
+
+        $cookieData = $_COOKIE[self::COOKIE_NAME];
+
+        if (!$this->verifyCookieIntegrity($cookieData)) {
+            $this->clearPreferencesCookie();
+            return new UserPreferences();
+        }
+
+        $serializedData = $this->extractSerializedData($cookieData);
+
+        if ($serializedData === null) {
+            $this->clearPreferencesCookie();
+            return new UserPreferences();
+        }
+
+        $preferences = $this->safeUnserialize($serializedData);
+
+        if ($preferences === null) {
+            $this->clearPreferencesCookie();
+            return new UserPreferences();
+        }
+
+        return $this->validateAndSanitizePreferences($preferences);
+    }
+
+    public function savePreferences(UserPreferences $preferences): bool
+    {
+        $sanitizedPreferences = $this->validateAndSanitizePreferences($preferences);
+        $serialized = serialize($sanitizedPreferences);
+        $cookieData = $this->signCookieData($serialized);
+
+        return setcookie(
+            self::COOKIE_NAME,
+            $cookieData,
+            [
+                'expires' => time() + self::COOKIE_EXPIRY,
+                'path' => '/',
+                'secure' => true,
+                'httponly' => true,
+                'samesite' => 'Strict'
+            ]
+        );
+    }
+
+    private function safeUnserialize(string $data): ?UserPreferences
+    {
+        $options = [
+            'allowed_classes' => self::ALLOWED_CLASSES
+        ];
+
+        set_error_handler(function () {
+            return true;
+        });
+
+        try {
+            $result = unserialize($data, $options);
+        } catch (\Throwable $e) {
+            restore_error_handler();
+            error_log('Erro ao desserializar preferências: ' . $e->getMessage());
+            return null;
+        }
+
+        restore_error_handler();
+
+        if ($result === false || !($result instanceof UserPreferences)) {
+            return null;
+        }
+
+        return $result;
+    }
+
+    private function signCookieData(string $serializedData): string
+    {
+        $encodedData = base64_encode($serializedData);
+        $signature = hash_hmac('sha256', $encodedData, self::SECRET_KEY);
+        return $encodedData . '.' . $signature;
+    }
+
+    private function verifyCookieIntegrity(string $cookieData): bool
+    {
+        $parts = explode('.', $cookieData, 2);
+
+        if (count($parts) !== 2) {
+            return false;
+        }
+
+        [$encodedData, $signature] = $parts;
+        $expectedSignature = hash_hmac('sha256', $encodedData, self::SECRET_KEY);
+
+        return hash_equals($expectedSignature, $signature);
+    }
+
+    private function extractSerializedData(string $cookieData): ?string
+    {
+        $parts = explode('.', $cookieData, 2);
+
+        if (count($parts) !== 2) {
+            return null;
+        }
+
+        $decoded = base64_decode($parts[0], true);
+
+        if ($decoded === false) {
+            return null;
+        }
+
+        return $decoded;
+    }
+
+    private function validateAndSanitizePreferences(UserPreferences $preferences): UserPreferences
+    {
+        if (!in_array($preferences->theme, $this->validThemes, true)) {
+            $preferences->theme = 'light';
+        }
+
+        if (!in_array($preferences->language, $this->validLanguages, true)) {
+            $preferences->language = 'pt-BR';
+        }
+
+        if (!in_array($preferences->itemsPerPage, $this->validItemsPerPage, true)) {
+            $preferences->itemsPerPage = 10;
+        }
+
+        $preferences->notifications = (bool) $preferences->notifications;
+
+        if (!is_array($preferences->favoriteCategories)) {
+            $preferences->favoriteCategories = [];
+        }
+
+        $preferences->favoriteCategories = array_filter(
+            $preferences->favoriteCategories,
+            fn($cat) => is_string($cat) && strlen($cat) <= 50
+        );
+
+        $preferences->favoriteCategories = array_values(
+            array_slice($preferences->favoriteCategories, 0, 10)
+        );
+
+        if (!in_array($preferences->timezone, $this->validTimezones, true)) {
+            $preferences->timezone = 'America/Sao_Paulo';
+        }
+
+        return $preferences;
+    }
+
+    private function clearPreferencesCookie(): void
+    {
+        setcookie(
+            self::COOKIE_NAME,
+            '',
+            [
+                'expires' => time() - 3600,
+                'path' => '/',
+                'secure' => true,
+                'httponly' => true,
+                'samesite' => 'Strict'
+            ]
+        );
+    }
+}
+
+class PreferencesController
+{
+    private PreferencesManager $manager;
+
+    public function __construct()
+    {
+        $this->manager = new PreferencesManager();
+    }
+
+    public function handleRequest(): void
+    {
+        $action = $_POST['action'] ?? $_GET['action'] ?? 'view';
+
+        switch ($action) {
+            case 'save':
+                $this->handleSave();
+                break;
+            case 'reset':
+                $this->handleReset();
+                break;
+            default:
+                $this->handleView();
+                break;
+        }
+    }
+
+    private function handleSave(): void
+    {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            http_response_code(405);
+            echo json_encode(['error' => 'Método não permitido']);
+            return;
+        }
+
+        $preferences = new UserPreferences(
+            theme: $_POST['theme'] ?? 'light',
+            language: $_POST['language'] ?? 'pt-BR',
+            itemsPerPage: (int) ($_POST['items_per_page'] ?? 10),
+            notifications: isset($_POST['notifications']),
+            favoriteCategories: isset($_POST['categories']) && is_array($_POST['categories'])
+                ? $_POST['categories']
+                : [],
+            timezone: $_POST['timezone'] ?? 'America/Sao_Paulo'
+        );
+
+        $saved = $this->manager->savePreferences($preferences);
+
+        if ($saved) {
+            header('Location: ' . $_SERVER['PHP_SELF'] . '?action=view&saved=1');
+        } else {
+            header('Location: ' . $_SERVER['PHP_SELF'] . '?action=view&error=1');
+        }
+        exit;
+    }
+
+    private function handleReset(): void
+    {
+        $this->manager->savePreferences(new UserPreferences());
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?action=view&reset=1');
+        exit;
+    }
+
+    private function handleView(): void
+    {
+        $preferences = $this->manager->loadPreferences();
+        $this->renderPage($preferences);
+    }
+
+    private function renderPage(UserPreferences $preferences): void
+    {
+        $saved = isset($_GET['saved']);
+        $reset = isset($_GET['reset']);
+        $error = isset($_GET['error']);
+
+        $themeClass = htmlspecialchars($preferences->theme);
+        $language = htmlspecialchars($preferences->language);
+        $itemsPerPage = (int) $preferences->itemsPerPage;
+        $notifications = $preferences->notifications;
+        $timezone = htmlspecialchars($preferences->timezone);
+        $categories = array_map('htmlspecialchars', $preferences->favoriteCategories);
+
+        ?>
+        <!DOCTYPE html>
+        <html lang="pt-BR" data-theme="<?= $themeClass ?>">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Preferências do Usuário</title>
+            <style>
+                :root {
+                    --bg-color: #f5f5f5;
+                    --text-color: #333;
+                    --card-bg: #fff;
+                    --border-color: #ddd;
+                    --primary-color: #4a90e2;
+                    --success-color: #27ae60;
+                    --error-color: #e74c3c;
+                    --warning-color: #f39c12;
+                }
+
+                [data-theme="dark"] {
+                    --bg-color: #1a1a2e;
+                    --text-color: #e0e0e0;
+                    --card-bg: #16213e;
+                    --border-color: #444;
+                    --primary-color: #6ab0f5;
+                }
+
+                * {
+                    box-sizing: border-box;
+                    margin: 0;
+                    padding: 0;
+                }
+
+                body {
+                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                    background-color: var(--bg-color);
+                    color: var(--text-color);
+                    padding: 20px;
+                    transition: all 0.3s ease;
+                }
+
+                .container {
+                    max-width: 800px;
+                    margin: 0 auto;
+                }
+
+                h1 {
+                    text-align: center;
+                    margin-bottom: 30px;
+                    color: var(--primary-color);
+                    font-size: 2rem;
+                }
+
+                .card {
+                    background: var(--card-bg);
+                    border: 1px solid var(--border-color);
+                    border-radius: 12px;
+                    padding: 30px;
+                    margin-bottom: 20px;
+                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+                }
+
+                .card h2 {
+                    margin-bottom: 20px;
+                    color: var(--primary-color);
+                    font-size: 1.3rem;
+                    border-bottom: 2px solid var(--border-color);
+                    padding-bottom: 10px;
+                }
+
+                .form-group {
+                    margin-bottom: 20px;
+                }
+
+                label {
+                    display: block;
+                    margin-bottom: 8px;
+                    font-weight: 600;
+                    color: var(--text-color);
+                }
+
+                select, input[type="text"] {
+                    width: 100%;
+                    padding: 10px 15px;
+                    border: 2px solid var(--border-color);
+                    border-radius: 8px;
+                    background: var(--card-bg);
+                    color: var(--text-color);
+                    font-size: 1rem;
+                    transition: border-color 0.3s;
+                }
+
+                select:focus, input[type="text"]:focus {
+                    outline: none;
+                    border-color: var(--primary-color);
+                }
+
+                .checkbox-group {
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }
+
+                .checkbox-group input[type="checkbox"] {
+                    width: 20px;
+                    height: 20px;
+                    cursor: pointer;
+                }
+
+                .categories-grid {
+                    display: grid;
+                    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+                    gap: 10px;
+                }
+
+                .category-item {
+                    display: flex;
+                    align-items: center;
+                    gap: 8px;
+                    padding: 8px;
+                    border: 1px solid var(--border-color);
+                    border-radius: 6px;
+                    cursor: pointer;
+                    transition: background 0.2s;
+                }
+
+                .category-item:hover {
+                    background: var(--bg-color);
+                }
+
+                .category-item input[type="checkbox"] {
+                    width: 16px;
+                    height: 16px;
+                }
+
+                .btn-group {
+                    display: flex;
+                    gap: 15px;
+                    flex-wrap: wrap;
+                }
+
+                .btn {
+                    padding: 12px 25px;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 1rem;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.3s;
+                    text-decoration: none;
+                    display: inline-block;
+                }
+
+                .btn-primary {
+                    background: var(--primary-color);
+                    color: white;
+                }
+
+                .btn-primary:hover {
+                    opacity: 0.85;
+                    transform: translateY(-2px);
+                }
+
+                .btn-secondary {
+                    background: var(--border-color);
+                    color: var(--text-color);
+                }
+
+                .btn-secondary:hover {
+                    opacity: 0.85;
+                    transform: translateY(-2px);
+                }
+
+                .alert {
+                    padding: 15px 20px;
+                    border-radius: 8px;
+                    margin-bottom: 20px;
+                    font-weight: 500;
+                }
+
+                .alert-success {
+                    background: #d4edda;
+                    color: #155724;
+                    border: 1px solid #c3e6cb;
+                }
+
+                .alert-error {
+                    background: #f8d7da;
+                    color: #721c24;
+                    border: 1px solid #f5c6cb;
+                }
+
+                .alert-info {
+                    background: #d1ecf1;
+                    color: #0c5460;
+                    border: 1px solid #bee5eb;
+                }
+
+                .current-preferences {
+                    background: var(--bg-color);
+                    border-radius: 8px;
+                    padding: 15px;
+                    margin-top: 10px;
+                }
+
+                .pref-item {
+                    display: flex;
+                    justify-content: space-between;
+                    padding: 8px 0;
+                    border-bottom: 1px solid var(--border-color);
+                }
+
+                .pref-item:last-child {
+                    border-bottom: none;
+                }
+
+                .pref-label {
+                    font-weight: 600;
+                    color: var(--primary-color);
+                }
+
+                .pref-value {
+                    color: var(--text-color);
+                }
+
+                .security-info {
+                    font-size: 0.85rem;
+                    color: #666;
+                    margin-top: 15px;
+                    padding: 10px;
+                    background: var(--bg-color);
+                    border-radius: 6px;
+                    border-left: 4px solid var(--primary-color);
+                }
+
+                @media (max-width: 600px) {
+                    .btn-group {
+                        flex-direction: column;
+                    }
+
+                    .btn {
+                        text-align: center;
+                    }
+                }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>⚙️ Preferências do Usuário</h1>
+
+                <?php if ($saved): ?>
+                    <div class="alert alert-success">
+                        ✅ Preferências salvas com sucesso!
+                    </div>
+                <?php endif; ?>
+
+                <?php if ($reset): ?>
+                    <div class="alert alert-info">
+                        🔄 Preferências redefinidas para os valores padrão.
+                    </div>
+                <?php endif; ?>
+
+                <?php if ($error): ?>
+                    <div class="alert alert-error">
+                        ❌ Erro ao salvar preferências. Tente novamente.
+                    </div>
+                <?php endif; ?>
+
+                <div class="card">
+                    <h2>📊 Preferências Atuais</h2>
+                    <div class="current-preferences">
+                        <div class="pref-item">
+                            <span class="pref-label">Tema:</span>
+                            <span class="pref-value"><?= $themeClass ?></span>
+                        </div>
+                        <div class="pref-item">
+                            <span class="pref-label">Idioma:</span>
+                            <span class="pref-value"><?= $language ?></span>
+                        </div>
+                        <div class="pref-item">
+                            <span class="pref-label">Itens por página:</span>
+                            <span class="pref-value"><?= $itemsPerPage ?></span>
+                        </div>
+                        <div class="pref-item">
+                            <span class="pref-label">Notificações:</span>
+                            <span class="pref-value"><?= $notifications ? '✅ Ativadas' : '❌ Desativadas' ?></span>
+                        </div>
+                        <div class="pref-item">
+                            <span class="pref-label">Fuso horário:</span>
+                            <span class="pref-value"><?= $timezone ?></span>
+                        </div>
+                        <div class="pref-item">
+                            <span class="pref-label">Categorias favoritas:</span>
+                            <span class="pref-value">
+                                <?= !empty($categories) ? implode(', ', $categories) : 'Nenhuma selecionada' ?>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <h2>✏️ Editar Preferências</h2>
+                    <form method="POST" action="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>">
+                        <input type="hidden" name="action" value="save">
+
+                        <div class="form-group">
+                            <label for="theme">🎨 Tema</label>
+                            <select name="theme" id="theme">
+                                <option value="light" <?= $preferences->theme === 'light' ? 'selected' : '' ?>>
+                                    ☀️ Claro
+                                </option>
+                                <option value="dark" <?= $preferences->theme === 'dark' ? 'selected' : '' ?>>
+                                    🌙 Escuro
+                                </option>
+                                <option value="system" <?= $preferences->theme === 'system' ? 'selected' : '' ?>>
+                                    💻 Sistema
+                                </option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="language">🌍 Idioma</label>
+                            <select name="language" id="language">
+                                <option value="pt-BR" <?= $preferences->language === 'pt-BR' ? 'selected' : '' ?>>
+                                    🇧🇷 Português (Brasil)
+                                </option>
+                                <option value="en-US" <?= $preferences->language === 'en-US' ? 'selected' : '' ?>>
+                                    🇺🇸 English (US)
+                                </option>
+                                <option value="es-ES" <?= $preferences->language === 'es-ES' ? 'selected' : '' ?>>
+                                    🇪🇸 Español
+                                </option>
+                                <option value="fr-FR" <?= $preferences->language === 'fr-FR' ? 'selected' : '' ?>>
+                                    🇫🇷 Français
+                                </option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="items_per_page">📋 Itens por página</label>
+                            <select name="items_per_page" id="items_per_page">
+                                <?php foreach ([5, 10, 25, 50, 100] as $value): ?>
+                                    <option value="<?= $value ?>"
+                                        <?= $preferences->itemsPerPage === $value ? 'selected' : '' ?>>
+                                        <?= $value ?> itens
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label>🔔 Notificações</label>
+                            <div class="checkbox-group">
+                                <input type="checkbox"
+                                       name="notifications"
+                                       id="notifications"
+                                       <?= $preferences->notifications ? 'checked' : '' ?>>
+                                <label for="notifications" style="margin-bottom: 0; font-weight: normal;">
+                                    Receber notificações
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="timezone">🕐 Fuso horário</label>
+                            <select name="timezone" id="timezone">
+                                <option value="America/Sao_Paulo"
+                                    <?= $preferences->timezone === 'America/Sao_Paulo' ? 'selected' : '' ?>>
+                                    🇧🇷 Brasília (GMT-3)
+                                </option>
+                                <option value="America/New_York"
+                                    <?= $preferences->timezone === 'America/New_York' ? 'selected' : '' ?>>
+                                    🇺🇸 Nova York (GMT-5)
+                                </option>
+                                <option value="Europe/London"
+                                    <?= $preferences->timezone === 'Europe/London' ? 'selected' : '' ?>>
+                                    🇬🇧 Londres (GMT+0)
+                                </option>
+                                <option value="Asia/Tokyo"
+                                    <?= $preferences->timezone === 'Asia/Tokyo' ? 'selected' : '' ?>>
+                                    🇯🇵 Tóquio (GMT+9)
+                                </option>
+                                <option value="UTC"
+                                    <?= $preferences->timezone === 'UTC' ? 'selected' : '' ?>>
+                                    🌐 UTC
+                                </option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label>📁 Categorias favoritas</label>
+                            <div class="categories-grid">
+                                <?php
+                                $availableCategories = [
+                                    'tecnologia' => '💻 Tecnologia',
+                                    'esportes' => '⚽ Esportes',
+                                    'musica' => '🎵 Música',
+                                    'cinema' => '🎬 Cinema',
+                                    'culinaria' => '🍳 Culinária',
+                                    'viagens' => '✈️ Viagens',
+                                    'ciencia' => '🔬 Ciência',
+                                    'arte' => '🎨 Arte',
+                                    'negocios' => '💼 Negócios',
+                                    'saude' => '❤️ Saúde',
+                                ];
+
+                                foreach ($availableCategories as $value => $label):
+                                    $checked = in_array($value, $preferences->favoriteCategories, true);
+                                    ?>
+                                    <label class="category-item">
+                                        <input type="checkbox"
+                                               name="categories[]"
+                                               value="<?= htmlspecialchars($value) ?>"
+                                               <?= $checked ? 'checked' : '' ?>>
+                                        <?= $label ?>
+                                    </label>
+                                <?php endforeach; ?>
+                            </div>
+                        </div>
+
+                        <div class="btn-group">
+                            <button type="submit" class="btn btn-primary">
+                                💾 Salvar Preferências
+                            </button>
+                            <a href="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>?action=reset"
+                               class="btn btn-secondary"
+                               onclick="return confirm('Redefinir todas as preferências para o padrão?')">
+                                🔄 Redefinir Padrões
+                            </a>
+                        </div>
+                    </form>
+
+                    <div class="security-info">
+                        🔒 <strong>Segurança:</strong> Os dados são serializados com PHP e armazenados em cookie
+                        assinado com HMAC-SHA256. A desserialização utiliza <code>allowed_classes</code> para
+                        prevenir ataques de injeção de objetos. O cookie é configurado com
+                        <code>HttpOnly</code>, <code>Secure</code> e <code>SameSite=Strict</code>.
+                    </div>
+                </div>
+            </div>
+        </body>
+        </html>
+        <?php
+    }
+}
+
+$controller = new PreferencesController();
+$controller->handleRequest();

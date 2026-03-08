@@ -1,0 +1,195 @@
+
+```python
+import anthropic
+import base64
+import hashlib
+import hmac
+import struct
+import time
+
+
+def generate_totp(secret: str, time_step: int = 30, digits: int = 6) -> str:
+    """Generate a TOTP code for testing purposes."""
+    # Decode the base32 secret
+    key = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
+    
+    # Get current time step
+    current_time = int(time.time()) // time_step
+    
+    # Pack time as big-endian 8-byte integer
+    time_bytes = struct.pack(">Q", current_time)
+    
+    # Generate HMAC-SHA1
+    hmac_hash = hmac.new(key, time_bytes, hashlib.sha1).digest()
+    
+    # Dynamic truncation
+    offset = hmac_hash[-1] & 0x0F
+    code = struct.unpack(">I", hmac_hash[offset:offset + 4])[0] & 0x7FFFFFFF
+    
+    # Generate OTP
+    otp = code % (10 ** digits)
+    return str(otp).zfill(digits)
+
+
+def validate_totp_with_claude(secret: str, user_code: str, username: str) -> dict:
+    """
+    Validate a TOTP code using Claude AI for the 2FA login flow.
+    
+    Args:
+        secret: The base32-encoded TOTP secret
+        user_code: The 6-digit code provided by the user
+        username: The username attempting to login
+    
+    Returns:
+        dict with validation result and explanation
+    """
+    client = anthropic.Anthropic()
+    
+    # Generate valid TOTP codes (current and adjacent time windows for tolerance)
+    current_time = int(time.time())
+    time_step = 30
+    
+    valid_codes = []
+    for offset in [-1, 0, 1]:  # Check previous, current, and next time window
+        adjusted_time = current_time + (offset * time_step)
+        key = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
+        time_bytes = struct.pack(">Q", adjusted_time // time_step)
+        hmac_hash = hmac.new(key, time_bytes, hashlib.sha1).digest()
+        offset_val = hmac_hash[-1] & 0x0F
+        code = struct.unpack(">I", hmac_hash[offset_val:offset_val + 4])[0] & 0x7FFFFFFF
+        otp = str(code % (10 ** 6)).zfill(6)
+        valid_codes.append(otp)
+    
+    # Prepare validation context for Claude
+    is_valid = user_code in valid_codes
+    time_remaining = time_step - (current_time % time_step)
+    
+    # Create a prompt for Claude to analyze the 2FA validation
+    prompt = f"""You are a security system analyzing a 2FA (Two-Factor Authentication) login attempt.
+
+User Information:
+- Username: {username}
+- Provided TOTP Code: {user_code}
+- Code Length: {len(user_code)} digits
+- Validation Result: {"VALID" if is_valid else "INVALID"}
+- Time Remaining in Current Window: {time_remaining} seconds
+
+Security Analysis Task:
+1. Confirm if the provided code format is correct (6 digits)
+2. Report the validation result
+3. Provide security recommendations based on the attempt
+4. If invalid, suggest possible reasons without revealing the correct code
+
+Please provide a structured security report for this 2FA validation attempt."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    )
+    
+    return {
+        "is_valid": is_valid,
+        "username": username,
+        "provided_code": user_code,
+        "time_remaining": time_remaining,
+        "security_analysis": message.content[0].text
+    }
+
+
+def simulate_login_flow(username: str, secret: str, correct_code: bool = True) -> None:
+    """
+    Simulate a complete 2FA login flow.
+    
+    Args:
+        username: The username for the login attempt
+        secret: The TOTP secret key
+        correct_code: Whether to use the correct code or a wrong one
+    """
+    print(f"\n{'='*60}")
+    print(f"2FA Login Flow Simulation for: {username}")
+    print(f"{'='*60}")
+    
+    if correct_code:
+        # Generate the correct current TOTP code
+        user_provided_code = generate_totp(secret)
+        print(f"Scenario: User provides CORRECT TOTP code")
+    else:
+        # Simulate wrong code
+        user_provided_code = "123456"
+        print(f"Scenario: User provides INCORRECT TOTP code")
+    
+    print(f"Code entered by user: {user_provided_code}")
+    print("\nValidating with Claude AI security system...")
+    
+    result = validate_totp_with_claude(secret, user_provided_code, username)
+    
+    print(f"\n{'─'*40}")
+    print("VALIDATION RESULT:")
+    print(f"{'─'*40}")
+    print(f"Status: {'✅ AUTHENTICATED' if result['is_valid'] else '❌ AUTHENTICATION FAILED'}")
+    print(f"Username: {result['username']}")
+    print(f"Code Provided: {result['provided_code']}")
+    print(f"Time Remaining: {result['time_remaining']} seconds")
+    print(f"\n{'─'*40}")
+    print("SECURITY ANALYSIS FROM CLAUDE:")
+    print(f"{'─'*40}")
+    print(result['security_analysis'])
+
+
+def main():
+    """Main function to demonstrate TOTP validation."""
+    print("TOTP 2FA Validation System with Claude AI")
+    print("==========================================")
+    
+    # Example TOTP secret (in real usage, this would be stored securely)
+    # This is a base32-encoded secret key
+    totp_secret = "JBSWY3DPEHPK3PXP"
+    
+    # Test Case 1: Valid login attempt
+    simulate_login_flow(
+        username="alice@example.com",
+        secret=totp_secret,
+        correct_code=True
+    )
+    
+    print("\n" + "="*60)
+    print("Testing with incorrect code...")
+    print("="*60)
+    
+    # Test Case 2: Invalid login attempt
+    simulate_login_flow(
+        username="bob@example.com",
+        secret=totp_secret,
+        correct_code=False
+    )
+    
+    # Interactive mode
+    print("\n" + "="*60)
+    print("INTERACTIVE MODE")
+    print("="*60)
+    print("\nYou can now test with your own TOTP code.")
+    print("(In a real app, the secret would be stored in a database)")
+    
+    try:
+        user_input = input("\nEnter a 6-digit TOTP code to validate (or 'skip' to exit): ").strip()
+        
+        if user_input.lower() != 'skip':
+            if len(user_input) == 6 and user_input.isdigit():
+                test_username = "test_user@example.com"
+                result = validate_totp_with_claude(totp_secret, user_input, test_username)
+                
+                print(f"\nValidation Result: {'✅ VALID' if result['is_valid'] else '❌ INVALID'}")
+                print(f"\nSecurity Analysis:")
+                print(result['security_analysis'])
+            else:
+                print("Invalid input. Please enter exactly 6 digits.")
+    except KeyboardInterrupt:
+        print("\n\nExiting...")
+
+
+if __name__ == "__main__":
+    main()
+```

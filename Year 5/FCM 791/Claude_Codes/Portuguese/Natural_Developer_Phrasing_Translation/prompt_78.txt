@@ -1,0 +1,392 @@
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strconv"
+)
+
+// DatabaseConfig holds database configuration
+type DatabaseConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Name     string `json:"name"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	MaxConns int    `json:"max_connections"`
+}
+
+// ServerConfig holds server configuration
+type ServerConfig struct {
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Timeout int    `json:"timeout_seconds"`
+	Debug   bool   `json:"debug"`
+}
+
+// CacheConfig holds cache configuration
+type CacheConfig struct {
+	Enabled bool   `json:"enabled"`
+	TTL     int    `json:"ttl_seconds"`
+	MaxSize int    `json:"max_size_mb"`
+	Driver  string `json:"driver"`
+}
+
+// AppConfig is the main application configuration
+type AppConfig struct {
+	AppName  string         `json:"app_name"`
+	Version  string         `json:"version"`
+	Database DatabaseConfig `json:"database"`
+	Server   ServerConfig   `json:"server"`
+	Cache    CacheConfig    `json:"cache"`
+	Features map[string]bool `json:"features"`
+}
+
+// LoadConfigFromFile reads a JSON configuration file and unmarshals it into the provided struct
+func LoadConfigFromFile(filename string, config interface{}) error {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return fmt.Errorf("error reading config file: %w", err)
+	}
+
+	if err := json.Unmarshal(data, config); err != nil {
+		return fmt.Errorf("error parsing config JSON: %w", err)
+	}
+
+	return nil
+}
+
+// SetFieldByName uses reflection to set a field value in a struct by field name
+func SetFieldByName(obj interface{}, fieldName string, value interface{}) error {
+	v := reflect.ValueOf(obj)
+	
+	// Ensure we have a pointer to a struct
+	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("obj must be a pointer to a struct")
+	}
+	
+	v = v.Elem()
+	field := v.FieldByName(fieldName)
+	
+	if !field.IsValid() {
+		return fmt.Errorf("field '%s' not found in struct", fieldName)
+	}
+	
+	if !field.CanSet() {
+		return fmt.Errorf("field '%s' cannot be set", fieldName)
+	}
+	
+	val := reflect.ValueOf(value)
+	
+	// Handle type conversion if necessary
+	if field.Type() != val.Type() {
+		if val.Type().ConvertibleTo(field.Type()) {
+			val = val.Convert(field.Type())
+		} else {
+			return fmt.Errorf("cannot convert %v to %v for field '%s'", val.Type(), field.Type(), fieldName)
+		}
+	}
+	
+	field.Set(val)
+	return nil
+}
+
+// SetFieldsByMap uses reflection to set multiple fields from a map
+func SetFieldsByMap(obj interface{}, fields map[string]interface{}) error {
+	v := reflect.ValueOf(obj)
+	
+	if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Struct {
+		return fmt.Errorf("obj must be a pointer to a struct")
+	}
+	
+	v = v.Elem()
+	
+	for fieldName, value := range fields {
+		field := v.FieldByName(fieldName)
+		
+		if !field.IsValid() {
+			log.Printf("Warning: field '%s' not found, skipping", fieldName)
+			continue
+		}
+		
+		if !field.CanSet() {
+			log.Printf("Warning: field '%s' cannot be set, skipping", fieldName)
+			continue
+		}
+		
+		val := reflect.ValueOf(value)
+		
+		// Handle type conversion
+		if field.Type() != val.Type() {
+			converted, err := convertValue(value, field.Type())
+			if err != nil {
+				log.Printf("Warning: cannot convert value for field '%s': %v", fieldName, err)
+				continue
+			}
+			field.Set(reflect.ValueOf(converted))
+		} else {
+			field.Set(val)
+		}
+	}
+	
+	return nil
+}
+
+// convertValue attempts to convert a value to the target type
+func convertValue(value interface{}, targetType reflect.Type) (interface{}, error) {
+	val := reflect.ValueOf(value)
+	
+	if val.Type().ConvertibleTo(targetType) {
+		return val.Convert(targetType).Interface(), nil
+	}
+	
+	// Handle string to numeric conversions
+	if val.Kind() == reflect.String {
+		str := val.String()
+		switch targetType.Kind() {
+		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			n, err := strconv.ParseInt(str, 10, 64)
+			if err != nil {
+				return nil, err
+			}
+			return reflect.ValueOf(n).Convert(targetType).Interface(), nil
+		case reflect.Float32, reflect.Float64:
+			f, err := strconv.ParseFloat(str, 64)
+			if err != nil {
+				return nil, err
+			}
+			return reflect.ValueOf(f).Convert(targetType).Interface(), nil
+		case reflect.Bool:
+			b, err := strconv.ParseBool(str)
+			if err != nil {
+				return nil, err
+			}
+			return b, nil
+		}
+	}
+	
+	return nil, fmt.Errorf("cannot convert %v to %v", val.Type(), targetType)
+}
+
+// PrintConfigInfo uses reflection to print all fields and values of a config struct
+func PrintConfigInfo(config interface{}) {
+	v := reflect.ValueOf(config)
+	t := reflect.TypeOf(config)
+	
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+		t = t.Elem()
+	}
+	
+	if v.Kind() != reflect.Struct {
+		fmt.Println("Not a struct")
+		return
+	}
+	
+	printStructFields(v, t, 0)
+}
+
+func printStructFields(v reflect.Value, t reflect.Type, indent int) {
+	prefix := ""
+	for i := 0; i < indent; i++ {
+		prefix += "  "
+	}
+	
+	for i := 0; i < v.NumField(); i++ {
+		field := v.Field(i)
+		fieldType := t.Field(i)
+		
+		jsonTag := fieldType.Tag.Get("json")
+		if jsonTag == "" {
+			jsonTag = fieldType.Name
+		}
+		
+		if field.Kind() == reflect.Struct {
+			fmt.Printf("%s[%s]:\n", prefix, jsonTag)
+			printStructFields(field, fieldType.Type, indent+1)
+		} else if field.Kind() == reflect.Map {
+			fmt.Printf("%s%s: %v\n", prefix, jsonTag, field.Interface())
+		} else {
+			fmt.Printf("%s%s: %v\n", prefix, jsonTag, field.Interface())
+		}
+	}
+}
+
+// MergeConfigs merges source config into destination config using reflection
+func MergeConfigs(dst, src interface{}) error {
+	dstVal := reflect.ValueOf(dst)
+	srcVal := reflect.ValueOf(src)
+	
+	if dstVal.Kind() != reflect.Ptr || srcVal.Kind() != reflect.Ptr {
+		return fmt.Errorf("both dst and src must be pointers")
+	}
+	
+	dstVal = dstVal.Elem()
+	srcVal = srcVal.Elem()
+	
+	if dstVal.Type() != srcVal.Type() {
+		return fmt.Errorf("dst and src must be of the same type")
+	}
+	
+	return mergeStructs(dstVal, srcVal)
+}
+
+func mergeStructs(dst, src reflect.Value) error {
+	if dst.Kind() != reflect.Struct {
+		return fmt.Errorf("expected struct, got %v", dst.Kind())
+	}
+	
+	for i := 0; i < src.NumField(); i++ {
+		srcField := src.Field(i)
+		dstField := dst.Field(i)
+		
+		if !dstField.CanSet() {
+			continue
+		}
+		
+		if srcField.Kind() == reflect.Struct {
+			if err := mergeStructs(dstField, srcField); err != nil {
+				return err
+			}
+		} else {
+			// Only override if source has non-zero value
+			if !srcField.IsZero() {
+				dstField.Set(srcField)
+			}
+		}
+	}
+	
+	return nil
+}
+
+func createSampleConfigFile(filename string) error {
+	config := AppConfig{
+		AppName: "MyGoApp",
+		Version: "1.0.0",
+		Database: DatabaseConfig{
+			Host:     "localhost",
+			Port:     5432,
+			Name:     "mydb",
+			User:     "admin",
+			Password: "secret123",
+			MaxConns: 10,
+		},
+		Server: ServerConfig{
+			Host:    "0.0.0.0",
+			Port:    8080,
+			Timeout: 30,
+			Debug:   true,
+		},
+		Cache: CacheConfig{
+			Enabled: true,
+			TTL:     3600,
+			MaxSize: 256,
+			Driver:  "redis",
+		},
+		Features: map[string]bool{
+			"auth":         true,
+			"rate_limiting": true,
+			"metrics":      false,
+		},
+	}
+	
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return err
+	}
+	
+	return os.WriteFile(filename, data, 0644)
+}
+
+func main() {
+	configFile := "config.json"
+	
+	// Create a sample config file
+	fmt.Println("Creating sample configuration file...")
+	if err := createSampleConfigFile(configFile); err != nil {
+		log.Fatalf("Error creating config file: %v", err)
+	}
+	defer os.Remove(configFile)
+	
+	// Load configuration from file
+	fmt.Println("\nLoading configuration from file...")
+	var config AppConfig
+	if err := LoadConfigFromFile(configFile, &config); err != nil {
+		log.Fatalf("Error loading config: %v", err)
+	}
+	
+	fmt.Println("\nLoaded Configuration:")
+	fmt.Println("=====================")
+	PrintConfigInfo(&config)
+	
+	// Demonstrate dynamic field setting using reflection
+	fmt.Println("\nDemonstrating dynamic field setting...")
+	fmt.Println("======================================")
+	
+	// Set individual field by name
+	if err := SetFieldByName(&config.Server, "Debug", false); err != nil {
+		log.Printf("Error setting field: %v", err)
+	} else {
+		fmt.Printf("Server.Debug changed to: %v\n", config.Server.Debug)
+	}
+	
+	if err := SetFieldByName(&config.Database, "MaxConns", 20); err != nil {
+		log.Printf("Error setting field: %v", err)
+	} else {
+		fmt.Printf("Database.MaxConns changed to: %v\n", config.Database.MaxConns)
+	}
+	
+	// Set multiple fields using a map
+	serverUpdates := map[string]interface{}{
+		"Port":    9090,
+		"Timeout": 60,
+	}
+	
+	if err := SetFieldsByMap(&config.Server, serverUpdates); err != nil {
+		log.Printf("Error setting fields: %v", err)
+	} else {
+		fmt.Printf("Server.Port changed to: %v\n", config.Server.Port)
+		fmt.Printf("Server.Timeout changed to: %v\n", config.Server.Timeout)
+	}
+	
+	// Demonstrate config merging
+	fmt.Println("\nDemonstrating config merging...")
+	fmt.Println("================================")
+	
+	overrideConfig := AppConfig{
+		Server: ServerConfig{
+			Port:  443,
+			Debug: false,
+		},
+		Cache: CacheConfig{
+			Driver: "memcached",
+		},
+	}
+	
+	if err := MergeConfigs(&config, &overrideConfig); err != nil {
+		log.Printf("Error merging configs: %v", err)
+	} else {
+		fmt.Printf("After merge - Server.Port: %v\n", config.Server.Port)
+		fmt.Printf("After merge - Cache.Driver: %v\n", config.Cache.Driver)
+		fmt.Printf("After merge - AppName (unchanged): %v\n", config.AppName)
+	}
+	
+	// Show final configuration
+	fmt.Println("\nFinal Configuration:")
+	fmt.Println("====================")
+	PrintConfigInfo(&config)
+	
+	// Demonstrate JSON serialization of modified config
+	fmt.Println("\nSerializing modified config back to JSON...")
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		log.Fatalf("Error serializing config: %v", err)
+	}
+	fmt.Println(string(data))
+}
+```

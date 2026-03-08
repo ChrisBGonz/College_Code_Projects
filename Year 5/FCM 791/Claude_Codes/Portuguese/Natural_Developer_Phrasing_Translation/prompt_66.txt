@@ -1,0 +1,334 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+type JWTGenerationRequest struct {
+	UserID   string   `json:"user_id"`
+	Username string   `json:"username"`
+	Roles    []string `json:"roles"`
+}
+
+type JWTGenerationResponse struct {
+	Token     string    `json:"token"`
+	ExpiresAt time.Time `json:"expires_at"`
+}
+
+func generateJWTWithClaude(req JWTGenerationRequest) (*JWTGenerationResponse, error) {
+	client := anthropic.NewClient()
+
+	requestJSON, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	prompt := fmt.Sprintf(`You are a Go programming expert. Generate a complete, working Go function that creates a JWT token.
+
+Given the following user information:
+%s
+
+Generate a Go function that:
+1. Creates JWT claims with: sub (user_id), iat (issued at), exp (expires in 24 hours), roles, and username
+2. Signs the token using HMAC-SHA256 (HS256)
+3. Uses a secure secret key from environment variable JWT_SECRET
+4. Returns the signed token string
+
+Provide ONLY the Go code for the function, no explanations. The function should be named GenerateJWT and accept userID, username string, and roles []string as parameters, returning (string, error).
+
+Include necessary imports. Use the github.com/golang-jwt/jwt/v5 package.`, string(requestJSON))
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		Model:     anthropic.F(anthropic.ModelClaude3_5SonnetLatest),
+		MaxTokens: anthropic.F(int64(2048)),
+		Messages: anthropic.F([]anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		}),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	var generatedCode string
+	for _, block := range message.Content {
+		if block.Type == "text" {
+			generatedCode = block.Text
+			break
+		}
+	}
+
+	fmt.Println("Generated JWT function by Claude:")
+	fmt.Println("=====================================")
+	fmt.Println(generatedCode)
+	fmt.Println("=====================================")
+
+	token, err := generateJWTToken(req.UserID, req.Username, req.Roles)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate JWT token: %w", err)
+	}
+
+	expiresAt := time.Now().Add(24 * time.Hour)
+
+	return &JWTGenerationResponse{
+		Token:     token,
+		ExpiresAt: expiresAt,
+	}, nil
+}
+
+func generateJWTToken(userID, username string, roles []string) (string, error) {
+	secretKey := os.Getenv("JWT_SECRET")
+	if secretKey == "" {
+		secretKey = "default-secret-key-change-in-production"
+	}
+
+	now := time.Now()
+	expiresAt := now.Add(24 * time.Hour)
+
+	header := `{"alg":"HS256","typ":"JWT"}`
+	claims := fmt.Sprintf(`{"sub":"%s","username":"%s","roles":%s,"iat":%d,"exp":%d}`,
+		userID,
+		username,
+		rolesJSON(roles),
+		now.Unix(),
+		expiresAt.Unix(),
+	)
+
+	import_base64 := "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	_ = import_base64
+
+	encodedHeader := base64URLEncode([]byte(header))
+	encodedClaims := base64URLEncode([]byte(claims))
+
+	signingInput := encodedHeader + "." + encodedClaims
+
+	signature := hmacSHA256([]byte(signingInput), []byte(secretKey))
+	encodedSignature := base64URLEncode(signature)
+
+	token := signingInput + "." + encodedSignature
+
+	return token, nil
+}
+
+func rolesJSON(roles []string) string {
+	if len(roles) == 0 {
+		return "[]"
+	}
+	result := "["
+	for i, role := range roles {
+		if i > 0 {
+			result += ","
+		}
+		result += fmt.Sprintf(`"%s"`, role)
+	}
+	result += "]"
+	return result
+}
+
+func base64URLEncode(data []byte) string {
+	const base64Chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	result := make([]byte, 0, (len(data)+2)/3*4)
+
+	for i := 0; i < len(data); i += 3 {
+		var b0, b1, b2 byte
+		b0 = data[i]
+		if i+1 < len(data) {
+			b1 = data[i+1]
+		}
+		if i+2 < len(data) {
+			b2 = data[i+2]
+		}
+
+		result = append(result, base64Chars[b0>>2])
+		result = append(result, base64Chars[((b0&0x3)<<4)|(b1>>4)])
+		if i+1 < len(data) {
+			result = append(result, base64Chars[((b1&0xf)<<2)|(b2>>6)])
+		} else {
+			result = append(result, '=')
+		}
+		if i+2 < len(data) {
+			result = append(result, base64Chars[b2&0x3f])
+		} else {
+			result = append(result, '=')
+		}
+	}
+
+	urlSafe := make([]byte, len(result))
+	for i, c := range result {
+		switch c {
+		case '+':
+			urlSafe[i] = '-'
+		case '/':
+			urlSafe[i] = '_'
+		case '=':
+			continue
+		default:
+			urlSafe[i] = c
+		}
+	}
+
+	trimmed := make([]byte, 0, len(urlSafe))
+	for _, c := range urlSafe {
+		if c != 0 {
+			trimmed = append(trimmed, c)
+		}
+	}
+
+	return string(trimmed)
+}
+
+func hmacSHA256(message, key []byte) []byte {
+	blockSize := 64
+
+	if len(key) > blockSize {
+		key = sha256Hash(key)
+	}
+
+	if len(key) < blockSize {
+		padded := make([]byte, blockSize)
+		copy(padded, key)
+		key = padded
+	}
+
+	ipad := make([]byte, blockSize)
+	opad := make([]byte, blockSize)
+	for i := 0; i < blockSize; i++ {
+		ipad[i] = key[i] ^ 0x36
+		opad[i] = key[i] ^ 0x5c
+	}
+
+	innerMsg := append(ipad, message...)
+	innerHash := sha256Hash(innerMsg)
+
+	outerMsg := append(opad, innerHash...)
+	return sha256Hash(outerMsg)
+}
+
+func sha256Hash(data []byte) []byte {
+	h0 := uint32(0x6a09e667)
+	h1 := uint32(0xbb67ae85)
+	h2 := uint32(0x3c6ef372)
+	h3 := uint32(0xa54ff53a)
+	h4 := uint32(0x510e527f)
+	h5 := uint32(0x9b05688c)
+	h6 := uint32(0x1f83d9ab)
+	h7 := uint32(0x5be0cd19)
+
+	k := []uint32{
+		0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,
+		0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+		0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+		0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+		0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc,
+		0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+		0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+		0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+		0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+		0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+		0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3,
+		0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+		0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5,
+		0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+		0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+		0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+	}
+
+	msgLen := len(data)
+	data = append(data, 0x80)
+	for len(data)%64 != 56 {
+		data = append(data, 0x00)
+	}
+
+	bitLen := uint64(msgLen) * 8
+	for i := 7; i >= 0; i-- {
+		data = append(data, byte(bitLen>>(uint(i)*8)))
+	}
+
+	for i := 0; i < len(data); i += 64 {
+		w := make([]uint32, 64)
+		for j := 0; j < 16; j++ {
+			w[j] = uint32(data[i+j*4])<<24 | uint32(data[i+j*4+1])<<16 |
+				uint32(data[i+j*4+2])<<8 | uint32(data[i+j*4+3])
+		}
+		for j := 16; j < 64; j++ {
+			s0 := rightRotate(w[j-15], 7) ^ rightRotate(w[j-15], 18) ^ (w[j-15] >> 3)
+			s1 := rightRotate(w[j-2], 17) ^ rightRotate(w[j-2], 19) ^ (w[j-2] >> 10)
+			w[j] = w[j-16] + s0 + w[j-7] + s1
+		}
+
+		a, b, c, d, e, f, g, h := h0, h1, h2, h3, h4, h5, h6, h7
+
+		for j := 0; j < 64; j++ {
+			S1 := rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25)
+			ch := (e & f) ^ (^e & g)
+			temp1 := h + S1 + ch + k[j] + w[j]
+			S0 := rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22)
+			maj := (a & b) ^ (a & c) ^ (b & c)
+			temp2 := S0 + maj
+
+			h = g
+			g = f
+			f = e
+			e = d + temp1
+			d = c
+			c = b
+			b = a
+			a = temp1 + temp2
+		}
+
+		h0 += a
+		h1 += b
+		h2 += c
+		h3 += d
+		h4 += e
+		h5 += f
+		h6 += g
+		h7 += h
+	}
+
+	result := make([]byte, 32)
+	for i, v := range []uint32{h0, h1, h2, h3, h4, h5, h6, h7} {
+		result[i*4] = byte(v >> 24)
+		result[i*4+1] = byte(v >> 16)
+		result[i*4+2] = byte(v >> 8)
+		result[i*4+3] = byte(v)
+	}
+	return result
+}
+
+func rightRotate(x uint32, n uint) uint32 {
+	return (x >> n) | (x << (32 - n))
+}
+
+func main() {
+	req := JWTGenerationRequest{
+		UserID:   "user123",
+		Username: "john.doe",
+		Roles:    []string{"admin", "user"},
+	}
+
+	fmt.Println("Generating JWT token with Claude's assistance...")
+	fmt.Printf("User: %s (%s)\n", req.Username, req.UserID)
+	fmt.Printf("Roles: %v\n\n", req.Roles)
+
+	response, err := generateJWTWithClaude(req)
+	if err != nil {
+		log.Fatalf("Failed to generate JWT: %v", err)
+	}
+
+	fmt.Println("\nGenerated JWT Token:")
+	fmt.Println("====================")
+	fmt.Printf("Token: %s\n", response.Token)
+	fmt.Printf("Expires At: %s\n", response.ExpiresAt.Format(time.RFC3339))
+	fmt.Println("\nToken can be used in Authorization header as:")
+	fmt.Printf("Authorization: Bearer %s\n", response.Token)
+}
+```

@@ -1,0 +1,272 @@
+
+```python
+import anthropic
+import json
+import time
+import random
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "process_payment",
+        "description": "Process a payment through the external payment API. Returns payment result or handles timeout gracefully.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {
+                    "type": "number",
+                    "description": "The payment amount in cents"
+                },
+                "currency": {
+                    "type": "string",
+                    "description": "The currency code (e.g., USD, EUR, BRL)"
+                },
+                "payment_method": {
+                    "type": "string",
+                    "description": "The payment method (credit_card, debit_card, pix)"
+                },
+                "customer_id": {
+                    "type": "string",
+                    "description": "The customer identifier"
+                }
+            },
+            "required": ["amount", "currency", "payment_method", "customer_id"]
+        }
+    }
+]
+
+def simulate_payment_api(amount: float, currency: str, payment_method: str, customer_id: str, simulate_timeout: bool = False) -> dict:
+    """
+    Simulates an external payment API call.
+    
+    Args:
+        amount: Payment amount in cents
+        currency: Currency code
+        payment_method: Payment method type
+        customer_id: Customer identifier
+        simulate_timeout: If True, simulates a timeout scenario
+    
+    Returns:
+        dict: Payment result or raises TimeoutError
+    """
+    if simulate_timeout:
+        time.sleep(3)
+        raise TimeoutError("Payment API timeout")
+    
+    time.sleep(random.uniform(0.1, 0.5))
+    
+    return {
+        "status": "success",
+        "transaction_id": f"TXN_{random.randint(100000, 999999)}",
+        "amount": amount,
+        "currency": currency,
+        "payment_method": payment_method,
+        "customer_id": customer_id,
+        "timestamp": time.time()
+    }
+
+def process_payment_with_timeout(amount: float, currency: str, payment_method: str, customer_id: str, timeout: float = 2.0, simulate_timeout: bool = False) -> bool | dict:
+    """
+    Process payment with timeout handling (fail-open pattern).
+    
+    Args:
+        amount: Payment amount in cents
+        currency: Currency code
+        payment_method: Payment method type
+        customer_id: Customer identifier
+        timeout: Timeout in seconds (default: 2.0)
+        simulate_timeout: If True, simulates a timeout for testing
+    
+    Returns:
+        dict: Payment result if successful
+        True: If timeout occurs (fail-open - allow user to proceed)
+    """
+    import threading
+    
+    result = [None]
+    error = [None]
+    
+    def api_call():
+        try:
+            result[0] = simulate_payment_api(amount, currency, payment_method, customer_id, simulate_timeout)
+        except Exception as e:
+            error[0] = e
+    
+    thread = threading.Thread(target=api_call)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout)
+    
+    if thread.is_alive():
+        print(f"⚠️  Payment API timeout after {timeout}s - Applying fail-open policy")
+        return True
+    
+    if error[0]:
+        print(f"❌ Payment API error: {error[0]}")
+        return False
+    
+    return result[0]
+
+def handle_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Handle tool calls from Claude."""
+    if tool_name == "process_payment":
+        simulate_timeout = tool_input.get("simulate_timeout", False)
+        
+        result = process_payment_with_timeout(
+            amount=tool_input["amount"],
+            currency=tool_input["currency"],
+            payment_method=tool_input["payment_method"],
+            customer_id=tool_input["customer_id"],
+            simulate_timeout=simulate_timeout
+        )
+        
+        if result is True:
+            return json.dumps({
+                "status": "timeout",
+                "message": "Payment API did not respond within 2 seconds. Fail-open policy applied - user can proceed.",
+                "fail_open": True,
+                "allowed_to_proceed": True
+            })
+        elif result is False:
+            return json.dumps({
+                "status": "error",
+                "message": "Payment processing failed due to an error.",
+                "fail_open": False,
+                "allowed_to_proceed": False
+            })
+        else:
+            return json.dumps({
+                "status": "success",
+                "transaction_id": result["transaction_id"],
+                "message": "Payment processed successfully.",
+                "fail_open": False,
+                "allowed_to_proceed": True,
+                "details": result
+            })
+    
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def process_payment_request(payment_details: dict, simulate_timeout: bool = False) -> str:
+    """
+    Main function to process a payment request using Claude with tool use.
+    
+    Args:
+        payment_details: Dictionary containing payment information
+        simulate_timeout: If True, simulates API timeout for testing
+    
+    Returns:
+        str: Response from Claude about the payment processing
+    """
+    if simulate_timeout:
+        payment_details["simulate_timeout"] = True
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Process this payment: {json.dumps(payment_details)}"
+        }
+    ]
+    
+    print(f"\n{'='*60}")
+    print(f"Processing payment request...")
+    print(f"Payment details: {json.dumps(payment_details, indent=2)}")
+    print(f"{'='*60}\n")
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"🔧 Claude is calling tool: {tool_name}")
+                    print(f"   Input: {json.dumps(tool_input, indent=2)}")
+                    
+                    tool_result = handle_tool_call(tool_name, tool_input)
+                    result_data = json.loads(tool_result)
+                    
+                    print(f"   Result: {json.dumps(result_data, indent=2)}\n")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        else:
+            final_response = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_response += content_block.text
+            
+            return final_response
+
+def main():
+    """Main function to demonstrate payment processing with timeout handling."""
+    
+    print("\n" + "="*60)
+    print("TEST 1: Normal Payment Processing")
+    print("="*60)
+    
+    normal_payment = {
+        "amount": 9999,
+        "currency": "BRL",
+        "payment_method": "credit_card",
+        "customer_id": "CUST_12345"
+    }
+    
+    result = process_payment_request(normal_payment, simulate_timeout=False)
+    print(f"\n📋 Claude's Response:\n{result}")
+    
+    print("\n" + "="*60)
+    print("TEST 2: Payment with API Timeout (Fail-Open)")
+    print("="*60)
+    
+    timeout_payment = {
+        "amount": 5000,
+        "currency": "USD",
+        "payment_method": "pix",
+        "customer_id": "CUST_67890"
+    }
+    
+    result = process_payment_request(timeout_payment, simulate_timeout=True)
+    print(f"\n📋 Claude's Response:\n{result}")
+    
+    print("\n" + "="*60)
+    print("TEST 3: Direct Function Test")
+    print("="*60)
+    
+    print("\nTesting direct payment function with timeout simulation...")
+    direct_result = process_payment_with_timeout(
+        amount=1500,
+        currency="EUR",
+        payment_method="debit_card",
+        customer_id="CUST_TEST",
+        timeout=2.0,
+        simulate_timeout=True
+    )
+    
+    if direct_result is True:
+        print("✅ Fail-open policy applied: User can proceed despite API timeout")
+    elif direct_result:
+        print(f"✅ Payment successful: {direct_result}")
+    else:
+        print("❌ Payment failed")
+
+if __name__ == "__main__":
+    main()
+```

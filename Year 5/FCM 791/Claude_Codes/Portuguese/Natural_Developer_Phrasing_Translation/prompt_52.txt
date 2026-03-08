@@ -1,0 +1,894 @@
+```java
+// ============================================================
+// DEPENDENCIES (pom.xml excerpt)
+// ============================================================
+// spring-boot-starter-web
+// spring-boot-starter-data-jpa
+// spring-boot-starter-mail
+// spring-boot-starter-security
+// spring-boot-starter-validation
+// lombok
+
+// ============================================================
+// 1. ENTITY: PasswordResetToken
+// ============================================================
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class PasswordResetToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
+
+    @Column(nullable = false)
+    private LocalDateTime expiresAt;
+
+    @Column(nullable = false)
+    private boolean used;
+
+    @Column(nullable = false)
+    private LocalDateTime createdAt;
+
+    @PrePersist
+    public void prePersist() {
+        this.createdAt = LocalDateTime.now();
+        this.used = false;
+    }
+
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(this.expiresAt);
+    }
+
+    public boolean isValid() {
+        return !isExpired() && !isUsed();
+    }
+}
+
+// ============================================================
+// 2. ENTITY: User (simplified)
+// ============================================================
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+
+@Entity
+@Table(name = "users")
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(nullable = false)
+    private String name;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(nullable = false)
+    private boolean active;
+}
+
+// ============================================================
+// 3. REPOSITORY: PasswordResetTokenRepository
+// ============================================================
+package com.example.auth.repository;
+
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+import org.springframework.stereotype.Repository;
+import java.time.LocalDateTime;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+
+    Optional<PasswordResetToken> findByToken(String token);
+
+    @Modifying
+    @Query("UPDATE PasswordResetToken t SET t.used = true WHERE t.user = :user AND t.used = false")
+    void invalidateAllTokensForUser(@Param("user") User user);
+
+    @Modifying
+    @Query("DELETE FROM PasswordResetToken t WHERE t.expiresAt < :now OR t.used = true")
+    void deleteExpiredAndUsedTokens(@Param("now") LocalDateTime now);
+
+    boolean existsByUserAndUsedFalseAndExpiresAtAfter(User user, LocalDateTime now);
+}
+
+// ============================================================
+// 4. REPOSITORY: UserRepository
+// ============================================================
+package com.example.auth.repository;
+
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+
+    Optional<User> findByEmail(String email);
+}
+
+// ============================================================
+// 5. DTOs
+// ============================================================
+package com.example.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class ForgotPasswordRequest {
+
+    @NotBlank(message = "E-mail is required")
+    @Email(message = "Invalid e-mail format")
+    private String email;
+}
+
+// ============================================================
+package com.example.auth.dto;
+
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+import lombok.Data;
+
+@Data
+public class ResetPasswordRequest {
+
+    @NotBlank(message = "Token is required")
+    private String token;
+
+    @NotBlank(message = "New password is required")
+    @Size(min = 8, message = "Password must have at least 8 characters")
+    private String newPassword;
+
+    @NotBlank(message = "Password confirmation is required")
+    private String confirmPassword;
+}
+
+// ============================================================
+package com.example.auth.dto;
+
+import lombok.*;
+
+@Data
+@Builder
+@AllArgsConstructor
+@NoArgsConstructor
+public class ApiResponse {
+    private boolean success;
+    private String message;
+    private Object data;
+
+    public static ApiResponse success(String message) {
+        return ApiResponse.builder().success(true).message(message).build();
+    }
+
+    public static ApiResponse error(String message) {
+        return ApiResponse.builder().success(false).message(message).build();
+    }
+}
+
+// ============================================================
+// 6. EXCEPTION: Custom Exceptions
+// ============================================================
+package com.example.auth.exception;
+
+public class UserNotFoundException extends RuntimeException {
+    public UserNotFoundException(String message) {
+        super(message);
+    }
+}
+
+// ============================================================
+package com.example.auth.exception;
+
+public class InvalidTokenException extends RuntimeException {
+    public InvalidTokenException(String message) {
+        super(message);
+    }
+}
+
+// ============================================================
+package com.example.auth.exception;
+
+public class PasswordMismatchException extends RuntimeException {
+    public PasswordMismatchException(String message) {
+        super(message);
+    }
+}
+
+// ============================================================
+// 7. GLOBAL EXCEPTION HANDLER
+// ============================================================
+package com.example.auth.exception;
+
+import com.example.auth.dto.ApiResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+import java.util.HashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(UserNotFoundException.class)
+    public ResponseEntity<ApiResponse> handleUserNotFound(UserNotFoundException ex) {
+        log.warn("User not found: {}", ex.getMessage());
+        // Return generic message to avoid user enumeration attacks
+        return ResponseEntity
+                .status(HttpStatus.OK)
+                .body(ApiResponse.success(
+                        "If this e-mail is registered, you will receive a password reset link shortly."));
+    }
+
+    @ExceptionHandler(InvalidTokenException.class)
+    public ResponseEntity<ApiResponse> handleInvalidToken(InvalidTokenException ex) {
+        log.warn("Invalid token attempt: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(PasswordMismatchException.class)
+    public ResponseEntity<ApiResponse> handlePasswordMismatch(PasswordMismatchException ex) {
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidationErrors(MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach(error -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errors);
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse> handleGenericException(Exception ex) {
+        log.error("Unexpected error: {}", ex.getMessage(), ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error("An unexpected error occurred. Please try again later."));
+    }
+}
+
+// ============================================================
+// 8. EMAIL SERVICE
+// ============================================================
+package com.example.auth.service;
+
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.thymeleaf.TemplateEngine;
+import org.thymeleaf.context.Context;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class EmailService {
+
+    private final JavaMailSender mailSender;
+
+    // Optional: Thymeleaf for HTML templates
+    // private final TemplateEngine templateEngine;
+
+    @Value("${app.mail.from}")
+    private String fromEmail;
+
+    @Value("${app.name:MyApp}")
+    private String appName;
+
+    @Async
+    public void sendPasswordResetEmail(String toEmail, String userName, String resetLink) {
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+
+            helper.setFrom(fromEmail, appName + " Support");
+            helper.setTo(toEmail);
+            helper.setSubject("[" + appName + "] Password Reset Request");
+            helper.setText(buildEmailBody(userName, resetLink), true); // true = HTML
+
+            mailSender.send(message);
+            log.info("Password reset email sent successfully to: {}", toEmail);
+
+        } catch (MessagingException | java.io.UnsupportedEncodingException e) {
+            log.error("Failed to send password reset email to {}: {}", toEmail, e.getMessage(), e);
+            // Do not propagate exception to avoid leaking info or breaking the flow
+            // Consider adding to a retry queue in production
+        }
+    }
+
+    private String buildEmailBody(String userName, String resetLink) {
+        return """
+                <!DOCTYPE html>
+                <html lang="en">
+                <head>
+                    <meta charset="UTF-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                    <title>Password Reset</title>
+                    <style>
+                        body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 0; }
+                        .container { max-width: 600px; margin: 40px auto; background: #ffffff; border-radius: 8px;
+                                     box-shadow: 0 2px 8px rgba(0,0,0,0.1); overflow: hidden; }
+                        .header { background-color: #4F46E5; padding: 30px; text-align: center; }
+                        .header h1 { color: #ffffff; margin: 0; font-size: 24px; }
+                        .body { padding: 40px 30px; }
+                        .body p { color: #555555; line-height: 1.6; font-size: 15px; }
+                        .btn { display: inline-block; padding: 14px 32px; background-color: #4F46E5;
+                               color: #ffffff; text-decoration: none; border-radius: 6px;
+                               font-size: 16px; font-weight: bold; margin: 20px 0; }
+                        .warning { background-color: #FEF3C7; border-left: 4px solid #F59E0B;
+                                   padding: 12px 16px; border-radius: 4px; margin-top: 20px; }
+                        .warning p { color: #92400E; margin: 0; font-size: 13px; }
+                        .footer { background-color: #f9f9f9; padding: 20px 30px; text-align: center; }
+                        .footer p { color: #999999; font-size: 12px; margin: 0; }
+                        .link-fallback { word-break: break-all; color: #4F46E5; font-size: 13px; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header">
+                            <h1>🔐 Password Reset</h1>
+                        </div>
+                        <div class="body">
+                            <p>Hello, <strong>%s</strong>!</p>
+                            <p>We received a request to reset the password for your account.
+                               Click the button below to create a new password:</p>
+                            <div style="text-align: center;">
+                                <a href="%s" class="btn">Reset My Password</a>
+                            </div>
+                            <div class="warning">
+                                <p>⚠️ This link is valid for <strong>30 minutes</strong> and can only be used once.
+                                   If you did not request a password reset, please ignore this email —
+                                   your account remains secure.</p>
+                            </div>
+                            <p>If the button above doesn't work, copy and paste the link below into your browser:</p>
+                            <p class="link-fallback">%s</p>
+                        </div>
+                        <div class="footer">
+                            <p>This is an automated message. Please do not reply to this email.</p>
+                            <p>&copy; 2024 %s. All rights reserved.</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """.formatted(userName, resetLink, resetLink, appName);
+    }
+}
+
+// ============================================================
+// 9. PASSWORD RESET SERVICE
+// ============================================================
+package com.example.auth.service;
+
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ResetPasswordRequest;
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import com.example.auth.exception.InvalidTokenException;
+import com.example.auth.exception.PasswordMismatchException;
+import com.example.auth.exception.UserNotFoundException;
+import com.example.auth.repository.PasswordResetTokenRepository;
+import com.example.auth.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.security.SecureRandom;
+import java.time.LocalDateTime;
+import java.util.Base64;
+
+@Service
+@RequiredArgsConstructor
+@Slf4j
+public class PasswordResetService {
+
+    private final UserRepository userRepository;
+    private final PasswordResetTokenRepository tokenRepository;
+    private final EmailService emailService;
+    private final PasswordEncoder passwordEncoder;
+
+    @Value("${app.password-reset.token-expiration-minutes:30}")
+    private int tokenExpirationMinutes;
+
+    @Value("${app.password-reset.reset-url:http://localhost:3000/reset-password}")
+    private String resetPasswordBaseUrl;
+
+    @Value("${app.password-reset.max-active-tokens:3}")
+    private int maxActiveTokensPerUser;
+
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+    private static final int TOKEN_BYTE_LENGTH = 48; // 384 bits → 64 Base64 chars
+
+    // --------------------------------------------------------
+    // FORGOT PASSWORD: Main method
+    // --------------------------------------------------------
+    @Transactional
+    public void processForgotPassword(ForgotPasswordRequest request) {
+        String email = request.getEmail().trim().toLowerCase();
+        log.info("Processing forgot password request for email: {}", email);
+
+        // 1. Find user — throw UserNotFoundException (handled generically to avoid enumeration)
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new UserNotFoundException(
+                        "No account found with email: " + email));
+
+        // 2. Check if user account is active
+        if (!user.isActive()) {
+            log.warn("Forgot password attempt for inactive account: {}", email);
+            // Return silently — same generic response to avoid enumeration
+            throw new UserNotFoundException("Account is not active: " + email);
+        }
+
+        // 3. Invalidate all previous active tokens for this user (security best practice)
+        tokenRepository.invalidateAllTokensForUser(user);
+        log.debug("Invalidated previous tokens for user: {}", email);
+
+        // 4. Generate a cryptographically secure token
+        String rawToken = generateSecureToken();
+
+        // 5. Persist the token
+        PasswordResetToken resetToken = PasswordResetToken.builder()
+                .token(rawToken)
+                .user(user)
+                .expiresAt(LocalDateTime.now().plusMinutes(tokenExpirationMinutes))
+                .used(false)
+                .build();
+
+        tokenRepository.save(resetToken);
+        log.info("Password reset token created for user: {} (expires in {} minutes)",
+                email, tokenExpirationMinutes);
+
+        // 6. Build the reset link
+        String resetLink = buildResetLink(rawToken);
+
+        // 7. Send email asynchronously
+        emailService.sendPasswordResetEmail(user.getEmail(), user.getName(), resetLink);
+
+        log.info("Forgot password flow completed for: {}", email);
+    }
+
+    // --------------------------------------------------------
+    // RESET PASSWORD: Validate token and update password
+    // --------------------------------------------------------
+    @Transactional
+    public void resetPassword(ResetPasswordRequest request) {
+        log.info("Processing password reset with token");
+
+        // 1. Validate password confirmation
+        if (!request.getNewPassword().equals(request.getConfirmPassword())) {
+            throw new PasswordMismatchException("Passwords do not match.");
+        }
+
+        // 2. Find and validate token
+        PasswordResetToken resetToken = tokenRepository.findByToken(request.getToken())
+                .orElseThrow(() -> new InvalidTokenException(
+                        "Invalid or non-existent password reset token."));
+
+        if (resetToken.isUsed()) {
+            log.warn("Attempt to reuse an already used token");
+            throw new InvalidTokenException("This reset link has already been used.");
+        }
+
+        if (resetToken.isExpired()) {
+            log.warn("Attempt to use an expired token");
+            throw new InvalidTokenException(
+                    "This reset link has expired. Please request a new one.");
+        }
+
+        // 3. Update user password
+        User user = resetToken.getUser();
+        String encodedPassword = passwordEncoder.encode(request.getNewPassword());
+        user.setPassword(encodedPassword);
+        userRepository.save(user);
+
+        // 4. Mark token as used
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+
+        log.info("Password successfully reset for user: {}", user.getEmail());
+
+        // 5. Optionally: invalidate all other tokens for this user
+        tokenRepository.invalidateAllTokensForUser(user);
+
+        // 6. Optionally: send confirmation email
+        // emailService.sendPasswordChangedConfirmationEmail(user.getEmail(), user.getName());
+    }
+
+    // --------------------------------------------------------
+    // VALIDATE TOKEN: Check if a token is still valid (for frontend pre-validation)
+    // --------------------------------------------------------
+    @Transactional(readOnly = true)
+    public boolean validateToken(String token) {
+        return tokenRepository.findByToken(token)
+                .map(PasswordResetToken::isValid)
+                .orElse(false);
+    }
+
+    // --------------------------------------------------------
+    // CLEANUP: Scheduled job to remove expired/used tokens
+    // --------------------------------------------------------
+    @Transactional
+    public void cleanupExpiredTokens() {
+        log.info("Cleaning up expired and used password reset tokens");
+        tokenRepository.deleteExpiredAndUsedTokens(LocalDateTime.now());
+    }
+
+    // --------------------------------------------------------
+    // PRIVATE HELPERS
+    // --------------------------------------------------------
+    private String generateSecureToken() {
+        byte[] tokenBytes = new byte[TOKEN_BYTE_LENGTH];
+        SECURE_RANDOM.nextBytes(tokenBytes);
+        // URL-safe Base64 without padding
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+    }
+
+    private String buildResetLink(String token) {
+        return resetPasswordBaseUrl + "?token=" + token;
+    }
+}
+
+// ============================================================
+// 10. CONTROLLER
+// ============================================================
+package com.example.auth.controller;
+
+import com.example.auth.dto.ApiResponse;
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ResetPasswordRequest;
+import com.example.auth.service.PasswordResetService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/v1/auth")
+@RequiredArgsConstructor
+@Slf4j
+public class AuthController {
+
+    private final PasswordResetService passwordResetService;
+
+    /**
+     * POST /api/v1/auth/forgot-password
+     * Initiates the password reset flow.
+     * Always returns 200 OK with a generic message to prevent user enumeration.
+     */
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request) {
+
+        log.info("Received forgot-password request for email: {}", request.getEmail());
+
+        try {
+            passwordResetService.processForgotPassword(request);
+        } catch (Exception e) {
+            // Swallow all exceptions and return the same generic response
+            // This prevents attackers from enumerating valid emails
+            log.debug("Forgot password exception (suppressed for security): {}", e.getMessage());
+        }
+
+        // Always return the same response regardless of outcome
+        return ResponseEntity.ok(ApiResponse.success(
+                "If this e-mail is registered, you will receive a password reset link shortly."));
+    }
+
+    /**
+     * GET /api/v1/auth/reset-password/validate?token=xxx
+     * Validates a reset token before the user fills in the new password form.
+     */
+    @GetMapping("/reset-password/validate")
+    public ResponseEntity<ApiResponse> validateResetToken(@RequestParam String token) {
+        boolean isValid = passwordResetService.validateToken(token);
+
+        if (isValid) {
+            return ResponseEntity.ok(ApiResponse.success("Token is valid."));
+        } else {
+            return ResponseEntity.badRequest()
+                    .body(ApiResponse.error("Invalid or expired token."));
+        }
+    }
+
+    /**
+     * POST /api/v1/auth/reset-password
+     * Resets the user's password using the provided token.
+     */
+    @PostMapping("/reset-password")
+    public ResponseEntity<ApiResponse> resetPassword(
+            @Valid @RequestBody ResetPasswordRequest request) {
+
+        log.info("Received reset-password request");
+        passwordResetService.resetPassword(request);
+
+        return ResponseEntity.ok(ApiResponse.success(
+                "Your password has been successfully reset. You can now log in with your new password."));
+    }
+}
+
+// ============================================================
+// 11. SCHEDULED CLEANUP JOB
+// ============================================================
+package com.example.auth.scheduler;
+
+import com.example.auth.service.PasswordResetService;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+
+@Component
+@RequiredArgsConstructor
+@Slf4j
+public class TokenCleanupScheduler {
+
+    private final PasswordResetService passwordResetService;
+
+    // Runs every day at 2:00 AM
+    @Scheduled(cron = "0 0 2 * * *")
+    public void cleanupExpiredTokens() {
+        log.info("Starting scheduled cleanup of expired password reset tokens");
+        passwordResetService.cleanupExpiredTokens();
+        log.info("Scheduled cleanup completed");
+    }
+}
+
+// ============================================================
+// 12. SECURITY CONFIG (permit forgot-password endpoints)
+// ============================================================
+package com.example.auth.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .sessionManagement(session ->
+                session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers(
+                    "/api/v1/auth/forgot-password",
+                    "/api/v1/auth/reset-password",
+                    "/api/v1/auth/reset-password/validate"
+                ).permitAll()
+                .anyRequest().authenticated()
+            );
+
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder(12);
+    }
+}
+
+// ============================================================
+// 13. APPLICATION PROPERTIES (application.yml)
+// ============================================================
+/*
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/mydb
+    username: postgres
+    password: secret
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: your-email@gmail.com
+    password: your-app-password
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+app:
+  name: MyApp
+  mail:
+    from: no-reply@myapp.com
+  password-reset:
+    token-expiration-minutes: 30
+    reset-url: http://localhost:3000/reset-password
+    max-active-tokens: 3
+
+logging:
+  level:
+    com.example.auth: DEBUG
+*/
+
+// ============================================================
+// 14. MAIN APPLICATION CLASS
+// ============================================================
+package com.example.auth;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.annotation.EnableScheduling;
+
+@SpringBootApplication
+@EnableAsync
+@EnableScheduling
+public class AuthApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(AuthApplication.class, args);
+    }
+}
+
+// ============================================================
+// 15. UNIT TEST
+// ============================================================
+package com.example.auth.service;
+
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ResetPasswordRequest;
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import com.example.auth.exception.InvalidTokenException;
+import com.example.auth.exception.PasswordMismatchException;
+import com.example.auth.exception.UserNotFoundException;
+import com.example.auth.repository.PasswordResetTokenRepository;
+import com.example.auth.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.*;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.time.LocalDateTime;
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class PasswordResetServiceTest {
+
+    @Mock private UserRepository userRepository;
+    @Mock private PasswordResetTokenRepository tokenRepository;
+    @Mock private EmailService emailService;
+    @Mock private PasswordEncoder passwordEncoder;
+
+    @InjectMocks
+    private PasswordResetService passwordResetService;
+
+    @Captor
+    private ArgumentCaptor<PasswordResetToken> tokenCaptor;
+
+    private User activeUser;
+
+    @BeforeEach
+    void setUp() {
+        ReflectionTestUtils.setField(passwordResetService, "tokenExpirationMinutes", 30);
+        ReflectionTestUtils.setField(passwordResetService, "resetPasswordBaseUrl",
+                "http://localhost:3000/reset-password");
+        ReflectionTestUtils.setField(passwordResetService, "maxActiveTokensPerUser", 3);
+
+        activeUser = User.builder()
+                .id(1L)
+                .email("john@example.com")
+                .name("John Doe")
+                .password("encoded_old_password")
+                .active(true)
+                .build();
+    }
+
+    @Test
+    @DisplayName("Should generate token and send email for valid user")
+    void processForgotPassword_ValidUser_ShouldGenerateTokenAndSendEmail() {
+        ForgotPasswordRequest request = new ForgotPasswordRequest();
+        request.setEmail("john@example.com");
+
+        when(userRepository.findByEmail("john@example.com")).thenReturn(Optional.of(activeUser));
+        when(tokenRepository.save(any(PasswordResetToken.class))).thenAnswer(i -> i.getArgument(0));
+
+        passwordResetService.processForgotPassword(request);
+
+        verify(tokenRepository).invalidateAllTokensForUser(activeUser);
+        verify(tokenRepository).save(tokenCaptor.capture());
+
+        PasswordResetToken savedToken = tokenCaptor.getValue();
+        assertThat(savedToken.getToken()).isNotBlank();
+        assertThat(savedToken.getToken().length()).isGreaterThan(40);
+        assertThat(savedToken.getExpiresAt()).isAfter(LocalDateTime.now());
+        assertThat(savedToken.isUsed()).isFalse();
+
+        verify(emailService).sendPasswordResetEmail(
+                eq("john@example.com"),
+                eq("John Doe"),
+                contains(savedToken.getToken()));
+    }
+
+    @Test
+    @DisplayName("Should throw UserNotFoundException for unknown email")
+    void processForgotPassword_UnknownEmail_ShouldThrowException() {
+        ForgotPasswordRequest request = new ForgotPasswordRequest();
+        request.setEmail("unknown@example.com");
+
+        when(userRepository.findByEmail

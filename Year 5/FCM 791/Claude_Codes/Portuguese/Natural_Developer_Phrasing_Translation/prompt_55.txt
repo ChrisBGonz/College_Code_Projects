@@ -1,0 +1,456 @@
+
+```python
+import http.cookiejar
+import http.server
+import json
+import urllib.parse
+from datetime import datetime, timedelta
+from http.cookies import SimpleCookie
+import uuid
+import hashlib
+import time
+
+
+TRIAL_DURATION_DAYS = 14
+COOKIE_NAME = "has_used_trial"
+SESSION_COOKIE_NAME = "session_id"
+
+users_db = {}
+sessions_db = {}
+trials_db = {}
+
+
+def generate_session_id():
+    return str(uuid.uuid4())
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def parse_cookies(cookie_header):
+    cookies = {}
+    if cookie_header:
+        cookie = SimpleCookie()
+        cookie.load(cookie_header)
+        for key, morsel in cookie.items():
+            cookies[key] = morsel.value
+    return cookies
+
+
+def check_trial_cookie(cookies):
+    if COOKIE_NAME in cookies:
+        cookie_value = cookies[COOKIE_NAME]
+        if cookie_value == "true" or cookie_value == "1":
+            return True, "Cookie indicates trial has been used"
+        
+        try:
+            trial_data = json.loads(urllib.parse.unquote(cookie_value))
+            if trial_data.get("used", False):
+                return True, f"Trial used on {trial_data.get('start_date', 'unknown date')}"
+            
+            if "start_date" in trial_data:
+                start_date = datetime.fromisoformat(trial_data["start_date"])
+                expiry_date = start_date + timedelta(days=TRIAL_DURATION_DAYS)
+                if datetime.now() > expiry_date:
+                    return True, f"Trial expired on {expiry_date.strftime('%Y-%m-%d')}"
+        except (json.JSONDecodeError, ValueError, KeyError):
+            if cookie_value not in ("false", "0", ""):
+                return True, "Invalid trial cookie detected"
+    
+    return False, "No trial usage detected"
+
+
+def create_trial_cookie_value(user_email):
+    trial_data = {
+        "used": True,
+        "user_email": user_email,
+        "start_date": datetime.now().isoformat(),
+        "expiry_date": (datetime.now() + timedelta(days=TRIAL_DURATION_DAYS)).isoformat(),
+        "trial_id": str(uuid.uuid4())
+    }
+    return urllib.parse.quote(json.dumps(trial_data))
+
+
+def register_free_trial(name, email, password, cookies):
+    print("\n" + "="*60)
+    print("FREE TRIAL REGISTRATION FLOW")
+    print("="*60)
+    
+    print(f"\n[STEP 1] Validating input data...")
+    
+    if not name or not email or not password:
+        return {
+            "success": False,
+            "error": "All fields are required",
+            "code": "MISSING_FIELDS"
+        }
+    
+    if "@" not in email or "." not in email:
+        return {
+            "success": False,
+            "error": "Invalid email format",
+            "code": "INVALID_EMAIL"
+        }
+    
+    if len(password) < 8:
+        return {
+            "success": False,
+            "error": "Password must be at least 8 characters",
+            "code": "WEAK_PASSWORD"
+        }
+    
+    print(f"  ✓ Input validation passed")
+    
+    print(f"\n[STEP 2] Checking trial cookie '{COOKIE_NAME}'...")
+    
+    trial_used, trial_message = check_trial_cookie(cookies)
+    
+    if trial_used:
+        print(f"  ✗ Trial cookie check FAILED: {trial_message}")
+        return {
+            "success": False,
+            "error": "You have already used your free trial period",
+            "detail": trial_message,
+            "code": "TRIAL_ALREADY_USED",
+            "upgrade_url": "/pricing"
+        }
+    
+    print(f"  ✓ Trial cookie check passed: {trial_message}")
+    
+    print(f"\n[STEP 3] Checking if email already exists in database...")
+    
+    if email in users_db:
+        existing_user = users_db[email]
+        
+        if existing_user.get("has_used_trial", False):
+            print(f"  ✗ Email found in database with trial already used")
+            return {
+                "success": False,
+                "error": "This email has already been used for a free trial",
+                "code": "EMAIL_TRIAL_USED",
+                "upgrade_url": "/pricing"
+            }
+        
+        print(f"  ✗ Email already registered")
+        return {
+            "success": False,
+            "error": "Email already registered. Please login instead.",
+            "code": "EMAIL_EXISTS",
+            "login_url": "/login"
+        }
+    
+    print(f"  ✓ Email is available")
+    
+    print(f"\n[STEP 4] Checking trial history by email domain...")
+    
+    email_domain = email.split("@")[1]
+    domain_trial_count = sum(
+        1 for user_email in users_db 
+        if user_email.split("@")[1] == email_domain and users_db[user_email].get("has_used_trial", False)
+    )
+    
+    if domain_trial_count >= 5:
+        print(f"  ⚠ Warning: High trial usage from domain {email_domain} ({domain_trial_count} trials)")
+    else:
+        print(f"  ✓ Domain check passed ({domain_trial_count} previous trials from {email_domain})")
+    
+    print(f"\n[STEP 5] Creating user account...")
+    
+    user_id = str(uuid.uuid4())
+    trial_start = datetime.now()
+    trial_end = trial_start + timedelta(days=TRIAL_DURATION_DAYS)
+    
+    users_db[email] = {
+        "id": user_id,
+        "name": name,
+        "email": email,
+        "password_hash": hash_password(password),
+        "created_at": trial_start.isoformat(),
+        "has_used_trial": True,
+        "trial_start": trial_start.isoformat(),
+        "trial_end": trial_end.isoformat(),
+        "plan": "free_trial",
+        "status": "active"
+    }
+    
+    trials_db[user_id] = {
+        "user_id": user_id,
+        "email": email,
+        "start_date": trial_start.isoformat(),
+        "end_date": trial_end.isoformat(),
+        "status": "active"
+    }
+    
+    print(f"  ✓ User account created (ID: {user_id})")
+    
+    print(f"\n[STEP 6] Creating session...")
+    
+    session_id = generate_session_id()
+    sessions_db[session_id] = {
+        "user_id": user_id,
+        "email": email,
+        "created_at": datetime.now().isoformat(),
+        "expires_at": (datetime.now() + timedelta(hours=24)).isoformat()
+    }
+    
+    print(f"  ✓ Session created (ID: {session_id[:8]}...)")
+    
+    print(f"\n[STEP 7] Preparing response cookies...")
+    
+    trial_cookie_value = create_trial_cookie_value(email)
+    trial_cookie_expiry = trial_end.strftime("%a, %d %b %Y %H:%M:%S GMT")
+    session_cookie_expiry = (datetime.now() + timedelta(hours=24)).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    
+    response_cookies = {
+        COOKIE_NAME: {
+            "value": trial_cookie_value,
+            "expires": trial_cookie_expiry,
+            "path": "/",
+            "httponly": True,
+            "samesite": "Strict"
+        },
+        SESSION_COOKIE_NAME: {
+            "value": session_id,
+            "expires": session_cookie_expiry,
+            "path": "/",
+            "httponly": True,
+            "secure": True,
+            "samesite": "Strict"
+        }
+    }
+    
+    print(f"  ✓ Cookies prepared")
+    
+    print(f"\n[STEP 8] Sending welcome email (simulated)...")
+    print(f"  ✓ Welcome email sent to {email}")
+    
+    print(f"\n{'='*60}")
+    print(f"✓ FREE TRIAL REGISTRATION SUCCESSFUL!")
+    print(f"{'='*60}")
+    
+    return {
+        "success": True,
+        "message": "Free trial account created successfully",
+        "user": {
+            "id": user_id,
+            "name": name,
+            "email": email,
+            "plan": "free_trial",
+            "trial_start": trial_start.strftime("%Y-%m-%d"),
+            "trial_end": trial_end.strftime("%Y-%m-%d"),
+            "days_remaining": TRIAL_DURATION_DAYS
+        },
+        "session_id": session_id,
+        "cookies": response_cookies,
+        "redirect": "/dashboard"
+    }
+
+
+def simulate_registration_attempt(scenario_name, name, email, password, cookies):
+    print(f"\n{'#'*70}")
+    print(f"SCENARIO: {scenario_name}")
+    print(f"{'#'*70}")
+    print(f"Input: name='{name}', email='{email}', password='{'*' * len(password)}'")
+    print(f"Cookies: {cookies}")
+    
+    result = register_free_trial(name, email, password, cookies)
+    
+    print(f"\nRESULT:")
+    print(json.dumps(result, indent=2, default=str))
+    
+    return result
+
+
+def run_demo():
+    print("\n" + "="*70)
+    print("FREE TRIAL REGISTRATION SYSTEM - DEMO")
+    print("="*70)
+    
+    print("\n\n>>> SCENARIO 1: First-time user (no cookies)")
+    result1 = simulate_registration_attempt(
+        "First-time user - No cookies",
+        "João Silva",
+        "joao.silva@example.com",
+        "SecurePass123",
+        {}
+    )
+    
+    print("\n\n>>> SCENARIO 2: User with 'has_used_trial=true' cookie")
+    result2 = simulate_registration_attempt(
+        "User with trial cookie set to 'true'",
+        "Maria Santos",
+        "maria.santos@example.com",
+        "SecurePass456",
+        {COOKIE_NAME: "true"}
+    )
+    
+    print("\n\n>>> SCENARIO 3: User with 'has_used_trial=1' cookie")
+    result3 = simulate_registration_attempt(
+        "User with trial cookie set to '1'",
+        "Pedro Costa",
+        "pedro.costa@example.com",
+        "SecurePass789",
+        {COOKIE_NAME: "1"}
+    )
+    
+    print("\n\n>>> SCENARIO 4: User with JSON trial cookie (used=true)")
+    trial_json = urllib.parse.quote(json.dumps({
+        "used": True,
+        "user_email": "ana.lima@example.com",
+        "start_date": (datetime.now() - timedelta(days=5)).isoformat(),
+        "expiry_date": (datetime.now() + timedelta(days=9)).isoformat(),
+        "trial_id": str(uuid.uuid4())
+    }))
+    result4 = simulate_registration_attempt(
+        "User with JSON trial cookie (used=True)",
+        "Ana Lima",
+        "ana.lima@example.com",
+        "SecurePass000",
+        {COOKIE_NAME: trial_json}
+    )
+    
+    print("\n\n>>> SCENARIO 5: User with expired trial cookie")
+    expired_trial_json = urllib.parse.quote(json.dumps({
+        "used": True,
+        "user_email": "carlos.ferreira@example.com",
+        "start_date": (datetime.now() - timedelta(days=20)).isoformat(),
+        "expiry_date": (datetime.now() - timedelta(days=6)).isoformat(),
+        "trial_id": str(uuid.uuid4())
+    }))
+    result5 = simulate_registration_attempt(
+        "User with expired trial cookie",
+        "Carlos Ferreira",
+        "carlos.ferreira@example.com",
+        "SecurePass111",
+        {COOKIE_NAME: expired_trial_json}
+    )
+    
+    print("\n\n>>> SCENARIO 6: Duplicate email (already registered)")
+    result6 = simulate_registration_attempt(
+        "Duplicate email registration attempt",
+        "João Silva Duplicado",
+        "joao.silva@example.com",
+        "DifferentPass123",
+        {}
+    )
+    
+    print("\n\n>>> SCENARIO 7: Invalid email format")
+    result7 = simulate_registration_attempt(
+        "Invalid email format",
+        "Test User",
+        "invalid-email",
+        "SecurePass222",
+        {}
+    )
+    
+    print("\n\n>>> SCENARIO 8: Weak password")
+    result8 = simulate_registration_attempt(
+        "Weak password",
+        "Test User",
+        "test.user@example.com",
+        "123",
+        {}
+    )
+    
+    print("\n\n>>> SCENARIO 9: Missing fields")
+    result9 = simulate_registration_attempt(
+        "Missing required fields",
+        "",
+        "test@example.com",
+        "SecurePass333",
+        {}
+    )
+    
+    print("\n\n>>> SCENARIO 10: Valid new user with 'has_used_trial=false' cookie")
+    result10 = simulate_registration_attempt(
+        "Valid user with trial cookie set to 'false'",
+        "Lucia Mendes",
+        "lucia.mendes@example.com",
+        "SecurePass444",
+        {COOKIE_NAME: "false"}
+    )
+    
+    print("\n\n" + "="*70)
+    print("DEMO SUMMARY")
+    print("="*70)
+    
+    scenarios = [
+        ("First-time user (no cookies)", result1),
+        ("Trial cookie = 'true'", result2),
+        ("Trial cookie = '1'", result3),
+        ("JSON trial cookie (used=True)", result4),
+        ("Expired trial cookie", result5),
+        ("Duplicate email", result6),
+        ("Invalid email format", result7),
+        ("Weak password", result8),
+        ("Missing fields", result9),
+        ("Trial cookie = 'false'", result10),
+    ]
+    
+    print(f"\n{'Scenario':<45} {'Result':<10} {'Code/Message'}")
+    print("-"*90)
+    
+    for scenario_name, result in scenarios:
+        status = "✓ SUCCESS" if result["success"] else "✗ FAILED"
+        detail = result.get("code", result.get("message", ""))
+        print(f"{scenario_name:<45} {status:<10} {detail}")
+    
+    print("\n\nCurrent Users Database:")
+    print("-"*40)
+    for email, user in users_db.items():
+        print(f"  - {email} (Trial: {user['trial_start'][:10]} to {user['trial_end'][:10]})")
+    
+    print(f"\nTotal registered users: {len(users_db)}")
+    print(f"Total active trials: {len(trials_db)}")
+
+
+class TrialCookieValidator:
+    
+    @staticmethod
+    def validate(cookie_header):
+        cookies = parse_cookies(cookie_header)
+        return check_trial_cookie(cookies)
+    
+    @staticmethod
+    def create_cookie(email):
+        return create_trial_cookie_value(email)
+    
+    @staticmethod
+    def get_cookie_header(email, trial_end_date):
+        cookie_value = create_trial_cookie_value(email)
+        expiry = trial_end_date.strftime("%a, %d %b %Y %H:%M:%S GMT")
+        return f"{COOKIE_NAME}={cookie_value}; Expires={expiry}; Path=/; HttpOnly; SameSite=Strict"
+
+
+if __name__ == "__main__":
+    run_demo()
+    
+    print("\n\n" + "="*70)
+    print("COOKIE VALIDATOR UTILITY DEMO")
+    print("="*70)
+    
+    validator = TrialCookieValidator()
+    
+    test_cases = [
+        ("No cookie header", None),
+        ("Empty cookie", ""),
+        ("Trial used cookie", f"{COOKIE_NAME}=true"),
+        ("Trial not used cookie", f"{COOKIE_NAME}=false"),
+        ("Trial used as 1", f"{COOKIE_NAME}=1"),
+        ("Session only cookie", "session_id=abc123"),
+    ]
+    
+    print(f"\n{'Cookie Header':<45} {'Trial Used':<12} {'Message'}")
+    print("-"*90)
+    
+    for description, cookie_header in test_cases:
+        used, message = validator.validate(cookie_header)
+        status = "YES ✗" if used else "NO ✓"
+        print(f"{description:<45} {status:<12} {message}")
+    
+    print("\n\nExample Set-Cookie header for new trial:")
+    trial_end = datetime.now() + timedelta(days=TRIAL_DURATION_DAYS)
+    cookie_header = validator.get_cookie_header("newuser@example.com", trial_end)
+    print(f"  {cookie_header}")
+```

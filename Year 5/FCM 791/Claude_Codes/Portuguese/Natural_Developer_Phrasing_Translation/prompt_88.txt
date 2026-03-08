@@ -1,0 +1,251 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Anthropic.SDK;
+using Anthropic.SDK.Messaging;
+
+class MFAAuditLogger
+{
+    private readonly AnthropicClient _client;
+    private readonly List<Message> _conversationHistory;
+    private readonly List<MFAAuditLog> _auditLogs;
+
+    public MFAAuditLogger()
+    {
+        _client = new AnthropicClient();
+        _conversationHistory = new List<Message>();
+        _auditLogs = new List<MFAAuditLog>();
+    }
+
+    public async Task StartAuditSession()
+    {
+        Console.WriteLine("=== Sistema de Auditoria de Configurações MFA ===");
+        Console.WriteLine("Este sistema registra alterações nas configurações de autenticação multifator.");
+        Console.WriteLine("Digite 'sair' para encerrar a sessão.\n");
+
+        // Initial system context
+        var systemPrompt = @"Você é um assistente especializado em auditoria de segurança, focado em registrar e analisar alterações nas configurações de autenticação multifator (MFA). 
+
+Quando um usuário reportar uma alteração de MFA, você deve:
+1. Extrair as informações relevantes: quem fez a alteração, o que mudou, e quando ocorreu
+2. Gerar um registro de auditoria estruturado
+3. Identificar possíveis riscos de segurança
+4. Sugerir ações de acompanhamento se necessário
+
+Responda sempre em português e seja preciso na extração de informações de auditoria.";
+
+        while (true)
+        {
+            Console.Write("\nVocê: ");
+            var userInput = Console.ReadLine();
+
+            if (string.IsNullOrWhiteSpace(userInput) || userInput.ToLower() == "sair")
+            {
+                Console.WriteLine("\nEncerrando sessão de auditoria...");
+                DisplayAuditSummary();
+                break;
+            }
+
+            // Add user message to history
+            _conversationHistory.Add(new Message
+            {
+                Role = RoleType.User,
+                Content = userInput
+            });
+
+            try
+            {
+                var response = await _client.Messages.GetClaudeMessageAsync(
+                    new MessageParameters
+                    {
+                        Model = AnthropicModels.Claude3_5Sonnet,
+                        MaxTokens = 1024,
+                        System = new List<SystemMessage>
+                        {
+                            new SystemMessage { Text = systemPrompt }
+                        },
+                        Messages = _conversationHistory
+                    }
+                );
+
+                var assistantMessage = response.Content[0].Text;
+                
+                // Add assistant response to history
+                _conversationHistory.Add(new Message
+                {
+                    Role = RoleType.Assistant,
+                    Content = assistantMessage
+                });
+
+                Console.WriteLine($"\nAssistente: {assistantMessage}");
+
+                // Try to extract and log audit information
+                await ExtractAndLogAuditInfo(userInput, assistantMessage);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nErro ao processar mensagem: {ex.Message}");
+            }
+        }
+    }
+
+    private async Task ExtractAndLogAuditInfo(string userInput, string assistantResponse)
+    {
+        // Use Claude to extract structured audit information
+        var extractionPrompt = $@"Analise a seguinte conversa sobre alteração de MFA e extraia informações estruturadas de auditoria.
+
+Entrada do usuário: {userInput}
+Resposta do assistente: {assistantResponse}
+
+Se houver informações de auditoria, responda EXATAMENTE neste formato (sem texto adicional):
+AUDIT_LOG:
+USUARIO: [nome do usuário que fez a alteração]
+ACAO: [descrição da ação realizada]
+TIMESTAMP: [data/hora da alteração, use 'agora' se não especificado]
+RISCO: [BAIXO/MEDIO/ALTO]
+DETALHES: [detalhes adicionais relevantes]
+
+Se não houver informações de auditoria suficientes, responda apenas: SEM_AUDITORIA";
+
+        try
+        {
+            var extractionResponse = await _client.Messages.GetClaudeMessageAsync(
+                new MessageParameters
+                {
+                    Model = AnthropicModels.Claude3_5Sonnet,
+                    MaxTokens = 512,
+                    Messages = new List<Message>
+                    {
+                        new Message
+                        {
+                            Role = RoleType.User,
+                            Content = extractionPrompt
+                        }
+                    }
+                }
+            );
+
+            var extractedInfo = extractionResponse.Content[0].Text;
+            
+            if (extractedInfo.Contains("AUDIT_LOG:"))
+            {
+                var auditLog = ParseAuditLog(extractedInfo);
+                if (auditLog != null)
+                {
+                    _auditLogs.Add(auditLog);
+                    Console.WriteLine($"\n[AUDITORIA REGISTRADA] ID: {auditLog.Id}");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"\n[Aviso] Não foi possível extrair informações de auditoria: {ex.Message}");
+        }
+    }
+
+    private MFAAuditLog? ParseAuditLog(string auditText)
+    {
+        try
+        {
+            var lines = auditText.Split('\n');
+            var log = new MFAAuditLog
+            {
+                Id = Guid.NewGuid().ToString("N")[..8].ToUpper(),
+                RecordedAt = DateTime.UtcNow
+            };
+
+            foreach (var line in lines)
+            {
+                if (line.StartsWith("USUARIO:"))
+                    log.UserId = line.Replace("USUARIO:", "").Trim();
+                else if (line.StartsWith("ACAO:"))
+                    log.Action = line.Replace("ACAO:", "").Trim();
+                else if (line.StartsWith("TIMESTAMP:"))
+                {
+                    var timestampStr = line.Replace("TIMESTAMP:", "").Trim();
+                    log.Timestamp = timestampStr.ToLower() == "agora" ? DateTime.UtcNow : 
+                        DateTime.TryParse(timestampStr, out var dt) ? dt : DateTime.UtcNow;
+                }
+                else if (line.StartsWith("RISCO:"))
+                    log.RiskLevel = line.Replace("RISCO:", "").Trim();
+                else if (line.StartsWith("DETALHES:"))
+                    log.Details = line.Replace("DETALHES:", "").Trim();
+            }
+
+            return string.IsNullOrEmpty(log.UserId) ? null : log;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private void DisplayAuditSummary()
+    {
+        if (_auditLogs.Count == 0)
+        {
+            Console.WriteLine("\nNenhum registro de auditoria foi criado nesta sessão.");
+            return;
+        }
+
+        Console.WriteLine("\n=== RESUMO DE AUDITORIA DA SESSÃO ===");
+        Console.WriteLine($"Total de registros: {_auditLogs.Count}");
+        Console.WriteLine($"Período: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC\n");
+
+        foreach (var log in _auditLogs)
+        {
+            Console.WriteLine($"┌─ Registro ID: {log.Id}");
+            Console.WriteLine($"│  Usuário: {log.UserId}");
+            Console.WriteLine($"│  Ação: {log.Action}");
+            Console.WriteLine($"│  Timestamp: {log.Timestamp:yyyy-MM-dd HH:mm:ss} UTC");
+            Console.WriteLine($"│  Nível de Risco: {log.RiskLevel}");
+            Console.WriteLine($"│  Detalhes: {log.Details}");
+            Console.WriteLine($"│  Registrado em: {log.RecordedAt:yyyy-MM-dd HH:mm:ss} UTC");
+            Console.WriteLine("└─────────────────────────────────\n");
+        }
+
+        // Risk summary
+        var highRisk = _auditLogs.Count(l => l.RiskLevel?.ToUpper() == "ALTO");
+        var mediumRisk = _auditLogs.Count(l => l.RiskLevel?.ToUpper() == "MEDIO");
+        var lowRisk = _auditLogs.Count(l => l.RiskLevel?.ToUpper() == "BAIXO");
+
+        Console.WriteLine("=== ANÁLISE DE RISCO ===");
+        Console.WriteLine($"Alto Risco: {highRisk} ocorrência(s)");
+        Console.WriteLine($"Médio Risco: {mediumRisk} ocorrência(s)");
+        Console.WriteLine($"Baixo Risco: {lowRisk} ocorrência(s)");
+
+        if (highRisk > 0)
+        {
+            Console.WriteLine("\n⚠️  ATENÇÃO: Existem alterações de alto risco que requerem revisão imediata!");
+        }
+    }
+}
+
+class MFAAuditLog
+{
+    public string Id { get; set; } = string.Empty;
+    public string UserId { get; set; } = string.Empty;
+    public string Action { get; set; } = string.Empty;
+    public DateTime Timestamp { get; set; }
+    public string RiskLevel { get; set; } = string.Empty;
+    public string Details { get; set; } = string.Empty;
+    public DateTime RecordedAt { get; set; }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var logger = new MFAAuditLogger();
+        
+        Console.WriteLine("Exemplos de como reportar alterações MFA:");
+        Console.WriteLine("- 'O usuário João Silva desativou o MFA da conta admin@empresa.com às 14:30'");
+        Console.WriteLine("- 'Maria Santos alterou o método MFA de SMS para aplicativo autenticador'");
+        Console.WriteLine("- 'Administrador removeu todos os dispositivos MFA do usuário pedro@empresa.com'\n");
+        
+        await logger.StartAuditSession();
+    }
+}
+```

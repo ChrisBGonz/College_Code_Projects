@@ -1,0 +1,270 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import express from "express";
+import { Request, Response, NextFunction } from "express";
+
+const client = new Anthropic();
+
+interface LogEntry {
+  timestamp: string;
+  method: string;
+  url: string;
+  headers: Record<string, string | string[] | undefined>;
+  body: unknown;
+  query: Record<string, unknown>;
+  params: Record<string, string>;
+  ip: string;
+  userAgent: string | undefined;
+}
+
+async function analyzeRequestWithClaude(logEntry: LogEntry): Promise<string> {
+  const requestInfo = JSON.stringify(logEntry, null, 2);
+
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: `Analyze this HTTP request for debugging purposes. Provide insights about:
+1. What the request is trying to do
+2. Any potential issues or security concerns
+3. Suggestions for improvement if applicable
+
+Request details:
+${requestInfo}
+
+Please provide a concise analysis.`,
+      },
+    ],
+  });
+
+  let analysis = "";
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      analysis += chunk.delta.text;
+      process.stdout.write(chunk.delta.text);
+    }
+  }
+
+  console.log("\n");
+  return analysis;
+}
+
+function createRequestLogger() {
+  return async (req: Request, res: Response, next: NextFunction) => {
+    const startTime = Date.now();
+
+    const logEntry: LogEntry = {
+      timestamp: new Date().toISOString(),
+      method: req.method,
+      url: req.url,
+      headers: req.headers as Record<string, string | string[] | undefined>,
+      body: req.body,
+      query: req.query as Record<string, unknown>,
+      params: req.params,
+      ip: req.ip || req.connection.remoteAddress || "unknown",
+      userAgent: req.get("user-agent"),
+    };
+
+    console.log("\n" + "=".repeat(80));
+    console.log("📥 INCOMING REQUEST");
+    console.log("=".repeat(80));
+    console.log(`⏰ Timestamp: ${logEntry.timestamp}`);
+    console.log(`🔗 ${logEntry.method} ${logEntry.url}`);
+    console.log(`🌐 IP: ${logEntry.ip}`);
+    console.log(`🖥️  User-Agent: ${logEntry.userAgent || "Not provided"}`);
+
+    if (Object.keys(logEntry.query).length > 0) {
+      console.log("\n📋 Query Parameters:");
+      console.log(JSON.stringify(logEntry.query, null, 2));
+    }
+
+    if (logEntry.body && Object.keys(logEntry.body).length > 0) {
+      console.log("\n📦 Request Body:");
+      console.log(JSON.stringify(logEntry.body, null, 2));
+    }
+
+    console.log("\n🔍 Headers:");
+    const relevantHeaders = {
+      "content-type": logEntry.headers["content-type"],
+      authorization: logEntry.headers["authorization"]
+        ? "[REDACTED]"
+        : undefined,
+      accept: logEntry.headers["accept"],
+      "content-length": logEntry.headers["content-length"],
+    };
+    console.log(
+      JSON.stringify(
+        Object.fromEntries(
+          Object.entries(relevantHeaders).filter(([, v]) => v !== undefined)
+        ),
+        null,
+        2
+      )
+    );
+
+    console.log("\n🤖 Claude AI Analysis (streaming):");
+    console.log("-".repeat(40));
+
+    try {
+      await analyzeRequestWithClaude(logEntry);
+    } catch (error) {
+      console.error("Error getting Claude analysis:", error);
+    }
+
+    const originalSend = res.send.bind(res);
+    res.send = function (body: unknown) {
+      const duration = Date.now() - startTime;
+      console.log("\n📤 RESPONSE");
+      console.log("-".repeat(40));
+      console.log(`⏱️  Duration: ${duration}ms`);
+      console.log(`📊 Status: ${res.statusCode}`);
+      console.log("=".repeat(80) + "\n");
+      return originalSend(body);
+    };
+
+    next();
+  };
+}
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(createRequestLogger());
+
+app.get("/", (req: Request, res: Response) => {
+  res.json({
+    message: "Hello! This is a request logging middleware demo.",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.post("/api/users", (req: Request, res: Response) => {
+  const { name, email, age } = req.body;
+
+  if (!name || !email) {
+    return res.status(400).json({
+      error: "Name and email are required",
+    });
+  }
+
+  res.status(201).json({
+    message: "User created successfully",
+    user: {
+      id: Math.floor(Math.random() * 1000),
+      name,
+      email,
+      age,
+      createdAt: new Date().toISOString(),
+    },
+  });
+});
+
+app.get("/api/products", (req: Request, res: Response) => {
+  const { category, minPrice, maxPrice, sort } = req.query;
+
+  const products = [
+    { id: 1, name: "Laptop", category: "electronics", price: 999.99 },
+    { id: 2, name: "Phone", category: "electronics", price: 699.99 },
+    { id: 3, name: "Book", category: "education", price: 29.99 },
+  ];
+
+  let filtered = products;
+
+  if (category) {
+    filtered = filtered.filter((p) => p.category === category);
+  }
+
+  if (minPrice) {
+    filtered = filtered.filter((p) => p.price >= parseFloat(minPrice as string));
+  }
+
+  if (maxPrice) {
+    filtered = filtered.filter((p) => p.price <= parseFloat(maxPrice as string));
+  }
+
+  if (sort === "price_asc") {
+    filtered.sort((a, b) => a.price - b.price);
+  } else if (sort === "price_desc") {
+    filtered.sort((a, b) => b.price - a.price);
+  }
+
+  res.json({
+    products: filtered,
+    total: filtered.length,
+    filters: { category, minPrice, maxPrice, sort },
+  });
+});
+
+app.put("/api/users/:id", (req: Request, res: Response) => {
+  const { id } = req.params;
+  const updates = req.body;
+
+  res.json({
+    message: `User ${id} updated successfully`,
+    updatedFields: Object.keys(updates),
+    user: {
+      id: parseInt(id),
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    },
+  });
+});
+
+app.delete("/api/users/:id", (req: Request, res: Response) => {
+  const { id } = req.params;
+
+  res.json({
+    message: `User ${id} deleted successfully`,
+    deletedAt: new Date().toISOString(),
+  });
+});
+
+app.post("/api/auth/login", (req: Request, res: Response) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({
+      error: "Username and password are required",
+    });
+  }
+
+  if (username === "admin" && password === "password123") {
+    res.json({
+      message: "Login successful",
+      token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      user: {
+        id: 1,
+        username,
+        role: "admin",
+      },
+    });
+  } else {
+    res.status(401).json({
+      error: "Invalid credentials",
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`\n🚀 Server running on port ${PORT}`);
+  console.log(`📝 Request logging middleware with Claude AI analysis enabled`);
+  console.log(`\nTest endpoints:`);
+  console.log(`  GET  http://localhost:${PORT}/`);
+  console.log(`  POST http://localhost:${PORT}/api/users`);
+  console.log(`  GET  http://localhost:${PORT}/api/products?category=electronics`);
+  console.log(`  PUT  http://localhost:${PORT}/api/users/123`);
+  console.log(`  DELETE http://localhost:${PORT}/api/users/123`);
+  console.log(`  POST http://localhost:${PORT}/api/auth/login\n`);
+});
+
+export { createRequestLogger, analyzeRequestWithClaude };
+```
