@@ -1,0 +1,603 @@
+<?php
+
+declare(strict_types=1);
+
+// Configuration
+$config = [
+    'admin_path' => '/admin',
+    'log_file' => __DIR__ . '/unauthorized_access.log',
+    
+    // Email settings
+    'email' => [
+        'enabled' => true,
+        'to' => 'admin@example.com',
+        'from' => 'security@example.com',
+        'from_name' => 'Security Alert System',
+        'subject' => '🚨 Unauthorized Admin Access Attempt Detected',
+    ],
+    
+    // Slack settings
+    'slack' => [
+        'enabled' => true,
+        'webhook_url' => 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK',
+        'channel' => '#security-alerts',
+        'username' => 'Security Bot',
+        'icon_emoji' => ':warning:',
+    ],
+    
+    // Rate limiting (max alerts per IP per hour)
+    'rate_limit' => [
+        'enabled' => true,
+        'max_attempts' => 3,
+        'window_seconds' => 3600,
+        'storage_file' => __DIR__ . '/rate_limit_data.json',
+    ],
+    
+    // Session/Auth settings
+    'session_key' => 'user_role',
+    'admin_role' => 'admin',
+];
+
+/**
+ * Get client IP address
+ */
+function getClientIP(): string
+{
+    $ipKeys = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($ipKeys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ips = explode(',', $_SERVER[$key]);
+            $ip = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $_SERVER['REMOTE_ADDR'] ?? 'Unknown';
+}
+
+/**
+ * Get current request information
+ */
+function getRequestInfo(): array
+{
+    return [
+        'ip' => getClientIP(),
+        'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown',
+        'request_uri' => $_SERVER['REQUEST_URI'] ?? 'Unknown',
+        'request_method' => $_SERVER['REQUEST_METHOD'] ?? 'Unknown',
+        'referer' => $_SERVER['HTTP_REFERER'] ?? 'Direct Access',
+        'timestamp' => date('Y-m-d H:i:s'),
+        'timestamp_utc' => gmdate('Y-m-d H:i:s') . ' UTC',
+        'server_name' => $_SERVER['SERVER_NAME'] ?? 'Unknown',
+        'protocol' => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'HTTPS' : 'HTTP',
+        'session_id' => session_id() ?: 'No Session',
+        'user_id' => $_SESSION['user_id'] ?? 'Not Logged In',
+        'username' => $_SESSION['username'] ?? 'Anonymous',
+    ];
+}
+
+/**
+ * Check rate limiting to avoid alert flooding
+ */
+function isRateLimited(string $ip, array $config): bool
+{
+    if (!$config['rate_limit']['enabled']) {
+        return false;
+    }
+
+    $storageFile = $config['rate_limit']['storage_file'];
+    $data = [];
+
+    if (file_exists($storageFile)) {
+        $content = file_get_contents($storageFile);
+        $data = json_decode($content, true) ?? [];
+    }
+
+    $now = time();
+    $windowStart = $now - $config['rate_limit']['window_seconds'];
+
+    // Clean old entries
+    if (isset($data[$ip])) {
+        $data[$ip] = array_filter($data[$ip], fn($timestamp) => $timestamp > $windowStart);
+        $data[$ip] = array_values($data[$ip]);
+    }
+
+    $attempts = count($data[$ip] ?? []);
+
+    if ($attempts >= $config['rate_limit']['max_attempts']) {
+        return true;
+    }
+
+    // Record this attempt
+    $data[$ip][] = $now;
+    file_put_contents($storageFile, json_encode($data), LOCK_EX);
+
+    return false;
+}
+
+/**
+ * Log unauthorized access attempt to file
+ */
+function logUnauthorizedAccess(array $requestInfo, string $logFile): void
+{
+    $logEntry = sprintf(
+        "[%s] UNAUTHORIZED ACCESS ATTEMPT | IP: %s | User: %s (ID: %s) | URI: %s | Method: %s | UA: %s | Referer: %s | Session: %s\n",
+        $requestInfo['timestamp'],
+        $requestInfo['ip'],
+        $requestInfo['username'],
+        $requestInfo['user_id'],
+        $requestInfo['request_uri'],
+        $requestInfo['request_method'],
+        $requestInfo['user_agent'],
+        $requestInfo['referer'],
+        $requestInfo['session_id']
+    );
+
+    file_put_contents($logFile, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Send email alert
+ */
+function sendEmailAlert(array $requestInfo, array $emailConfig): bool
+{
+    $to = $emailConfig['to'];
+    $subject = $emailConfig['subject'];
+
+    $htmlBody = generateEmailBody($requestInfo);
+    $textBody = generateTextEmailBody($requestInfo);
+
+    $boundary = md5(uniqid((string)time(), true));
+
+    $headers = [
+        'MIME-Version: 1.0',
+        'Content-Type: multipart/alternative; boundary="' . $boundary . '"',
+        'From: ' . $emailConfig['from_name'] . ' <' . $emailConfig['from'] . '>',
+        'Reply-To: ' . $emailConfig['from'],
+        'X-Mailer: PHP/' . phpversion(),
+        'X-Priority: 1 (Highest)',
+        'X-MSMail-Priority: High',
+        'Importance: High',
+    ];
+
+    $message = "--{$boundary}\r\n";
+    $message .= "Content-Type: text/plain; charset=UTF-8\r\n";
+    $message .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
+    $message .= $textBody . "\r\n\r\n";
+    $message .= "--{$boundary}\r\n";
+    $message .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $message .= "Content-Transfer-Encoding: 8bit\r\n\r\n";
+    $message .= $htmlBody . "\r\n\r\n";
+    $message .= "--{$boundary}--";
+
+    return mail($to, $subject, $message, implode("\r\n", $headers));
+}
+
+/**
+ * Generate HTML email body
+ */
+function generateEmailBody(array $info): string
+{
+    return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Alert</title>
+    <style>
+        body { font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { background: linear-gradient(135deg, #c0392b, #e74c3c); color: white; padding: 30px; text-align: center; }
+        .header h1 { margin: 0; font-size: 24px; }
+        .header p { margin: 10px 0 0; opacity: 0.9; }
+        .alert-badge { display: inline-block; background: rgba(255,255,255,0.2); border: 2px solid rgba(255,255,255,0.5); border-radius: 20px; padding: 5px 15px; margin-top: 10px; font-size: 12px; letter-spacing: 1px; text-transform: uppercase; }
+        .content { padding: 30px; }
+        .info-table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+        .info-table th { background: #f8f9fa; text-align: left; padding: 10px 15px; font-size: 12px; text-transform: uppercase; color: #666; border-bottom: 2px solid #dee2e6; }
+        .info-table td { padding: 12px 15px; border-bottom: 1px solid #dee2e6; font-size: 14px; }
+        .info-table tr:last-child td { border-bottom: none; }
+        .info-table td:first-child { font-weight: bold; color: #495057; width: 35%; }
+        .info-table td:last-child { color: #212529; word-break: break-all; }
+        .highlight { background: #fff3cd; border-left: 4px solid #ffc107; padding: 15px; margin: 20px 0; border-radius: 0 4px 4px 0; }
+        .footer { background: #f8f9fa; padding: 20px; text-align: center; font-size: 12px; color: #6c757d; border-top: 1px solid #dee2e6; }
+        .ip-badge { display: inline-block; background: #e74c3c; color: white; padding: 3px 10px; border-radius: 12px; font-family: monospace; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 Security Alert</h1>
+            <p>Unauthorized Admin Access Attempt</p>
+            <span class="alert-badge">High Priority</span>
+        </div>
+        <div class="content">
+            <div class="highlight">
+                <strong>⚠️ Action Required:</strong> An unauthorized user attempted to access the admin panel. 
+                Please review the details below and take appropriate action if necessary.
+            </div>
+            
+            <table class="info-table">
+                <tr>
+                    <th colspan="2">Incident Details</th>
+                </tr>
+                <tr>
+                    <td>Timestamp</td>
+                    <td>{$info['timestamp']} ({$info['timestamp_utc']})</td>
+                </tr>
+                <tr>
+                    <td>IP Address</td>
+                    <td><span class="ip-badge">{$info['ip']}</span></td>
+                </tr>
+                <tr>
+                    <td>Username</td>
+                    <td>{$info['username']}</td>
+                </tr>
+                <tr>
+                    <td>User ID</td>
+                    <td>{$info['user_id']}</td>
+                </tr>
+                <tr>
+                    <td>Requested URI</td>
+                    <td><code>{$info['request_uri']}</code></td>
+                </tr>
+                <tr>
+                    <td>HTTP Method</td>
+                    <td>{$info['request_method']}</td>
+                </tr>
+                <tr>
+                    <td>Protocol</td>
+                    <td>{$info['protocol']}</td>
+                </tr>
+                <tr>
+                    <td>Server</td>
+                    <td>{$info['server_name']}</td>
+                </tr>
+                <tr>
+                    <td>Referer</td>
+                    <td>{$info['referer']}</td>
+                </tr>
+                <tr>
+                    <td>Session ID</td>
+                    <td><code>{$info['session_id']}</code></td>
+                </tr>
+                <tr>
+                    <td>User Agent</td>
+                    <td>{$info['user_agent']}</td>
+                </tr>
+            </table>
+        </div>
+        <div class="footer">
+            <p>This is an automated security alert. Do not reply to this email.</p>
+            <p>Generated by Security Alert System | {$info['timestamp_utc']}</p>
+        </div>
+    </div>
+</body>
+</html>
+HTML;
+}
+
+/**
+ * Generate plain text email body
+ */
+function generateTextEmailBody(array $info): string
+{
+    return <<<TEXT
+SECURITY ALERT - UNAUTHORIZED ADMIN ACCESS ATTEMPT
+===================================================
+
+An unauthorized user attempted to access the admin panel.
+
+INCIDENT DETAILS:
+-----------------
+Timestamp:      {$info['timestamp']} ({$info['timestamp_utc']})
+IP Address:     {$info['ip']}
+Username:       {$info['username']}
+User ID:        {$info['user_id']}
+Requested URI:  {$info['request_uri']}
+HTTP Method:    {$info['request_method']}
+Protocol:       {$info['protocol']}
+Server:         {$info['server_name']}
+Referer:        {$info['referer']}
+Session ID:     {$info['session_id']}
+User Agent:     {$info['user_agent']}
+
+This is an automated security alert. Please review and take appropriate action.
+TEXT;
+}
+
+/**
+ * Send Slack notification
+ */
+function sendSlackAlert(array $requestInfo, array $slackConfig): bool
+{
+    if (empty($slackConfig['webhook_url']) || $slackConfig['webhook_url'] === 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK') {
+        error_log('Slack webhook URL not configured');
+        return false;
+    }
+
+    $payload = [
+        'channel' => $slackConfig['channel'],
+        'username' => $slackConfig['username'],
+        'icon_emoji' => $slackConfig['icon_emoji'],
+        'text' => '🚨 *SECURITY ALERT: Unauthorized Admin Access Attempt*',
+        'attachments' => [
+            [
+                'color' => 'danger',
+                'title' => 'Unauthorized Access to /admin',
+                'title_link' => $requestInfo['protocol'] . '://' . $requestInfo['server_name'] . $requestInfo['request_uri'],
+                'fields' => [
+                    [
+                        'title' => '🕐 Timestamp',
+                        'value' => $requestInfo['timestamp_utc'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '🌐 IP Address',
+                        'value' => '`' . $requestInfo['ip'] . '`',
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '👤 Username',
+                        'value' => $requestInfo['username'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '🔑 User ID',
+                        'value' => $requestInfo['user_id'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '📍 Requested URI',
+                        'value' => '`' . $requestInfo['request_uri'] . '`',
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '📡 HTTP Method',
+                        'value' => $requestInfo['request_method'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => '🔗 Referer',
+                        'value' => $requestInfo['referer'],
+                        'short' => false,
+                    ],
+                    [
+                        'title' => '🖥️ User Agent',
+                        'value' => $requestInfo['user_agent'],
+                        'short' => false,
+                    ],
+                ],
+                'footer' => 'Security Alert System',
+                'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                'ts' => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    $ch = curl_init($slackConfig['webhook_url']);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST => true,
+        CURLOPT_POSTFIELDS => $jsonPayload,
+        CURLOPT_HTTPHEADER => [
+            'Content-Type: application/json',
+            'Content-Length: ' . strlen($jsonPayload),
+        ],
+        CURLOPT_TIMEOUT => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $curlError = curl_error($ch);
+    curl_close($ch);
+
+    if ($curlError) {
+        error_log('Slack alert cURL error: ' . $curlError);
+        return false;
+    }
+
+    if ($httpCode !== 200 || $response !== 'ok') {
+        error_log('Slack alert failed. HTTP Code: ' . $httpCode . ' Response: ' . $response);
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Check if user has admin access
+ */
+function hasAdminAccess(array $config): bool
+{
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    $userRole = $_SESSION[$config['session_key']] ?? null;
+    return $userRole === $config['admin_role'];
+}
+
+/**
+ * Trigger all configured alerts
+ */
+function triggerAdminAlert(array $requestInfo, array $config): array
+{
+    $results = [
+        'logged' => false,
+        'email_sent' => false,
+        'slack_sent' => false,
+        'rate_limited' => false,
+    ];
+
+    // Check rate limiting
+    if (isRateLimited($requestInfo['ip'], $config)) {
+        $results['rate_limited'] = true;
+        // Still log even if rate limited
+        logUnauthorizedAccess($requestInfo, $config['log_file']);
+        $results['logged'] = true;
+        return $results;
+    }
+
+    // Log to file
+    logUnauthorizedAccess($requestInfo, $config['log_file']);
+    $results['logged'] = true;
+
+    // Send email alert
+    if ($config['email']['enabled']) {
+        $results['email_sent'] = sendEmailAlert($requestInfo, $config['email']);
+    }
+
+    // Send Slack alert
+    if ($config['slack']['enabled']) {
+        $results['slack_sent'] = sendSlackAlert($requestInfo, $config['slack']);
+    }
+
+    return $results;
+}
+
+/**
+ * Handle unauthorized access
+ */
+function handleUnauthorizedAccess(array $config): void
+{
+    $requestInfo = getRequestInfo();
+    $alertResults = triggerAdminAlert($requestInfo, $config);
+
+    // Log alert results
+    $logMessage = sprintf(
+        "[%s] ALERT RESULTS | IP: %s | Logged: %s | Email: %s | Slack: %s | Rate Limited: %s\n",
+        date('Y-m-d H:i:s'),
+        $requestInfo['ip'],
+        $alertResults['logged'] ? 'YES' : 'NO',
+        $alertResults['email_sent'] ? 'YES' : 'NO',
+        $alertResults['slack_sent'] ? 'YES' : 'NO',
+        $alertResults['rate_limited'] ? 'YES' : 'NO'
+    );
+    file_put_contents($config['log_file'], $logMessage, FILE_APPEND | LOCK_EX);
+
+    // Send HTTP 403 response
+    http_response_code(403);
+    
+    // Display user-friendly error page
+    displayAccessDeniedPage($requestInfo);
+    exit;
+}
+
+/**
+ * Display access denied page
+ */
+function displayAccessDeniedPage(array $requestInfo): void
+{
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>403 - Access Denied</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+            background: linear-gradient(135deg, #1a1a2e, #16213e, #0f3460);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+        }
+        .container { text-align: center; padding: 40px; max-width: 500px; }
+        .icon { font-size: 80px; margin-bottom: 20px; animation: pulse 2s infinite; }
+        @keyframes pulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.1); } }
+        h1 { font-size: 48px; color: #e74c3c; margin-bottom: 10px; }
+        h2 { font-size: 24px; margin-bottom: 20px; color: #ecf0f1; }
+        p { color: #bdc3c7; line-height: 1.6; margin-bottom: 30px; }
+        .btn { 
+            display: inline-block; 
+            padding: 12px 30px; 
+            background: #e74c3c; 
+            color: white; 
+            text-decoration: none; 
+            border-radius: 25px; 
+            transition: background 0.3s;
+            font-weight: bold;
+        }
+        .btn:hover { background: #c0392b; }
+        .warning { 
+            background: rgba(231, 76, 60, 0.1); 
+            border: 1px solid rgba(231, 76, 60, 0.3); 
+            border-radius: 8px; 
+            padding: 15px; 
+            margin: 20px 0; 
+            font-size: 13px;
+            color: #e74c3c;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="icon">🔒</div>
+        <h1>403</h1>
+        <h2>Access Denied</h2>
+        <p>You do not have permission to access this area. This incident has been logged and the administrator has been notified.</p>
+        <div class="warning">
+            ⚠️ This unauthorized access attempt has been recorded.
+        </div>
+        <a href="/" class="btn">← Return to Home</a>
+    </div>
+</body>
+</html>
+HTML;
+}
+
+// ============================================================
+// MAIN EXECUTION
+// ============================================================
+
+// Start session if not already started
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+// Get current request path
+$requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$requestPath = rtrim($requestPath, '/') ?: '/';
+
+// Check if accessing admin path
+$isAdminPath = (
+    $requestPath === $config['admin_path'] ||
+    strpos($requestPath, $config['admin_path'] . '/') === 0
+);
+
+if ($isAdminPath) {
+    if (!hasAdminAccess($config)) {
+        // Unauthorized access detected - trigger alerts
+        handleUnauthorizedAccess($config);
+    } else {
+        // User has admin access - proceed normally
+        // In a real application, you would include your admin panel here
+        echo '<h1>Welcome to the Admin Panel</h1>';
+        echo '<p>You have successfully authenticated as an administrator.</p>';
+    }
+} else {
+    // Not an admin path - normal page handling
+    // This would typically be handled by your routing system
+    echo '<h1>Welcome to the Website</h1>';
+    echo '<p>This is the public area of the website.</p>';
+    echo '<p><a href="/admin">Try to access Admin Panel</a></p>';
+}

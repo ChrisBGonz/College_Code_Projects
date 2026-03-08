@@ -1,0 +1,285 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.Json;
+using Anthropic.SDK;
+using Anthropic.SDK.Messaging;
+
+// Data models for the checkout process
+public class CartItem
+{
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public int Quantity { get; set; }
+}
+
+public class CheckoutRequest
+{
+    public List<CartItem> Items { get; set; } = new List<CartItem>();
+    public string? DiscountCode { get; set; }
+    public string? CustomerType { get; set; }
+}
+
+public class CheckoutResult
+{
+    public decimal Subtotal { get; set; }
+    public decimal DiscountAmount { get; set; }
+    public decimal TaxAmount { get; set; }
+    public decimal TotalPrice { get; set; }
+    public string Summary { get; set; } = string.Empty;
+    public List<string> AppliedDiscounts { get; set; } = new List<string>();
+}
+
+public class CheckoutProcessor
+{
+    private readonly AnthropicClient _client;
+    private const string MODEL = "claude-opus-4-5";
+
+    public CheckoutProcessor()
+    {
+        _client = new AnthropicClient();
+    }
+
+    public async Task<CheckoutResult> ProcessCheckoutAsync(CheckoutRequest request)
+    {
+        // Prepare the cart data as JSON for Claude
+        var cartJson = JsonSerializer.Serialize(request, new JsonSerializerOptions 
+        { 
+            WriteIndented = true 
+        });
+
+        var messages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = $@"You are a checkout processing assistant. Calculate the total price for the following shopping cart and provide a detailed breakdown.
+
+Cart Data:
+{cartJson}
+
+Please calculate:
+1. Subtotal (sum of all items: price × quantity)
+2. Any applicable discounts based on:
+   - Discount code (if provided): 'SAVE10' = 10% off, 'SAVE20' = 20% off, 'FREESHIP' = free shipping
+   - Customer type discounts: 'premium' = 5% off, 'vip' = 15% off
+3. Tax (8.5% of subtotal after discounts)
+4. Final total
+
+Respond with a JSON object in this exact format:
+{{
+  ""subtotal"": <number>,
+  ""discountAmount"": <number>,
+  ""taxAmount"": <number>,
+  ""totalPrice"": <number>,
+  ""appliedDiscounts"": [<list of discount descriptions>],
+  ""summary"": ""<brief summary of the calculation>""
+}}
+
+Only respond with the JSON object, no additional text."
+            }
+        };
+
+        var response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+        {
+            Model = MODEL,
+            MaxTokens = 1024,
+            Messages = messages
+        });
+
+        // Parse Claude's response
+        var responseText = response.Content[0].ToString() ?? string.Empty;
+        
+        try
+        {
+            var result = JsonSerializer.Deserialize<CheckoutResult>(responseText, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+            
+            return result ?? new CheckoutResult { Summary = "Error processing checkout" };
+        }
+        catch (JsonException)
+        {
+            // If JSON parsing fails, return a basic calculation
+            return CalculateFallback(request);
+        }
+    }
+
+    private CheckoutResult CalculateFallback(CheckoutRequest request)
+    {
+        decimal subtotal = 0;
+        foreach (var item in request.Items)
+        {
+            subtotal += item.Price * item.Quantity;
+        }
+
+        decimal discountAmount = 0;
+        var appliedDiscounts = new List<string>();
+
+        // Apply discount codes
+        if (!string.IsNullOrEmpty(request.DiscountCode))
+        {
+            switch (request.DiscountCode.ToUpper())
+            {
+                case "SAVE10":
+                    discountAmount += subtotal * 0.10m;
+                    appliedDiscounts.Add("10% discount code applied");
+                    break;
+                case "SAVE20":
+                    discountAmount += subtotal * 0.20m;
+                    appliedDiscounts.Add("20% discount code applied");
+                    break;
+            }
+        }
+
+        // Apply customer type discounts
+        if (!string.IsNullOrEmpty(request.CustomerType))
+        {
+            switch (request.CustomerType.ToLower())
+            {
+                case "premium":
+                    discountAmount += subtotal * 0.05m;
+                    appliedDiscounts.Add("5% premium customer discount");
+                    break;
+                case "vip":
+                    discountAmount += subtotal * 0.15m;
+                    appliedDiscounts.Add("15% VIP customer discount");
+                    break;
+            }
+        }
+
+        decimal taxableAmount = subtotal - discountAmount;
+        decimal taxAmount = taxableAmount * 0.085m;
+        decimal totalPrice = taxableAmount + taxAmount;
+
+        return new CheckoutResult
+        {
+            Subtotal = Math.Round(subtotal, 2),
+            DiscountAmount = Math.Round(discountAmount, 2),
+            TaxAmount = Math.Round(taxAmount, 2),
+            TotalPrice = Math.Round(totalPrice, 2),
+            AppliedDiscounts = appliedDiscounts,
+            Summary = $"Checkout processed with {appliedDiscounts.Count} discount(s) applied"
+        };
+    }
+
+    public async Task<string> GetCheckoutAdviceAsync(CheckoutRequest request, CheckoutResult result)
+    {
+        var messages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = $@"Based on this shopping cart and checkout result, provide a brief, friendly message to the customer:
+
+Cart Items: {request.Items.Count} items
+Subtotal: ${result.Subtotal:F2}
+Discounts Applied: {string.Join(", ", result.AppliedDiscounts)}
+Total: ${result.TotalPrice:F2}
+Customer Type: {request.CustomerType ?? "standard"}
+
+Provide a 2-3 sentence personalized message that:
+1. Confirms their order total
+2. Mentions any savings they received
+3. Suggests if they could save more (e.g., if they're not a premium member)"
+            }
+        };
+
+        var response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+        {
+            Model = MODEL,
+            MaxTokens = 256,
+            Messages = messages
+        });
+
+        return response.Content[0].ToString() ?? "Thank you for your order!";
+    }
+}
+
+// Main program to demonstrate the checkout process
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("=== Shopping Cart Checkout System ===\n");
+
+        var processor = new CheckoutProcessor();
+
+        // Example checkout request
+        var checkoutRequest = new CheckoutRequest
+        {
+            Items = new List<CartItem>
+            {
+                new CartItem { Name = "Laptop", Price = 999.99m, Quantity = 1 },
+                new CartItem { Name = "Mouse", Price = 29.99m, Quantity = 2 },
+                new CartItem { Name = "Keyboard", Price = 79.99m, Quantity = 1 },
+                new CartItem { Name = "USB Hub", Price = 39.99m, Quantity = 1 }
+            },
+            DiscountCode = "SAVE10",
+            CustomerType = "premium"
+        };
+
+        Console.WriteLine("Processing checkout for:");
+        foreach (var item in checkoutRequest.Items)
+        {
+            Console.WriteLine($"  - {item.Name}: ${item.Price:F2} x {item.Quantity}");
+        }
+        Console.WriteLine($"Discount Code: {checkoutRequest.DiscountCode}");
+        Console.WriteLine($"Customer Type: {checkoutRequest.CustomerType}");
+        Console.WriteLine("\nCalculating total with Claude AI...\n");
+
+        try
+        {
+            // Process the checkout
+            var result = await processor.ProcessCheckoutAsync(checkoutRequest);
+
+            Console.WriteLine("=== Checkout Summary ===");
+            Console.WriteLine($"Subtotal:          ${result.Subtotal:F2}");
+            
+            if (result.DiscountAmount > 0)
+            {
+                Console.WriteLine($"Discounts:         -${result.DiscountAmount:F2}");
+                foreach (var discount in result.AppliedDiscounts)
+                {
+                    Console.WriteLine($"  • {discount}");
+                }
+            }
+            
+            Console.WriteLine($"Tax (8.5%):        ${result.TaxAmount:F2}");
+            Console.WriteLine($"Total:             ${result.TotalPrice:F2}");
+            Console.WriteLine($"\nSummary: {result.Summary}");
+
+            // Get personalized advice
+            Console.WriteLine("\n=== Personalized Message ===");
+            var advice = await processor.GetCheckoutAdviceAsync(checkoutRequest, result);
+            Console.WriteLine(advice);
+
+            // Test with another scenario - no discounts
+            Console.WriteLine("\n\n=== Testing Without Discounts ===");
+            var simpleRequest = new CheckoutRequest
+            {
+                Items = new List<CartItem>
+                {
+                    new CartItem { Name = "Book", Price = 24.99m, Quantity = 3 },
+                    new CartItem { Name = "Pen Set", Price = 12.99m, Quantity = 1 }
+                }
+            };
+
+            Console.WriteLine("Processing simple cart...");
+            var simpleResult = await processor.ProcessCheckoutAsync(simpleRequest);
+            
+            Console.WriteLine($"Subtotal: ${simpleResult.Subtotal:F2}");
+            Console.WriteLine($"Tax: ${simpleResult.TaxAmount:F2}");
+            Console.WriteLine($"Total: ${simpleResult.TotalPrice:F2}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error processing checkout: {ex.Message}");
+            Console.WriteLine(ex.StackTrace);
+        }
+    }
+}
+```

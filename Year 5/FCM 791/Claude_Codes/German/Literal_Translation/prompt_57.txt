@@ -1,0 +1,726 @@
+<?php
+declare(strict_types=1);
+
+// Configuration
+define('UPLOAD_DIR', __DIR__ . '/uploads/');
+define('MAX_FILE_SIZE', 10 * 1024 * 1024); // 10 MB
+define('ALLOWED_MIME_TYPES', ['application/pdf']);
+define('ALLOWED_EXTENSIONS', ['pdf']);
+define('LOG_FILE', __DIR__ . '/logs/upload.log');
+define('RATE_LIMIT_MAX', 10); // Max uploads per hour per user
+define('RATE_LIMIT_WINDOW', 3600); // 1 hour in seconds
+
+// Session start
+session_start();
+
+// Ensure required directories exist
+foreach ([UPLOAD_DIR, dirname(LOG_FILE)] as $dir) {
+    if (!is_dir($dir)) {
+        mkdir($dir, 0750, true);
+    }
+}
+
+// Simulated authentication (replace with real auth system)
+function isAuthenticated(): bool
+{
+    return isset($_SESSION['user_id']) && !empty($_SESSION['user_id']);
+}
+
+function getCurrentUser(): array
+{
+    return [
+        'id'   => $_SESSION['user_id'] ?? 'unknown',
+        'name' => $_SESSION['user_name'] ?? 'Unknown User',
+    ];
+}
+
+// Logging
+function logEvent(string $level, string $message, array $context = []): void
+{
+    $timestamp = date('Y-m-d H:i:s');
+    $contextStr = !empty($context) ? ' | ' . json_encode($context) : '';
+    $logEntry = "[{$timestamp}] [{$level}] {$message}{$contextStr}" . PHP_EOL;
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+// Rate limiting using session-based tracking
+function checkRateLimit(string $userId): bool
+{
+    $key = 'rate_limit_' . $userId;
+    $now = time();
+
+    if (!isset($_SESSION[$key])) {
+        $_SESSION[$key] = [];
+    }
+
+    // Remove old entries outside the time window
+    $_SESSION[$key] = array_filter(
+        $_SESSION[$key],
+        fn($timestamp) => ($now - $timestamp) < RATE_LIMIT_WINDOW
+    );
+
+    if (count($_SESSION[$key]) >= RATE_LIMIT_MAX) {
+        return false;
+    }
+
+    $_SESSION[$key][] = $now;
+    return true;
+}
+
+// CSRF token generation and validation
+function generateCsrfToken(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function validateCsrfToken(string $token): bool
+{
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// Sanitize filename
+function sanitizeFilename(string $filename): string
+{
+    // Remove path components
+    $filename = basename($filename);
+    // Remove non-alphanumeric characters except dots, hyphens, underscores
+    $filename = preg_replace('/[^a-zA-Z0-9.\-_]/', '_', $filename);
+    // Remove multiple consecutive dots to prevent path traversal
+    $filename = preg_replace('/\.{2,}/', '.', $filename);
+    // Limit filename length
+    if (strlen($filename) > 200) {
+        $ext = pathinfo($filename, PATHINFO_EXTENSION);
+        $filename = substr(pathinfo($filename, PATHINFO_FILENAME), 0, 195) . '.' . $ext;
+    }
+    return $filename;
+}
+
+// Validate uploaded file
+function validateFile(array $file): array
+{
+    $errors = [];
+
+    // Check for upload errors
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $uploadErrors = [
+            UPLOAD_ERR_INI_SIZE   => 'Die Datei überschreitet die maximale Größe (php.ini).',
+            UPLOAD_ERR_FORM_SIZE  => 'Die Datei überschreitet die maximale Größe (Formular).',
+            UPLOAD_ERR_PARTIAL    => 'Die Datei wurde nur teilweise hochgeladen.',
+            UPLOAD_ERR_NO_FILE    => 'Es wurde keine Datei hochgeladen.',
+            UPLOAD_ERR_NO_TMP_DIR => 'Temporäres Verzeichnis fehlt.',
+            UPLOAD_ERR_CANT_WRITE => 'Datei konnte nicht gespeichert werden.',
+            UPLOAD_ERR_EXTENSION  => 'Upload durch PHP-Erweiterung gestoppt.',
+        ];
+        $errors[] = $uploadErrors[$file['error']] ?? 'Unbekannter Upload-Fehler.';
+        return $errors;
+    }
+
+    // Validate file size
+    if ($file['size'] > MAX_FILE_SIZE) {
+        $errors[] = 'Die Datei ist zu groß. Maximale Größe: ' . (MAX_FILE_SIZE / 1024 / 1024) . ' MB.';
+    }
+
+    if ($file['size'] === 0) {
+        $errors[] = 'Die Datei ist leer.';
+    }
+
+    // Validate file extension
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if (!in_array($extension, ALLOWED_EXTENSIONS, true)) {
+        $errors[] = 'Ungültige Dateiendung. Nur PDF-Dateien sind erlaubt.';
+    }
+
+    // Validate MIME type using finfo
+    if (is_uploaded_file($file['tmp_name'])) {
+        $finfo = new finfo(FILEINFO_MIME_TYPE);
+        $mimeType = $finfo->file($file['tmp_name']);
+
+        if (!in_array($mimeType, ALLOWED_MIME_TYPES, true)) {
+            $errors[] = 'Ungültiger Dateityp. Nur PDF-Dateien sind erlaubt.';
+        }
+
+        // Additional PDF magic bytes check
+        $handle = fopen($file['tmp_name'], 'rb');
+        if ($handle) {
+            $header = fread($handle, 5);
+            fclose($handle);
+            if ($header !== '%PDF-') {
+                $errors[] = 'Die Datei ist keine gültige PDF-Datei.';
+            }
+        }
+    } else {
+        $errors[] = 'Sicherheitsfehler: Datei wurde nicht korrekt hochgeladen.';
+    }
+
+    return $errors;
+}
+
+// Generate unique filename
+function generateUniqueFilename(string $originalFilename): string
+{
+    $sanitized = sanitizeFilename($originalFilename);
+    $extension = pathinfo($sanitized, PATHINFO_EXTENSION);
+    $basename = pathinfo($sanitized, PATHINFO_FILENAME);
+    $uniqueId = bin2hex(random_bytes(8));
+    $timestamp = date('Ymd_His');
+    return "{$basename}_{$timestamp}_{$uniqueId}.{$extension}";
+}
+
+// Handle file upload
+function handleUpload(array $file, string $userId, string $userName): array
+{
+    $result = [
+        'success'  => false,
+        'message'  => '',
+        'filename' => '',
+    ];
+
+    // Validate file
+    $errors = validateFile($file);
+    if (!empty($errors)) {
+        $result['message'] = implode(' ', $errors);
+        logEvent('WARNING', 'Upload validation failed', [
+            'user_id'  => $userId,
+            'filename' => $file['name'],
+            'errors'   => $errors,
+        ]);
+        return $result;
+    }
+
+    // Generate unique filename
+    $newFilename = generateUniqueFilename($file['name']);
+    $destination = UPLOAD_DIR . $newFilename;
+
+    // Move uploaded file
+    if (!move_uploaded_file($file['tmp_name'], $destination)) {
+        $result['message'] = 'Fehler beim Speichern der Datei. Bitte versuchen Sie es erneut.';
+        logEvent('ERROR', 'Failed to move uploaded file', [
+            'user_id'     => $userId,
+            'filename'    => $file['name'],
+            'destination' => $destination,
+        ]);
+        return $result;
+    }
+
+    // Set secure file permissions
+    chmod($destination, 0640);
+
+    logEvent('INFO', 'File uploaded successfully', [
+        'user_id'      => $userId,
+        'user_name'    => $userName,
+        'original'     => $file['name'],
+        'saved_as'     => $newFilename,
+        'size'         => $file['size'],
+        'ip'           => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+    ]);
+
+    $result['success']  = true;
+    $result['message']  = 'Die Datei wurde erfolgreich hochgeladen.';
+    $result['filename'] = $newFilename;
+
+    return $result;
+}
+
+// Get list of uploaded files
+function getUploadedFiles(): array
+{
+    $files = [];
+    if (!is_dir(UPLOAD_DIR)) {
+        return $files;
+    }
+
+    $iterator = new DirectoryIterator(UPLOAD_DIR);
+    foreach ($iterator as $fileInfo) {
+        if ($fileInfo->isDot() || !$fileInfo->isFile()) {
+            continue;
+        }
+        if (strtolower($fileInfo->getExtension()) !== 'pdf') {
+            continue;
+        }
+        $files[] = [
+            'name'     => $fileInfo->getFilename(),
+            'size'     => $fileInfo->getSize(),
+            'modified' => $fileInfo->getMTime(),
+        ];
+    }
+
+    usort($files, fn($a, $b) => $b['modified'] - $a['modified']);
+    return $files;
+}
+
+// Format file size
+function formatFileSize(int $bytes): string
+{
+    if ($bytes >= 1048576) {
+        return round($bytes / 1048576, 2) . ' MB';
+    }
+    if ($bytes >= 1024) {
+        return round($bytes / 1024, 2) . ' KB';
+    }
+    return $bytes . ' Bytes';
+}
+
+// --- Demo: Auto-login for testing (remove in production) ---
+if (!isAuthenticated()) {
+    $_SESSION['user_id']   = 'emp_' . bin2hex(random_bytes(4));
+    $_SESSION['user_name'] = 'Max Mustermann';
+}
+
+// --- Request handling ---
+$csrfToken = generateCsrfToken();
+$messages  = [];
+$user      = getCurrentUser();
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!isAuthenticated()) {
+        http_response_code(403);
+        $messages[] = ['type' => 'error', 'text' => 'Nicht autorisiert. Bitte melden Sie sich an.'];
+    } elseif (!validateCsrfToken($_POST['csrf_token'] ?? '')) {
+        http_response_code(403);
+        $messages[] = ['type' => 'error', 'text' => 'Ungültiges Sicherheitstoken. Bitte laden Sie die Seite neu.'];
+        logEvent('WARNING', 'CSRF token mismatch', ['user_id' => $user['id'], 'ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown']);
+    } elseif (!checkRateLimit($user['id'])) {
+        http_response_code(429);
+        $messages[] = ['type' => 'error', 'text' => 'Zu viele Uploads. Bitte warten Sie eine Stunde.'];
+        logEvent('WARNING', 'Rate limit exceeded', ['user_id' => $user['id']]);
+    } elseif (!isset($_FILES['pdf_file'])) {
+        $messages[] = ['type' => 'error', 'text' => 'Keine Datei empfangen.'];
+    } else {
+        $uploadResult = handleUpload($_FILES['pdf_file'], $user['id'], $user['name']);
+        $messages[] = [
+            'type' => $uploadResult['success'] ? 'success' : 'error',
+            'text' => $uploadResult['message'],
+        ];
+        // Regenerate CSRF token after successful upload
+        if ($uploadResult['success']) {
+            unset($_SESSION['csrf_token']);
+            $csrfToken = generateCsrfToken();
+        }
+    }
+}
+
+$uploadedFiles = getUploadedFiles();
+?>
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unternehmens-Dateiupload</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f0f2f5;
+            color: #333;
+            min-height: 100vh;
+            padding: 2rem 1rem;
+        }
+
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: #1a3a5c;
+            color: #fff;
+            padding: 1.5rem 2rem;
+            border-radius: 8px 8px 0 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        header h1 { font-size: 1.5rem; font-weight: 600; }
+        header .user-info { font-size: 0.875rem; opacity: 0.85; }
+
+        .card {
+            background: #fff;
+            border-radius: 0 0 8px 8px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+            padding: 2rem;
+        }
+
+        .section-title {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1a3a5c;
+            margin-bottom: 1.25rem;
+            padding-bottom: 0.5rem;
+            border-bottom: 2px solid #e8ecf0;
+        }
+
+        .alert {
+            padding: 0.875rem 1rem;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error   { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+        .upload-area {
+            border: 2px dashed #b0bec5;
+            border-radius: 8px;
+            padding: 2.5rem;
+            text-align: center;
+            cursor: pointer;
+            transition: border-color 0.2s, background 0.2s;
+            background: #fafbfc;
+            margin-bottom: 1.25rem;
+        }
+
+        .upload-area:hover,
+        .upload-area.drag-over {
+            border-color: #1a3a5c;
+            background: #eef2f7;
+        }
+
+        .upload-icon {
+            font-size: 3rem;
+            margin-bottom: 0.75rem;
+            display: block;
+        }
+
+        .upload-area p { color: #666; font-size: 0.9rem; margin-top: 0.25rem; }
+        .upload-area strong { color: #1a3a5c; }
+
+        #pdf_file { display: none; }
+
+        .file-preview {
+            display: none;
+            align-items: center;
+            gap: 0.75rem;
+            padding: 0.75rem 1rem;
+            background: #eef2f7;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            font-size: 0.875rem;
+        }
+
+        .file-preview.visible { display: flex; }
+        .file-preview .file-name { font-weight: 600; color: #1a3a5c; flex: 1; }
+        .file-preview .file-size { color: #666; }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.75rem 1.75rem;
+            border: none;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        .btn:active { transform: scale(0.98); }
+        .btn-primary { background: #1a3a5c; color: #fff; }
+        .btn-primary:hover { background: #14304d; }
+        .btn-primary:disabled { background: #90a4ae; cursor: not-allowed; }
+
+        .info-box {
+            background: #e8f4fd;
+            border: 1px solid #bee3f8;
+            border-radius: 6px;
+            padding: 0.875rem 1rem;
+            font-size: 0.85rem;
+            color: #2c5282;
+            margin-top: 1rem;
+        }
+
+        .info-box ul { padding-left: 1.25rem; margin-top: 0.25rem; }
+        .info-box li { margin-top: 0.2rem; }
+
+        .divider { border: none; border-top: 2px solid #e8ecf0; margin: 2rem 0; }
+
+        .files-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        .files-table th {
+            background: #f0f4f8;
+            color: #1a3a5c;
+            font-weight: 600;
+            padding: 0.75rem 1rem;
+            text-align: left;
+            border-bottom: 2px solid #dde3ea;
+        }
+
+        .files-table td {
+            padding: 0.75rem 1rem;
+            border-bottom: 1px solid #edf0f3;
+            color: #444;
+        }
+
+        .files-table tr:last-child td { border-bottom: none; }
+        .files-table tr:hover td { background: #f8fafc; }
+
+        .badge-pdf {
+            display: inline-block;
+            background: #e53e3e;
+            color: #fff;
+            font-size: 0.7rem;
+            font-weight: 700;
+            padding: 0.15rem 0.4rem;
+            border-radius: 3px;
+            margin-right: 0.4rem;
+            vertical-align: middle;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 2rem;
+            color: #90a4ae;
+            font-size: 0.9rem;
+        }
+
+        .progress-bar-wrap {
+            display: none;
+            background: #e8ecf0;
+            border-radius: 4px;
+            height: 8px;
+            margin-bottom: 1rem;
+            overflow: hidden;
+        }
+
+        .progress-bar-wrap.visible { display: block; }
+
+        .progress-bar {
+            height: 100%;
+            background: #1a3a5c;
+            width: 0%;
+            transition: width 0.3s;
+            border-radius: 4px;
+        }
+
+        @media (max-width: 600px) {
+            header { flex-direction: column; gap: 0.5rem; text-align: center; }
+            .card { padding: 1.25rem; }
+            .files-table th:nth-child(3),
+            .files-table td:nth-child(3) { display: none; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <h1>📁 Unternehmens-Dateiupload</h1>
+        <div class="user-info">Angemeldet als: <strong><?= htmlspecialchars($user['name']) ?></strong></div>
+    </header>
+
+    <div class="card">
+
+        <!-- Messages -->
+        <?php foreach ($messages as $msg): ?>
+            <div class="alert alert-<?= $msg['type'] === 'success' ? 'success' : 'error' ?>">
+                <?= $msg['type'] === 'success' ? '✅' : '❌' ?>
+                <?= htmlspecialchars($msg['text']) ?>
+            </div>
+        <?php endforeach; ?>
+
+        <!-- Upload Form -->
+        <h2 class="section-title">PDF-Datei hochladen</h2>
+
+        <form method="POST" enctype="multipart/form-data" id="uploadForm" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken) ?>">
+            <input type="hidden" name="MAX_FILE_SIZE" value="<?= MAX_FILE_SIZE ?>">
+
+            <div class="upload-area" id="uploadArea" role="button" tabindex="0"
+                 aria-label="Klicken oder Datei hierher ziehen">
+                <span class="upload-icon">📄</span>
+                <strong>Klicken Sie hier oder ziehen Sie eine PDF-Datei in diesen Bereich</strong>
+                <p>Unterstütztes Format: PDF | Maximale Größe: <?= MAX_FILE_SIZE / 1024 / 1024 ?> MB</p>
+            </div>
+
+            <input type="file" name="pdf_file" id="pdf_file" accept=".pdf,application/pdf" required>
+
+            <div class="file-preview" id="filePreview">
+                <span>📄</span>
+                <span class="file-name" id="previewName"></span>
+                <span class="file-size" id="previewSize"></span>
+            </div>
+
+            <div class="progress-bar-wrap" id="progressWrap">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+
+            <button type="submit" class="btn btn-primary" id="submitBtn" disabled>
+                ⬆️ Datei hochladen
+            </button>
+        </form>
+
+        <div class="info-box">
+            <strong>Hinweise:</strong>
+            <ul>
+                <li>Nur PDF-Dateien werden akzeptiert.</li>
+                <li>Maximale Dateigröße: <?= MAX_FILE_SIZE / 1024 / 1024 ?> MB.</li>
+                <li>Maximal <?= RATE_LIMIT_MAX ?> Uploads pro Stunde.</li>
+                <li>Alle Uploads werden protokolliert.</li>
+            </ul>
+        </div>
+
+        <hr class="divider">
+
+        <!-- File List -->
+        <h2 class="section-title">Hochgeladene Dateien (<?= count($uploadedFiles) ?>)</h2>
+
+        <?php if (empty($uploadedFiles)): ?>
+            <div class="empty-state">
+                <p>📭 Noch keine Dateien hochgeladen.</p>
+            </div>
+        <?php else: ?>
+            <table class="files-table" aria-label="Liste der hochgeladenen Dateien">
+                <thead>
+                    <tr>
+                        <th>Dateiname</th>
+                        <th>Größe</th>
+                        <th>Hochgeladen am</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ($uploadedFiles as $file): ?>
+                        <tr>
+                            <td>
+                                <span class="badge-pdf">PDF</span>
+                                <?= htmlspecialchars($file['name']) ?>
+                            </td>
+                            <td><?= htmlspecialchars(formatFileSize($file['size'])) ?></td>
+                            <td><?= htmlspecialchars(date('d.m.Y H:i', $file['modified'])) ?></td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+        <?php endif; ?>
+
+    </div>
+</div>
+
+<script>
+(function () {
+    'use strict';
+
+    const uploadArea  = document.getElementById('uploadArea');
+    const fileInput   = document.getElementById('pdf_file');
+    const filePreview = document.getElementById('filePreview');
+    const previewName = document.getElementById('previewName');
+    const previewSize = document.getElementById('previewSize');
+    const submitBtn   = document.getElementById('submitBtn');
+    const uploadForm  = document.getElementById('uploadForm');
+    const progressWrap = document.getElementById('progressWrap');
+    const progressBar  = document.getElementById('progressBar');
+
+    const MAX_SIZE = <?= MAX_FILE_SIZE ?>;
+
+    function formatSize(bytes) {
+        if (bytes >= 1048576) return (bytes / 1048576).toFixed(2) + ' MB';
+        if (bytes >= 1024)    return (bytes / 1024).toFixed(2) + ' KB';
+        return bytes + ' Bytes';
+    }
+
+    function handleFile(file) {
+        if (!file) return;
+
+        const ext = file.name.split('.').pop().toLowerCase();
+
+        if (ext !== 'pdf' || file.type !== 'application/pdf') {
+            alert('Bitte wählen Sie eine gültige PDF-Datei aus.');
+            fileInput.value = '';
+            return;
+        }
+
+        if (file.size > MAX_SIZE) {
+            alert('Die Datei ist zu groß. Maximale Größe: ' + formatSize(MAX_SIZE));
+            fileInput.value = '';
+            return;
+        }
+
+        if (file.size === 0) {
+            alert('Die Datei ist leer.');
+            fileInput.value = '';
+            return;
+        }
+
+        previewName.textContent = file.name;
+        previewSize.textContent = formatSize(file.size);
+        filePreview.classList.add('visible');
+        submitBtn.disabled = false;
+    }
+
+    // Click on upload area
+    uploadArea.addEventListener('click', () => fileInput.click());
+    uploadArea.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            fileInput.click();
+        }
+    });
+
+    // File input change
+    fileInput.addEventListener('change', () => {
+        handleFile(fileInput.files[0] || null);
+    });
+
+    // Drag and drop
+    uploadArea.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        uploadArea.classList.add('drag-over');
+    });
+
+    uploadArea.addEventListener('dragleave', () => {
+        uploadArea.classList.remove('drag-over');
+    });
+
+    uploadArea.addEventListener('drop', (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove('drag-over');
+        const file = e.dataTransfer.files[0] || null;
+        if (file) {
+            // Transfer to file input
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            fileInput.files = dt.files;
+            handleFile(file);
+        }
+    });
+
+    // Form submit with progress simulation
+    uploadForm.addEventListener('submit', (e) => {
+        if (!fileInput.files[0]) {
+            e.preventDefault();
+            alert('Bitte wählen Sie eine Datei aus.');
+            return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = 'Wird hochgeladen...';
+        progressWrap.classList.add('visible');
+
+        // Simulate progress (real XHR progress would require AJAX)
+        let progress = 0;
+        const interval = setInterval(() => {
+            progress += Math.random() * 15;
+            if (progress >= 90) {
+                clearInterval(interval);
+                progress = 90;
+            }
+            progressBar.style.width = progress + '%';
+        }, 200);
+    });
+
+})();
+</script>
+</body>
+</html>

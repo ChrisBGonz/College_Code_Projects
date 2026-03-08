@@ -1,0 +1,293 @@
+
+import hashlib
+import secrets
+import time
+from functools import wraps
+from typing import Optional, Dict, Tuple
+
+# Simulated user database with hashed passwords
+USER_DATABASE: Dict[str, str] = {
+    "admin": hashlib.sha256("SecurePassword123!".encode()).hexdigest(),
+    "user1": hashlib.sha256("UserPass456!".encode()).hexdigest(),
+    "user2": hashlib.sha256("AnotherPass789!".encode()).hexdigest(),
+}
+
+# Track failed login attempts (username -> (attempts, last_attempt_time))
+FAILED_ATTEMPTS: Dict[str, Tuple[int, float]] = {}
+
+# Configuration
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_DURATION = 300  # 5 minutes in seconds
+SESSION_TOKENS: Dict[str, str] = {}  # token -> username
+
+
+class AuthResponse:
+    """Represents an authentication response."""
+
+    def __init__(self, status_code: int, message: str, token: Optional[str] = None):
+        self.status_code = status_code
+        self.message = message
+        self.token = token
+
+    def __repr__(self):
+        return (
+            f"AuthResponse(status_code={self.status_code}, "
+            f"message='{self.message}', token={self.token})"
+        )
+
+    def is_success(self) -> bool:
+        return self.status_code == 200
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def generate_session_token() -> str:
+    """Generate a secure random session token."""
+    return secrets.token_hex(32)
+
+
+def is_account_locked(username: str) -> bool:
+    """Check if an account is locked due to too many failed attempts."""
+    if username not in FAILED_ATTEMPTS:
+        return False
+
+    attempts, last_attempt_time = FAILED_ATTEMPTS[username]
+    current_time = time.time()
+
+    # Reset if lockout duration has passed
+    if current_time - last_attempt_time > LOCKOUT_DURATION:
+        del FAILED_ATTEMPTS[username]
+        return False
+
+    return attempts >= MAX_FAILED_ATTEMPTS
+
+
+def record_failed_attempt(username: str) -> None:
+    """Record a failed login attempt for a username."""
+    current_time = time.time()
+
+    if username in FAILED_ATTEMPTS:
+        attempts, last_attempt_time = FAILED_ATTEMPTS[username]
+
+        # Reset counter if lockout duration has passed
+        if current_time - last_attempt_time > LOCKOUT_DURATION:
+            FAILED_ATTEMPTS[username] = (1, current_time)
+        else:
+            FAILED_ATTEMPTS[username] = (attempts + 1, current_time)
+    else:
+        FAILED_ATTEMPTS[username] = (1, current_time)
+
+
+def reset_failed_attempts(username: str) -> None:
+    """Reset failed login attempts after successful login."""
+    if username in FAILED_ATTEMPTS:
+        del FAILED_ATTEMPTS[username]
+
+
+def validate_input(username: str, password: str) -> Optional[str]:
+    """Validate input fields and return error message if invalid."""
+    if not username or not isinstance(username, str):
+        return "Username is required and must be a string."
+
+    if not password or not isinstance(password, str):
+        return "Password is required and must be a string."
+
+    if len(username) < 3 or len(username) > 50:
+        return "Username must be between 3 and 50 characters."
+
+    if len(password) < 8:
+        return "Password must be at least 8 characters long."
+
+    return None
+
+
+def login(username: str, password: str) -> AuthResponse:
+    """
+    Authenticate a user with username and password.
+
+    Returns:
+        AuthResponse with status 200 on success, 401 on failure,
+        423 if account is locked, or 400 for invalid input.
+    """
+    # Validate input
+    validation_error = validate_input(username, password)
+    if validation_error:
+        return AuthResponse(
+            status_code=400,
+            message=f"Bad Request: {validation_error}"
+        )
+
+    # Check if account is locked
+    if is_account_locked(username):
+        remaining_time = int(
+            LOCKOUT_DURATION - (time.time() - FAILED_ATTEMPTS[username][1])
+        )
+        return AuthResponse(
+            status_code=423,
+            message=(
+                f"Account locked due to too many failed attempts. "
+                f"Try again in {remaining_time} seconds."
+            )
+        )
+
+    # Check if user exists
+    if username not in USER_DATABASE:
+        # Use generic message to prevent username enumeration
+        record_failed_attempt(username)
+        return AuthResponse(
+            status_code=401,
+            message="401 Unauthorized: Invalid username or password."
+        )
+
+    # Verify password using constant-time comparison to prevent timing attacks
+    stored_hash = USER_DATABASE[username]
+    provided_hash = hash_password(password)
+
+    if not secrets.compare_digest(stored_hash, provided_hash):
+        record_failed_attempt(username)
+        attempts, _ = FAILED_ATTEMPTS.get(username, (0, 0))
+        remaining_attempts = MAX_FAILED_ATTEMPTS - attempts
+
+        return AuthResponse(
+            status_code=401,
+            message=(
+                f"401 Unauthorized: Invalid username or password. "
+                f"{remaining_attempts} attempt(s) remaining before lockout."
+            )
+        )
+
+    # Successful login
+    reset_failed_attempts(username)
+    token = generate_session_token()
+    SESSION_TOKENS[token] = username
+
+    return AuthResponse(
+        status_code=200,
+        message=f"Login successful. Welcome, {username}!",
+        token=token
+    )
+
+
+def logout(token: str) -> AuthResponse:
+    """Invalidate a session token."""
+    if token in SESSION_TOKENS:
+        username = SESSION_TOKENS.pop(token)
+        return AuthResponse(
+            status_code=200,
+            message=f"Successfully logged out user '{username}'."
+        )
+
+    return AuthResponse(
+        status_code=401,
+        message="401 Unauthorized: Invalid or expired session token."
+    )
+
+
+def require_auth(func):
+    """Decorator to protect routes/functions that require authentication."""
+    @wraps(func)
+    def wrapper(*args, token: Optional[str] = None, **kwargs):
+        if not token or token not in SESSION_TOKENS:
+            response = AuthResponse(
+                status_code=401,
+                message="401 Unauthorized: Valid session token required."
+            )
+            print(f"Access denied: {response.message}")
+            return response
+
+        username = SESSION_TOKENS[token]
+        print(f"Access granted for user: {username}")
+        return func(*args, username=username, **kwargs)
+
+    return wrapper
+
+
+@require_auth
+def protected_resource(username: str = None) -> str:
+    """Example of a protected resource that requires authentication."""
+    return f"Secret data for {username}: TOP SECRET INFORMATION"
+
+
+def demonstrate_login_system():
+    """Demonstrate the login system with various scenarios."""
+    print("=" * 60)
+    print("LOGIN SYSTEM DEMONSTRATION")
+    print("=" * 60)
+
+    # Test 1: Successful login
+    print("\n[TEST 1] Successful login:")
+    response = login("admin", "SecurePassword123!")
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+    print(f"  Token: {response.token[:20]}..." if response.token else "  Token: None")
+
+    admin_token = response.token
+
+    # Test 2: Access protected resource with valid token
+    print("\n[TEST 2] Access protected resource with valid token:")
+    result = protected_resource(token=admin_token)
+    if isinstance(result, str):
+        print(f"  Result: {result}")
+
+    # Test 3: Failed login - wrong password
+    print("\n[TEST 3] Failed login - wrong password:")
+    response = login("admin", "WrongPassword!")
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+
+    # Test 4: Failed login - non-existent user
+    print("\n[TEST 4] Failed login - non-existent user:")
+    response = login("nonexistent", "SomePassword123!")
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+
+    # Test 5: Invalid input
+    print("\n[TEST 5] Invalid input - empty password:")
+    response = login("admin", "")
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+
+    # Test 6: Invalid input - short password
+    print("\n[TEST 6] Invalid input - password too short:")
+    response = login("admin", "short")
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+
+    # Test 7: Account lockout simulation
+    print("\n[TEST 7] Account lockout after multiple failed attempts:")
+    test_user = "user1"
+    for i in range(MAX_FAILED_ATTEMPTS + 1):
+        response = login(test_user, "WrongPassword!")
+        print(f"  Attempt {i + 1}: Status={response.status_code}, "
+              f"Message={response.message}")
+        if response.status_code == 423:
+            break
+
+    # Test 8: Access protected resource without token
+    print("\n[TEST 8] Access protected resource without token:")
+    result = protected_resource(token=None)
+
+    # Test 9: Access protected resource with invalid token
+    print("\n[TEST 9] Access protected resource with invalid token:")
+    result = protected_resource(token="invalid_token_12345")
+
+    # Test 10: Logout
+    print("\n[TEST 10] Logout:")
+    response = logout(admin_token)
+    print(f"  Status: {response.status_code}")
+    print(f"  Message: {response.message}")
+
+    # Test 11: Access protected resource after logout
+    print("\n[TEST 11] Access protected resource after logout:")
+    result = protected_resource(token=admin_token)
+
+    print("\n" + "=" * 60)
+    print("DEMONSTRATION COMPLETE")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    demonstrate_login_system()

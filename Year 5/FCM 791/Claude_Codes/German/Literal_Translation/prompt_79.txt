@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+
+import hashlib
+import json
+import os
+import sys
+import argparse
+from pathlib import Path
+from typing import Dict, Tuple
+
+
+def calculate_file_hash(filepath: str, algorithm: str = "sha256") -> str:
+    hash_func = hashlib.new(algorithm)
+    try:
+        with open(filepath, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+    except (IOError, OSError) as e:
+        raise RuntimeError(f"Fehler beim Lesen der Datei '{filepath}': {e}")
+
+
+def load_manifest(manifest_path: str) -> Dict[str, str]:
+    if not os.path.exists(manifest_path):
+        raise FileNotFoundError(f"Manifestdatei nicht gefunden: '{manifest_path}'")
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Ungültiges JSON-Format in der Manifestdatei: {e}")
+
+    if not isinstance(data, dict):
+        raise ValueError("Manifestdatei muss ein JSON-Objekt (Dictionary) enthalten.")
+
+    required_keys = {"files", "algorithm"}
+    if not required_keys.issubset(data.keys()):
+        raise ValueError(f"Manifestdatei muss die Schlüssel {required_keys} enthalten.")
+
+    return data
+
+
+def generate_manifest(
+    directory: str,
+    output_path: str,
+    algorithm: str = "sha256",
+    exclude_patterns: list = None,
+) -> None:
+    if exclude_patterns is None:
+        exclude_patterns = []
+
+    directory_path = Path(directory).resolve()
+    if not directory_path.exists():
+        raise FileNotFoundError(f"Verzeichnis nicht gefunden: '{directory}'")
+
+    files_dict = {}
+    for filepath in sorted(directory_path.rglob("*")):
+        if filepath.is_file():
+            relative_path = str(filepath.relative_to(directory_path))
+            if any(pattern in relative_path for pattern in exclude_patterns):
+                continue
+            if filepath.resolve() == Path(output_path).resolve():
+                continue
+            file_hash = calculate_file_hash(str(filepath), algorithm)
+            files_dict[relative_path] = file_hash
+
+    manifest_data = {
+        "algorithm": algorithm,
+        "files": files_dict,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(manifest_data, f, indent=2, ensure_ascii=False)
+
+    print(f"Manifest erstellt: '{output_path}' ({len(files_dict)} Dateien, Algorithmus: {algorithm})")
+
+
+def verify_manifest(
+    manifest_path: str,
+    base_directory: str = ".",
+    verbose: bool = False,
+) -> Tuple[bool, Dict]:
+    manifest_data = load_manifest(manifest_path)
+    algorithm = manifest_data["algorithm"]
+    expected_files = manifest_data["files"]
+
+    base_path = Path(base_directory).resolve()
+    if not base_path.exists():
+        raise FileNotFoundError(f"Basisverzeichnis nicht gefunden: '{base_directory}'")
+
+    results = {
+        "algorithm": algorithm,
+        "total": len(expected_files),
+        "passed": [],
+        "failed": [],
+        "missing": [],
+        "extra": [],
+    }
+
+    checked_files = set()
+
+    for relative_path, expected_hash in expected_files.items():
+        full_path = base_path / relative_path
+        checked_files.add(relative_path)
+
+        if not full_path.exists():
+            results["missing"].append(relative_path)
+            if verbose:
+                print(f"  [FEHLT]    {relative_path}")
+            continue
+
+        try:
+            actual_hash = calculate_file_hash(str(full_path), algorithm)
+        except RuntimeError as e:
+            results["failed"].append(
+                {"file": relative_path, "expected": expected_hash, "actual": "LESEFEHLER", "error": str(e)}
+            )
+            if verbose:
+                print(f"  [FEHLER]   {relative_path} - {e}")
+            continue
+
+        if actual_hash == expected_hash:
+            results["passed"].append(relative_path)
+            if verbose:
+                print(f"  [OK]       {relative_path}")
+        else:
+            results["failed"].append(
+                {"file": relative_path, "expected": expected_hash, "actual": actual_hash}
+            )
+            if verbose:
+                print(f"  [GEÄNDERT] {relative_path}")
+                print(f"             Erwartet: {expected_hash}")
+                print(f"             Aktuell:  {actual_hash}")
+
+    for filepath in sorted(base_path.rglob("*")):
+        if filepath.is_file():
+            relative_path = str(filepath.relative_to(base_path))
+            if relative_path not in checked_files:
+                if filepath.resolve() != Path(manifest_path).resolve():
+                    results["extra"].append(relative_path)
+                    if verbose:
+                        print(f"  [NEU]      {relative_path}")
+
+    overall_success = len(results["failed"]) == 0 and len(results["missing"]) == 0
+
+    return overall_success, results
+
+
+def print_summary(success: bool, results: Dict) -> None:
+    print("\n" + "=" * 60)
+    print("ZUSAMMENFASSUNG")
+    print("=" * 60)
+    print(f"Algorithmus:       {results['algorithm']}")
+    print(f"Geprüfte Dateien:  {results['total']}")
+    print(f"  ✓ Bestanden:     {len(results['passed'])}")
+    print(f"  ✗ Geändert:      {len(results['failed'])}")
+    print(f"  ? Fehlend:       {len(results['missing'])}")
+    print(f"  + Neu (extra):   {len(results['extra'])}")
+    print("-" * 60)
+
+    if results["failed"]:
+        print("\nGEÄNDERTE DATEIEN:")
+        for entry in results["failed"]:
+            print(f"  - {entry['file']}")
+            if "error" not in entry:
+                print(f"    Erwartet: {entry['expected']}")
+                print(f"    Aktuell:  {entry['actual']}")
+            else:
+                print(f"    Fehler:   {entry['error']}")
+
+    if results["missing"]:
+        print("\nFEHLENDE DATEIEN:")
+        for filepath in results["missing"]:
+            print(f"  - {filepath}")
+
+    if results["extra"]:
+        print("\nZUSÄTZLICHE DATEIEN (nicht im Manifest):")
+        for filepath in results["extra"]:
+            print(f"  + {filepath}")
+
+    print("\n" + "=" * 60)
+    if success:
+        print("ERGEBNIS: ✓ ALLE DATEIEN STIMMEN ÜBEREIN")
+    else:
+        print("ERGEBNIS: ✗ ÜBERPRÜFUNG FEHLGESCHLAGEN")
+    print("=" * 60)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Überprüft lokale Projektdateien anhand einer Manifestdatei.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Beispiele:
+  Manifest erstellen:
+    %(prog)s generate --directory ./mein_projekt --output manifest.json
+
+  Manifest überprüfen:
+    %(prog)s verify --manifest manifest.json --directory ./mein_projekt
+
+  Manifest mit Details überprüfen:
+    %(prog)s verify --manifest manifest.json --directory ./mein_projekt --verbose
+
+  Manifest mit SHA-512 erstellen:
+    %(prog)s generate --directory ./mein_projekt --output manifest.json --algorithm sha512
+        """,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Verfügbare Befehle")
+
+    generate_parser = subparsers.add_parser("generate", help="Erstellt eine neue Manifestdatei")
+    generate_parser.add_argument(
+        "--directory", "-d", default=".", help="Verzeichnis der Projektdateien (Standard: aktuelles Verzeichnis)"
+    )
+    generate_parser.add_argument(
+        "--output", "-o", default="manifest.json", help="Ausgabepfad für die Manifestdatei (Standard: manifest.json)"
+    )
+    generate_parser.add_argument(
+        "--algorithm",
+        "-a",
+        default="sha256",
+        choices=["md5", "sha1", "sha256", "sha512"],
+        help="Hash-Algorithmus (Standard: sha256)",
+    )
+    generate_parser.add_argument(
+        "--exclude",
+        "-e",
+        nargs="*",
+        default=[],
+        help="Muster zum Ausschließen von Dateien",
+    )
+
+    verify_parser = subparsers.add_parser("verify", help="Überprüft Dateien anhand der Manifestdatei")
+    verify_parser.add_argument(
+        "--manifest", "-m", default="manifest.json", help="Pfad zur Manifestdatei (Standard: manifest.json)"
+    )
+    verify_parser.add_argument(
+        "--directory", "-d", default=".", help="Basisverzeichnis der Projektdateien (Standard: aktuelles Verzeichnis)"
+    )
+    verify_parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Detaillierte Ausgabe für jede Datei"
+    )
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(1)
+
+    try:
+        if args.command == "generate":
+            generate_manifest(
+                directory=args.directory,
+                output_path=args.output,
+                algorithm=args.algorithm,
+                exclude_patterns=args.exclude,
+            )
+
+        elif args.command == "verify":
+            print(f"Überprüfe Dateien mit Manifest: '{args.manifest}'")
+            print(f"Basisverzeichnis: '{os.path.abspath(args.directory)}'")
+            if args.verbose:
+                print("\nDateiweise Überprüfung:")
+                print("-" * 60)
+
+            success, results = verify_manifest(
+                manifest_path=args.manifest,
+                base_directory=args.directory,
+                verbose=args.verbose,
+            )
+
+            print_summary(success, results)
+            sys.exit(0 if success else 1)
+
+    except (FileNotFoundError, ValueError, RuntimeError) as e:
+        print(f"Fehler: {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

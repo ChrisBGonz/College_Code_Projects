@@ -1,0 +1,358 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Log file rotation script using Claude AI for intelligent log analysis and rotation decisions.
+Rotates log files every 24 hours to prevent disk from filling up.
+"""
+
+import os
+import sys
+import time
+import gzip
+import shutil
+import logging
+import schedule
+import anthropic
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# Configure basic logging for the rotation script itself
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_file_size_mb(file_path: str) -> float:
+    """Get file size in megabytes."""
+    try:
+        return os.path.getsize(file_path) / (1024 * 1024)
+    except OSError:
+        return 0.0
+
+
+def get_disk_usage_percent(path: str) -> float:
+    """Get disk usage percentage for the given path."""
+    try:
+        total, used, free = shutil.disk_usage(path)
+        return (used / total) * 100
+    except OSError:
+        return 0.0
+
+
+def compress_log_file(file_path: str) -> str:
+    """Compress a log file using gzip."""
+    compressed_path = f"{file_path}.gz"
+    try:
+        with open(file_path, 'rb') as f_in:
+            with gzip.open(compressed_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        os.remove(file_path)
+        logger.info(f"Compressed {file_path} to {compressed_path}")
+        return compressed_path
+    except Exception as e:
+        logger.error(f"Failed to compress {file_path}: {e}")
+        return file_path
+
+
+def rotate_log_file(log_file: str, backup_count: int = 5, compress: bool = True) -> dict:
+    """
+    Rotate a single log file.
+    
+    Returns a dict with rotation details for Claude analysis.
+    """
+    rotation_info = {
+        "file": log_file,
+        "timestamp": datetime.now().isoformat(),
+        "original_size_mb": 0,
+        "rotated_files": [],
+        "deleted_files": [],
+        "errors": []
+    }
+    
+    if not os.path.exists(log_file):
+        rotation_info["errors"].append(f"File not found: {log_file}")
+        return rotation_info
+    
+    original_size = get_file_size_mb(log_file)
+    rotation_info["original_size_mb"] = original_size
+    
+    try:
+        # Rotate existing backup files
+        for i in range(backup_count - 1, 0, -1):
+            old_backup = f"{log_file}.{i}"
+            old_backup_gz = f"{old_backup}.gz"
+            new_backup = f"{log_file}.{i + 1}"
+            new_backup_gz = f"{new_backup}.gz"
+            
+            if os.path.exists(old_backup_gz):
+                if i + 1 > backup_count:
+                    os.remove(old_backup_gz)
+                    rotation_info["deleted_files"].append(old_backup_gz)
+                else:
+                    shutil.move(old_backup_gz, new_backup_gz)
+                    rotation_info["rotated_files"].append(f"{old_backup_gz} -> {new_backup_gz}")
+            elif os.path.exists(old_backup):
+                if i + 1 > backup_count:
+                    os.remove(old_backup)
+                    rotation_info["deleted_files"].append(old_backup)
+                else:
+                    shutil.move(old_backup, new_backup)
+                    rotation_info["rotated_files"].append(f"{old_backup} -> {new_backup}")
+        
+        # Move current log to .1
+        backup_file = f"{log_file}.1"
+        shutil.copy2(log_file, backup_file)
+        
+        # Clear the original log file
+        with open(log_file, 'w') as f:
+            f.write(f"# Log rotated at {datetime.now().isoformat()}\n")
+        
+        # Compress the backup if requested
+        if compress:
+            compressed = compress_log_file(backup_file)
+            rotation_info["rotated_files"].append(f"Created: {compressed}")
+        else:
+            rotation_info["rotated_files"].append(f"Created: {backup_file}")
+        
+        logger.info(f"Successfully rotated {log_file} ({original_size:.2f} MB)")
+        
+    except Exception as e:
+        error_msg = f"Error rotating {log_file}: {str(e)}"
+        rotation_info["errors"].append(error_msg)
+        logger.error(error_msg)
+    
+    return rotation_info
+
+
+def analyze_rotation_with_claude(rotation_results: list, disk_usage: float) -> str:
+    """
+    Use Claude AI to analyze log rotation results and provide recommendations.
+    Uses streaming for real-time output.
+    """
+    client = anthropic.Anthropic()
+    
+    # Prepare summary for Claude
+    total_files = len(rotation_results)
+    total_size_mb = sum(r.get("original_size_mb", 0) for r in rotation_results)
+    errors = [r for r in rotation_results if r.get("errors")]
+    
+    analysis_prompt = f"""Analyze the following log rotation results and provide recommendations:
+
+Log Rotation Summary:
+- Total files processed: {total_files}
+- Total size rotated: {total_size_mb:.2f} MB
+- Current disk usage: {disk_usage:.1f}%
+- Files with errors: {len(errors)}
+- Timestamp: {datetime.now().isoformat()}
+
+Detailed Results:
+{str(rotation_results)}
+
+Please provide:
+1. A brief assessment of the rotation operation
+2. Any concerns about disk usage or errors
+3. Recommendations for log management
+4. Whether immediate action is needed
+
+Keep the response concise and actionable."""
+
+    print("\n" + "="*60)
+    print("Claude AI Analysis of Log Rotation:")
+    print("="*60)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": analysis_prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "="*60 + "\n")
+    
+    return full_response
+
+
+def find_log_files(directories: list, patterns: list = None) -> list:
+    """Find log files in specified directories."""
+    if patterns is None:
+        patterns = ["*.log", "*.txt", "*.out"]
+    
+    log_files = []
+    for directory in directories:
+        if os.path.exists(directory):
+            for pattern in patterns:
+                log_files.extend(Path(directory).glob(pattern))
+    
+    return [str(f) for f in log_files]
+
+
+def perform_rotation(log_directories: list = None, log_files: list = None, 
+                     backup_count: int = 5, compress: bool = True,
+                     max_size_mb: float = 100.0) -> None:
+    """
+    Main rotation function that rotates log files and analyzes results with Claude.
+    """
+    logger.info("Starting log rotation process...")
+    
+    # Default directories if none specified
+    if log_directories is None:
+        log_directories = ["/var/log", "/tmp/logs", "./logs"]
+    
+    # Collect all log files to rotate
+    files_to_rotate = []
+    
+    if log_files:
+        files_to_rotate.extend(log_files)
+    
+    if log_directories:
+        found_files = find_log_files(log_directories)
+        files_to_rotate.extend(found_files)
+    
+    # Remove duplicates
+    files_to_rotate = list(set(files_to_rotate))
+    
+    if not files_to_rotate:
+        logger.warning("No log files found to rotate")
+        # Create a demo log file for testing
+        demo_log = "./demo_application.log"
+        with open(demo_log, 'w') as f:
+            for i in range(100):
+                f.write(f"2024-01-{i%28+1:02d} {i%24:02d}:00:00 INFO Application log entry {i}\n")
+        files_to_rotate = [demo_log]
+        logger.info(f"Created demo log file: {demo_log}")
+    
+    # Filter files that need rotation (based on size or age)
+    rotation_results = []
+    
+    for log_file in files_to_rotate:
+        if not os.path.exists(log_file):
+            continue
+            
+        file_size = get_file_size_mb(log_file)
+        file_age_hours = 0
+        
+        try:
+            mtime = os.path.getmtime(log_file)
+            file_age_hours = (time.time() - mtime) / 3600
+        except OSError:
+            pass
+        
+        # Rotate if file is large enough or old enough
+        should_rotate = file_size > max_size_mb or file_age_hours >= 24
+        
+        if should_rotate or True:  # Always rotate for demo purposes
+            logger.info(f"Rotating {log_file} (size: {file_size:.2f} MB, age: {file_age_hours:.1f} hours)")
+            result = rotate_log_file(log_file, backup_count, compress)
+            rotation_results.append(result)
+    
+    # Get current disk usage
+    disk_usage = get_disk_usage_percent(".")
+    
+    # Analyze results with Claude
+    if rotation_results:
+        analysis = analyze_rotation_with_claude(rotation_results, disk_usage)
+        
+        # Save analysis to file
+        analysis_file = f"rotation_analysis_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        with open(analysis_file, 'w') as f:
+            f.write(f"Log Rotation Analysis - {datetime.now().isoformat()}\n")
+            f.write("="*60 + "\n")
+            f.write(analysis)
+        
+        logger.info(f"Analysis saved to {analysis_file}")
+    else:
+        logger.info("No files were rotated")
+    
+    logger.info("Log rotation process completed")
+
+
+def setup_scheduled_rotation(log_directories: list = None, log_files: list = None,
+                              interval_hours: int = 24, backup_count: int = 5,
+                              compress: bool = True, max_size_mb: float = 100.0) -> None:
+    """
+    Set up scheduled log rotation every 24 hours.
+    """
+    logger.info(f"Setting up log rotation every {interval_hours} hours")
+    
+    # Run immediately on start
+    perform_rotation(log_directories, log_files, backup_count, compress, max_size_mb)
+    
+    # Schedule future rotations
+    schedule.every(interval_hours).hours.do(
+        perform_rotation,
+        log_directories=log_directories,
+        log_files=log_files,
+        backup_count=backup_count,
+        compress=compress,
+        max_size_mb=max_size_mb
+    )
+    
+    logger.info(f"Next rotation scheduled in {interval_hours} hours")
+    logger.info("Press Ctrl+C to stop the rotation scheduler")
+    
+    try:
+        while True:
+            schedule.run_pending()
+            time.sleep(60)  # Check every minute
+    except KeyboardInterrupt:
+        logger.info("Log rotation scheduler stopped by user")
+
+
+def main():
+    """Main entry point for the log rotation script."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Automated log file rotation with AI analysis')
+    parser.add_argument('--directories', nargs='+', help='Directories to scan for log files',
+                       default=['./logs', '/tmp/logs'])
+    parser.add_argument('--files', nargs='+', help='Specific log files to rotate')
+    parser.add_argument('--interval', type=int, default=24, 
+                       help='Rotation interval in hours (default: 24)')
+    parser.add_argument('--backup-count', type=int, default=5,
+                       help='Number of backup files to keep (default: 5)')
+    parser.add_argument('--no-compress', action='store_true',
+                       help='Disable compression of rotated files')
+    parser.add_argument('--max-size', type=float, default=100.0,
+                       help='Maximum file size in MB before rotation (default: 100)')
+    parser.add_argument('--once', action='store_true',
+                       help='Run rotation once and exit (no scheduling)')
+    
+    args = parser.parse_args()
+    
+    if args.once:
+        # Run once and exit
+        perform_rotation(
+            log_directories=args.directories,
+            log_files=args.files,
+            backup_count=args.backup_count,
+            compress=not args.no_compress,
+            max_size_mb=args.max_size
+        )
+    else:
+        # Set up scheduled rotation
+        setup_scheduled_rotation(
+            log_directories=args.directories,
+            log_files=args.files,
+            interval_hours=args.interval,
+            backup_count=args.backup_count,
+            compress=not args.no_compress,
+            max_size_mb=args.max_size
+        )
+
+
+if __name__ == "__main__":
+    main()
+```

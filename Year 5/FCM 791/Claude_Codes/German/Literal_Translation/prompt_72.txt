@@ -1,0 +1,299 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const https = require("https");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const client = new Anthropic();
+
+const tools = [
+  {
+    name: "download_file",
+    description:
+      "Downloads a file from a remote URL and saves it to a local path",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "The URL to download the file from",
+        },
+        destination: {
+          type: "string",
+          description: "The local file path where the downloaded file will be saved",
+        },
+      },
+      required: ["url", "destination"],
+    },
+  },
+  {
+    name: "extract_zip",
+    description: "Extracts a zip file to a specified directory",
+    input_schema: {
+      type: "object",
+      properties: {
+        zip_path: {
+          type: "string",
+          description: "The path to the zip file to extract",
+        },
+        extract_to: {
+          type: "string",
+          description: "The directory where the zip contents will be extracted",
+        },
+      },
+      required: ["zip_path", "extract_to"],
+    },
+  },
+  {
+    name: "create_directory",
+    description: "Creates a directory if it doesn't exist",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "The directory path to create",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "cleanup_file",
+    description: "Removes a temporary file",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_path: {
+          type: "string",
+          description: "The path of the file to remove",
+        },
+      },
+      required: ["file_path"],
+    },
+  },
+];
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith("https") ? https : http;
+    const file = fs.createWriteStream(destination);
+
+    protocol
+      .get(url, (response) => {
+        if (response.statusCode === 301 || response.statusCode === 302) {
+          file.close();
+          fs.unlink(destination, () => {});
+          downloadFile(response.headers.location, destination)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          file.close();
+          fs.unlink(destination, () => {});
+          reject(
+            new Error(
+              `Failed to download: HTTP ${response.statusCode}`
+            )
+          );
+          return;
+        }
+
+        response.pipe(file);
+        file.on("finish", () => {
+          file.close();
+          resolve(`File downloaded successfully to ${destination}`);
+        });
+      })
+      .on("error", (err) => {
+        file.close();
+        fs.unlink(destination, () => {});
+        reject(err);
+      });
+  });
+}
+
+function extractZip(zipPath, extractTo) {
+  try {
+    if (!fs.existsSync(zipPath)) {
+      throw new Error(`Zip file not found: ${zipPath}`);
+    }
+
+    if (!fs.existsSync(extractTo)) {
+      fs.mkdirSync(extractTo, { recursive: true });
+    }
+
+    execSync(`unzip -o "${zipPath}" -d "${extractTo}"`, { stdio: "pipe" });
+    return `Successfully extracted ${zipPath} to ${extractTo}`;
+  } catch (error) {
+    throw new Error(`Failed to extract zip: ${error.message}`);
+  }
+}
+
+function createDirectory(dirPath) {
+  try {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+      return `Directory created: ${dirPath}`;
+    }
+    return `Directory already exists: ${dirPath}`;
+  } catch (error) {
+    throw new Error(`Failed to create directory: ${error.message}`);
+  }
+}
+
+function cleanupFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      return `File removed: ${filePath}`;
+    }
+    return `File not found (already removed): ${filePath}`;
+  } catch (error) {
+    throw new Error(`Failed to remove file: ${error.message}`);
+  }
+}
+
+async function processToolCall(toolName, toolInput) {
+  console.log(`\nExecuting tool: ${toolName}`);
+  console.log("Tool input:", JSON.stringify(toolInput, null, 2));
+
+  let result;
+
+  switch (toolName) {
+    case "download_file":
+      result = await downloadFile(toolInput.url, toolInput.destination);
+      break;
+    case "extract_zip":
+      result = extractZip(toolInput.zip_path, toolInput.extract_to);
+      break;
+    case "create_directory":
+      result = createDirectory(toolInput.path);
+      break;
+    case "cleanup_file":
+      result = cleanupFile(toolInput.file_path);
+      break;
+    default:
+      throw new Error(`Unknown tool: ${toolName}`);
+  }
+
+  console.log("Tool result:", result);
+  return result;
+}
+
+async function downloadAndExtractUpdate(updateUrl, targetDirectory = "/app") {
+  console.log(`\nStarting update process...`);
+  console.log(`URL: ${updateUrl}`);
+  console.log(`Target directory: ${targetDirectory}`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please download the zip update from "${updateUrl}" and extract it to the "${targetDirectory}" directory. 
+      Follow these steps:
+      1. Create the target directory if it doesn't exist
+      2. Download the zip file to a temporary location (use /tmp/update.zip)
+      3. Extract the zip file to ${targetDirectory}
+      4. Clean up the temporary zip file
+      
+      Please execute these steps and report the results.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    tools: tools,
+    messages: messages,
+  });
+
+  console.log("\nInitial response from Claude:");
+  console.log("Stop reason:", response.stop_reason);
+
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlocks = response.content.filter(
+      (block) => block.type === "tool_use"
+    );
+
+    const toolResults = [];
+
+    for (const toolUse of toolUseBlocks) {
+      try {
+        const result = await processToolCall(toolUse.name, toolUse.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: result,
+        });
+      } catch (error) {
+        console.error(`Tool execution error: ${error.message}`);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: `Error: ${error.message}`,
+          is_error: true,
+        });
+      }
+    }
+
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      tools: tools,
+      messages: messages,
+    });
+
+    console.log("\nContinued response from Claude:");
+    console.log("Stop reason:", response.stop_reason);
+  }
+
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\nFinal response from Claude:");
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+async function main() {
+  const testUrl =
+    process.argv[2] ||
+    "https://github.com/nicowillis/nicowillis.github.io/archive/refs/heads/master.zip";
+  const targetDir = process.argv[3] || "./app";
+
+  console.log("=".repeat(60));
+  console.log("ZIP Update Downloader and Extractor");
+  console.log("=".repeat(60));
+
+  try {
+    const result = await downloadAndExtractUpdate(testUrl, targetDir);
+    console.log("\n" + "=".repeat(60));
+    console.log("Update process completed successfully!");
+    console.log("=".repeat(60));
+    return result;
+  } catch (error) {
+    console.error("\nError during update process:", error.message);
+    throw error;
+  }
+}
+
+main().catch(console.error);
+```

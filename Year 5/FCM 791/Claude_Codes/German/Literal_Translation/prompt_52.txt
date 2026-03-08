@@ -1,0 +1,281 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Repository;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.http.ResponseEntity;
+import org.springframework.http.HttpStatus;
+import jakarta.persistence.*;
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import java.time.LocalDateTime;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.Map;
+import java.util.HashMap;
+
+import com.anthropic.client.AnthropicClient;
+import com.anthropic.client.okhttp.AnthropicOkHttpClient;
+import com.anthropic.models.messages.*;
+
+@SpringBootApplication
+public class PasswordResetApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(PasswordResetApplication.class, args);
+    }
+}
+
+@Entity
+@Table(name = "users")
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(unique = true)
+    private String email;
+    
+    private String username;
+    private String password;
+    
+    public User() {}
+    
+    public User(String email, String username, String password) {
+        this.email = email;
+        this.username = username;
+        this.password = password;
+    }
+    
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public String getUsername() { return username; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+}
+
+@Entity
+@Table(name = "password_reset_tokens")
+class PasswordResetToken {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(unique = true)
+    private String token;
+    
+    @ManyToOne
+    @JoinColumn(name = "user_id")
+    private User user;
+    
+    private LocalDateTime expiryDate;
+    private boolean used;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, User user, LocalDateTime expiryDate) {
+        this.token = token;
+        this.user = user;
+        this.expiryDate = expiryDate;
+        this.used = false;
+    }
+    
+    public Long getId() { return id; }
+    public String getToken() { return token; }
+    public User getUser() { return user; }
+    public LocalDateTime getExpiryDate() { return expiryDate; }
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+}
+
+@Repository
+interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+}
+
+@Repository
+interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByUser(User user);
+}
+
+@Service
+class PasswordResetService {
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    private static final int TOKEN_EXPIRY_HOURS = 24;
+    private static final String BASE_URL = "http://localhost:8080";
+    
+    private final AnthropicClient anthropicClient;
+    
+    public PasswordResetService() {
+        this.anthropicClient = AnthropicOkHttpClient.fromEnv();
+    }
+    
+    public Map<String, String> processForgotPassword(String email) {
+        Map<String, String> response = new HashMap<>();
+        
+        Optional<User> userOptional = userRepository.findByEmail(email);
+        
+        if (userOptional.isEmpty()) {
+            response.put("message", "If an account with this email exists, a password reset link has been sent.");
+            return response;
+        }
+        
+        User user = userOptional.get();
+        
+        String resetToken = UUID.randomUUID().toString();
+        
+        LocalDateTime expiryDate = LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS);
+        PasswordResetToken passwordResetToken = new PasswordResetToken(resetToken, user, expiryDate);
+        tokenRepository.save(passwordResetToken);
+        
+        String resetLink = BASE_URL + "/api/auth/reset-password?token=" + resetToken;
+        
+        String emailContent = generateEmailContent(user.getUsername(), resetLink);
+        
+        sendPasswordResetEmail(user.getEmail(), emailContent);
+        
+        response.put("message", "If an account with this email exists, a password reset link has been sent.");
+        response.put("debug_token", resetToken);
+        return response;
+    }
+    
+    private String generateEmailContent(String username, String resetLink) {
+        Message message = anthropicClient.messages().create(
+            MessageCreateParams.builder()
+                .model(Model.CLAUDE_OPUS_4_5)
+                .maxTokens(1024)
+                .addUserMessage("Generate a professional and friendly password reset email in HTML format for a user named '" + 
+                    username + "'. Include the following reset link: " + resetLink + 
+                    ". The email should explain that they requested a password reset, " +
+                    "provide the link prominently, mention it expires in 24 hours, " +
+                    "and include a security note that if they didn't request this, they should ignore the email. " +
+                    "Return only the HTML content without any explanation.")
+                .build()
+        );
+        
+        return message.content().get(0).text().get().text();
+    }
+    
+    private void sendPasswordResetEmail(String toEmail, String htmlContent) {
+        try {
+            MimeMessage mimeMessage = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(mimeMessage, true, "UTF-8");
+            
+            helper.setFrom("noreply@yourapp.com");
+            helper.setTo(toEmail);
+            helper.setSubject("Password Reset Request");
+            helper.setText(htmlContent, true);
+            
+            mailSender.send(mimeMessage);
+        } catch (MessagingException e) {
+            throw new RuntimeException("Failed to send password reset email", e);
+        }
+    }
+    
+    public Map<String, String> resetPassword(String token, String newPassword) {
+        Map<String, String> response = new HashMap<>();
+        
+        Optional<PasswordResetToken> tokenOptional = tokenRepository.findByToken(token);
+        
+        if (tokenOptional.isEmpty()) {
+            response.put("error", "Invalid or expired reset token");
+            return response;
+        }
+        
+        PasswordResetToken resetToken = tokenOptional.get();
+        
+        if (resetToken.isUsed()) {
+            response.put("error", "This reset link has already been used");
+            return response;
+        }
+        
+        if (resetToken.getExpiryDate().isBefore(LocalDateTime.now())) {
+            response.put("error", "Reset link has expired. Please request a new one.");
+            return response;
+        }
+        
+        User user = resetToken.getUser();
+        user.setPassword(newPassword);
+        userRepository.save(user);
+        
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+        
+        response.put("message", "Password has been successfully reset");
+        return response;
+    }
+}
+
+@RestController
+@RequestMapping("/api/auth")
+class AuthController {
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public ResponseEntity<Map<String, String>> forgotPassword(@RequestBody Map<String, String> request) {
+        String email = request.get("email");
+        
+        if (email == null || email.isEmpty()) {
+            Map<String, String> error = new HashMap<>();
+            error.put("error", "Email is required");
+            return ResponseEntity.badRequest().body(error);
+        }
+        
+        Map<String, String> response = passwordResetService.processForgotPassword(email);
+        return ResponseEntity.ok(response);
+    }
+    
+    @PostMapping("/reset-password")
+    public ResponseEntity<Map<String, String>> resetPassword(
+            @RequestParam String token,
+            @RequestBody Map<String, String> request) {
+        
+        String newPassword = request.get("newPassword");
+        
+        if (newPassword == null || newPassword.isEmpty()) {
+            Map<String, String> error = new HashMap<>();
+            error.put("error", "New password is required");
+            return ResponseEntity.badRequest().body(error);
+        }
+        
+        if (newPassword.length() < 8) {
+            Map<String, String> error = new HashMap<>();
+            error.put("error", "Password must be at least 8 characters long");
+            return ResponseEntity.badRequest().body(error);
+        }
+        
+        Map<String, String> response = passwordResetService.resetPassword(token, newPassword);
+        
+        if (response.containsKey("error")) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(response);
+        }
+        
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/reset-password")
+    public ResponseEntity<Map<String, String>> validateResetToken(@RequestParam String token) {
+        Map<String, String> response = new HashMap<>();
+        response.put("token", token);
+        response.put("message", "Token received. Please submit your new password.");
+        return ResponseEntity.ok(response);
+    }
+}
+```

@@ -1,0 +1,505 @@
+```javascript
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 60000;
+    this.requestTimeout = options.requestTimeout || 10000;
+    this.monitorInterval = options.monitorInterval || 5000;
+
+    this.state = CircuitBreaker.STATES.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+
+    this.listeners = {
+      open: [],
+      close: [],
+      halfOpen: [],
+      success: [],
+      failure: [],
+      reject: [],
+    };
+
+    this.stats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rejectedRequests: 0,
+      lastStateChange: new Date(),
+    };
+
+    this._startMonitoring();
+  }
+
+  static get STATES() {
+    return {
+      CLOSED: "CLOSED",
+      OPEN: "OPEN",
+      HALF_OPEN: "HALF_OPEN",
+    };
+  }
+
+  async execute(requestFn, fallbackFn = null) {
+    this.stats.totalRequests++;
+
+    if (this.state === CircuitBreaker.STATES.OPEN) {
+      if (Date.now() < this.nextAttemptTime) {
+        this.stats.rejectedRequests++;
+        this._emit("reject", {
+          state: this.state,
+          nextAttemptTime: this.nextAttemptTime,
+        });
+
+        if (fallbackFn) {
+          return await fallbackFn(new CircuitBreakerOpenError(this));
+        }
+
+        throw new CircuitBreakerOpenError(this);
+      }
+
+      this._transitionTo(CircuitBreaker.STATES.HALF_OPEN);
+    }
+
+    try {
+      const result = await this._executeWithTimeout(requestFn);
+      this._onSuccess();
+      return result;
+    } catch (error) {
+      if (error instanceof CircuitBreakerTimeoutError) {
+        this._onFailure(error);
+        if (fallbackFn) {
+          return await fallbackFn(error);
+        }
+        throw error;
+      }
+
+      this._onFailure(error);
+
+      if (fallbackFn) {
+        return await fallbackFn(error);
+      }
+
+      throw error;
+    }
+  }
+
+  async _executeWithTimeout(requestFn) {
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        reject(
+          new CircuitBreakerTimeoutError(
+            `Request timed out after ${this.requestTimeout}ms`
+          )
+        );
+      }, this.requestTimeout);
+
+      Promise.resolve(requestFn())
+        .then((result) => {
+          clearTimeout(timeoutId);
+          resolve(result);
+        })
+        .catch((error) => {
+          clearTimeout(timeoutId);
+          reject(error);
+        });
+    });
+  }
+
+  _onSuccess() {
+    this.stats.successfulRequests++;
+    this.failureCount = 0;
+
+    if (this.state === CircuitBreaker.STATES.HALF_OPEN) {
+      this.successCount++;
+
+      if (this.successCount >= this.successThreshold) {
+        this._transitionTo(CircuitBreaker.STATES.CLOSED);
+      }
+    }
+
+    this._emit("success", { state: this.state, stats: this.getStats() });
+  }
+
+  _onFailure(error) {
+    this.stats.failedRequests++;
+    this.failureCount++;
+    this.lastFailureTime = new Date();
+
+    this._emit("failure", {
+      error,
+      failureCount: this.failureCount,
+      state: this.state,
+    });
+
+    if (
+      this.state === CircuitBreaker.STATES.HALF_OPEN ||
+      this.failureCount >= this.failureThreshold
+    ) {
+      this._transitionTo(CircuitBreaker.STATES.OPEN);
+    }
+  }
+
+  _transitionTo(newState) {
+    const previousState = this.state;
+    this.state = newState;
+    this.stats.lastStateChange = new Date();
+
+    switch (newState) {
+      case CircuitBreaker.STATES.OPEN:
+        this.nextAttemptTime = Date.now() + this.timeout;
+        this.successCount = 0;
+        this._emit("open", {
+          failureCount: this.failureCount,
+          nextAttemptTime: this.nextAttemptTime,
+          previousState,
+        });
+        break;
+
+      case CircuitBreaker.STATES.HALF_OPEN:
+        this.successCount = 0;
+        this._emit("halfOpen", { previousState });
+        break;
+
+      case CircuitBreaker.STATES.CLOSED:
+        this.failureCount = 0;
+        this.successCount = 0;
+        this.nextAttemptTime = null;
+        this._emit("close", { previousState });
+        break;
+    }
+
+    console.log(
+      `[CircuitBreaker] State transition: ${previousState} -> ${newState}`
+    );
+  }
+
+  _startMonitoring() {
+    this._monitorTimer = setInterval(() => {
+      if (
+        this.state === CircuitBreaker.STATES.OPEN &&
+        Date.now() >= this.nextAttemptTime
+      ) {
+        this._transitionTo(CircuitBreaker.STATES.HALF_OPEN);
+      }
+    }, this.monitorInterval);
+
+    if (this._monitorTimer.unref) {
+      this._monitorTimer.unref();
+    }
+  }
+
+  on(event, listener) {
+    if (this.listeners[event]) {
+      this.listeners[event].push(listener);
+    }
+    return this;
+  }
+
+  off(event, listener) {
+    if (this.listeners[event]) {
+      this.listeners[event] = this.listeners[event].filter(
+        (l) => l !== listener
+      );
+    }
+    return this;
+  }
+
+  _emit(event, data) {
+    if (this.listeners[event]) {
+      this.listeners[event].forEach((listener) => {
+        try {
+          listener(data);
+        } catch (error) {
+          console.error(`[CircuitBreaker] Error in ${event} listener:`, error);
+        }
+      });
+    }
+  }
+
+  getStats() {
+    return {
+      ...this.stats,
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime,
+      nextAttemptTime: this.nextAttemptTime,
+    };
+  }
+
+  reset() {
+    this._transitionTo(CircuitBreaker.STATES.CLOSED);
+    this.stats = {
+      totalRequests: 0,
+      successfulRequests: 0,
+      failedRequests: 0,
+      rejectedRequests: 0,
+      lastStateChange: new Date(),
+    };
+  }
+
+  destroy() {
+    if (this._monitorTimer) {
+      clearInterval(this._monitorTimer);
+    }
+  }
+
+  isOpen() {
+    return this.state === CircuitBreaker.STATES.OPEN;
+  }
+
+  isClosed() {
+    return this.state === CircuitBreaker.STATES.CLOSED;
+  }
+
+  isHalfOpen() {
+    return this.state === CircuitBreaker.STATES.HALF_OPEN;
+  }
+}
+
+class CircuitBreakerOpenError extends Error {
+  constructor(circuitBreaker) {
+    super(
+      `Circuit breaker is OPEN. Next attempt at: ${new Date(circuitBreaker.nextAttemptTime).toISOString()}`
+    );
+    this.name = "CircuitBreakerOpenError";
+    this.nextAttemptTime = circuitBreaker.nextAttemptTime;
+    this.stats = circuitBreaker.getStats();
+  }
+}
+
+class CircuitBreakerTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CircuitBreakerTimeoutError";
+  }
+}
+
+class ApiService {
+  constructor(baseUrl, circuitBreakerOptions = {}) {
+    this.baseUrl = baseUrl;
+    this.circuitBreaker = new CircuitBreaker(circuitBreakerOptions);
+    this._setupListeners();
+  }
+
+  _setupListeners() {
+    this.circuitBreaker
+      .on("open", ({ failureCount, nextAttemptTime }) => {
+        console.warn(
+          `[ApiService] Circuit breaker opened after ${failureCount} failures. ` +
+            `Next attempt: ${new Date(nextAttemptTime).toISOString()}`
+        );
+        this._showUserNotification(
+          "Backend service is currently unavailable. Please try again later.",
+          "error"
+        );
+      })
+      .on("halfOpen", () => {
+        console.info("[ApiService] Circuit breaker is testing the connection...");
+      })
+      .on("close", () => {
+        console.info("[ApiService] Circuit breaker closed. Service is back online.");
+        this._showUserNotification("Service is back online!", "success");
+      })
+      .on("reject", ({ nextAttemptTime }) => {
+        console.warn(
+          `[ApiService] Request rejected. Circuit is open until: ${new Date(nextAttemptTime).toISOString()}`
+        );
+      });
+  }
+
+  _showUserNotification(message, type) {
+    console.log(`[Notification - ${type.toUpperCase()}]: ${message}`);
+  }
+
+  async get(endpoint, options = {}) {
+    return this.circuitBreaker.execute(
+      () => this._fetch("GET", endpoint, null, options),
+      options.fallback || null
+    );
+  }
+
+  async post(endpoint, data, options = {}) {
+    return this.circuitBreaker.execute(
+      () => this._fetch("POST", endpoint, data, options),
+      options.fallback || null
+    );
+  }
+
+  async put(endpoint, data, options = {}) {
+    return this.circuitBreaker.execute(
+      () => this._fetch("PUT", endpoint, data, options),
+      options.fallback || null
+    );
+  }
+
+  async delete(endpoint, options = {}) {
+    return this.circuitBreaker.execute(
+      () => this._fetch("DELETE", endpoint, null, options),
+      options.fallback || null
+    );
+  }
+
+  async _fetch(method, endpoint, data, options = {}) {
+    const url = `${this.baseUrl}${endpoint}`;
+    const config = {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+        ...options.headers,
+      },
+    };
+
+    if (data) {
+      config.body = JSON.stringify(data);
+    }
+
+    const response = await fetch(url, config);
+
+    if (!response.ok) {
+      const error = new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+      error.status = response.status;
+      error.response = response;
+
+      if (response.status >= 500) {
+        throw error;
+      }
+
+      if (response.status === 429) {
+        throw error;
+      }
+
+      return response;
+    }
+
+    return response.json();
+  }
+
+  getCircuitBreakerStats() {
+    return this.circuitBreaker.getStats();
+  }
+
+  destroy() {
+    this.circuitBreaker.destroy();
+  }
+}
+
+async function demonstrateCircuitBreaker() {
+  console.log("=== Circuit Breaker Demonstration ===\n");
+
+  const circuitBreaker = new CircuitBreaker({
+    failureThreshold: 3,
+    successThreshold: 2,
+    timeout: 5000,
+    requestTimeout: 2000,
+    monitorInterval: 1000,
+  });
+
+  circuitBreaker
+    .on("open", (data) =>
+      console.log("\n🔴 Circuit OPENED:", JSON.stringify(data, null, 2))
+    )
+    .on("halfOpen", (data) =>
+      console.log("\n🟡 Circuit HALF-OPEN:", JSON.stringify(data, null, 2))
+    )
+    .on("close", (data) =>
+      console.log("\n🟢 Circuit CLOSED:", JSON.stringify(data, null, 2))
+    )
+    .on("failure", (data) =>
+      console.log(`\n❌ Failure #${data.failureCount}: ${data.error.message}`)
+    )
+    .on("success", () => console.log("\n✅ Request succeeded"))
+    .on("reject", (data) =>
+      console.log(
+        `\n🚫 Request rejected - Circuit is OPEN until ${new Date(data.nextAttemptTime).toISOString()}`
+      )
+    );
+
+  let requestCount = 0;
+
+  const mockFailingRequest = () => {
+    requestCount++;
+    return new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Backend unavailable")), 100);
+    });
+  };
+
+  const mockSuccessRequest = () => {
+    requestCount++;
+    return new Promise((resolve) => {
+      setTimeout(() => resolve({ data: "success", requestCount }), 100);
+    });
+  };
+
+  console.log("--- Phase 1: Sending failing requests ---");
+  for (let i = 0; i < 5; i++) {
+    try {
+      await circuitBreaker.execute(mockFailingRequest);
+    } catch (error) {
+      console.log(`Request ${i + 1} error: ${error.name} - ${error.message}`);
+    }
+    await sleep(200);
+  }
+
+  console.log("\n--- Phase 2: Circuit is OPEN - requests will be rejected ---");
+  for (let i = 0; i < 3; i++) {
+    try {
+      await circuitBreaker.execute(mockFailingRequest);
+    } catch (error) {
+      console.log(`Request ${i + 1} error: ${error.name}`);
+    }
+    await sleep(200);
+  }
+
+  console.log("\n--- Phase 3: Using fallback function ---");
+  const result = await circuitBreaker.execute(
+    mockFailingRequest,
+    async (error) => {
+      console.log(`Fallback triggered due to: ${error.name}`);
+      return { data: "cached data", fromCache: true };
+    }
+  );
+  console.log("Fallback result:", result);
+
+  console.log("\n--- Phase 4: Waiting for circuit to transition to HALF-OPEN ---");
+  await sleep(6000);
+
+  console.log("\n--- Phase 5: Sending successful requests to close circuit ---");
+  for (let i = 0; i < 3; i++) {
+    try {
+      const response = await circuitBreaker.execute(mockSuccessRequest);
+      console.log(`Request ${i + 1} succeeded:`, response);
+    } catch (error) {
+      console.log(`Request ${i + 1} error: ${error.name}`);
+    }
+    await sleep(200);
+  }
+
+  console.log("\n--- Final Stats ---");
+  console.log(JSON.stringify(circuitBreaker.getStats(), null, 2));
+
+  circuitBreaker.destroy();
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const apiService = new ApiService("https://api.example.com", {
+  failureThreshold: 5,
+  successThreshold: 2,
+  timeout: 30000,
+  requestTimeout: 10000,
+});
+
+demonstrateCircuitBreaker().catch(console.error);
+
+export {
+  CircuitBreaker,
+  CircuitBreakerOpenError,
+  CircuitBreakerTimeoutError,
+  ApiService,
+};
+```

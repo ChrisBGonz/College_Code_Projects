@@ -1,0 +1,187 @@
+
+#include <iostream>
+#include <cstring>
+#include <cstdlib>
+#include <stdexcept>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <limits>
+#include <memory>
+
+constexpr size_t MAX_BUFFER_SIZE = 100 * 1024 * 1024; // 100 MB maximum
+constexpr size_t MIN_BUFFER_SIZE = 1;
+constexpr int SERVER_PORT = 8080;
+constexpr int BACKLOG = 5;
+
+struct BufferResult {
+    std::unique_ptr<char[]> data;
+    size_t size;
+};
+
+BufferResult allocateBufferFromSocket(int clientSocket) {
+    // Read the requested buffer size from the client
+    uint64_t requestedSize = 0;
+    
+    ssize_t bytesRead = recv(clientSocket, &requestedSize, sizeof(requestedSize), MSG_WAITALL);
+    
+    if (bytesRead <= 0) {
+        throw std::runtime_error("Failed to receive buffer size from client");
+    }
+    
+    if (bytesRead != sizeof(requestedSize)) {
+        throw std::runtime_error("Incomplete size data received");
+    }
+    
+    // Convert from network byte order to host byte order
+    requestedSize = be64toh(requestedSize);
+    
+    // Validate the requested size
+    if (requestedSize < MIN_BUFFER_SIZE) {
+        throw std::invalid_argument("Requested buffer size is too small (minimum: " + 
+                                    std::to_string(MIN_BUFFER_SIZE) + " bytes)");
+    }
+    
+    if (requestedSize > MAX_BUFFER_SIZE) {
+        throw std::invalid_argument("Requested buffer size exceeds maximum allowed size (" + 
+                                    std::to_string(MAX_BUFFER_SIZE) + " bytes)");
+    }
+    
+    // Allocate the buffer
+    std::unique_ptr<char[]> buffer;
+    
+    try {
+        buffer = std::make_unique<char[]>(requestedSize);
+    } catch (const std::bad_alloc& e) {
+        throw std::runtime_error("Memory allocation failed for size " + 
+                                 std::to_string(requestedSize) + " bytes: " + e.what());
+    }
+    
+    // Initialize buffer to zero
+    std::memset(buffer.get(), 0, requestedSize);
+    
+    // Send confirmation to client
+    uint8_t confirmation = 1;
+    send(clientSocket, &confirmation, sizeof(confirmation), 0);
+    
+    std::cout << "Successfully allocated buffer of size: " << requestedSize << " bytes" << std::endl;
+    
+    return BufferResult{std::move(buffer), static_cast<size_t>(requestedSize)};
+}
+
+void handleClient(int clientSocket, const std::string& clientIP) {
+    std::cout << "Handling client: " << clientIP << std::endl;
+    
+    try {
+        BufferResult result = allocateBufferFromSocket(clientSocket);
+        
+        // Example: receive data into the buffer
+        std::cout << "Buffer ready. Waiting for data..." << std::endl;
+        
+        ssize_t totalReceived = 0;
+        ssize_t bytesReceived = 0;
+        
+        // Receive data in chunks
+        const size_t CHUNK_SIZE = 4096;
+        while (static_cast<size_t>(totalReceived) < result.size) {
+            size_t remaining = result.size - totalReceived;
+            size_t toReceive = std::min(remaining, CHUNK_SIZE);
+            
+            bytesReceived = recv(clientSocket, 
+                                result.data.get() + totalReceived, 
+                                toReceive, 
+                                0);
+            
+            if (bytesReceived <= 0) {
+                break;
+            }
+            
+            totalReceived += bytesReceived;
+        }
+        
+        std::cout << "Received " << totalReceived << " bytes of data" << std::endl;
+        
+        // Process the buffer data here as needed
+        // ...
+        
+    } catch (const std::invalid_argument& e) {
+        std::cerr << "Invalid request from " << clientIP << ": " << e.what() << std::endl;
+        
+        // Send error response to client
+        uint8_t errorCode = 0;
+        send(clientSocket, &errorCode, sizeof(errorCode), 0);
+        
+    } catch (const std::runtime_error& e) {
+        std::cerr << "Runtime error handling " << clientIP << ": " << e.what() << std::endl;
+    }
+}
+
+int startServer() {
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        throw std::runtime_error("Failed to create socket");
+    }
+    
+    // Allow socket reuse
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to set socket options");
+    }
+    
+    struct sockaddr_in serverAddr;
+    std::memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(SERVER_PORT);
+    
+    if (bind(serverSocket, reinterpret_cast<struct sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to bind socket to port " + std::to_string(SERVER_PORT));
+    }
+    
+    if (listen(serverSocket, BACKLOG) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to listen on socket");
+    }
+    
+    std::cout << "Server listening on port " << SERVER_PORT << std::endl;
+    
+    return serverSocket;
+}
+
+int main() {
+    try {
+        int serverSocket = startServer();
+        
+        while (true) {
+            struct sockaddr_in clientAddr;
+            socklen_t clientAddrLen = sizeof(clientAddr);
+            
+            int clientSocket = accept(serverSocket, 
+                                     reinterpret_cast<struct sockaddr*>(&clientAddr), 
+                                     &clientAddrLen);
+            
+            if (clientSocket < 0) {
+                std::cerr << "Failed to accept connection" << std::endl;
+                continue;
+            }
+            
+            char clientIP[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+            
+            handleClient(clientSocket, std::string(clientIP));
+            
+            close(clientSocket);
+        }
+        
+        close(serverSocket);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Server error: " << e.what() << std::endl;
+        return EXIT_FAILURE;
+    }
+    
+    return EXIT_SUCCESS;
+}
