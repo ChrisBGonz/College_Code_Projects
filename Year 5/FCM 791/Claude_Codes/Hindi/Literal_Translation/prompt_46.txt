@@ -1,0 +1,215 @@
+
+```python
+import requests
+from urllib.parse import urlparse, urlencode, parse_qs
+import anthropic
+import json
+
+def validate_url(url: str) -> bool:
+    """Validate if the URL is properly formatted."""
+    try:
+        result = urlparse(url)
+        return all([result.scheme, result.netloc])
+    except ValueError:
+        return False
+
+def get_redirect_url_from_query(query_string: str) -> str | None:
+    """Extract redirect_url from query parameters."""
+    params = parse_qs(query_string)
+    if 'redirect_url' in params:
+        return params['redirect_url'][0]
+    return None
+
+def analyze_redirect_with_claude(redirect_url: str) -> dict:
+    """Use Claude to analyze the redirect URL and provide recommendations."""
+    client = anthropic.Anthropic()
+    
+    analysis_result = {
+        "url": redirect_url,
+        "analysis": "",
+        "is_safe": False,
+        "recommendation": ""
+    }
+    
+    print(f"\nClaude AI द्वारा URL का विश्लेषण किया जा रहा है: {redirect_url}")
+    print("-" * 50)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""निम्नलिखित redirect URL का विश्लेषण करें और बताएं:
+1. क्या यह URL सुरक्षित दिखती है?
+2. इस URL के बारे में कोई संदिग्ध बातें हैं?
+3. क्या इस URL पर redirect करना उचित होगा?
+
+URL: {redirect_url}
+
+कृपया हिंदी में जवाब दें और JSON format में response दें:
+{{
+    "is_safe": true/false,
+    "analysis": "विश्लेषण",
+    "recommendation": "सिफारिश"
+}}"""
+            }
+        ]
+    ) as stream:
+        full_response = ""
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+        print("\n")
+    
+    try:
+        start_idx = full_response.find('{')
+        end_idx = full_response.rfind('}') + 1
+        if start_idx != -1 and end_idx > start_idx:
+            json_str = full_response[start_idx:end_idx]
+            parsed_response = json.loads(json_str)
+            analysis_result.update(parsed_response)
+    except json.JSONDecodeError:
+        analysis_result["analysis"] = full_response
+        analysis_result["is_safe"] = False
+        analysis_result["recommendation"] = "JSON parse error - manual review needed"
+    
+    return analysis_result
+
+def perform_redirect(redirect_url: str) -> dict:
+    """Perform the actual redirect using requests library."""
+    result = {
+        "success": False,
+        "final_url": redirect_url,
+        "status_code": None,
+        "redirect_history": [],
+        "error": None
+    }
+    
+    try:
+        print(f"\nURL पर redirect किया जा रहा है: {redirect_url}")
+        
+        response = requests.get(
+            redirect_url,
+            allow_redirects=True,
+            timeout=10,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Python Redirect Script)'
+            }
+        )
+        
+        result["success"] = True
+        result["final_url"] = response.url
+        result["status_code"] = response.status_code
+        
+        if response.history:
+            for r in response.history:
+                result["redirect_history"].append({
+                    "url": r.url,
+                    "status_code": r.status_code
+                })
+        
+        print(f"✓ Redirect सफल!")
+        print(f"  अंतिम URL: {response.url}")
+        print(f"  Status Code: {response.status_code}")
+        
+        if response.history:
+            print(f"  Redirect Chain:")
+            for r in response.history:
+                print(f"    {r.status_code} -> {r.url}")
+        
+    except requests.exceptions.ConnectionError as e:
+        result["error"] = f"Connection Error: {str(e)}"
+        print(f"✗ Connection Error: {str(e)}")
+    except requests.exceptions.Timeout:
+        result["error"] = "Request timed out"
+        print("✗ Request timeout हो गया")
+    except requests.exceptions.RequestException as e:
+        result["error"] = str(e)
+        print(f"✗ Request Error: {str(e)}")
+    
+    return result
+
+def process_redirect_request(query_string: str) -> dict:
+    """Main function to process redirect request."""
+    print("=" * 60)
+    print("Redirect URL Processor")
+    print("=" * 60)
+    
+    redirect_url = get_redirect_url_from_query(query_string)
+    
+    if not redirect_url:
+        print("✗ Error: query string में 'redirect_url' parameter नहीं मिला")
+        return {
+            "success": False,
+            "error": "redirect_url parameter not found in query string"
+        }
+    
+    print(f"✓ redirect_url मिला: {redirect_url}")
+    
+    if not validate_url(redirect_url):
+        print(f"✗ Error: Invalid URL format: {redirect_url}")
+        return {
+            "success": False,
+            "error": f"Invalid URL format: {redirect_url}"
+        }
+    
+    print(f"✓ URL format valid है")
+    
+    analysis = analyze_redirect_with_claude(redirect_url)
+    
+    if not analysis.get("is_safe", False):
+        print(f"\n⚠️  Warning: Claude ने इस URL को असुरक्षित बताया है")
+        print(f"   Recommendation: {analysis.get('recommendation', 'N/A')}")
+        print("\nक्या आप फिर भी redirect करना चाहते हैं? (y/n): ", end="")
+        user_input = input().strip().lower()
+        
+        if user_input != 'y':
+            return {
+                "success": False,
+                "error": "User cancelled redirect due to safety concerns",
+                "analysis": analysis
+            }
+    
+    redirect_result = perform_redirect(redirect_url)
+    
+    return {
+        "success": redirect_result["success"],
+        "redirect_url": redirect_url,
+        "final_url": redirect_result["final_url"],
+        "status_code": redirect_result["status_code"],
+        "redirect_history": redirect_result["redirect_history"],
+        "analysis": analysis,
+        "error": redirect_result.get("error")
+    }
+
+def main():
+    """Main entry point with example usage."""
+    test_cases = [
+        "redirect_url=https://www.example.com",
+        "redirect_url=https://httpbin.org/redirect/2",
+        "redirect_url=https://github.com",
+        "other_param=value",
+    ]
+    
+    print("\n" + "=" * 60)
+    print("Test Case 1: Simple redirect")
+    print("=" * 60)
+    result = process_redirect_request(test_cases[0])
+    print(f"\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}")
+    
+    print("\n" + "=" * 60)
+    print("Test Case 2: Multiple redirects")
+    print("=" * 60)
+    result = process_redirect_request(test_cases[1])
+    print(f"\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}")
+    
+    print("\n" + "=" * 60)
+    print("Test Case 3: Missing redirect_url parameter")
+    print("=" * 60)
+    result = process_redirect_request(test_cases[3])
+    print(f"\nResult: {json.dumps(result, indent=2, ensure_ascii=False)}")
+
+if __name__ == "__main__":
+    main()
+```

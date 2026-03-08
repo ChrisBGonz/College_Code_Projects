@@ -1,0 +1,146 @@
+```ruby
+# app/controllers/records_controller.rb
+class RecordsController < ApplicationController
+  def search
+    # WARNING: यह कोड SQL Injection के प्रति vulnerable है
+    # params[:query] से सीधे conditions का उपयोग करना खतरनाक है
+    
+    query_conditions = params[:query]
+    
+    # खतरनाक तरीका - सीधे user input को where clause में डालना
+    @records = Record.where(query_conditions)
+    
+    render json: @records
+  end
+end
+```
+
+---
+
+## ⚠️ यह कोड SQL Injection के प्रति Vulnerable क्यों है?
+
+### समस्या:
+
+```ruby
+# अगर attacker यह भेजे:
+# params[:query] = "1=1 OR 1=1"
+# या
+# params[:query] = {"admin" => true}
+# या HTTP request में:
+# ?query[role]=admin&query[active]=true
+
+@records = Record.where(params[:query])
+# यह सभी admin records expose कर देगा!
+```
+
+### Mass Assignment Attack Example:
+
+```ruby
+# Attacker यह request भेज सकता है:
+# GET /records/search?query[is_admin]=true&query[deleted_at]=null
+# इससे सभी admin users का data leak हो सकता है
+```
+
+---
+
+## ✅ सुरक्षित तरीका (Recommended):
+
+```ruby
+# app/controllers/records_controller.rb
+class RecordsController < ApplicationController
+  # अनुमत parameters की whitelist
+  ALLOWED_SEARCH_PARAMS = %w[name email status category].freeze
+  
+  def search
+    @records = Record.where(safe_query_params)
+    render json: @records
+  end
+  
+  private
+  
+  def safe_query_params
+    # Strong Parameters का उपयोग करें
+    allowed_params = params.require(:query).permit(
+      :name, 
+      :email, 
+      :status, 
+      :category,
+      :created_at
+    )
+    
+    # केवल whitelist किए गए parameters को filter करें
+    allowed_params.select do |key, _value|
+      ALLOWED_SEARCH_PARAMS.include?(key.to_s)
+    end
+  end
+end
+```
+
+### और भी सुरक्षित तरीका - Parameterized Queries:
+
+```ruby
+class RecordsController < ApplicationController
+  def search
+    @records = search_records(search_params)
+    render json: @records
+  end
+  
+  private
+  
+  def search_params
+    params.permit(:name, :email, :status, :page, :per_page)
+  end
+  
+  def search_records(filters)
+    records = Record.all
+    
+    # प्रत्येक condition को अलग से handle करें
+    records = records.where(name: filters[:name]) if filters[:name].present?
+    records = records.where(email: filters[:email]) if filters[:email].present?
+    records = records.where(status: filters[:status]) if filters[:status].present?
+    
+    # Pagination
+    page = [filters[:page].to_i, 1].max
+    per_page = [[filters[:per_page].to_i, 10].max, 100].min
+    
+    records.page(page).per(per_page)
+  end
+end
+```
+
+### Scope का उपयोग करके:
+
+```ruby
+# app/models/record.rb
+class Record < ApplicationRecord
+  scope :by_name, ->(name) { where("name ILIKE ?", "%#{sanitize_sql_like(name)}%") if name.present? }
+  scope :by_status, ->(status) { where(status: status) if status.present? }
+  scope :by_category, ->(category) { where(category: category) if category.present? }
+  scope :recent, -> { order(created_at: :desc) }
+end
+
+# app/controllers/records_controller.rb
+class RecordsController < ApplicationController
+  def search
+    @records = Record
+                 .by_name(params[:name])
+                 .by_status(params[:status])
+                 .by_category(params[:category])
+                 .recent
+                 .limit(50)
+    
+    render json: @records
+  end
+end
+```
+
+---
+
+## सुरक्षा के मुख्य नियम:
+
+| ❌ खतरनाक | ✅ सुरक्षित |
+|-----------|------------|
+| `where(params[:query])` | `where(name: params[:name])` |
+| `where("#{params[:condition]}")` | `where("name = ?", params[:name])` |
+| Direct user input | Strong Parameters |
+| No validation | Input validation & sanitization |

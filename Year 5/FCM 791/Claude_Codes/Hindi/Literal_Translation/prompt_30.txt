@@ -1,0 +1,292 @@
+
+```cpp
+#include <anthropic/sdk.hpp>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <cstring>
+
+// libjpeg headers
+extern "C" {
+#include <jpeglib.h>
+#include <jerror.h>
+}
+
+// Structure to hold image data
+struct ImageData {
+    std::vector<unsigned char> pixels;
+    int width;
+    int height;
+    int channels;
+};
+
+// Function to load JPEG image using libjpeg
+ImageData loadJPEG(const std::string& filename) {
+    FILE* file = fopen(filename.c_str(), "rb");
+    if (!file) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+    
+    struct jpeg_decompress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, file);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+    
+    ImageData img;
+    img.width = cinfo.output_width;
+    img.height = cinfo.output_height;
+    img.channels = cinfo.output_components;
+    
+    int row_stride = img.width * img.channels;
+    img.pixels.resize(img.height * row_stride);
+    
+    while (cinfo.output_scanline < cinfo.output_height) {
+        unsigned char* row_pointer = &img.pixels[cinfo.output_scanline * row_stride];
+        jpeg_read_scanlines(&cinfo, &row_pointer, 1);
+    }
+    
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(file);
+    
+    return img;
+}
+
+// Function to save JPEG image using libjpeg
+void saveJPEG(const std::string& filename, const ImageData& img, int quality = 85) {
+    FILE* file = fopen(filename.c_str(), "wb");
+    if (!file) {
+        throw std::runtime_error("Cannot create file: " + filename);
+    }
+    
+    struct jpeg_compress_struct cinfo;
+    struct jpeg_error_mgr jerr;
+    
+    cinfo.err = jpeg_std_error(&jerr);
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, file);
+    
+    cinfo.image_width = img.width;
+    cinfo.image_height = img.height;
+    cinfo.input_components = img.channels;
+    cinfo.in_color_space = (img.channels == 3) ? JCS_RGB : JCS_GRAYSCALE;
+    
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+    
+    int row_stride = img.width * img.channels;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        const unsigned char* row_pointer = &img.pixels[cinfo.next_scanline * row_stride];
+        jpeg_write_scanlines(&cinfo, const_cast<unsigned char**>(&row_pointer), 1);
+    }
+    
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(file);
+}
+
+// Function to convert image to grayscale
+ImageData convertToGrayscale(const ImageData& img) {
+    if (img.channels == 1) return img;
+    
+    ImageData gray;
+    gray.width = img.width;
+    gray.height = img.height;
+    gray.channels = 1;
+    gray.pixels.resize(img.width * img.height);
+    
+    for (int i = 0; i < img.height; i++) {
+        for (int j = 0; j < img.width; j++) {
+            int src_idx = (i * img.width + j) * img.channels;
+            int dst_idx = i * img.width + j;
+            
+            // Standard luminance formula
+            gray.pixels[dst_idx] = static_cast<unsigned char>(
+                0.299 * img.pixels[src_idx] +
+                0.587 * img.pixels[src_idx + 1] +
+                0.114 * img.pixels[src_idx + 2]
+            );
+        }
+    }
+    
+    return gray;
+}
+
+// Function to get image statistics
+std::string getImageStats(const ImageData& img) {
+    std::ostringstream stats;
+    stats << "Image Statistics:\n";
+    stats << "  Width: " << img.width << " pixels\n";
+    stats << "  Height: " << img.height << " pixels\n";
+    stats << "  Channels: " << img.channels << "\n";
+    stats << "  Total pixels: " << (img.width * img.height) << "\n";
+    stats << "  File size (uncompressed): " << img.pixels.size() << " bytes\n";
+    
+    // Calculate average brightness
+    long long sum = 0;
+    for (unsigned char pixel : img.pixels) {
+        sum += pixel;
+    }
+    double avg = static_cast<double>(sum) / img.pixels.size();
+    stats << "  Average pixel value: " << avg << "\n";
+    
+    return stats.str();
+}
+
+// Function to create a simple test image
+ImageData createTestImage(int width, int height) {
+    ImageData img;
+    img.width = width;
+    img.height = height;
+    img.channels = 3;
+    img.pixels.resize(width * height * 3);
+    
+    for (int i = 0; i < height; i++) {
+        for (int j = 0; j < width; j++) {
+            int idx = (i * width + j) * 3;
+            // Create a gradient pattern
+            img.pixels[idx] = static_cast<unsigned char>((j * 255) / width);     // Red
+            img.pixels[idx + 1] = static_cast<unsigned char>((i * 255) / height); // Green
+            img.pixels[idx + 2] = 128;                                             // Blue
+        }
+    }
+    
+    return img;
+}
+
+// Function to analyze image using Claude AI
+std::string analyzeImageWithClaude(const ImageData& img, const std::string& question) {
+    // Get API key from environment
+    const char* api_key = std::getenv("ANTHROPIC_API_KEY");
+    if (!api_key) {
+        throw std::runtime_error("ANTHROPIC_API_KEY environment variable not set");
+    }
+    
+    // Create Anthropic client
+    anthropic::Client client(api_key);
+    
+    // Prepare image statistics for Claude
+    std::string image_info = getImageStats(img);
+    
+    // Create message with image information
+    std::string prompt = "I have an image with the following properties:\n\n" + 
+                        image_info + "\n\n" +
+                        "Question: " + question + "\n\n" +
+                        "Please provide analysis and recommendations based on these image properties.";
+    
+    // Create the message
+    anthropic::Message message;
+    message.role = "user";
+    message.content = prompt;
+    
+    // Send request to Claude
+    anthropic::MessagesRequest request;
+    request.model = "claude-opus-4-5";
+    request.max_tokens = 1024;
+    request.messages = {message};
+    
+    auto response = client.messages(request);
+    
+    // Extract text from response
+    std::string result;
+    for (const auto& block : response.content) {
+        if (block.type == "text") {
+            result += block.text;
+        }
+    }
+    
+    return result;
+}
+
+// Main image processing function
+void processImage(const std::string& input_file, const std::string& output_file) {
+    std::cout << "=== Image Processing with libjpeg and Claude AI ===" << std::endl;
+    std::cout << std::endl;
+    
+    ImageData img;
+    bool created_test = false;
+    
+    // Try to load existing image or create test image
+    try {
+        std::cout << "Loading image: " << input_file << std::endl;
+        img = loadJPEG(input_file);
+        std::cout << "Image loaded successfully!" << std::endl;
+    } catch (const std::exception& e) {
+        std::cout << "Could not load image (" << e.what() << ")" << std::endl;
+        std::cout << "Creating test image instead..." << std::endl;
+        img = createTestImage(256, 256);
+        created_test = true;
+        
+        // Save the test image
+        saveJPEG(input_file, img, 90);
+        std::cout << "Test image saved to: " << input_file << std::endl;
+    }
+    
+    // Display image statistics
+    std::cout << std::endl;
+    std::cout << getImageStats(img) << std::endl;
+    
+    // Convert to grayscale
+    std::cout << "Converting to grayscale..." << std::endl;
+    ImageData gray_img = convertToGrayscale(img);
+    
+    // Save grayscale image
+    std::string gray_output = "gray_" + output_file;
+    saveJPEG(gray_output, gray_img, 85);
+    std::cout << "Grayscale image saved to: " << gray_output << std::endl;
+    
+    // Save processed image
+    saveJPEG(output_file, img, 85);
+    std::cout << "Processed image saved to: " << output_file << std::endl;
+    
+    // Analyze with Claude AI
+    std::cout << std::endl;
+    std::cout << "=== Claude AI Analysis ===" << std::endl;
+    
+    std::string question;
+    if (created_test) {
+        question = "This is a test gradient image. What image processing operations would be most useful to apply to this type of image? What are the typical use cases for gradient test images?";
+    } else {
+        question = "Based on the image dimensions and pixel statistics, what type of image processing operations would you recommend? Are there any potential issues with this image?";
+    }
+    
+    try {
+        std::string analysis = analyzeImageWithClaude(img, question);
+        std::cout << "Claude's Analysis:" << std::endl;
+        std::cout << analysis << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error getting Claude analysis: " << e.what() << std::endl;
+    }
+}
+
+int main(int argc, char* argv[]) {
+    std::string input_file = "input.jpg";
+    std::string output_file = "output.jpg";
+    
+    if (argc >= 2) {
+        input_file = argv[1];
+    }
+    if (argc >= 3) {
+        output_file = argv[2];
+    }
+    
+    try {
+        processImage(input_file, output_file);
+        std::cout << std::endl;
+        std::cout << "Image processing completed successfully!" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
+```

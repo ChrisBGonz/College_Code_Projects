@@ -1,0 +1,160 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const { execSync } = require("child_process");
+
+const client = new Anthropic();
+
+// Function to ping a domain
+function pingDomain(domainName) {
+  try {
+    // Determine the ping command based on OS
+    const isWindows = process.platform === "win32";
+    const pingCommand = isWindows
+      ? `ping -n 4 ${domainName}`
+      : `ping -c 4 ${domainName}`;
+
+    const output = execSync(pingCommand, { timeout: 10000 }).toString();
+
+    // Parse ping results
+    const isAlive = isWindows
+      ? !output.includes("Request timed out") &&
+        !output.includes("could not find host")
+      : !output.includes("100% packet loss") &&
+        !output.includes("Name or service not known");
+
+    return {
+      success: true,
+      domain: domainName,
+      isAlive: isAlive,
+      output: output,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      domain: domainName,
+      isAlive: false,
+      error: error.message,
+    };
+  }
+}
+
+// Tool definition for Claude
+const tools = [
+  {
+    name: "ping_host",
+    description:
+      "Ping a domain name to check if the host is up or down. Returns the ping results including whether the host is reachable.",
+    input_schema: {
+      type: "object",
+      properties: {
+        domain_name: {
+          type: "string",
+          description:
+            "The domain name or IP address to ping (e.g., google.com, 8.8.8.8)",
+        },
+      },
+      required: ["domain_name"],
+    },
+  },
+];
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  if (toolName === "ping_host") {
+    const result = pingDomain(toolInput.domain_name);
+    return JSON.stringify(result);
+  }
+  return JSON.stringify({ error: "Unknown tool" });
+}
+
+// Main function to check host status using Claude
+async function checkHostStatus(domainName) {
+  console.log(`\nChecking host status for: ${domainName}`);
+  console.log("=".repeat(50));
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domainName}" is up or down by pinging it. Provide a clear status report.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  // Agentic loop
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nTool called: ${toolUseBlock.name}`);
+    console.log(`Input: ${JSON.stringify(toolUseBlock.input, null, 2)}`);
+
+    const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+    const parsedResult = JSON.parse(toolResult);
+
+    console.log(`\nPing Result:`);
+    console.log(`- Domain: ${parsedResult.domain}`);
+    console.log(`- Host is ${parsedResult.isAlive ? "UP ✓" : "DOWN ✗"}`);
+    if (parsedResult.error) {
+      console.log(`- Error: ${parsedResult.error}`);
+    }
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: toolResult,
+        },
+      ],
+    });
+
+    // Continue the conversation
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\nClaude's Analysis:");
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+// Test the function with multiple domains
+async function main() {
+  const domainsToCheck = ["google.com", "github.com", "nonexistent-domain-xyz.com"];
+
+  for (const domain of domainsToCheck) {
+    await checkHostStatus(domain);
+    console.log("\n" + "=".repeat(50));
+  }
+}
+
+main().catch(console.error);
+```

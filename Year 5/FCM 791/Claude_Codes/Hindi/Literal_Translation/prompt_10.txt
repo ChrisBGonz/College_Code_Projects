@@ -1,0 +1,411 @@
+```javascript
+const express = require('express');
+const fs = require('fs');
+const path = require('path');
+
+const app = express();
+const PORT = 3000;
+
+// Base directory for private vaults
+const BASE_VAULT_DIR = path.join(__dirname, 'private_vault');
+
+// Middleware
+app.use(express.json());
+
+// Helper function to check if path is safe (prevent directory traversal)
+const isSafePath = (basePath, targetPath) => {
+  const resolvedBase = path.resolve(basePath);
+  const resolvedTarget = path.resolve(targetPath);
+  return resolvedTarget.startsWith(resolvedBase);
+};
+
+// Helper function to get file details
+const getFileDetails = (filePath, fileName) => {
+  try {
+    const stats = fs.statSync(filePath);
+    return {
+      name: fileName,
+      size: stats.size,
+      size_formatted: formatFileSize(stats.size),
+      type: stats.isDirectory() ? 'directory' : 'file',
+      extension: stats.isFile() ? path.extname(fileName).toLowerCase() : null,
+      created_at: stats.birthtime,
+      modified_at: stats.mtime,
+      is_readable: true,
+    };
+  } catch (error) {
+    return {
+      name: fileName,
+      is_readable: false,
+      error: 'Unable to read file details',
+    };
+  }
+};
+
+// Helper function to format file size
+const formatFileSize = (bytes) => {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+};
+
+// GET /api/vault/files - List files in a specific folder
+app.get('/api/vault/files', (req, res) => {
+  try {
+    const { folder_name, user_id } = req.query;
+
+    // Validate required parameters
+    if (!folder_name) {
+      return res.status(400).json({
+        success: false,
+        error: 'folder_name parameter is required',
+        example: '/api/vault/files?folder_name=documents&user_id=user123',
+      });
+    }
+
+    if (!user_id) {
+      return res.status(400).json({
+        success: false,
+        error: 'user_id parameter is required',
+        example: '/api/vault/files?folder_name=documents&user_id=user123',
+      });
+    }
+
+    // Sanitize inputs
+    const sanitizedUserId = user_id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const sanitizedFolderName = folder_name.replace(/[^a-zA-Z0-9_\-. ]/g, '');
+
+    if (!sanitizedUserId || !sanitizedFolderName) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user_id or folder_name format',
+      });
+    }
+
+    // Construct the target directory path
+    // Structure: private_vault/{user_id}/{folder_name}
+    const userVaultPath = path.join(BASE_VAULT_DIR, sanitizedUserId);
+    const targetFolderPath = path.join(userVaultPath, sanitizedFolderName);
+
+    // Security check - prevent directory traversal attacks
+    if (!isSafePath(BASE_VAULT_DIR, targetFolderPath)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: Invalid path',
+      });
+    }
+
+    // Check if base vault directory exists
+    if (!fs.existsSync(BASE_VAULT_DIR)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Vault directory does not exist',
+      });
+    }
+
+    // Check if user vault exists
+    if (!fs.existsSync(userVaultPath)) {
+      return res.status(404).json({
+        success: false,
+        error: `No vault found for user: ${sanitizedUserId}`,
+      });
+    }
+
+    // Check if target folder exists
+    if (!fs.existsSync(targetFolderPath)) {
+      return res.status(404).json({
+        success: false,
+        error: `Folder '${sanitizedFolderName}' not found in user's vault`,
+        user_id: sanitizedUserId,
+        folder_name: sanitizedFolderName,
+      });
+    }
+
+    // Check if it's actually a directory
+    const folderStats = fs.statSync(targetFolderPath);
+    if (!folderStats.isDirectory()) {
+      return res.status(400).json({
+        success: false,
+        error: `'${sanitizedFolderName}' is not a directory`,
+      });
+    }
+
+    // Read all files in the directory
+    const items = fs.readdirSync(targetFolderPath);
+
+    // Get detailed information for each file/directory
+    const fileList = items.map((item) => {
+      const itemPath = path.join(targetFolderPath, item);
+      return getFileDetails(itemPath, item);
+    });
+
+    // Separate files and directories
+    const files = fileList.filter((item) => item.type === 'file');
+    const directories = fileList.filter((item) => item.type === 'directory');
+
+    // Calculate total size
+    const totalSize = files.reduce((acc, file) => acc + (file.size || 0), 0);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Files retrieved successfully',
+      data: {
+        user_id: sanitizedUserId,
+        folder_name: sanitizedFolderName,
+        folder_path: `private_vault/${sanitizedUserId}/${sanitizedFolderName}`,
+        summary: {
+          total_items: fileList.length,
+          total_files: files.length,
+          total_directories: directories.length,
+          total_size: totalSize,
+          total_size_formatted: formatFileSize(totalSize),
+        },
+        directories: directories,
+        files: files,
+      },
+    });
+  } catch (error) {
+    console.error('Error reading vault directory:', error);
+
+    if (error.code === 'EACCES') {
+      return res.status(403).json({
+        success: false,
+        error: 'Permission denied to access this directory',
+      });
+    }
+
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message,
+    });
+  }
+});
+
+// GET /api/vault/files/:user_id/:folder_name - Alternative route with path params
+app.get('/api/vault/files/:user_id/:folder_name', (req, res) => {
+  try {
+    const { user_id, folder_name } = req.params;
+
+    // Sanitize inputs
+    const sanitizedUserId = user_id.replace(/[^a-zA-Z0-9_-]/g, '');
+    const sanitizedFolderName = folder_name.replace(/[^a-zA-Z0-9_\-. ]/g, '');
+
+    if (!sanitizedUserId || !sanitizedFolderName) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user_id or folder_name format',
+      });
+    }
+
+    const userVaultPath = path.join(BASE_VAULT_DIR, sanitizedUserId);
+    const targetFolderPath = path.join(userVaultPath, sanitizedFolderName);
+
+    // Security check
+    if (!isSafePath(BASE_VAULT_DIR, targetFolderPath)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied: Invalid path',
+      });
+    }
+
+    // Check directories exist
+    if (!fs.existsSync(BASE_VAULT_DIR)) {
+      return res.status(404).json({
+        success: false,
+        error: 'Vault directory does not exist',
+      });
+    }
+
+    if (!fs.existsSync(userVaultPath)) {
+      return res.status(404).json({
+        success: false,
+        error: `No vault found for user: ${sanitizedUserId}`,
+      });
+    }
+
+    if (!fs.existsSync(targetFolderPath)) {
+      return res.status(404).json({
+        success: false,
+        error: `Folder '${sanitizedFolderName}' not found`,
+        user_id: sanitizedUserId,
+        folder_name: sanitizedFolderName,
+      });
+    }
+
+    const folderStats = fs.statSync(targetFolderPath);
+    if (!folderStats.isDirectory()) {
+      return res.status(400).json({
+        success: false,
+        error: `'${sanitizedFolderName}' is not a directory`,
+      });
+    }
+
+    const items = fs.readdirSync(targetFolderPath);
+    const fileList = items.map((item) => {
+      const itemPath = path.join(targetFolderPath, item);
+      return getFileDetails(itemPath, item);
+    });
+
+    const files = fileList.filter((item) => item.type === 'file');
+    const directories = fileList.filter((item) => item.type === 'directory');
+    const totalSize = files.reduce((acc, file) => acc + (file.size || 0), 0);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Files retrieved successfully',
+      data: {
+        user_id: sanitizedUserId,
+        folder_name: sanitizedFolderName,
+        folder_path: `private_vault/${sanitizedUserId}/${sanitizedFolderName}`,
+        summary: {
+          total_items: fileList.length,
+          total_files: files.length,
+          total_directories: directories.length,
+          total_size: totalSize,
+          total_size_formatted: formatFileSize(totalSize),
+        },
+        directories: directories,
+        files: files,
+      },
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      message: error.message,
+    });
+  }
+});
+
+// GET /api/vault/folders/:user_id - List all folders for a user
+app.get('/api/vault/folders/:user_id', (req, res) => {
+  try {
+    const { user_id } = req.params;
+    const sanitizedUserId = user_id.replace(/[^a-zA-Z0-9_-]/g, '');
+
+    if (!sanitizedUserId) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid user_id format',
+      });
+    }
+
+    const userVaultPath = path.join(BASE_VAULT_DIR, sanitizedUserId);
+
+    if (!isSafePath(BASE_VAULT_DIR, userVaultPath)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Access denied',
+      });
+    }
+
+    if (!fs.existsSync(userVaultPath)) {
+      return res.status(404).json({
+        success: false,
+        error: `No vault found for user: ${sanitizedUserId}`,
+      });
+    }
+
+    const items = fs.readdirSync(userVaultPath);
+    const folders = items
+      .filter((item) => {
+        const itemPath = path.join(userVaultPath, item);
+        return fs.statSync(itemPath).isDirectory();
+      })
+      .map((folder) => {
+        const folderPath = path.join(userVaultPath, folder);
+        const stats = fs.statSync(folderPath);
+        const contents = fs.readdirSync(folderPath);
+        return {
+          name: folder,
+          created_at: stats.birthtime,
+          modified_at: stats.mtime,
+          item_count: contents.length,
+        };
+      });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Folders retrieved successfully',
+      data: {
+        user_id: sanitizedUserId,
+        total_folders: folders.length,
+        folders: folders,
+      },
+    });
+  } catch (error) {
+    console.error('Error:', error);
+    return res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+});
+
+// Setup demo vault structure for testing
+const setupDemoVault = () => {
+  const demoStructure = {
+    user123: {
+      documents: ['report.pdf', 'notes.txt', 'presentation.pptx'],
+      images: ['photo1.jpg', 'photo2.png', 'screenshot.png'],
+      videos: ['video1.mp4', 'tutorial.avi'],
+    },
+    user456: {
+      projects: ['project_plan.docx', 'budget.xlsx'],
+      backups: ['backup_2024.zip', 'backup_2023.zip'],
+    },
+  };
+
+  Object.entries(demoStructure).forEach(([userId, folders]) => {
+    Object.entries(folders).forEach(([folderName, files]) => {
+      const folderPath = path.join(BASE_VAULT_DIR, userId, folderName);
+      if (!fs.existsSync(folderPath)) {
+        fs.mkdirSync(folderPath, { recursive: true });
+        files.forEach((file) => {
+          const filePath = path.join(folderPath, file);
+          if (!fs.existsSync(filePath)) {
+            fs.writeFileSync(filePath, `Demo content for ${file}`);
+          }
+        });
+      }
+    });
+  });
+
+  console.log('✅ Demo vault structure created successfully');
+};
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found',
+    available_endpoints: [
+      'GET /api/vault/files?folder_name=<folder>&user_id=<id>',
+      'GET /api/vault/files/:user_id/:folder_name',
+      'GET /api/vault/folders/:user_id',
+    ],
+  });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log('\n📁 Available API Endpoints:');
+  console.log(
+    `   GET http://localhost:${PORT}/api/vault/files?folder_name=documents&user_id=user123`
+  );
+  console.log(
+    `   GET http://localhost:${PORT}/api/vault/files/user123/documents`
+  );
+  console.log(`   GET http://localhost:${PORT}/api/vault/folders/user123`);
+
+  // Create demo vault structure
+  setupDemoVault();
+});
+
+module.exports = app;
+```

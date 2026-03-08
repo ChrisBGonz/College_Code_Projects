@@ -1,0 +1,628 @@
+```yaml
+name: Build and Upload Artifact to Storage Bucket
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment Environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  NODE_VERSION: '18'
+  PYTHON_VERSION: '3.11'
+  BUILD_DIR: 'dist'
+  ARTIFACT_NAME: 'build-artifact'
+
+jobs:
+  # ============================================================
+  # Job 1: Code Quality Check
+  # ============================================================
+  code-quality:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: |
+          echo "📦 Dependencies install हो रही हैं..."
+          npm ci --prefer-offline
+          echo "✅ Dependencies install हो गई!"
+
+      - name: Run Linting
+        run: |
+          echo "🔍 Code linting चल रही है..."
+          npm run lint || echo "⚠️ Linting warnings मिले"
+
+      - name: Run Tests
+        run: |
+          echo "🧪 Tests चल रहे हैं..."
+          npm test -- --coverage --watchAll=false
+          echo "✅ सभी Tests पास हो गए!"
+
+      - name: Upload Test Coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-coverage-report
+          path: coverage/
+          retention-days: 7
+
+  # ============================================================
+  # Job 2: Build Project
+  # ============================================================
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+    needs: code-quality
+    
+    strategy:
+      matrix:
+        node-version: [18, 20]
+        os: [ubuntu-latest]
+    
+    outputs:
+      artifact-version: ${{ steps.version.outputs.version }}
+      build-timestamp: ${{ steps.timestamp.outputs.timestamp }}
+      artifact-path: ${{ steps.build-info.outputs.artifact-path }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Get Version Information
+        id: version
+        run: |
+          VERSION=$(node -p "require('./package.json').version" 2>/dev/null || echo "1.0.0")
+          GIT_SHA=$(git rev-parse --short HEAD)
+          FULL_VERSION="${VERSION}-${GIT_SHA}"
+          echo "version=${FULL_VERSION}" >> $GITHUB_OUTPUT
+          echo "📌 Version: ${FULL_VERSION}"
+
+      - name: Get Build Timestamp
+        id: timestamp
+        run: |
+          TIMESTAMP=$(date -u +"%Y%m%d_%H%M%S")
+          echo "timestamp=${TIMESTAMP}" >> $GITHUB_OUTPUT
+          echo "⏰ Build Timestamp: ${TIMESTAMP}"
+
+      - name: Install Dependencies
+        run: |
+          echo "📦 Production dependencies install हो रही हैं..."
+          npm ci --prefer-offline
+          echo "✅ Dependencies ready!"
+
+      - name: Build Application
+        env:
+          NODE_ENV: production
+          REACT_APP_VERSION: ${{ steps.version.outputs.version }}
+          REACT_APP_BUILD_TIME: ${{ steps.timestamp.outputs.timestamp }}
+        run: |
+          echo "🔨 Application build हो रही है..."
+          npm run build
+          echo "✅ Build सफलतापूर्वक पूरी हुई!"
+
+      - name: Get Build Info
+        id: build-info
+        run: |
+          BUILD_SIZE=$(du -sh ${{ env.BUILD_DIR }} | cut -f1)
+          FILE_COUNT=$(find ${{ env.BUILD_DIR }} -type f | wc -l)
+          ARTIFACT_PATH="${{ env.BUILD_DIR }}"
+          echo "artifact-path=${ARTIFACT_PATH}" >> $GITHUB_OUTPUT
+          echo "📊 Build Size: ${BUILD_SIZE}"
+          echo "📁 Total Files: ${FILE_COUNT}"
+
+      - name: Create Build Archive
+        run: |
+          echo "📦 Build archive बना रहे हैं..."
+          ARCHIVE_NAME="build-${{ steps.version.outputs.version }}-${{ steps.timestamp.outputs.timestamp }}.tar.gz"
+          tar -czf "${ARCHIVE_NAME}" -C . ${{ env.BUILD_DIR }}
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+          ls -lh "${ARCHIVE_NAME}"
+          echo "✅ Archive तैयार: ${ARCHIVE_NAME}"
+
+      - name: Generate Build Manifest
+        run: |
+          echo "📋 Build manifest बना रहे हैं..."
+          cat > build-manifest.json << EOF
+          {
+            "version": "${{ steps.version.outputs.version }}",
+            "timestamp": "${{ steps.timestamp.outputs.timestamp }}",
+            "git_sha": "$(git rev-parse HEAD)",
+            "git_branch": "${GITHUB_REF_NAME}",
+            "node_version": "${{ matrix.node-version }}",
+            "build_number": "${GITHUB_RUN_NUMBER}",
+            "workflow_run_id": "${GITHUB_RUN_ID}",
+            "repository": "${GITHUB_REPOSITORY}",
+            "actor": "${GITHUB_ACTOR}",
+            "files": $(find ${{ env.BUILD_DIR }} -type f | wc -l),
+            "size_bytes": $(du -sb ${{ env.BUILD_DIR }} | cut -f1)
+          }
+          EOF
+          cat build-manifest.json
+          echo "✅ Manifest तैयार!"
+
+      - name: Upload Build Artifact (GitHub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-node${{ matrix.node-version }}-${{ steps.timestamp.outputs.timestamp }}
+          path: |
+            ${{ env.BUILD_DIR }}/
+            build-manifest.json
+          retention-days: 30
+          compression-level: 9
+
+      - name: Upload Archive Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-archive-node${{ matrix.node-version }}
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 30
+
+  # ============================================================
+  # Job 3: Upload to AWS S3
+  # ============================================================
+  upload-to-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+    
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+      S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-node18-${{ needs.build.outputs.build-timestamp }}
+          path: ./artifact
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS Connection
+        run: |
+          echo "🔐 AWS Connection verify हो रही है..."
+          aws sts get-caller-identity
+          echo "✅ AWS Connection सफल!"
+
+      - name: Upload Static Files to S3
+        run: |
+          echo "☁️ S3 पर files upload हो रही हैं..."
+          
+          DEPLOY_PATH="${{ github.event.inputs.environment || 'staging' }}/v${{ needs.build.outputs.artifact-version }}"
+          
+          # HTML files - no cache
+          aws s3 sync ./artifact/${{ env.BUILD_DIR }}/ \
+            s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "no-cache, no-store, must-revalidate" \
+            --content-type "text/html" \
+            --delete \
+            --acl public-read
+          
+          # CSS files - long cache
+          aws s3 sync ./artifact/${{ env.BUILD_DIR }}/ \
+            s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ \
+            --exclude "*" \
+            --include "*.css" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --content-type "text/css" \
+            --acl public-read
+          
+          # JavaScript files - long cache
+          aws s3 sync ./artifact/${{ env.BUILD_DIR }}/ \
+            s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ \
+            --exclude "*" \
+            --include "*.js" \
+            --cache-control "public, max-age=31536000, immutable" \
+            --content-type "application/javascript" \
+            --acl public-read
+          
+          # Images and other assets
+          aws s3 sync ./artifact/${{ env.BUILD_DIR }}/ \
+            s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ \
+            --exclude "*.html" \
+            --exclude "*.css" \
+            --exclude "*.js" \
+            --cache-control "public, max-age=86400" \
+            --acl public-read
+          
+          echo "✅ S3 पर upload सफल!"
+          echo "📍 S3 Path: s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/"
+
+      - name: Upload Build Manifest to S3
+        run: |
+          echo "📋 Manifest S3 पर upload हो रही है..."
+          aws s3 cp ./artifact/build-manifest.json \
+            s3://${{ env.S3_BUCKET }}/manifests/build-${{ needs.build.outputs.artifact-version }}.json \
+            --cache-control "no-cache" \
+            --content-type "application/json"
+          echo "✅ Manifest upload सफल!"
+
+      - name: Invalidate CloudFront Cache
+        if: env.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          echo "🔄 CloudFront cache invalidate हो रही है..."
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id ${{ env.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+          echo "Invalidation ID: ${INVALIDATION_ID}"
+          echo "✅ CloudFront cache invalidation शुरू हुई!"
+
+      - name: Verify S3 Upload
+        run: |
+          echo "🔍 S3 upload verify हो रही है..."
+          DEPLOY_PATH="${{ github.event.inputs.environment || 'staging' }}/v${{ needs.build.outputs.artifact-version }}"
+          FILE_COUNT=$(aws s3 ls s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ --recursive | wc -l)
+          echo "📁 S3 पर कुल files: ${FILE_COUNT}"
+          aws s3 ls s3://${{ env.S3_BUCKET }}/${DEPLOY_PATH}/ --recursive --human-readable
+          echo "✅ Verification सफल!"
+
+  # ============================================================
+  # Job 4: Upload to Google Cloud Storage
+  # ============================================================
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && vars.USE_GCS == 'true'
+    
+    env:
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET_NAME }}
+      GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-node18-${{ needs.build.outputs.build-timestamp }}
+          path: ./artifact
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      - name: Upload to GCS
+        run: |
+          echo "☁️ Google Cloud Storage पर upload हो रही है..."
+          
+          DEPLOY_PATH="${{ github.event.inputs.environment || 'staging' }}/v${{ needs.build.outputs.artifact-version }}"
+          
+          gsutil -m rsync -r -d \
+            ./artifact/${{ env.BUILD_DIR }}/ \
+            gs://${{ env.GCS_BUCKET }}/${DEPLOY_PATH}/
+          
+          # Cache headers set करें
+          gsutil -m setmeta \
+            -h "Cache-Control:public, max-age=31536000" \
+            "gs://${{ env.GCS_BUCKET }}/${DEPLOY_PATH}/static/**"
+          
+          gsutil -m setmeta \
+            -h "Cache-Control:no-cache, no-store" \
+            "gs://${{ env.GCS_BUCKET }}/${DEPLOY_PATH}/*.html"
+          
+          echo "✅ GCS पर upload सफल!"
+          echo "📍 GCS Path: gs://${{ env.GCS_BUCKET }}/${DEPLOY_PATH}/"
+
+      - name: Make Files Public
+        run: |
+          echo "🌐 Files को public बना रहे हैं..."
+          DEPLOY_PATH="${{ github.event.inputs.environment || 'staging' }}/v${{ needs.build.outputs.artifact-version }}"
+          gsutil -m acl ch -r -u AllUsers:R gs://${{ env.GCS_BUCKET }}/${DEPLOY_PATH}/
+          echo "✅ Files public हो गई!"
+
+  # ============================================================
+  # Job 5: Upload to Azure Blob Storage
+  # ============================================================
+  upload-to-azure:
+    name: Upload to Azure Blob Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && vars.USE_AZURE == 'true'
+    
+    env:
+      AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+      AZURE_CONTAINER_NAME: ${{ secrets.AZURE_CONTAINER_NAME || '$web' }}
+
+    steps:
+      - name: Download Build Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-node18-${{ needs.build.outputs.build-timestamp }}
+          path: ./artifact
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Upload to Azure Blob Storage
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            echo "☁️ Azure Blob Storage पर upload हो रही है..."
+            
+            DEPLOY_PATH="${{ github.event.inputs.environment || 'staging' }}/v${{ needs.build.outputs.artifact-version }}"
+            
+            az storage blob upload-batch \
+              --account-name ${{ env.AZURE_STORAGE_ACCOUNT }} \
+              --destination "${{ env.AZURE_CONTAINER_NAME }}/${DEPLOY_PATH}" \
+              --source "./artifact/${{ env.BUILD_DIR }}" \
+              --overwrite true \
+              --auth-mode login
+            
+            echo "✅ Azure Blob Storage पर upload सफल!"
+
+      - name: Purge Azure CDN Cache
+        if: secrets.AZURE_CDN_PROFILE != ''
+        uses: azure/CLI@v1
+        with:
+          azcliversion: latest
+          inlineScript: |
+            echo "🔄 Azure CDN cache purge हो रही है..."
+            az cdn endpoint purge \
+              --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+              --profile-name ${{ secrets.AZURE_CDN_PROFILE }} \
+              --name ${{ secrets.AZURE_CDN_ENDPOINT }} \
+              --content-paths "/*"
+            echo "✅ CDN cache purge सफल!"
+
+  # ============================================================
+  # Job 6: Notification and Summary
+  # ============================================================
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-s3]
+    if: always()
+    
+    steps:
+      - name: Check Job Status
+        id: status
+        run: |
+          BUILD_STATUS="${{ needs.build.result }}"
+          UPLOAD_STATUS="${{ needs.upload-to-s3.result }}"
+          
+          if [[ "${BUILD_STATUS}" == "success" && ("${UPLOAD_STATUS}" == "success" || "${UPLOAD_STATUS}" == "skipped") ]]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "message=Build और Upload सफलतापूर्वक पूरा हुआ!" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "message=Build या Upload में कोई समस्या आई!" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack Notification
+        if: secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ steps.status.outputs.emoji }} *GitHub Actions - Build & Deploy*",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": {
+                    "type": "plain_text",
+                    "text": "${{ steps.status.outputs.emoji }} Build & Deploy Status"
+                  }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Repository:*\n${{ github.repository }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Branch:*\n${{ github.ref_name }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Version:*\n${{ needs.build.outputs.artifact-version }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Status:*\n${{ steps.status.outputs.message }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Actor:*\n${{ github.actor }}"
+                    },
+                    {
+                      "type": "mrkdwn",
+                      "text": "*Run Number:*\n#${{ github.run_number }}"
+                    }
+                  ]
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "🔗 Workflow देखें"
+                      },
+                      "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                    }
+                  ]
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Create GitHub Summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          # 🚀 Build & Deploy Summary
+          
+          ## 📊 Build Information
+          | Field | Value |
+          |-------|-------|
+          | **Version** | `${{ needs.build.outputs.artifact-version }}` |
+          | **Timestamp** | `${{ needs.build.outputs.build-timestamp }}` |
+          | **Branch** | `${{ github.ref_name }}` |
+          | **Commit** | `${{ github.sha }}` |
+          | **Actor** | `${{ github.actor }}` |
+          | **Run Number** | `#${{ github.run_number }}` |
+          
+          ## ✅ Job Results
+          | Job | Status |
+          |-----|--------|
+          | Code Quality | ${{ needs.code-quality.result || 'N/A' }} |
+          | Build | ${{ needs.build.result }} |
+          | Upload to S3 | ${{ needs.upload-to-s3.result || 'Skipped' }} |
+          
+          ## 🔗 Links
+          - [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          - [Repository](${{ github.server_url }}/${{ github.repository }})
+          
+          ---
+          > ${{ steps.status.outputs.emoji }} **${{ steps.status.outputs.message }}**
+          EOF
+
+      - name: Send Email Notification
+        if: failure() && secrets.NOTIFICATION_EMAIL != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "❌ Build Failed - ${{ github.repository }} #${{ github.run_number }}"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: GitHub Actions <noreply@github.com>
+          body: |
+            Build या Deploy में समस्या आई है।
+            
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Run: #${{ github.run_number }}
+            Actor: ${{ github.actor }}
+            
+            Details: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+  # ============================================================
+  # Job 7: Cleanup Old Artifacts
+  # ============================================================
+  cleanup:
+    name: Cleanup Old Artifacts
+    runs-on: ubuntu-latest
+    needs: [upload-to-s3]
+    if: success() && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Delete Old S3 Versions
+        if: secrets.AWS_ACCESS_KEY_ID != ''
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+        run: |
+          echo "🧹 पुराने S3 artifacts cleanup हो रहे हैं..."
+          
+          # 5 से पुराने versions delete करें
+          BUCKET="${{ secrets.AWS_S3_BUCKET }}"
+          ENV="${{ github.event.inputs.environment || 'staging' }}"
+          
+          OLD_VERSIONS=$(aws s3 ls s3://${BUCKET}/${ENV}/ \
+            --recursive \
+            | awk '{print $4}' \
+            | grep -oP 'v[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]+' \
+            | sort -u \
+            | head -n -5)
+          
+          for VERSION in ${OLD_VERSIONS}; do
+            echo "🗑️ Delete हो रहा है: ${VERSION}"
+            aws s3 rm s3://${BUCKET}/${ENV}/${VERSION}/ --recursive
+          done
+          
+          echo "✅ Cleanup पूरी हुई!"
+
+      - name: Delete Old GitHub Artifacts
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifacts = await github.rest.actions.listArtifactsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            
+            const oldArtifacts = artifacts.data.artifacts
+              .filter(a => {
+                const ageInDays = (Date.now() - new Date(a.created_at)) / (1000 * 60 * 60 * 24);
+                return ageInDays > 30;
+              });
+            
+            console.log(`🗑️ ${oldArtifacts.length} पुराने artifacts मिले`);
+            
+            for (const artifact of oldArtifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id
+              });
+              console.log(`✅ Delete हुआ: ${artifact.name}`);
+            }
+            
+            console.log('✅ GitHub Artifacts cleanup पूरी!');
+```

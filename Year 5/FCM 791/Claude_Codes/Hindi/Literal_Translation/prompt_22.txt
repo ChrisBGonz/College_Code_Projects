@@ -1,0 +1,720 @@
+#!/bin/bash
+
+# Security Tool Auto-Installer Script
+# यह स्क्रिप्ट किसी सुरक्षा उपकरण का नवीनतम संस्करण डाउनलोड और इंस्टॉल करती है
+
+set -euo pipefail
+
+# ============================================================
+# रंग और फॉर्मेटिंग
+# ============================================================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+NC='\033[0m' # No Color
+
+# ============================================================
+# कॉन्फ़िगरेशन
+# ============================================================
+TOOL_NAME="security-tool"
+INSTALL_DIR="/usr/local/bin"
+TEMP_DIR="/tmp/security_tool_install_$$"
+LOG_FILE="/var/log/security_tool_install.log"
+BACKUP_DIR="/var/backup/security_tools"
+CHECKSUM_ALGO="sha256"
+
+# GitHub API या डायरेक्ट URL (उदाहरण के लिए)
+GITHUB_REPO="owner/repository"
+GITHUB_API_URL="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+DOWNLOAD_BASE_URL="https://github.com/${GITHUB_REPO}/releases/download"
+
+# ============================================================
+# लॉगिंग फ़ंक्शन
+# ============================================================
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    echo "${timestamp} [${level}] ${message}" >> "${LOG_FILE}" 2>/dev/null || true
+    
+    case "${level}" in
+        "INFO")  echo -e "${GREEN}[INFO]${NC}  ${message}" ;;
+        "WARN")  echo -e "${YELLOW}[WARN]${NC}  ${message}" ;;
+        "ERROR") echo -e "${RED}[ERROR]${NC} ${message}" ;;
+        "DEBUG") echo -e "${BLUE}[DEBUG]${NC} ${message}" ;;
+        "STEP")  echo -e "${CYAN}[STEP]${NC}  ${message}" ;;
+    esac
+}
+
+print_banner() {
+    echo -e "${WHITE}"
+    echo "╔══════════════════════════════════════════════════════════╗"
+    echo "║         Security Tool Auto-Installer v2.0                ║"
+    echo "║         सुरक्षा उपकरण स्वचालित इंस्टॉलर                ║"
+    echo "╚══════════════════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+print_separator() {
+    echo -e "${BLUE}──────────────────────────────────────────────────────────${NC}"
+}
+
+# ============================================================
+# सिस्टम जाँच फ़ंक्शन
+# ============================================================
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log "ERROR" "यह स्क्रिप्ट root अधिकारों के साथ चलाएँ"
+        log "ERROR" "उपयोग: sudo $0"
+        exit 1
+    fi
+    log "INFO" "Root अधिकार सत्यापित"
+}
+
+detect_os() {
+    log "STEP" "ऑपरेटिंग सिस्टम पहचान रहे हैं..."
+    
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        OS_NAME="${NAME}"
+        OS_VERSION="${VERSION_ID:-unknown}"
+        OS_ID="${ID}"
+        OS_ID_LIKE="${ID_LIKE:-}"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS_NAME=$(cat /etc/redhat-release)
+        OS_ID="rhel"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        OS_NAME="macOS"
+        OS_ID="darwin"
+        OS_VERSION=$(sw_vers -productVersion)
+    else
+        log "ERROR" "असमर्थित ऑपरेटिंग सिस्टम"
+        exit 1
+    fi
+    
+    ARCH=$(uname -m)
+    case "${ARCH}" in
+        x86_64)  ARCH_NAME="amd64" ;;
+        aarch64) ARCH_NAME="arm64" ;;
+        armv7l)  ARCH_NAME="armv7" ;;
+        i386|i686) ARCH_NAME="386" ;;
+        *)       ARCH_NAME="${ARCH}" ;;
+    esac
+    
+    log "INFO" "OS: ${OS_NAME} ${OS_VERSION} (${ARCH})"
+    log "INFO" "Architecture: ${ARCH_NAME}"
+}
+
+check_dependencies() {
+    log "STEP" "आवश्यक निर्भरताएँ जाँच रहे हैं..."
+    
+    local required_tools=("curl" "wget" "tar" "gzip" "sha256sum" "grep" "awk" "sed")
+    local missing_tools=()
+    
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "${tool}" &>/dev/null; then
+            missing_tools+=("${tool}")
+            log "WARN" "${tool} नहीं मिला"
+        else
+            log "DEBUG" "${tool} उपलब्ध है"
+        fi
+    done
+    
+    if [[ ${#missing_tools[@]} -gt 0 ]]; then
+        log "WARN" "कुछ उपकरण अनुपलब्ध हैं: ${missing_tools[*]}"
+        install_dependencies "${missing_tools[@]}"
+    else
+        log "INFO" "सभी निर्भरताएँ उपलब्ध हैं"
+    fi
+}
+
+install_dependencies() {
+    local tools=("$@")
+    log "STEP" "निर्भरताएँ इंस्टॉल कर रहे हैं: ${tools[*]}"
+    
+    case "${OS_ID}" in
+        ubuntu|debian|linuxmint)
+            apt-get update -qq
+            apt-get install -y -qq "${tools[@]}" 2>/dev/null || true
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            if command -v dnf &>/dev/null; then
+                dnf install -y -q "${tools[@]}" 2>/dev/null || true
+            else
+                yum install -y -q "${tools[@]}" 2>/dev/null || true
+            fi
+            ;;
+        arch|manjaro)
+            pacman -S --noconfirm --quiet "${tools[@]}" 2>/dev/null || true
+            ;;
+        darwin)
+            if command -v brew &>/dev/null; then
+                brew install "${tools[@]}" 2>/dev/null || true
+            fi
+            ;;
+        *)
+            log "WARN" "स्वचालित निर्भरता इंस्टॉलेशन समर्थित नहीं"
+            ;;
+    esac
+}
+
+check_internet_connection() {
+    log "STEP" "इंटरनेट कनेक्शन जाँच रहे हैं..."
+    
+    local test_urls=("https://www.google.com" "https://github.com" "https://cloudflare.com")
+    
+    for url in "${test_urls[@]}"; do
+        if curl -s --connect-timeout 5 --max-time 10 "${url}" &>/dev/null; then
+            log "INFO" "इंटरनेट कनेक्शन सक्रिय है"
+            return 0
+        fi
+    done
+    
+    log "ERROR" "इंटरनेट कनेक्शन उपलब्ध नहीं है"
+    exit 1
+}
+
+# ============================================================
+# संस्करण प्रबंधन
+# ============================================================
+get_installed_version() {
+    if command -v "${TOOL_NAME}" &>/dev/null; then
+        local version
+        version=$("${TOOL_NAME}" --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1) || true
+        echo "${version:-unknown}"
+    else
+        echo "not_installed"
+    fi
+}
+
+get_latest_version() {
+    log "STEP" "नवीनतम संस्करण की जानकारी प्राप्त कर रहे हैं..."
+    
+    local api_response
+    local latest_version
+    
+    # GitHub API से नवीनतम संस्करण प्राप्त करें
+    if api_response=$(curl -s \
+        --connect-timeout 10 \
+        --max-time 30 \
+        -H "Accept: application/vnd.github.v3+json" \
+        -H "User-Agent: SecurityToolInstaller/2.0" \
+        "${GITHUB_API_URL}" 2>/dev/null); then
+        
+        latest_version=$(echo "${api_response}" | grep -oP '"tag_name":\s*"v?\K[^"]+' | head -1)
+        
+        if [[ -n "${latest_version}" ]]; then
+            log "INFO" "नवीनतम संस्करण: v${latest_version}"
+            echo "${latest_version}"
+            return 0
+        fi
+    fi
+    
+    # वैकल्पिक: सीधे URL से संस्करण प्राप्त करें
+    log "WARN" "GitHub API विफल, वैकल्पिक विधि आज़मा रहे हैं..."
+    
+    local fallback_version
+    fallback_version=$(curl -sI \
+        --connect-timeout 10 \
+        "https://github.com/${GITHUB_REPO}/releases/latest" 2>/dev/null | \
+        grep -i "location:" | \
+        grep -oP 'v?\K\d+\.\d+\.\d+' | \
+        head -1) || true
+    
+    if [[ -n "${fallback_version}" ]]; then
+        log "INFO" "नवीनतम संस्करण (fallback): v${fallback_version}"
+        echo "${fallback_version}"
+        return 0
+    fi
+    
+    log "ERROR" "नवीनतम संस्करण प्राप्त करने में विफल"
+    exit 1
+}
+
+compare_versions() {
+    local current="$1"
+    local latest="$2"
+    
+    if [[ "${current}" == "not_installed" ]]; then
+        return 1  # इंस्टॉल करना आवश्यक
+    fi
+    
+    if [[ "${current}" == "${latest}" ]]; then
+        return 0  # पहले से अप-टू-डेट
+    fi
+    
+    # संस्करण तुलना
+    local IFS='.'
+    read -ra current_parts <<< "${current}"
+    read -ra latest_parts <<< "${latest}"
+    
+    for i in "${!latest_parts[@]}"; do
+        local curr_part="${current_parts[$i]:-0}"
+        local lat_part="${latest_parts[$i]:-0}"
+        
+        if [[ "${lat_part}" -gt "${curr_part}" ]]; then
+            return 1  # अपडेट आवश्यक
+        elif [[ "${lat_part}" -lt "${curr_part}" ]]; then
+            return 0  # वर्तमान संस्करण नया है
+        fi
+    done
+    
+    return 0  # समान संस्करण
+}
+
+# ============================================================
+# डाउनलोड फ़ंक्शन
+# ============================================================
+construct_download_url() {
+    local version="$1"
+    local os_type
+    local arch="${ARCH_NAME}"
+    
+    case "${OS_ID}" in
+        darwin) os_type="darwin" ;;
+        *)      os_type="linux" ;;
+    esac
+    
+    # URL पैटर्न (अपने टूल के अनुसार बदलें)
+    local filename="${TOOL_NAME}_${version}_${os_type}_${arch}.tar.gz"
+    local url="${DOWNLOAD_BASE_URL}/v${version}/${filename}"
+    
+    echo "${url}"
+}
+
+download_with_progress() {
+    local url="$1"
+    local output="$2"
+    local description="${3:-फ़ाइल}"
+    
+    log "STEP" "${description} डाउनलोड कर रहे हैं..."
+    log "DEBUG" "URL: ${url}"
+    
+    # wget के साथ प्रगति दिखाएँ
+    if command -v wget &>/dev/null; then
+        if wget \
+            --progress=bar:force \
+            --timeout=60 \
+            --tries=3 \
+            --retry-connrefused \
+            --output-document="${output}" \
+            "${url}" 2>&1; then
+            return 0
+        fi
+    fi
+    
+    # curl के साथ प्रगति दिखाएँ
+    if command -v curl &>/dev/null; then
+        if curl \
+            --location \
+            --progress-bar \
+            --connect-timeout 10 \
+            --max-time 300 \
+            --retry 3 \
+            --retry-delay 5 \
+            --output "${output}" \
+            "${url}" 2>&1; then
+            return 0
+        fi
+    fi
+    
+    log "ERROR" "डाउनलोड विफल: ${url}"
+    return 1
+}
+
+verify_checksum() {
+    local file="$1"
+    local checksum_file="$2"
+    
+    log "STEP" "चेकसम सत्यापित कर रहे हैं..."
+    
+    if [[ ! -f "${checksum_file}" ]]; then
+        log "WARN" "चेकसम फ़ाइल नहीं मिली, सत्यापन छोड़ रहे हैं"
+        return 0
+    fi
+    
+    local expected_checksum
+    local filename
+    filename=$(basename "${file}")
+    
+    expected_checksum=$(grep "${filename}" "${checksum_file}" | awk '{print $1}')
+    
+    if [[ -z "${expected_checksum}" ]]; then
+        log "WARN" "चेकसम फ़ाइल में प्रविष्टि नहीं मिली"
+        return 0
+    fi
+    
+    local actual_checksum
+    actual_checksum=$(sha256sum "${file}" | awk '{print $1}')
+    
+    if [[ "${expected_checksum}" == "${actual_checksum}" ]]; then
+        log "INFO" "चेकसम सत्यापन सफल ✓"
+        log "DEBUG" "SHA256: ${actual_checksum}"
+        return 0
+    else
+        log "ERROR" "चेकसम सत्यापन विफल!"
+        log "ERROR" "अपेक्षित: ${expected_checksum}"
+        log "ERROR" "प्राप्त:   ${actual_checksum}"
+        return 1
+    fi
+}
+
+verify_gpg_signature() {
+    local file="$1"
+    local sig_file="$2"
+    
+    if ! command -v gpg &>/dev/null; then
+        log "WARN" "GPG उपलब्ध नहीं, हस्ताक्षर सत्यापन छोड़ रहे हैं"
+        return 0
+    fi
+    
+    if [[ ! -f "${sig_file}" ]]; then
+        log "WARN" "GPG हस्ताक्षर फ़ाइल नहीं मिली"
+        return 0
+    fi
+    
+    log "STEP" "GPG हस्ताक्षर सत्यापित कर रहे हैं..."
+    
+    if gpg --verify "${sig_file}" "${file}" 2>/dev/null; then
+        log "INFO" "GPG हस्ताक्षर सत्यापन सफल ✓"
+        return 0
+    else
+        log "ERROR" "GPG हस्ताक्षर सत्यापन विफल!"
+        return 1
+    fi
+}
+
+# ============================================================
+# इंस्टॉलेशन फ़ंक्शन
+# ============================================================
+create_backup() {
+    local tool_path
+    tool_path=$(command -v "${TOOL_NAME}" 2>/dev/null) || true
+    
+    if [[ -n "${tool_path}" && -f "${tool_path}" ]]; then
+        log "STEP" "मौजूदा इंस्टॉलेशन का बैकअप बना रहे हैं..."
+        
+        mkdir -p "${BACKUP_DIR}"
+        local backup_file="${BACKUP_DIR}/${TOOL_NAME}_$(date +%Y%m%d_%H%M%S)"
+        
+        cp "${tool_path}" "${backup_file}"
+        log "INFO" "बैकअप बनाया: ${backup_file}"
+    fi
+}
+
+extract_archive() {
+    local archive="$1"
+    local extract_dir="$2"
+    
+    log "STEP" "आर्काइव निकाल रहे हैं..."
+    
+    mkdir -p "${extract_dir}"
+    
+    case "${archive}" in
+        *.tar.gz|*.tgz)
+            tar -xzf "${archive}" -C "${extract_dir}" --strip-components=1 2>/dev/null || \
+            tar -xzf "${archive}" -C "${extract_dir}"
+            ;;
+        *.tar.bz2)
+            tar -xjf "${archive}" -C "${extract_dir}" --strip-components=1 2>/dev/null || \
+            tar -xjf "${archive}" -C "${extract_dir}"
+            ;;
+        *.tar.xz)
+            tar -xJf "${archive}" -C "${extract_dir}" --strip-components=1 2>/dev/null || \
+            tar -xJf "${archive}" -C "${extract_dir}"
+            ;;
+        *.zip)
+            unzip -q "${archive}" -d "${extract_dir}"
+            ;;
+        *)
+            # बाइनरी फ़ाइल सीधे कॉपी करें
+            cp "${archive}" "${extract_dir}/${TOOL_NAME}"
+            ;;
+    esac
+    
+    log "INFO" "आर्काइव सफलतापूर्वक निकाला"
+}
+
+install_binary() {
+    local source_dir="$1"
+    local version="$2"
+    
+    log "STEP" "बाइनरी इंस्टॉल कर रहे हैं..."
+    
+    # बाइनरी खोजें
+    local binary_path
+    binary_path=$(find "${source_dir}" -name "${TOOL_NAME}" -type f 2>/dev/null | head -1)
+    
+    if [[ -z "${binary_path}" ]]; then
+        # सभी executable फ़ाइलें खोजें
+        binary_path=$(find "${source_dir}" -type f -executable 2>/dev/null | head -1)
+    fi
+    
+    if [[ -z "${binary_path}" ]]; then
+        log "ERROR" "इंस्टॉल करने योग्य बाइनरी नहीं मिली"
+        return 1
+    fi
+    
+    log "DEBUG" "बाइनरी मिली: ${binary_path}"
+    
+    # अनुमतियाँ सेट करें
+    chmod 755 "${binary_path}"
+    
+    # इंस्टॉल करें
+    local install_path="${INSTALL_DIR}/${TOOL_NAME}"
+    
+    install -m 755 "${binary_path}" "${install_path}"
+    
+    log "INFO" "बाइनरी इंस्टॉल की: ${install_path}"
+    
+    # symlink बनाएँ (यदि आवश्यक हो)
+    if [[ ! -L "/usr/bin/${TOOL_NAME}" ]]; then
+        ln -sf "${install_path}" "/usr/bin/${TOOL_NAME}" 2>/dev/null || true
+    fi
+    
+    return 0
+}
+
+install_config_files() {
+    local source_dir="$1"
+    local config_dir="/etc/${TOOL_NAME}"
+    
+    log "STEP" "कॉन्फ़िगरेशन फ़ाइलें इंस्टॉल कर रहे हैं..."
+    
+    # कॉन्फ़िग डायरेक्टरी बनाएँ
+    mkdir -p "${config_dir}"
+    
+    # उदाहरण कॉन्फ़िग फ़ाइलें कॉपी करें
+    if [[ -d "${source_dir}/config" ]]; then
+        cp -r "${source_dir}/config/"* "${config_dir}/" 2>/dev/null || true
+        log "INFO" "कॉन्फ़िगरेशन फ़ाइलें इंस्टॉल की: ${config_dir}"
+    fi
+    
+    # डिफ़ॉल्ट कॉन्फ़िग बनाएँ
+    if [[ ! -f "${config_dir}/${TOOL_NAME}.conf" ]]; then
+        cat > "${config_dir}/${TOOL_NAME}.conf" << EOF
+# ${TOOL_NAME} कॉन्फ़िगरेशन
+# स्वचालित रूप से बनाया गया: $(date)
+# संस्करण: ${version:-unknown}
+
+[general]
+log_level = info
+log_file = /var/log/${TOOL_NAME}.log
+
+[security]
+enable_tls = true
+verify_certificates = true
+
+[performance]
+max_threads = 4
+timeout = 30
+EOF
+        log "INFO" "डिफ़ॉल्ट कॉन्फ़िगरेशन बनाई"
+    fi
+}
+
+install_man_page() {
+    local source_dir="$1"
+    local man_dir="/usr/local/share/man/man1"
+    
+    if [[ -f "${source_dir}/${TOOL_NAME}.1" ]]; then
+        mkdir -p "${man_dir}"
+        cp "${source_dir}/${TOOL_NAME}.1" "${man_dir}/"
+        gzip -f "${man_dir}/${TOOL_NAME}.1" 2>/dev/null || true
+        log "INFO" "Man page इंस्टॉल की"
+    fi
+}
+
+setup_systemd_service() {
+    local version="$1"
+    
+    if ! command -v systemctl &>/dev/null; then
+        log "DEBUG" "systemd उपलब्ध नहीं, सेवा सेटअप छोड़ रहे हैं"
+        return 0
+    fi
+    
+    log "STEP" "Systemd सेवा सेटअप कर रहे हैं..."
+    
+    local service_file="/etc/systemd/system/${TOOL_NAME}.service"
+    
+    cat > "${service_file}" << EOF
+[Unit]
+Description=${TOOL_NAME} Security Service
+Documentation=https://github.com/${GITHUB_REPO}
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=${INSTALL_DIR}/${TOOL_NAME} --config /etc/${TOOL_NAME}/${TOOL_NAME}.conf
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/${TOOL_NAME}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
+    log "INFO" "Systemd सेवा फ़ाइल बनाई: ${service_file}"
+    log "INFO" "सेवा शुरू करने के लिए: systemctl start ${TOOL_NAME}"
+    log "INFO" "स्वचालित शुरुआत के लिए: systemctl enable ${TOOL_NAME}"
+}
+
+update_path() {
+    log "STEP" "PATH अपडेट कर रहे हैं..."
+    
+    local profile_files=(
+        "/etc/profile.d/${TOOL_NAME}.sh"
+        "${HOME}/.bashrc"
+        "${HOME}/.zshrc"
+    )
+    
+    # सिस्टम-वाइड PATH
+    cat > "/etc/profile.d/${TOOL_NAME}.sh" << EOF
+# ${TOOL_NAME} PATH कॉन्फ़िगरेशन
+export PATH="\${PATH}:${INSTALL_DIR}"
+EOF
+    
+    log "INFO" "PATH अपडेट किया"
+}
+
+# ============================================================
+# सत्यापन फ़ंक्शन
+# ============================================================
+verify_installation() {
+    local expected_version="$1"
+    
+    log "STEP" "इंस्टॉलेशन सत्यापित कर रहे हैं..."
+    
+    # बाइनरी अस्तित्व जाँचें
+    if [[ ! -f "${INSTALL_DIR}/${TOOL_NAME}" ]]; then
+        log "ERROR" "बाइनरी नहीं मिली: ${INSTALL_DIR}/${TOOL_NAME}"
+        return 1
+    fi
+    
+    # executable अनुमति जाँचें
+    if [[ ! -x "${INSTALL_DIR}/${TOOL_NAME}" ]]; then
+        log "ERROR" "बाइनरी executable नहीं है"
+        return 1
+    fi
+    
+    # PATH में उपलब्धता जाँचें
+    if command -v "${TOOL_NAME}" &>/dev/null; then
+        log "INFO" "टूल PATH में उपलब्ध है ✓"
+    else
+        log "WARN" "टूल PATH में नहीं मिला, पुनः लॉगिन करें"
+    fi
+    
+    # संस्करण जाँचें
+    local installed_version
+    installed_version=$(get_installed_version)
+    
+    if [[ "${installed_version}" == "${expected_version}" ]]; then
+        log "INFO" "संस्करण सत्यापन सफल: v${installed_version} ✓"
+    else
+        log "WARN" "संस्करण मेल नहीं खाता: अपेक्षित v${expected_version}, मिला v${installed_version}"
+    fi
+    
+    # बेसिक फ़ंक्शनलिटी टेस्ट
+    if "${INSTALL_DIR}/${TOOL_NAME}" --help &>/dev/null; then
+        log "INFO" "बेसिक फ़ंक्शनलिटी टेस्ट सफल ✓"
+    else
+        log "WARN" "बेसिक फ़ंक्शनलिटी टेस्ट विफल (यह सामान्य हो सकता है)"
+    fi
+    
+    return 0
+}
+
+# ============================================================
+# क्लीनअप फ़ंक्शन
+# ============================================================
+cleanup() {
+    local exit_code=$?
+    
+    log "STEP" "अस्थायी फ़ाइलें साफ़ कर रहे हैं..."
+    
+    if [[ -d "${TEMP_DIR}" ]]; then
+        rm -rf "${TEMP_DIR}"
+        log "DEBUG" "अस्थायी डायरेक्टरी हटाई: ${TEMP_DIR}"
+    fi
+    
+    if [[ ${exit_code} -ne 0 ]]; then
+        log "ERROR" "इंस्टॉलेशन विफल (exit code: ${exit_code})"
+        log "INFO" "लॉग फ़ाइल देखें: ${LOG_FILE}"
+        
+        # रोलबैक की पेशकश
+        if [[ -d "${BACKUP_DIR}" ]]; then
+            log "INFO" "बैकअप से पुनर्स्थापित करने के लिए:"
+            log "INFO" "ls ${BACKUP_DIR}/"
+        fi
+    fi
+}
+
+rollback() {
+    log "WARN" "रोलबैक शुरू कर रहे हैं..."
+    
+    local latest_backup
+    latest_backup=$(ls -t "${BACKUP_DIR}/${TOOL_NAME}_"* 2>/dev/null | head -1)
+    
+    if [[ -n "${latest_backup}" ]]; then
+        cp "${latest_backup}" "${INSTALL_DIR}/${TOOL_NAME}"
+        chmod 755 "${INSTALL_DIR}/${TOOL_NAME}"
+        log "INFO" "रोलबैक सफल: ${latest_backup}"
+    else
+        log "ERROR" "रोलबैक के लिए कोई बैकअप नहीं मिला"
+    fi
+}
+
+# ============================================================
+# मुख्य इंस्टॉलेशन प्रक्रिया
+# ============================================================
+main() {
+    print_banner
+    
+    # लॉग डायरेक्टरी बनाएँ
+    mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || LOG_FILE="/tmp/security_tool_install.log"
+    
+    log "INFO" "इंस्टॉलेशन शुरू हो रही है: $(date)"
+    print_separator
+    
+    # trap सेट करें
+    trap cleanup EXIT
+    trap 'log "ERROR" "इंटरप्ट प्राप्त हुआ"; exit 130' INT TERM
+    
+    # ============================================================
+    # चरण 1: सिस्टम जाँच
+    # ============================================================
+    print_separator
+    log "INFO" "चरण 1/8: सिस्टम जाँच"
+    print_separator
+    
+    check_root
+    detect_os
+    check_dependencies
+    check_internet_connection
+    
+    # ============================================================
+    # चरण 2: संस्करण जाँच
+    # ============================================================
+    print_separator
+    log "INFO" "चरण 2/8: संस्करण जाँच"
+    print_separator
+    
+    local current_version
+    current_version=$(get_installed_version)
+    log "INFO"

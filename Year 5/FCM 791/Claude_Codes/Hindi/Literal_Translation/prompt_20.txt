@@ -1,0 +1,416 @@
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+)
+
+// CORSConfig CORS कॉन्फ़िगरेशन स्ट्रक्चर
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+// DefaultCORSConfig डिफ़ॉल्ट CORS कॉन्फ़िगरेशन
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+			"https://www.myapp.com",
+		},
+		AllowedMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodPut,
+			http.MethodPatch,
+			http.MethodDelete,
+			http.MethodOptions,
+			http.MethodHead,
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Requested-With",
+			"Origin",
+			"X-Api-Key",
+		},
+		ExposedHeaders: []string{
+			"Content-Length",
+			"Content-Range",
+			"X-Request-Id",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 घंटे
+	}
+}
+
+// CORSMiddleware CORS मिडलवेयर
+func CORSMiddleware(config CORSConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// Origin चेक करें
+			if origin != "" {
+				if isOriginAllowed(origin, config.AllowedOrigins) {
+					// CORS हेडर सेट करें
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+
+					// Credentials की अनुमति
+					if config.AllowCredentials {
+						w.Header().Set("Access-Control-Allow-Credentials", "true")
+					}
+
+					// Exposed Headers
+					if len(config.ExposedHeaders) > 0 {
+						w.Header().Set("Access-Control-Expose-Headers",
+							strings.Join(config.ExposedHeaders, ", "))
+					}
+
+					// Vary हेडर सेट करें (कैशिंग के लिए)
+					w.Header().Add("Vary", "Origin")
+
+					// Preflight Request हैंडल करें
+					if r.Method == http.MethodOptions {
+						handlePreflight(w, r, config)
+						return
+					}
+				} else {
+					// अनुमति नहीं है
+					log.Printf("⚠️  CORS: Origin '%s' को अनुमति नहीं है", origin)
+					http.Error(w, "CORS: Origin की अनुमति नहीं है", http.StatusForbidden)
+					return
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// isOriginAllowed चेक करता है कि origin अनुमत है या नहीं
+func isOriginAllowed(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		if allowed == "*" {
+			return true
+		}
+		if allowed == origin {
+			return true
+		}
+		// Wildcard subdomain सपोर्ट: *.myapp.com
+		if strings.HasPrefix(allowed, "*.") {
+			domain := allowed[2:]
+			if strings.HasSuffix(origin, "."+domain) ||
+				origin == "https://"+domain ||
+				origin == "http://"+domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// handlePreflight Preflight OPTIONS request हैंडल करता है
+func handlePreflight(w http.ResponseWriter, r *http.Request, config CORSConfig) {
+	// Allowed Methods
+	if len(config.AllowedMethods) > 0 {
+		w.Header().Set("Access-Control-Allow-Methods",
+			strings.Join(config.AllowedMethods, ", "))
+	}
+
+	// Allowed Headers
+	requestedHeaders := r.Header.Get("Access-Control-Request-Headers")
+	if requestedHeaders != "" {
+		if areHeadersAllowed(requestedHeaders, config.AllowedHeaders) {
+			w.Header().Set("Access-Control-Allow-Headers", requestedHeaders)
+		} else {
+			w.Header().Set("Access-Control-Allow-Headers",
+				strings.Join(config.AllowedHeaders, ", "))
+		}
+	} else if len(config.AllowedHeaders) > 0 {
+		w.Header().Set("Access-Control-Allow-Headers",
+			strings.Join(config.AllowedHeaders, ", "))
+	}
+
+	// Max Age (Preflight cache)
+	if config.MaxAge > 0 {
+		w.Header().Set("Access-Control-Max-Age",
+			fmt.Sprintf("%d", config.MaxAge))
+	}
+
+	w.WriteHeader(http.StatusNoContent) // 204
+}
+
+// areHeadersAllowed चेक करता है कि requested headers अनुमत हैं
+func areHeadersAllowed(requestedHeaders string, allowedHeaders []string) bool {
+	requested := strings.Split(requestedHeaders, ",")
+	for _, req := range requested {
+		req = strings.TrimSpace(strings.ToLower(req))
+		found := false
+		for _, allowed := range allowedHeaders {
+			if strings.ToLower(allowed) == req {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+// ==================== Response Helpers ====================
+
+// APIResponse स्टैंडर्ड API रिस्पॉन्स
+type APIResponse struct {
+	Success   bool        `json:"success"`
+	Message   string      `json:"message"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp time.Time   `json:"timestamp"`
+}
+
+// sendJSON JSON रिस्पॉन्स भेजता है
+func sendJSON(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	json.NewEncoder(w).Encode(data)
+}
+
+// ==================== Route Handlers ====================
+
+// homeHandler होम रूट
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	response := APIResponse{
+		Success:   true,
+		Message:   "Go CORS सर्वर चल रहा है!",
+		Data:      map[string]string{"version": "1.0.0", "status": "active"},
+		Timestamp: time.Now(),
+	}
+	sendJSON(w, http.StatusOK, response)
+}
+
+// usersHandler यूज़र्स रूट
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		users := []map[string]interface{}{
+			{"id": 1, "name": "राहुल शर्मा", "email": "rahul@example.com"},
+			{"id": 2, "name": "प्रिया पटेल", "email": "priya@example.com"},
+			{"id": 3, "name": "अमित कुमार", "email": "amit@example.com"},
+		}
+		response := APIResponse{
+			Success:   true,
+			Message:   "यूज़र्स सफलतापूर्वक प्राप्त हुए",
+			Data:      users,
+			Timestamp: time.Now(),
+		}
+		sendJSON(w, http.StatusOK, response)
+
+	case http.MethodPost:
+		var user map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+			sendJSON(w, http.StatusBadRequest, APIResponse{
+				Success:   false,
+				Message:   "Invalid JSON डेटा",
+				Timestamp: time.Now(),
+			})
+			return
+		}
+		user["id"] = 4
+		response := APIResponse{
+			Success:   true,
+			Message:   "यूज़र सफलतापूर्वक बनाया गया",
+			Data:      user,
+			Timestamp: time.Now(),
+		}
+		sendJSON(w, http.StatusCreated, response)
+
+	default:
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// productsHandler प्रोडक्ट्स रूट
+func productsHandler(w http.ResponseWriter, r *http.Request) {
+	products := []map[string]interface{}{
+		{"id": 1, "name": "लैपटॉप", "price": 45000, "category": "Electronics"},
+		{"id": 2, "name": "मोबाइल", "price": 15000, "category": "Electronics"},
+		{"id": 3, "name": "किताब", "price": 500, "category": "Education"},
+	}
+	response := APIResponse{
+		Success:   true,
+		Message:   "प्रोडक्ट्स सफलतापूर्वक प्राप्त हुए",
+		Data:      products,
+		Timestamp: time.Now(),
+	}
+	sendJSON(w, http.StatusOK, response)
+}
+
+// authHandler Authentication रूट
+func authHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var credentials map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&credentials); err != nil {
+		sendJSON(w, http.StatusBadRequest, APIResponse{
+			Success:   false,
+			Message:   "Invalid credentials format",
+			Timestamp: time.Now(),
+		})
+		return
+	}
+
+	// Demo authentication (production में proper auth use करें)
+	if credentials["username"] == "admin" && credentials["password"] == "password123" {
+		response := APIResponse{
+			Success: true,
+			Message: "Login सफल",
+			Data: map[string]string{
+				"token":   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.demo_token",
+				"expires": time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+			},
+			Timestamp: time.Now(),
+		}
+		sendJSON(w, http.StatusOK, response)
+	} else {
+		sendJSON(w, http.StatusUnauthorized, APIResponse{
+			Success:   false,
+			Message:   "Invalid username या password",
+			Timestamp: time.Now(),
+		})
+	}
+}
+
+// corsInfoHandler CORS जानकारी दिखाता है
+func corsInfoHandler(w http.ResponseWriter, r *http.Request) {
+	info := map[string]interface{}{
+		"allowed_origins": []string{
+			"https://myapp.com",
+			"https://www.myapp.com",
+		},
+		"allowed_methods": []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		"allowed_headers": []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
+		"credentials":     true,
+		"max_age_seconds": 86400,
+		"request_info": map[string]string{
+			"origin":     r.Header.Get("Origin"),
+			"method":     r.Method,
+			"user_agent": r.Header.Get("User-Agent"),
+		},
+	}
+	response := APIResponse{
+		Success:   true,
+		Message:   "CORS कॉन्फ़िगरेशन जानकारी",
+		Data:      info,
+		Timestamp: time.Now(),
+	}
+	sendJSON(w, http.StatusOK, response)
+}
+
+// ==================== Logging Middleware ====================
+
+// loggingMiddleware request logging
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = "Direct"
+		}
+
+		log.Printf("📥 %s %s | Origin: %s | IP: %s",
+			r.Method, r.URL.Path, origin, r.RemoteAddr)
+
+		next.ServeHTTP(w, r)
+
+		log.Printf("✅ %s %s | समय: %v",
+			r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+// ==================== Router ====================
+
+// setupRoutes सभी routes सेट करता है
+func setupRoutes(corsConfig CORSConfig) http.Handler {
+	mux := http.NewServeMux()
+
+	// Routes रजिस्टर करें
+	mux.HandleFunc("/", homeHandler)
+	mux.HandleFunc("/api/users", usersHandler)
+	mux.HandleFunc("/api/products", productsHandler)
+	mux.HandleFunc("/api/auth/login", authHandler)
+	mux.HandleFunc("/api/cors-info", corsInfoHandler)
+
+	// Middleware chain: Logging -> CORS -> Routes
+	corsHandler := CORSMiddleware(corsConfig)(mux)
+	loggedHandler := loggingMiddleware(corsHandler)
+
+	return loggedHandler
+}
+
+// ==================== Main ====================
+
+func main() {
+	// CORS कॉन्फ़िगरेशन
+	corsConfig := DefaultCORSConfig()
+
+	// Development के लिए localhost भी जोड़ें
+	corsConfig.AllowedOrigins = append(corsConfig.AllowedOrigins,
+		"http://localhost:3000",
+		"http://localhost:8080",
+		"http://127.0.0.1:3000",
+	)
+
+	// Routes सेट करें
+	handler := setupRoutes(corsConfig)
+
+	// सर्वर कॉन्फ़िगरेशन
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// स्टार्टअप जानकारी
+	fmt.Println("╔════════════════════════════════════════╗")
+	fmt.Println("║     Go CORS Web Server                 ║")
+	fmt.Println("╠════════════════════════════════════════╣")
+	fmt.Printf("║  🚀 सर्वर: http://localhost%s          ║\n", server.Addr)
+	fmt.Println("║  ✅ अनुमत Origins:                     ║")
+	for _, origin := range corsConfig.AllowedOrigins {
+		fmt.Printf("║     • %-33s ║\n", origin)
+	}
+	fmt.Println("╠════════════════════════════════════════╣")
+	fmt.Println("║  📡 Available Endpoints:               ║")
+	fmt.Println("║     GET  /                             ║")
+	fmt.Println("║     GET  /api/users                    ║")
+	fmt.Println("║     POST /api/users                    ║")
+	fmt.Println("║     GET  /api/products                 ║")
+	fmt.Println("║     POST /api/auth/login               ║")
+	fmt.Println("║     GET  /api/cors-info                ║")
+	fmt.Println("╚════════════════════════════════════════╝")
+
+	log.Printf("🌐 सर्वर शुरू हो रहा है: %s", server.Addr)
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("❌ सर्वर शुरू नहीं हो सका: %v", err)
+	}
+}
+```

@@ -1,0 +1,821 @@
+
+```python
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import asyncpg
+import asyncio
+from typing import Optional, List
+from pydantic import BaseModel
+import logging
+import os
+from datetime import datetime
+import random
+
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# ============================================================
+# Custom Exception Classes (कस्टम अपवाद क्लासेस)
+# ============================================================
+
+class DatabaseConnectionError(Exception):
+    """डेटाबेस कनेक्शन त्रुटि"""
+    def __init__(self, message: str, host: str = None, port: int = None, details: str = None):
+        self.message = message
+        self.host = host
+        self.port = port
+        self.details = details
+        self.timestamp = datetime.now().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """डेटाबेस क्वेरी त्रुटि"""
+    def __init__(self, message: str, query: str = None, details: str = None):
+        self.message = message
+        self.query = query
+        self.details = details
+        self.timestamp = datetime.now().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(Exception):
+    """डेटाबेस टाइमआउट त्रुटि"""
+    def __init__(self, message: str, timeout_seconds: int = None):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.timestamp = datetime.now().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseAuthenticationError(Exception):
+    """डेटाबेस प्रमाणीकरण त्रुटि"""
+    def __init__(self, message: str, username: str = None):
+        self.message = message
+        self.username = username
+        self.timestamp = datetime.now().isoformat()
+        super().__init__(self.message)
+
+
+class DatabasePoolExhaustedError(Exception):
+    """डेटाबेस कनेक्शन पूल समाप्त त्रुटि"""
+    def __init__(self, message: str, max_connections: int = None):
+        self.message = message
+        self.max_connections = max_connections
+        self.timestamp = datetime.now().isoformat()
+        super().__init__(self.message)
+
+
+# ============================================================
+# Pydantic Models (पाइडेंटिक मॉडल्स)
+# ============================================================
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    age: Optional[int] = None
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    age: Optional[int]
+    created_at: str
+
+
+class ErrorResponse(BaseModel):
+    error_type: str
+    message: str
+    details: Optional[str] = None
+    timestamp: str
+    status_code: int
+
+
+class HealthResponse(BaseModel):
+    status: str
+    database: str
+    timestamp: str
+    message: str
+
+
+# ============================================================
+# Database Manager (डेटाबेस मैनेजर)
+# ============================================================
+
+class DatabaseManager:
+    """डेटाबेस कनेक्शन और ऑपरेशन मैनेजर"""
+    
+    def __init__(self):
+        self.pool = None
+        self.db_config = {
+            "host": os.getenv("DB_HOST", "localhost"),
+            "port": int(os.getenv("DB_PORT", "5432")),
+            "database": os.getenv("DB_NAME", "myapp_db"),
+            "user": os.getenv("DB_USER", "postgres"),
+            "password": os.getenv("DB_PASSWORD", "password"),
+        }
+        self.max_connections = int(os.getenv("DB_MAX_CONNECTIONS", "10"))
+        self.min_connections = int(os.getenv("DB_MIN_CONNECTIONS", "2"))
+        self.connection_timeout = int(os.getenv("DB_TIMEOUT", "30"))
+        
+        # Simulation mode (जब वास्तविक DB उपलब्ध न हो)
+        self.simulation_mode = os.getenv("SIMULATION_MODE", "true").lower() == "true"
+        self.simulated_users = []
+        self.next_id = 1
+    
+    async def connect(self):
+        """डेटाबेस से कनेक्ट करें"""
+        if self.simulation_mode:
+            logger.info("✅ Simulation mode में चल रहा है (वास्तविक DB की आवश्यकता नहीं)")
+            return
+        
+        try:
+            logger.info(f"डेटाबेस से कनेक्ट हो रहा है: {self.db_config['host']}:{self.db_config['port']}")
+            
+            self.pool = await asyncio.wait_for(
+                asyncpg.create_pool(
+                    host=self.db_config["host"],
+                    port=self.db_config["port"],
+                    database=self.db_config["database"],
+                    user=self.db_config["user"],
+                    password=self.db_config["password"],
+                    min_size=self.min_connections,
+                    max_size=self.max_connections,
+                ),
+                timeout=self.connection_timeout
+            )
+            
+            logger.info("✅ डेटाबेस कनेक्शन सफल!")
+            await self._create_tables()
+            
+        except asyncio.TimeoutError:
+            raise DatabaseTimeoutError(
+                message=f"डेटाबेस कनेक्शन {self.connection_timeout} सेकंड में टाइमआउट हो गया",
+                timeout_seconds=self.connection_timeout
+            )
+        except asyncpg.InvalidPasswordError:
+            raise DatabaseAuthenticationError(
+                message="डेटाबेस प्रमाणीकरण विफल - गलत पासवर्ड",
+                username=self.db_config["user"]
+            )
+        except asyncpg.InvalidCatalogNameError:
+            raise DatabaseConnectionError(
+                message=f"डेटाबेस '{self.db_config['database']}' मौजूद नहीं है",
+                host=self.db_config["host"],
+                port=self.db_config["port"],
+                details="कृपया डेटाबेस बनाएं या नाम जांचें"
+            )
+        except OSError as e:
+            raise DatabaseConnectionError(
+                message=f"डेटाबेस सर्वर से कनेक्ट नहीं हो सका",
+                host=self.db_config["host"],
+                port=self.db_config["port"],
+                details=str(e)
+            )
+        except Exception as e:
+            raise DatabaseConnectionError(
+                message="अज्ञात डेटाबेस कनेक्शन त्रुटि",
+                host=self.db_config["host"],
+                port=self.db_config["port"],
+                details=str(e)
+            )
+    
+    async def disconnect(self):
+        """डेटाबेस से डिस्कनेक्ट करें"""
+        if self.simulation_mode:
+            logger.info("Simulation mode: disconnect")
+            return
+            
+        if self.pool:
+            await self.pool.close()
+            logger.info("डेटाबेस कनेक्शन बंद किया गया")
+    
+    async def _create_tables(self):
+        """टेबल बनाएं"""
+        if self.simulation_mode:
+            return
+            
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id SERIAL PRIMARY KEY,
+                    name VARCHAR(100) NOT NULL,
+                    email VARCHAR(200) UNIQUE NOT NULL,
+                    age INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        logger.info("✅ टेबल तैयार हैं")
+    
+    async def get_connection(self):
+        """कनेक्शन प्राप्त करें"""
+        if self.simulation_mode:
+            return None
+            
+        if not self.pool:
+            raise DatabaseConnectionError(
+                message="डेटाबेस पूल इनिशियलाइज़ नहीं है",
+                host=self.db_config["host"],
+                port=self.db_config["port"]
+            )
+        
+        try:
+            return await asyncio.wait_for(
+                self.pool.acquire(),
+                timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            raise DatabasePoolExhaustedError(
+                message="सभी डेटाबेस कनेक्शन व्यस्त हैं",
+                max_connections=self.max_connections
+            )
+    
+    # ============================================================
+    # CRUD Operations (सिमुलेशन + वास्तविक)
+    # ============================================================
+    
+    async def create_user(self, user: UserCreate) -> dict:
+        """नया उपयोगकर्ता बनाएं"""
+        if self.simulation_mode:
+            # Email uniqueness check
+            for u in self.simulated_users:
+                if u["email"] == user.email:
+                    raise DatabaseQueryError(
+                        message=f"Email '{user.email}' पहले से मौजूद है",
+                        query="INSERT INTO users",
+                        details="UNIQUE constraint violation"
+                    )
+            
+            new_user = {
+                "id": self.next_id,
+                "name": user.name,
+                "email": user.email,
+                "age": user.age,
+                "created_at": datetime.now().isoformat()
+            }
+            self.simulated_users.append(new_user)
+            self.next_id += 1
+            return new_user
+        
+        conn = await self.get_connection()
+        try:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO users (name, email, age)
+                    VALUES ($1, $2, $3)
+                    RETURNING id, name, email, age, created_at
+                    """,
+                    user.name, user.email, user.age
+                )
+                return dict(row)
+        except asyncpg.UniqueViolationError:
+            raise DatabaseQueryError(
+                message=f"Email '{user.email}' पहले से मौजूद है",
+                query="INSERT INTO users",
+                details="UNIQUE constraint violation on email"
+            )
+        except asyncpg.PostgresError as e:
+            raise DatabaseQueryError(
+                message="उपयोगकर्ता बनाने में त्रुटि",
+                query="INSERT INTO users",
+                details=str(e)
+            )
+        finally:
+            await self.pool.release(conn)
+    
+    async def get_all_users(self) -> List[dict]:
+        """सभी उपयोगकर्ता प्राप्त करें"""
+        if self.simulation_mode:
+            return self.simulated_users.copy()
+        
+        conn = await self.get_connection()
+        try:
+            rows = await conn.fetch("SELECT * FROM users ORDER BY id")
+            return [dict(row) for row in rows]
+        except asyncpg.PostgresError as e:
+            raise DatabaseQueryError(
+                message="उपयोगकर्ता सूची प्राप्त करने में त्रुटि",
+                query="SELECT * FROM users",
+                details=str(e)
+            )
+        finally:
+            await self.pool.release(conn)
+    
+    async def get_user_by_id(self, user_id: int) -> Optional[dict]:
+        """ID से उपयोगकर्ता प्राप्त करें"""
+        if self.simulation_mode:
+            for user in self.simulated_users:
+                if user["id"] == user_id:
+                    return user
+            return None
+        
+        conn = await self.get_connection()
+        try:
+            row = await conn.fetchrow(
+                "SELECT * FROM users WHERE id = $1", user_id
+            )
+            return dict(row) if row else None
+        except asyncpg.PostgresError as e:
+            raise DatabaseQueryError(
+                message=f"उपयोगकर्ता ID {user_id} प्राप्त करने में त्रुटि",
+                query=f"SELECT * FROM users WHERE id = {user_id}",
+                details=str(e)
+            )
+        finally:
+            await self.pool.release(conn)
+    
+    async def delete_user(self, user_id: int) -> bool:
+        """उपयोगकर्ता हटाएं"""
+        if self.simulation_mode:
+            for i, user in enumerate(self.simulated_users):
+                if user["id"] == user_id:
+                    self.simulated_users.pop(i)
+                    return True
+            return False
+        
+        conn = await self.get_connection()
+        try:
+            result = await conn.execute(
+                "DELETE FROM users WHERE id = $1", user_id
+            )
+            return result == "DELETE 1"
+        except asyncpg.PostgresError as e:
+            raise DatabaseQueryError(
+                message=f"उपयोगकर्ता ID {user_id} हटाने में त्रुटि",
+                query=f"DELETE FROM users WHERE id = {user_id}",
+                details=str(e)
+            )
+        finally:
+            await self.pool.release(conn)
+    
+    async def health_check(self) -> dict:
+        """डेटाबेस स्वास्थ्य जांच"""
+        if self.simulation_mode:
+            return {
+                "status": "healthy",
+                "mode": "simulation",
+                "users_count": len(self.simulated_users)
+            }
+        
+        if not self.pool:
+            raise DatabaseConnectionError(
+                message="डेटाबेस पूल उपलब्ध नहीं है"
+            )
+        
+        conn = await self.get_connection()
+        try:
+            result = await conn.fetchval("SELECT 1")
+            pool_size = self.pool.get_size()
+            idle_size = self.pool.get_idle_size()
+            
+            return {
+                "status": "healthy",
+                "pool_size": pool_size,
+                "idle_connections": idle_size,
+                "active_connections": pool_size - idle_size
+            }
+        except Exception as e:
+            raise DatabaseConnectionError(
+                message="डेटाबेस स्वास्थ्य जांच विफल",
+                host=self.db_config["host"],
+                details=str(e)
+            )
+        finally:
+            await self.pool.release(conn)
+
+
+# ============================================================
+# FastAPI Application Setup
+# ============================================================
+
+app = FastAPI(
+    title="FastAPI डेटाबेस कनेक्शन त्रुटि हैंडलर",
+    description="कस्टम डेटाबेस अपवाद हैंडलिंग के साथ FastAPI एप्लिकेशन",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Database Manager Instance
+db_manager = DatabaseManager()
+
+
+# ============================================================
+# Custom Exception Handlers (कस्टम अपवाद हैंडलर्स)
+# ============================================================
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request, 
+    exc: DatabaseConnectionError
+):
+    """डेटाबेस कनेक्शन त्रुटि हैंडलर"""
+    logger.error(
+        f"🔴 DatabaseConnectionError: {exc.message} | "
+        f"Host: {exc.host}:{exc.port} | "
+        f"Details: {exc.details}"
+    )
+    
+    error_detail = {
+        "error_type": "DatabaseConnectionError",
+        "message": exc.message,
+        "host": exc.host,
+        "port": exc.port,
+        "details": exc.details,
+        "timestamp": exc.timestamp,
+        "status_code": 503,
+        "suggestion": "कृपया डेटाबेस सर्वर की स्थिति जांचें और पुनः प्रयास करें"
+    }
+    
+    return JSONResponse(
+        status_code=503,
+        content=error_detail,
+        headers={"Retry-After": "30"}
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(
+    request: Request, 
+    exc: DatabaseQueryError
+):
+    """डेटाबेस क्वेरी त्रुटि हैंडलर"""
+    logger.error(
+        f"🟠 DatabaseQueryError: {exc.message} | "
+        f"Query: {exc.query} | "
+        f"Details: {exc.details}"
+    )
+    
+    error_detail = {
+        "error_type": "DatabaseQueryError",
+        "message": exc.message,
+        "query": exc.query,
+        "details": exc.details,
+        "timestamp": exc.timestamp,
+        "status_code": 400,
+        "suggestion": "कृपया अपना अनुरोध डेटा जांचें"
+    }
+    
+    return JSONResponse(
+        status_code=400,
+        content=error_detail
+    )
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(
+    request: Request, 
+    exc: DatabaseTimeoutError
+):
+    """डेटाबेस टाइमआउट त्रुटि हैंडलर"""
+    logger.error(
+        f"⏱️ DatabaseTimeoutError: {exc.message} | "
+        f"Timeout: {exc.timeout_seconds}s"
+    )
+    
+    error_detail = {
+        "error_type": "DatabaseTimeoutError",
+        "message": exc.message,
+        "timeout_seconds": exc.timeout_seconds,
+        "timestamp": exc.timestamp,
+        "status_code": 504,
+        "suggestion": f"डेटाबेस {exc.timeout_seconds} सेकंड में प्रतिक्रिया नहीं दे रहा"
+    }
+    
+    return JSONResponse(
+        status_code=504,
+        content=error_detail,
+        headers={"Retry-After": "60"}
+    )
+
+
+@app.exception_handler(DatabaseAuthenticationError)
+async def database_auth_error_handler(
+    request: Request, 
+    exc: DatabaseAuthenticationError
+):
+    """डेटाबेस प्रमाणीकरण त्रुटि हैंडलर"""
+    logger.error(
+        f"🔐 DatabaseAuthenticationError: {exc.message} | "
+        f"Username: {exc.username}"
+    )
+    
+    error_detail = {
+        "error_type": "DatabaseAuthenticationError",
+        "message": exc.message,
+        "username": exc.username,
+        "timestamp": exc.timestamp,
+        "status_code": 401,
+        "suggestion": "डेटाबेस क्रेडेंशियल्स जांचें (username/password)"
+    }
+    
+    return JSONResponse(
+        status_code=401,
+        content=error_detail
+    )
+
+
+@app.exception_handler(DatabasePoolExhaustedError)
+async def database_pool_exhausted_handler(
+    request: Request, 
+    exc: DatabasePoolExhaustedError
+):
+    """डेटाबेस पूल समाप्त त्रुटि हैंडलर"""
+    logger.error(
+        f"🏊 DatabasePoolExhaustedError: {exc.message} | "
+        f"Max Connections: {exc.max_connections}"
+    )
+    
+    error_detail = {
+        "error_type": "DatabasePoolExhaustedError",
+        "message": exc.message,
+        "max_connections": exc.max_connections,
+        "timestamp": exc.timestamp,
+        "status_code": 503,
+        "suggestion": "सर्वर पर अधिक लोड है, कृपया कुछ समय बाद पुनः प्रयास करें"
+    }
+    
+    return JSONResponse(
+        status_code=503,
+        content=error_detail,
+        headers={"Retry-After": "10"}
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """सामान्य HTTP अपवाद हैंडलर"""
+    logger.warning(f"⚠️ HTTPException: {exc.status_code} - {exc.detail}")
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error_type": "HTTPError",
+            "message": exc.detail,
+            "status_code": exc.status_code,
+            "timestamp": datetime.now().isoformat()
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """सामान्य अपवाद हैंडलर"""
+    logger.error(f"💥 Unexpected Error: {type(exc).__name__}: {str(exc)}")
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error_type": "InternalServerError",
+            "message": "आंतरिक सर्वर त्रुटि हुई",
+            "details": str(exc),
+            "timestamp": datetime.now().isoformat(),
+            "status_code": 500
+        }
+    )
+
+
+# ============================================================
+# Application Lifecycle Events
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+    """एप्लिकेशन शुरू होने पर"""
+    logger.info("🚀 FastAPI एप्लिकेशन शुरू हो रहा है...")
+    try:
+        await db_manager.connect()
+        logger.info("✅ एप्लिकेशन सफलतापूर्वक शुरू हुआ!")
+    except (DatabaseConnectionError, DatabaseTimeoutError, DatabaseAuthenticationError) as e:
+        logger.error(f"❌ डेटाबेस कनेक्शन विफल: {e.message}")
+        logger.warning("⚠️ एप्लिकेशन सीमित मोड में चल रहा है")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """एप्लिकेशन बंद होने पर"""
+    logger.info("🛑 एप्लिकेशन बंद हो रहा है...")
+    await db_manager.disconnect()
+    logger.info("✅ एप्लिकेशन सफलतापूर्वक बंद हुआ!")
+
+
+# ============================================================
+# API Routes (API मार्ग)
+# ============================================================
+
+@app.get("/", tags=["मुख्य"])
+async def root():
+    """मुख्य पृष्ठ"""
+    return {
+        "message": "FastAPI डेटाबेस त्रुटि हैंडलर में आपका स्वागत है!",
+        "version": "1.0.0",
+        "simulation_mode": db_manager.simulation_mode,
+        "docs": "/docs",
+        "endpoints": {
+            "health": "/health",
+            "users": "/users",
+            "test_errors": "/test/errors"
+        }
+    }
+
+
+@app.get("/health", response_model=HealthResponse, tags=["स्वास्थ्य"])
+async def health_check():
+    """डेटाबेस स्वास्थ्य जांच"""
+    try:
+        db_health = await db_manager.health_check()
+        return HealthResponse(
+            status="healthy",
+            database="connected",
+            timestamp=datetime.now().isoformat(),
+            message=f"सब कुछ ठीक है! {db_health}"
+        )
+    except DatabaseConnectionError as e:
+        logger.error(f"Health check failed: {e.message}")
+        raise
+
+
+# ============================================================
+# User CRUD Endpoints
+# ============================================================
+
+@app.post("/users", status_code=201, tags=["उपयोगकर्ता"])
+async def create_user(user: UserCreate):
+    """नया उपयोगकर्ता बनाएं"""
+    try:
+        new_user = await db_manager.create_user(user)
+        return {
+            "success": True,
+            "message": "उपयोगकर्ता सफलतापूर्वक बनाया गया",
+            "data": new_user
+        }
+    except DatabaseQueryError:
+        raise
+    except DatabaseConnectionError:
+        raise
+    except DatabasePoolExhaustedError:
+        raise
+
+
+@app.get("/users", tags=["उपयोगकर्ता"])
+async def get_all_users():
+    """सभी उपयोगकर्ता प्राप्त करें"""
+    try:
+        users = await db_manager.get_all_users()
+        return {
+            "success": True,
+            "count": len(users),
+            "data": users
+        }
+    except (DatabaseConnectionError, DatabaseQueryError, DatabasePoolExhaustedError):
+        raise
+
+
+@app.get("/users/{user_id}", tags=["उपयोगकर्ता"])
+async def get_user(user_id: int):
+    """ID से उपयोगकर्ता प्राप्त करें"""
+    if user_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="उपयोगकर्ता ID सकारात्मक होनी चाहिए"
+        )
+    
+    try:
+        user = await db_manager.get_user_by_id(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=404,
+                detail=f"उपयोगकर्ता ID {user_id} नहीं मिला"
+            )
+        return {
+            "success": True,
+            "data": user
+        }
+    except HTTPException:
+        raise
+    except (DatabaseConnectionError, DatabaseQueryError, DatabasePoolExhaustedError):
+        raise
+
+
+@app.delete("/users/{user_id}", tags=["उपयोगकर्ता"])
+async def delete_user(user_id: int):
+    """उपयोगकर्ता हटाएं"""
+    if user_id <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="उपयोगकर्ता ID सकारात्मक होनी चाहिए"
+        )
+    
+    try:
+        deleted = await db_manager.delete_user(user_id)
+        if not deleted:
+            raise HTTPException(
+                status_code=404,
+                detail=f"उपयोगकर्ता ID {user_id} नहीं मिला"
+            )
+        return {
+            "success": True,
+            "message": f"उपयोगकर्ता ID {user_id} सफलतापूर्वक हटाया गया"
+        }
+    except HTTPException:
+        raise
+    except (DatabaseConnectionError, DatabaseQueryError, DatabasePoolExhaustedError):
+        raise
+
+
+# ============================================================
+# Test Endpoints (परीक्षण एंडपॉइंट्स)
+# ============================================================
+
+@app.get("/test/errors", tags=["परीक्षण"])
+async def list_test_errors():
+    """उपलब्ध परीक्षण त्रुटियाँ"""
+    return {
+        "available_tests": [
+            {
+                "endpoint": "/test/errors/connection",
+                "description": "DatabaseConnectionError परीक्षण",
+                "expected_status": 503
+            },
+            {
+                "endpoint": "/test/errors/query",
+                "description": "DatabaseQueryError परीक्षण",
+                "expected_status": 400
+            },
+            {
+                "endpoint": "/test/errors/timeout",
+                "description": "DatabaseTimeoutError परीक्षण",
+                "expected_status": 504
+            },
+            {
+                "endpoint": "/test/errors/auth",
+                "description": "DatabaseAuthenticationError परीक्षण",
+                "expected_status": 401
+            },
+            {
+                "endpoint": "/test/errors/pool",
+                "description": "DatabasePoolExhaustedError परीक्षण",
+                "expected_status": 503
+            },
+            {
+                "endpoint": "/test/errors/random",
+                "description": "यादृच्छिक त्रुटि परीक्षण",
+                "expected_status": "varies"
+            }
+        ]
+    }
+
+
+@app.get("/test/errors/connection", tags=["परीक्षण"])
+async def test_connection_error():
+    """DatabaseConnectionError परीक्षण"""
+    raise DatabaseConnectionError(
+        message="परीक्षण: डेटाबेस सर्वर से कनेक्ट नहीं हो सका",
+        host="test-db-server.example.com",
+        port=5432,
+        details="Connection refused - सर्वर चालू नहीं है"
+    )
+
+
+@app.get("/test/errors/query", tags=["परीक्षण"])
+async def test_query_error():
+    """DatabaseQueryError परीक्षण"""
+    raise DatabaseQueryError(
+        message="परीक्षण: SQL क्वेरी निष्पादन विफल",
+        query="SELECT * FROM non_existent_table",
+        details="relation 'non_existent_table' does not exist"
+    )
+
+
+@app.get("/test/errors/timeout", tags=["परीक्षण"])
+async def test_timeout_error():
+    """DatabaseTimeoutError परीक्षण"""
+    raise DatabaseTimeoutError(
+        message="परीक्षण: डेटाबेस कनेक्शन टाइमआउट",
+        timeout_seconds=30
+    )
+
+
+@app.get("/test/errors/auth", tags=["परीक्षण"])
+async def test_auth_error():
+    """DatabaseAuthenticationError परीक्षण"""
+    raise DatabaseAuthenticationError(
+        message="परीक्षण: डेटाबेस प्रमाणीकरण विफल",
+        username="test_user"
+    )

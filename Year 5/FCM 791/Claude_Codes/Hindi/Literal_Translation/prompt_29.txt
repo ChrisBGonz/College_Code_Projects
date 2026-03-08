@@ -1,0 +1,357 @@
+
+```python
+import anthropic
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+
+def read_pom_xml(pom_path: str) -> str:
+    """Read the pom.xml file content."""
+    with open(pom_path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def get_maven_dependencies(pom_path: str) -> list[dict]:
+    """Extract dependencies from pom.xml."""
+    tree = ET.parse(pom_path)
+    root = tree.getroot()
+    
+    # Handle namespace
+    namespace = ""
+    if root.tag.startswith("{"):
+        namespace = root.tag.split("}")[0] + "}"
+    
+    dependencies = []
+    
+    # Find all dependency elements
+    for dep in root.findall(f".//{namespace}dependency"):
+        group_id = dep.find(f"{namespace}groupId")
+        artifact_id = dep.find(f"{namespace}artifactId")
+        version = dep.find(f"{namespace}version")
+        
+        if group_id is not None and artifact_id is not None:
+            dep_info = {
+                "groupId": group_id.text,
+                "artifactId": artifact_id.text,
+                "version": version.text if version is not None else "not specified"
+            }
+            dependencies.append(dep_info)
+    
+    return dependencies
+
+
+def check_maven_available() -> bool:
+    """Check if Maven is available on the system."""
+    try:
+        result = subprocess.run(
+            ["mvn", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+def run_maven_versions_check(pom_path: str) -> str:
+    """Run Maven versions plugin to check for updates."""
+    pom_dir = str(Path(pom_path).parent)
+    
+    try:
+        result = subprocess.run(
+            ["mvn", "versions:display-dependency-updates", "-f", pom_path],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=pom_dir
+        )
+        return result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return "Maven command timed out"
+    except FileNotFoundError:
+        return "Maven not found on system"
+
+
+def analyze_with_claude(pom_content: str, dependencies: list[dict], maven_output: str) -> None:
+    """Use Claude to analyze dependencies and suggest updates with streaming."""
+    
+    client = anthropic.Anthropic()
+    
+    # Prepare the prompt
+    deps_text = "\n".join([
+        f"- {dep['groupId']}:{dep['artifactId']} (version: {dep['version']})"
+        for dep in dependencies
+    ])
+    
+    prompt = f"""आप एक Java Maven प्रोजेक्ट के निर्भरता प्रबंधन विशेषज्ञ हैं।
+
+निम्नलिखित pom.xml की सामग्री और निर्भरताओं का विश्लेषण करें:
+
+**वर्तमान निर्भरताएं:**
+{deps_text}
+
+**Maven Versions Plugin आउटपुट:**
+{maven_output[:3000] if maven_output else "Maven उपलब्ध नहीं है"}
+
+**pom.xml सामग्री:**
+```xml
+{pom_content[:5000]}
+```
+
+कृपया निम्नलिखित कार्य करें:
+1. प्रत्येक निर्भरता के लिए नवीनतम स्थिर संस्करण की पहचान करें
+2. अपडेट करने की प्राथमिकता बताएं (सुरक्षा, बग फिक्स, नई सुविधाएं)
+3. संभावित breaking changes के बारे में चेतावनी दें
+4. अपडेट किए गए pom.xml के लिए XML स्निपेट प्रदान करें
+5. अपडेट प्रक्रिया के लिए Maven कमांड सुझाएं
+
+हिंदी में विस्तृत विश्लेषण प्रदान करें।"""
+
+    print("\n" + "="*60)
+    print("Claude AI द्वारा निर्भरता विश्लेषण")
+    print("="*60 + "\n")
+    
+    # Use streaming to get the response
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n\n" + "="*60)
+
+
+def generate_update_script(pom_path: str, dependencies: list[dict]) -> None:
+    """Generate a shell script to update dependencies."""
+    
+    client = anthropic.Anthropic()
+    
+    deps_text = "\n".join([
+        f"{dep['groupId']}:{dep['artifactId']}:{dep['version']}"
+        for dep in dependencies
+    ])
+    
+    prompt = f"""एक Maven प्रोजेक्ट के लिए निर्भरता अपडेट स्क्रिप्ट बनाएं।
+
+निर्भरताएं:
+{deps_text}
+
+pom.xml पथ: {pom_path}
+
+कृपया निम्नलिखित प्रदान करें:
+1. एक bash स्क्रिप्ट जो Maven versions plugin का उपयोग करके सभी निर्भरताओं को अपडेट करे
+2. बैकअप बनाने की प्रक्रिया
+3. अपडेट के बाद परीक्षण कमांड
+4. रोलबैक प्रक्रिया
+
+स्क्रिप्ट को हिंदी टिप्पणियों के साथ प्रदान करें।"""
+
+    print("\n" + "="*60)
+    print("अपडेट स्क्रिप्ट जनरेशन")
+    print("="*60 + "\n")
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        full_response = ""
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n")
+    
+    # Save the generated script
+    script_path = Path(pom_path).parent / "update_dependencies.sh"
+    
+    # Extract bash script from response
+    if "```bash" in full_response:
+        start = full_response.find("```bash") + 7
+        end = full_response.find("```", start)
+        if end > start:
+            script_content = full_response[start:end].strip()
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write("#!/bin/bash\n")
+                f.write(script_content)
+            
+            # Make script executable
+            import os
+            os.chmod(script_path, 0o755)
+            print(f"\n✅ अपडेट स्क्रिप्ट सहेजी गई: {script_path}")
+
+
+def create_sample_pom() -> str:
+    """Create a sample pom.xml for demonstration."""
+    sample_pom = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>my-java-project</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>My Java Project</name>
+    <description>एक नमूना Java Maven प्रोजेक्ट</description>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Framework -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-core</artifactId>
+            <version>5.3.20</version>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+            <version>5.3.20</version>
+        </dependency>
+
+        <!-- Hibernate -->
+        <dependency>
+            <groupId>org.hibernate</groupId>
+            <artifactId>hibernate-core</artifactId>
+            <version>5.6.9.Final</version>
+        </dependency>
+
+        <!-- Apache Commons -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.12.0</version>
+        </dependency>
+
+        <!-- Jackson -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.13.3</version>
+        </dependency>
+
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+
+        <!-- Testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- Database -->
+        <dependency>
+            <groupId>mysql</groupId>
+            <artifactId>mysql-connector-java</artifactId>
+            <version>8.0.29</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.10.1</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>"""
+    
+    # Save sample pom.xml
+    pom_path = "/tmp/sample_project/pom.xml"
+    Path("/tmp/sample_project").mkdir(parents=True, exist_ok=True)
+    
+    with open(pom_path, "w", encoding="utf-8") as f:
+        f.write(sample_pom)
+    
+    return pom_path
+
+
+def main():
+    print("🚀 Java Maven प्रोजेक्ट निर्भरता अपडेट स्वचालन")
+    print("="*60)
+    
+    # Check if pom.xml path is provided
+    if len(sys.argv) > 1:
+        pom_path = sys.argv[1]
+        if not Path(pom_path).exists():
+            print(f"❌ त्रुटि: {pom_path} नहीं मिला")
+            sys.exit(1)
+    else:
+        print("\n📝 नमूना pom.xml बना रहे हैं...")
+        pom_path = create_sample_pom()
+        print(f"✅ नमूना pom.xml बनाया गया: {pom_path}")
+    
+    print(f"\n📂 pom.xml पथ: {pom_path}")
+    
+    # Read pom.xml
+    print("\n📖 pom.xml पढ़ रहे हैं...")
+    pom_content = read_pom_xml(pom_path)
+    
+    # Extract dependencies
+    print("🔍 निर्भरताएं निकाल रहे हैं...")
+    dependencies = get_maven_dependencies(pom_path)
+    
+    print(f"\n📦 मिली निर्भरताएं ({len(dependencies)}):")
+    for dep in dependencies:
+        print(f"  • {dep['groupId']}:{dep['artifactId']} - {dep['version']}")
+    
+    # Check Maven availability and run versions check
+    maven_output = ""
+    if check_maven_available():
+        print("\n⚙️ Maven versions plugin चला रहे हैं...")
+        maven_output = run_maven_versions_check(pom_path)
+        print("✅ Maven विश्लेषण पूर्ण")
+    else:
+        print("\n⚠️ Maven उपलब्ध नहीं है, Claude AI विश्लेषण का उपयोग करेंगे")
+    
+    # Analyze with Claude
+    print("\n🤖 Claude AI से विश्लेषण प्राप्त कर रहे हैं...")
+    analyze_with_claude(pom_content, dependencies, maven_output)
+    
+    # Generate update script
+    print("\n📝 अपडेट स्क्रिप्ट बना रहे हैं...")
+    generate_update_script(pom_path, dependencies)
+    
+    print("\n✅ प्रक्रिया पूर्ण!")
+    print("\n📋 अगले कदम:")
+    print("  1. उत्पन्न विश्लेषण की समीक्षा करें")
+    print("  2. update_dependencies.sh स्क्रिप्ट की जांच करें")
+    print("  3. परीक्षण वातावरण में अपडेट लागू करें")
+    print("  4. सभी परीक्षण चलाएं")
+    print("  5. उत्पादन में तैनात करें")
+
+
+if __name__ == "__main__":
+    main()
+```

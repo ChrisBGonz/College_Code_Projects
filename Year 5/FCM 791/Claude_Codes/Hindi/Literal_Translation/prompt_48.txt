@@ -1,0 +1,327 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Text.RegularExpressions;
+
+public class DynamicSortQuery
+{
+    private readonly string _connectionString;
+
+    // Whitelist of allowed column names to prevent SQL injection
+    private static readonly HashSet<string> AllowedColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "id", "name", "email", "age", "created_date", "salary", "department", "city"
+    };
+
+    // Whitelist of allowed table names
+    private static readonly HashSet<string> AllowedTables = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "employees", "customers", "products", "orders"
+    };
+
+    public DynamicSortQuery(string connectionString)
+    {
+        _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+    }
+
+    /// <summary>
+    /// Executes a dynamic SQL query to sort a table based on the provided column name.
+    /// </summary>
+    /// <param name="tableName">Name of the table to query</param>
+    /// <param name="columnName">Column name to sort by</param>
+    /// <param name="sortOrder">Sort order: "ASC" or "DESC"</param>
+    /// <param name="pageNumber">Page number for pagination (1-based)</param>
+    /// <param name="pageSize">Number of records per page</param>
+    /// <returns>DataTable containing sorted results</returns>
+    public DataTable ExecuteSortedQuery(
+        string tableName,
+        string columnName,
+        string sortOrder = "ASC",
+        int pageNumber = 1,
+        int pageSize = 100)
+    {
+        // Validate inputs
+        ValidateTableName(tableName);
+        ValidateColumnName(columnName);
+        ValidateSortOrder(ref sortOrder);
+        ValidatePagination(pageNumber, pageSize);
+
+        // Sanitize identifiers using whitelist validation
+        string sanitizedTable = SanitizeIdentifier(tableName);
+        string sanitizedColumn = SanitizeIdentifier(columnName);
+
+        // Calculate offset for pagination
+        int offset = (pageNumber - 1) * pageSize;
+
+        // Build safe dynamic SQL query using whitelisted identifiers
+        // Note: We use string formatting here ONLY because identifiers have been
+        // validated against a whitelist - never use user input directly
+        string query = $@"
+            SELECT *
+            FROM [{sanitizedTable}]
+            ORDER BY [{sanitizedColumn}] {sortOrder}
+            OFFSET @Offset ROWS
+            FETCH NEXT @PageSize ROWS ONLY";
+
+        return ExecuteQuery(query, offset, pageSize);
+    }
+
+    /// <summary>
+    /// Executes a dynamic SQL query with multiple sort columns.
+    /// </summary>
+    /// <param name="tableName">Name of the table to query</param>
+    /// <param name="sortColumns">List of column names and their sort orders</param>
+    /// <param name="pageNumber">Page number for pagination</param>
+    /// <param name="pageSize">Number of records per page</param>
+    /// <returns>DataTable containing sorted results</returns>
+    public DataTable ExecuteMultiColumnSortedQuery(
+        string tableName,
+        List<(string ColumnName, string SortOrder)> sortColumns,
+        int pageNumber = 1,
+        int pageSize = 100)
+    {
+        // Validate inputs
+        ValidateTableName(tableName);
+
+        if (sortColumns == null || sortColumns.Count == 0)
+            throw new ArgumentException("At least one sort column must be provided.", nameof(sortColumns));
+
+        // Validate and build ORDER BY clause
+        var orderByParts = new List<string>();
+        foreach (var (columnName, sortOrder) in sortColumns)
+        {
+            ValidateColumnName(columnName);
+            string validatedSortOrder = sortOrder;
+            ValidateSortOrder(ref validatedSortOrder);
+
+            string sanitizedColumn = SanitizeIdentifier(columnName);
+            orderByParts.Add($"[{sanitizedColumn}] {validatedSortOrder}");
+        }
+
+        ValidatePagination(pageNumber, pageSize);
+
+        string sanitizedTable = SanitizeIdentifier(tableName);
+        string orderByClause = string.Join(", ", orderByParts);
+        int offset = (pageNumber - 1) * pageSize;
+
+        string query = $@"
+            SELECT *
+            FROM [{sanitizedTable}]
+            ORDER BY {orderByClause}
+            OFFSET @Offset ROWS
+            FETCH NEXT @PageSize ROWS ONLY";
+
+        return ExecuteQuery(query, offset, pageSize);
+    }
+
+    /// <summary>
+    /// Gets the total count of records in a table.
+    /// </summary>
+    /// <param name="tableName">Name of the table</param>
+    /// <returns>Total record count</returns>
+    public int GetTotalCount(string tableName)
+    {
+        ValidateTableName(tableName);
+        string sanitizedTable = SanitizeIdentifier(tableName);
+
+        string query = $"SELECT COUNT(*) FROM [{sanitizedTable}]";
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+            using (var command = new SqlCommand(query, connection))
+            {
+                return (int)command.ExecuteScalar();
+            }
+        }
+    }
+
+    private DataTable ExecuteQuery(string query, int offset, int pageSize)
+    {
+        var dataTable = new DataTable();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                // Use parameterized values for non-identifier inputs
+                command.Parameters.Add("@Offset", SqlDbType.Int).Value = offset;
+                command.Parameters.Add("@PageSize", SqlDbType.Int).Value = pageSize;
+
+                // Set command timeout
+                command.CommandTimeout = 30;
+
+                using (var adapter = new SqlDataAdapter(command))
+                {
+                    adapter.Fill(dataTable);
+                }
+            }
+        }
+
+        return dataTable;
+    }
+
+    private void ValidateTableName(string tableName)
+    {
+        if (string.IsNullOrWhiteSpace(tableName))
+            throw new ArgumentException("Table name cannot be null or empty.", nameof(tableName));
+
+        if (!AllowedTables.Contains(tableName))
+            throw new ArgumentException($"Table '{tableName}' is not in the allowed tables list.", nameof(tableName));
+    }
+
+    private void ValidateColumnName(string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(columnName))
+            throw new ArgumentException("Column name cannot be null or empty.", nameof(columnName));
+
+        if (!AllowedColumns.Contains(columnName))
+            throw new ArgumentException($"Column '{columnName}' is not in the allowed columns list.", nameof(columnName));
+    }
+
+    private void ValidateSortOrder(ref string sortOrder)
+    {
+        if (string.IsNullOrWhiteSpace(sortOrder))
+        {
+            sortOrder = "ASC";
+            return;
+        }
+
+        sortOrder = sortOrder.Trim().ToUpper();
+
+        if (sortOrder != "ASC" && sortOrder != "DESC")
+            throw new ArgumentException("Sort order must be 'ASC' or 'DESC'.", nameof(sortOrder));
+    }
+
+    private void ValidatePagination(int pageNumber, int pageSize)
+    {
+        if (pageNumber < 1)
+            throw new ArgumentException("Page number must be greater than 0.", nameof(pageNumber));
+
+        if (pageSize < 1 || pageSize > 1000)
+            throw new ArgumentException("Page size must be between 1 and 1000.", nameof(pageSize));
+    }
+
+    private string SanitizeIdentifier(string identifier)
+    {
+        // Additional safety: remove any characters that aren't alphanumeric or underscore
+        // This is a secondary defense after whitelist validation
+        return Regex.Replace(identifier, @"[^\w]", string.Empty);
+    }
+}
+
+// Example usage and demonstration
+class Program
+{
+    static void Main(string[] args)
+    {
+        string connectionString = "Server=localhost;Database=TestDB;Trusted_Connection=True;";
+
+        var queryExecutor = new DynamicSortQuery(connectionString);
+
+        try
+        {
+            Console.WriteLine("=== Dynamic SQL Sort Query Demo ===\n");
+
+            // Example 1: Single column sort
+            Console.WriteLine("Example 1: Sorting employees by 'name' in ASC order");
+            DataTable result1 = queryExecutor.ExecuteSortedQuery(
+                tableName: "employees",
+                columnName: "name",
+                sortOrder: "ASC",
+                pageNumber: 1,
+                pageSize: 10
+            );
+            PrintDataTable(result1);
+
+            // Example 2: Single column sort with DESC order
+            Console.WriteLine("\nExample 2: Sorting employees by 'salary' in DESC order");
+            DataTable result2 = queryExecutor.ExecuteSortedQuery(
+                tableName: "employees",
+                columnName: "salary",
+                sortOrder: "DESC",
+                pageNumber: 1,
+                pageSize: 10
+            );
+            PrintDataTable(result2);
+
+            // Example 3: Multi-column sort
+            Console.WriteLine("\nExample 3: Sorting employees by 'department' ASC, then 'salary' DESC");
+            var sortColumns = new List<(string, string)>
+            {
+                ("department", "ASC"),
+                ("salary", "DESC")
+            };
+            DataTable result3 = queryExecutor.ExecuteMultiColumnSortedQuery(
+                tableName: "employees",
+                sortColumns: sortColumns,
+                pageNumber: 1,
+                pageSize: 10
+            );
+            PrintDataTable(result3);
+
+            // Example 4: Get total count
+            Console.WriteLine("\nExample 4: Getting total count of employees");
+            int totalCount = queryExecutor.GetTotalCount("employees");
+            Console.WriteLine($"Total employees: {totalCount}");
+
+            // Example 5: Demonstrating SQL injection prevention
+            Console.WriteLine("\nExample 5: Testing SQL injection prevention");
+            try
+            {
+                queryExecutor.ExecuteSortedQuery(
+                    tableName: "employees",
+                    columnName: "name; DROP TABLE employees; --",
+                    sortOrder: "ASC"
+                );
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"SQL Injection prevented: {ex.Message}");
+            }
+        }
+        catch (SqlException ex)
+        {
+            Console.WriteLine($"Database error: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    static void PrintDataTable(DataTable dataTable)
+    {
+        if (dataTable.Rows.Count == 0)
+        {
+            Console.WriteLine("No data found.");
+            return;
+        }
+
+        // Print column headers
+        foreach (DataColumn column in dataTable.Columns)
+        {
+            Console.Write($"{column.ColumnName,-20}");
+        }
+        Console.WriteLine();
+        Console.WriteLine(new string('-', dataTable.Columns.Count * 20));
+
+        // Print rows
+        foreach (DataRow row in dataTable.Rows)
+        {
+            foreach (var item in row.ItemArray)
+            {
+                Console.Write($"{item,-20}");
+            }
+            Console.WriteLine();
+        }
+
+        Console.WriteLine($"\nTotal rows returned: {dataTable.Rows.Count}");
+    }
+}
+```

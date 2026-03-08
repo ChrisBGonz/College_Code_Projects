@@ -1,0 +1,299 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+async function updateUserProfile(userId, email, displayName) {
+  const tools = [
+    {
+      name: "validate_email",
+      description: "Validates if the provided email address is in correct format",
+      input_schema: {
+        type: "object",
+        properties: {
+          email: {
+            type: "string",
+            description: "The email address to validate",
+          },
+        },
+        required: ["email"],
+      },
+    },
+    {
+      name: "validate_display_name",
+      description:
+        "Validates if the display name meets requirements (3-50 characters, alphanumeric and spaces only)",
+      input_schema: {
+        type: "object",
+        properties: {
+          display_name: {
+            type: "string",
+            description: "The display name to validate",
+          },
+        },
+        required: ["display_name"],
+      },
+    },
+    {
+      name: "update_user_in_database",
+      description: "Updates the user profile in the database",
+      input_schema: {
+        type: "object",
+        properties: {
+          user_id: {
+            type: "string",
+            description: "The unique identifier of the user",
+          },
+          email: {
+            type: "string",
+            description: "The new email address",
+          },
+          display_name: {
+            type: "string",
+            description: "The new display name",
+          },
+        },
+        required: ["user_id"],
+      },
+    },
+    {
+      name: "send_confirmation_email",
+      description: "Sends a confirmation email to the user after profile update",
+      input_schema: {
+        type: "object",
+        properties: {
+          email: {
+            type: "string",
+            description: "The email address to send confirmation to",
+          },
+          display_name: {
+            type: "string",
+            description: "The display name of the user",
+          },
+        },
+        required: ["email", "display_name"],
+      },
+    },
+  ];
+
+  function processToolCall(toolName, toolInput) {
+    switch (toolName) {
+      case "validate_email": {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        const isValid = emailRegex.test(toolInput.email);
+        return {
+          valid: isValid,
+          message: isValid
+            ? "Email is valid"
+            : "Invalid email format. Please provide a valid email address.",
+        };
+      }
+
+      case "validate_display_name": {
+        const name = toolInput.display_name;
+        const nameRegex = /^[a-zA-Z0-9 ]{3,50}$/;
+        const isValid = nameRegex.test(name);
+        return {
+          valid: isValid,
+          message: isValid
+            ? "Display name is valid"
+            : "Display name must be 3-50 characters long and contain only letters, numbers, and spaces.",
+        };
+      }
+
+      case "update_user_in_database": {
+        console.log(
+          `[Database] Updating user ${toolInput.user_id} in database...`
+        );
+        const updatedUser = {
+          user_id: toolInput.user_id,
+          email: toolInput.email || "unchanged",
+          display_name: toolInput.display_name || "unchanged",
+          updated_at: new Date().toISOString(),
+        };
+        return {
+          success: true,
+          message: "User profile updated successfully",
+          updated_user: updatedUser,
+        };
+      }
+
+      case "send_confirmation_email": {
+        console.log(
+          `[Email Service] Sending confirmation email to ${toolInput.email}...`
+        );
+        return {
+          success: true,
+          message: `Confirmation email sent to ${toolInput.email}`,
+          email_id: `email_${Date.now()}`,
+        };
+      }
+
+      default:
+        return { error: "Unknown tool" };
+    }
+  }
+
+  const userRequest = `
+    Process a profile update request for user ID: ${userId}
+    
+    Update details:
+    - New Email: ${email || "not provided"}
+    - New Display Name: ${displayName || "not provided"}
+    
+    Please:
+    1. Validate the provided email and display name
+    2. If validation passes, update the user profile in the database
+    3. Send a confirmation email to the user
+    4. Return a summary of what was updated
+    
+    If any validation fails, explain what went wrong and don't proceed with the update.
+  `;
+
+  console.log("\n=== Processing Profile Update Request ===");
+  console.log(`User ID: ${userId}`);
+  console.log(`Email: ${email}`);
+  console.log(`Display Name: ${displayName}`);
+  console.log("=========================================\n");
+
+  const messages = [{ role: "user", content: userRequest }];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    tools: tools,
+    messages: messages,
+  });
+
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlocks = response.content.filter(
+      (block) => block.type === "tool_use"
+    );
+
+    const toolResults = [];
+
+    for (const toolUse of toolUseBlocks) {
+      console.log(`\n[Tool Call] ${toolUse.name}`);
+      console.log("Input:", JSON.stringify(toolUse.input, null, 2));
+
+      const result = processToolCall(toolUse.name, toolUse.input);
+      console.log("Result:", JSON.stringify(result, null, 2));
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(result),
+      });
+    }
+
+    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "user", content: toolResults });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  return {
+    success: true,
+    message: finalResponse,
+    userId: userId,
+  };
+}
+
+async function handleUpdateProfileRequest(req) {
+  const { userId, email, displayName } = req.body || {};
+
+  if (!userId) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: "User ID is required",
+      },
+    };
+  }
+
+  if (!email && !displayName) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: "At least one field (email or displayName) must be provided",
+      },
+    };
+  }
+
+  try {
+    const result = await updateUserProfile(userId, email, displayName);
+
+    return {
+      status: 200,
+      body: result,
+    };
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    return {
+      status: 500,
+      body: {
+        success: false,
+        error: "Internal server error while updating profile",
+      },
+    };
+  }
+}
+
+async function main() {
+  console.log("Testing /api/user/update-profile endpoint\n");
+
+  console.log("Test 1: Update both email and display name");
+  const request1 = {
+    body: {
+      userId: "user_123",
+      email: "newemail@example.com",
+      displayName: "John Doe",
+    },
+  };
+
+  const response1 = await handleUpdateProfileRequest(request1);
+  console.log("\nResponse:", JSON.stringify(response1, null, 2));
+
+  console.log("\n" + "=".repeat(50) + "\n");
+
+  console.log("Test 2: Update only email");
+  const request2 = {
+    body: {
+      userId: "user_456",
+      email: "another@test.com",
+    },
+  };
+
+  const response2 = await handleUpdateProfileRequest(request2);
+  console.log("\nResponse:", JSON.stringify(response2, null, 2));
+
+  console.log("\n" + "=".repeat(50) + "\n");
+
+  console.log("Test 3: Invalid email format");
+  const request3 = {
+    body: {
+      userId: "user_789",
+      email: "invalid-email",
+      displayName: "Test User",
+    },
+  };
+
+  const response3 = await handleUpdateProfileRequest(request3);
+  console.log("\nResponse:", JSON.stringify(response3, null, 2));
+}
+
+main().catch(console.error);
+```

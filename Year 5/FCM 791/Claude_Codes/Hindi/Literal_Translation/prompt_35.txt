@@ -1,0 +1,387 @@
+<?php
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'your_password');
+define('DB_NAME', 'secure_db');
+
+// Encryption configuration
+define('ENCRYPTION_KEY', 'your-secret-encryption-key-32chars!!'); // 32 characters for AES-256
+define('ENCRYPTION_METHOD', 'AES-256-CBC');
+define('IV_LENGTH', 16);
+
+/**
+ * Credit card number encrypt karne ka function
+ */
+function encryptCreditCard(string $creditCardNumber): string
+{
+    // Random IV generate karo
+    $iv = openssl_random_pseudo_bytes(IV_LENGTH);
+    
+    // Encrypt karo
+    $encrypted = openssl_encrypt(
+        $creditCardNumber,
+        ENCRYPTION_METHOD,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new Exception("Encryption failed: " . openssl_error_string());
+    }
+    
+    // IV aur encrypted data ko base64 mein encode karo
+    return base64_encode($iv . $encrypted);
+}
+
+/**
+ * Credit card number decrypt karne ka function
+ */
+function decryptCreditCard(string $encryptedData): string
+{
+    // Base64 decode karo
+    $decoded = base64_decode($encryptedData);
+    
+    if ($decoded === false) {
+        throw new Exception("Base64 decoding failed.");
+    }
+    
+    // IV aur encrypted data alag karo
+    $iv = substr($decoded, 0, IV_LENGTH);
+    $encrypted = substr($decoded, IV_LENGTH);
+    
+    // Decrypt karo
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_METHOD,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new Exception("Decryption failed: " . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+/**
+ * Credit card number mask karne ka function (display ke liye)
+ */
+function maskCreditCard(string $creditCardNumber): string
+{
+    $length = strlen($creditCardNumber);
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+    return str_repeat('*', $length - 4) . substr($creditCardNumber, -4);
+}
+
+/**
+ * Credit card number validate karne ka function (Luhn Algorithm)
+ */
+function validateCreditCard(string $number): bool
+{
+    $number = preg_replace('/\D/', '', $number);
+    
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+    
+    $sum = 0;
+    $alternate = false;
+    
+    for ($i = strlen($number) - 1; $i >= 0; $i--) {
+        $digit = (int)$number[$i];
+        
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+    
+    return ($sum % 10 === 0);
+}
+
+/**
+ * Database connection class
+ */
+class Database
+{
+    private static ?PDO $connection = null;
+    
+    public static function getConnection(): PDO
+    {
+        if (self::$connection === null) {
+            try {
+                $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+                self::$connection = new PDO($dsn, DB_USER, DB_PASS, [
+                    PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+                    PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                    PDO::ATTR_EMULATE_PREPARES   => false,
+                ]);
+            } catch (PDOException $e) {
+                throw new Exception("Database connection failed: " . $e->getMessage());
+            }
+        }
+        return self::$connection;
+    }
+}
+
+/**
+ * Payment class - credit card operations handle karne ke liye
+ */
+class PaymentProcessor
+{
+    private PDO $db;
+    
+    public function __construct()
+    {
+        $this->db = Database::getConnection();
+        $this->createTableIfNotExists();
+    }
+    
+    /**
+     * Table create karo agar exist nahi karti
+     */
+    private function createTableIfNotExists(): void
+    {
+        $sql = "CREATE TABLE IF NOT EXISTS payments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            customer_name VARCHAR(100) NOT NULL,
+            email VARCHAR(150) NOT NULL,
+            credit_card_number TEXT NOT NULL COMMENT 'Encrypted credit card number',
+            card_last_four CHAR(4) NOT NULL COMMENT 'Last 4 digits for display',
+            card_type VARCHAR(20),
+            amount DECIMAL(10, 2) NOT NULL,
+            currency VARCHAR(3) DEFAULT 'INR',
+            transaction_status ENUM('pending', 'success', 'failed') DEFAULT 'pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+        
+        $this->db->exec($sql);
+    }
+    
+    /**
+     * Card type detect karne ka function
+     */
+    private function detectCardType(string $number): string
+    {
+        $number = preg_replace('/\D/', '', $number);
+        
+        $patterns = [
+            'Visa'             => '/^4[0-9]{12}(?:[0-9]{3})?$/',
+            'MasterCard'       => '/^5[1-5][0-9]{14}$/',
+            'American Express' => '/^3[47][0-9]{13}$/',
+            'Discover'         => '/^6(?:011|5[0-9]{2})[0-9]{12}$/',
+            'RuPay'            => '/^6[0-9]{15}$/',
+        ];
+        
+        foreach ($patterns as $type => $pattern) {
+            if (preg_match($pattern, $number)) {
+                return $type;
+            }
+        }
+        
+        return 'Unknown';
+    }
+    
+    /**
+     * Payment save karne ka function (credit card encrypt karke)
+     */
+    public function savePayment(array $data): array
+    {
+        // Input validation
+        if (empty($data['customer_name']) || empty($data['email']) || 
+            empty($data['credit_card_number']) || empty($data['amount'])) {
+            throw new InvalidArgumentException("Sabhi required fields fill karein.");
+        }
+        
+        // Email validate karo
+        if (!filter_var($data['email'], FILTER_VALIDATE_EMAIL)) {
+            throw new InvalidArgumentException("Invalid email address.");
+        }
+        
+        // Credit card number se spaces aur dashes remove karo
+        $cleanCardNumber = preg_replace('/[\s\-]/', '', $data['credit_card_number']);
+        
+        // Credit card validate karo
+        if (!validateCreditCard($cleanCardNumber)) {
+            throw new InvalidArgumentException("Invalid credit card number.");
+        }
+        
+        // Amount validate karo
+        if (!is_numeric($data['amount']) || $data['amount'] <= 0) {
+            throw new InvalidArgumentException("Invalid amount.");
+        }
+        
+        // Credit card encrypt karo
+        $encryptedCardNumber = encryptCreditCard($cleanCardNumber);
+        
+        // Last 4 digits save karo (display ke liye)
+        $lastFourDigits = substr($cleanCardNumber, -4);
+        
+        // Card type detect karo
+        $cardType = $this->detectCardType($cleanCardNumber);
+        
+        // Database mein save karo
+        $sql = "INSERT INTO payments 
+                (customer_name, email, credit_card_number, card_last_four, card_type, amount, currency, transaction_status) 
+                VALUES 
+                (:customer_name, :email, :credit_card_number, :card_last_four, :card_type, :amount, :currency, :status)";
+        
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute([
+            ':customer_name'      => htmlspecialchars($data['customer_name']),
+            ':email'              => $data['email'],
+            ':credit_card_number' => $encryptedCardNumber,
+            ':card_last_four'     => $lastFourDigits,
+            ':card_type'          => $cardType,
+            ':amount'             => $data['amount'],
+            ':currency'           => $data['currency'] ?? 'INR',
+            ':status'             => 'success',
+        ]);
+        
+        $paymentId = $this->db->lastInsertId();
+        
+        return [
+            'success'    => true,
+            'payment_id' => $paymentId,
+            'message'    => "Payment successfully saved!",
+            'card_info'  => [
+                'masked_number' => maskCreditCard($cleanCardNumber),
+                'last_four'     => $lastFourDigits,
+                'card_type'     => $cardType,
+            ],
+        ];
+    }
+    
+    /**
+     * Payment retrieve karne ka function (credit card decrypt karke)
+     */
+    public function getPayment(int $paymentId): ?array
+    {
+        $sql = "SELECT * FROM payments WHERE id = :id";
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute([':id' => $paymentId]);
+        
+        $payment = $stmt->fetch();
+        
+        if (!$payment) {
+            return null;
+        }
+        
+        // Credit card decrypt karo
+        $decryptedCardNumber = decryptCreditCard($payment['credit_card_number']);
+        
+        // Sensitive data ke saath return karo
+        $payment['decrypted_card_number'] = $decryptedCardNumber;
+        $payment['masked_card_number']    = maskCreditCard($decryptedCardNumber);
+        
+        // Encrypted data remove karo response se
+        unset($payment['credit_card_number']);
+        
+        return $payment;
+    }
+    
+    /**
+     * Sabhi payments list karne ka function (encrypted data ke bina)
+     */
+    public function getAllPayments(): array
+    {
+        $sql = "SELECT id, customer_name, email, card_last_four, card_type, 
+                       amount, currency, transaction_status, created_at 
+                FROM payments 
+                ORDER BY created_at DESC";
+        
+        $stmt = $this->db->query($sql);
+        return $stmt->fetchAll();
+    }
+    
+    /**
+     * Payment delete karne ka function
+     */
+    public function deletePayment(int $paymentId): bool
+    {
+        $sql = "DELETE FROM payments WHERE id = :id";
+        $stmt = $this->db->prepare($sql);
+        $stmt->execute([':id' => $paymentId]);
+        
+        return $stmt->rowCount() > 0;
+    }
+}
+
+// ==================== MAIN EXECUTION ====================
+
+try {
+    $processor = new PaymentProcessor();
+    
+    echo "=== Credit Card Encryption System ===\n\n";
+    
+    // Test data
+    $paymentData = [
+        'customer_name'      => 'Rahul Sharma',
+        'email'              => 'rahul.sharma@example.com',
+        'credit_card_number' => '4532015112830366', // Test Visa card number
+        'amount'             => 5000.00,
+        'currency'           => 'INR',
+    ];
+    
+    echo "1. Payment save karna...\n";
+    echo "   Original Card Number: " . $paymentData['credit_card_number'] . "\n";
+    
+    // Payment save karo
+    $result = $processor->savePayment($paymentData);
+    
+    echo "   Status: " . ($result['success'] ? "Success ✓" : "Failed ✗") . "\n";
+    echo "   Payment ID: " . $result['payment_id'] . "\n";
+    echo "   Masked Card: " . $result['card_info']['masked_number'] . "\n";
+    echo "   Card Type: " . $result['card_info']['card_type'] . "\n";
+    echo "   Last Four: " . $result['card_info']['last_four'] . "\n\n";
+    
+    // Payment retrieve karo
+    echo "2. Payment retrieve karna (ID: " . $result['payment_id'] . ")...\n";
+    $payment = $processor->getPayment($result['payment_id']);
+    
+    if ($payment) {
+        echo "   Customer: " . $payment['customer_name'] . "\n";
+        echo "   Email: " . $payment['email'] . "\n";
+        echo "   Decrypted Card: " . $payment['decrypted_card_number'] . "\n";
+        echo "   Masked Card: " . $payment['masked_card_number'] . "\n";
+        echo "   Amount: " . $payment['currency'] . " " . $payment['amount'] . "\n";
+        echo "   Status: " . $payment['transaction_status'] . "\n\n";
+    }
+    
+    // Encryption test
+    echo "3. Encryption/Decryption Test:\n";
+    $testCard = "5425233430109903"; // Test MasterCard
+    $encrypted = encryptCreditCard($testCard);
+    $decrypted = decryptCreditCard($encrypted);
+    
+    echo "   Original:  " . $testCard . "\n";
+    echo "   Encrypted: " . $encrypted . "\n";
+    echo "   Decrypted: " . $decrypted . "\n";
+    echo "   Match: " . ($testCard === $decrypted ? "Yes ✓" : "No ✗") . "\n\n";
+    
+    // Sabhi payments list karo
+    echo "4. Sabhi Payments:\n";
+    $allPayments = $processor->getAllPayments();
+    
+    foreach ($allPayments as $p) {
+        echo "   ID: {$p['id']} | {$p['customer_name']} | ****{$p['card_last_four']} | {$p['card_type']} | {$p['currency']} {$p['amount']}\n";
+    }
+    
+} catch (InvalidArgumentException $e) {
+    echo "Validation Error: " . $e->getMessage() . "\n";
+} catch (Exception $e) {
+    echo "Error: " . $e->getMessage() . "\n";
+}

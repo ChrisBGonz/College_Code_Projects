@@ -1,0 +1,557 @@
+```python
+#!/usr/bin/env python3
+"""
+वेब फ़ॉर्म से username लेकर PostgreSQL डेटाबेस में जाँच करने की स्क्रिप्ट
+"""
+
+import psycopg2
+import psycopg2.extras
+from flask import Flask, request, jsonify, render_template_string
+import re
+import logging
+from contextlib import contextmanager
+
+# Logging सेटअप
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# डेटाबेस कॉन्फ़िगरेशन
+DB_CONFIG = {
+    'host': 'localhost',
+    'port': 5432,
+    'database': 'user_database',
+    'user': 'db_user',
+    'password': 'your_secure_password',
+    'connect_timeout': 10
+}
+
+# HTML टेम्पलेट
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>उपयोगकर्ता जाँच</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f0f2f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #555;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 16px;
+            box-sizing: border-box;
+            transition: border-color 0.3s;
+        }
+        input[type="text"]:focus {
+            border-color: #4CAF50;
+            outline: none;
+        }
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 6px;
+            text-align: center;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .info {
+            background-color: #d1ecf1;
+            color: #0c5460;
+            border: 1px solid #bee5eb;
+        }
+        .hint {
+            font-size: 12px;
+            color: #888;
+            margin-top: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔍 उपयोगकर्ता जाँच</h1>
+        <form id="userForm">
+            <div class="form-group">
+                <label for="username">उपयोगकर्ता नाम (Username):</label>
+                <input 
+                    type="text" 
+                    id="username" 
+                    name="username" 
+                    placeholder="अपना username दर्ज करें..."
+                    maxlength="50"
+                    required
+                >
+                <p class="hint">केवल अक्षर, अंक, underscore (_) और hyphen (-) की अनुमति है</p>
+            </div>
+            <button type="submit">जाँच करें</button>
+        </form>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        document.getElementById('userForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const username = document.getElementById('username').value.trim();
+            const resultDiv = document.getElementById('result');
+            
+            if (!username) {
+                resultDiv.innerHTML = '<div class="result error">⚠️ कृपया username दर्ज करें!</div>';
+                return;
+            }
+            
+            resultDiv.innerHTML = '<div class="result info">⏳ जाँच हो रही है...</div>';
+            
+            try {
+                const response = await fetch('/check-user', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ username: username })
+                });
+                
+                const data = await response.json();
+                
+                if (response.ok) {
+                    if (data.exists) {
+                        resultDiv.innerHTML = `
+                            <div class="result success">
+                                ✅ उपयोगकर्ता <strong>"${data.username}"</strong> मौजूद है!
+                                <br><small>Email: ${data.email || 'N/A'}</small>
+                            </div>`;
+                    } else {
+                        resultDiv.innerHTML = `
+                            <div class="result error">
+                                ❌ उपयोगकर्ता <strong>"${data.username}"</strong> मौजूद नहीं है।
+                            </div>`;
+                    }
+                } else {
+                    resultDiv.innerHTML = `<div class="result error">⚠️ त्रुटि: ${data.error}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = '<div class="result error">⚠️ सर्वर से कनेक्ट नहीं हो सका!</div>';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+
+class DatabaseManager:
+    """PostgreSQL डेटाबेस प्रबंधन क्लास"""
+    
+    def __init__(self, config):
+        self.config = config
+    
+    @contextmanager
+    def get_connection(self):
+        """डेटाबेस कनेक्शन context manager"""
+        conn = None
+        try:
+            conn = psycopg2.connect(**self.config)
+            logger.info("डेटाबेस से कनेक्शन सफल")
+            yield conn
+        except psycopg2.OperationalError as e:
+            logger.error(f"डेटाबेस कनेक्शन त्रुटि: {e}")
+            raise
+        finally:
+            if conn:
+                conn.close()
+                logger.info("डेटाबेस कनेक्शन बंद किया")
+    
+    def setup_database(self):
+        """डेटाबेस और टेबल सेटअप करें"""
+        create_table_query = """
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE,
+                password_hash VARCHAR(255) NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_login TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_username ON users(username);
+            CREATE INDEX IF NOT EXISTS idx_email ON users(email);
+        """
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(create_table_query)
+                    conn.commit()
+                    logger.info("डेटाबेस टेबल सफलतापूर्वक बनाई गई")
+        except Exception as e:
+            logger.error(f"टेबल बनाने में त्रुटि: {e}")
+            raise
+    
+    def insert_sample_data(self):
+        """परीक्षण के लिए नमूना डेटा डालें"""
+        sample_users = [
+            ('rahul_sharma', 'rahul@example.com', 'hashed_password_1'),
+            ('priya_singh', 'priya@example.com', 'hashed_password_2'),
+            ('amit_kumar', 'amit@example.com', 'hashed_password_3'),
+            ('neha_gupta', 'neha@example.com', 'hashed_password_4'),
+        ]
+        
+        insert_query = """
+            INSERT INTO users (username, email, password_hash) 
+            VALUES (%s, %s, %s)
+            ON CONFLICT (username) DO NOTHING;
+        """
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.executemany(insert_query, sample_users)
+                    conn.commit()
+                    logger.info(f"{len(sample_users)} नमूना उपयोगकर्ता जोड़े गए")
+        except Exception as e:
+            logger.error(f"नमूना डेटा डालने में त्रुटि: {e}")
+            raise
+    
+    def check_user_exists(self, username):
+        """
+        Username से उपयोगकर्ता की जाँच करें
+        
+        Args:
+            username (str): जाँचने के लिए username
+            
+        Returns:
+            dict: उपयोगकर्ता की जानकारी या None
+        """
+        # Parameterized query - SQL Injection से सुरक्षा
+        query = """
+            SELECT 
+                id,
+                username,
+                email,
+                is_active,
+                created_at,
+                last_login
+            FROM users 
+            WHERE username = %s
+            LIMIT 1;
+        """
+        
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                    # Parameterized query उपयोग करें - SQL Injection रोकने के लिए
+                    cursor.execute(query, (username,))
+                    user = cursor.fetchone()
+                    
+                    if user:
+                        logger.info(f"उपयोगकर्ता '{username}' मिला")
+                        return dict(user)
+                    else:
+                        logger.info(f"उपयोगकर्ता '{username}' नहीं मिला")
+                        return None
+                        
+        except psycopg2.Error as e:
+            logger.error(f"क्वेरी त्रुटि: {e}")
+            raise
+
+
+class InputValidator:
+    """Input validation क्लास"""
+    
+    # Username के लिए allowed pattern
+    USERNAME_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{3,50}$')
+    
+    @classmethod
+    def validate_username(cls, username):
+        """
+        Username को validate करें
+        
+        Args:
+            username (str): validate करने के लिए username
+            
+        Returns:
+            tuple: (is_valid, error_message)
+        """
+        if not username:
+            return False, "Username खाली नहीं हो सकता"
+        
+        if not isinstance(username, str):
+            return False, "Username string होना चाहिए"
+        
+        # Whitespace हटाएं
+        username = username.strip()
+        
+        if len(username) < 3:
+            return False, "Username कम से कम 3 अक्षर का होना चाहिए"
+        
+        if len(username) > 50:
+            return False, "Username 50 अक्षर से अधिक नहीं हो सकता"
+        
+        if not cls.USERNAME_PATTERN.match(username):
+            return False, "Username में केवल अक्षर, अंक, underscore और hyphen की अनुमति है"
+        
+        return True, None
+    
+    @classmethod
+    def sanitize_username(cls, username):
+        """Username को sanitize करें"""
+        if username:
+            return username.strip().lower()
+        return username
+
+
+# DatabaseManager instance बनाएं
+db_manager = DatabaseManager(DB_CONFIG)
+
+
+@app.route('/')
+def index():
+    """मुख्य पेज"""
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/check-user', methods=['POST'])
+def check_user():
+    """
+    Username जाँच करने का API endpoint
+    
+    Returns:
+        JSON response
+    """
+    try:
+        # Request data प्राप्त करें
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({
+                'error': 'अमान्य request data'
+            }), 400
+        
+        username = data.get('username', '').strip()
+        
+        # Input validation
+        is_valid, error_message = InputValidator.validate_username(username)
+        
+        if not is_valid:
+            logger.warning(f"अमान्य username: '{username}' - {error_message}")
+            return jsonify({
+                'error': error_message
+            }), 400
+        
+        # Username sanitize करें
+        clean_username = InputValidator.sanitize_username(username)
+        
+        logger.info(f"Username जाँच: '{clean_username}'")
+        
+        # डेटाबेस में जाँच करें
+        user_data = db_manager.check_user_exists(clean_username)
+        
+        if user_data:
+            # संवेदनशील जानकारी न भेजें
+            response_data = {
+                'exists': True,
+                'username': user_data['username'],
+                'email': user_data.get('email', ''),
+                'is_active': user_data.get('is_active', False),
+                'message': f"उपयोगकर्ता '{clean_username}' मौजूद है"
+            }
+            return jsonify(response_data), 200
+        else:
+            return jsonify({
+                'exists': False,
+                'username': clean_username,
+                'message': f"उपयोगकर्ता '{clean_username}' मौजूद नहीं है"
+            }), 200
+            
+    except psycopg2.OperationalError:
+        logger.error("डेटाबेस कनेक्शन विफल")
+        return jsonify({
+            'error': 'डेटाबेस से कनेक्ट नहीं हो सका'
+        }), 503
+        
+    except Exception as e:
+        logger.error(f"अप्रत्याशित त्रुटि: {e}")
+        return jsonify({
+            'error': 'सर्वर त्रुटि हुई'
+        }), 500
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """सर्वर और डेटाबेस health check"""
+    try:
+        with db_manager.get_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1")
+        
+        return jsonify({
+            'status': 'healthy',
+            'database': 'connected',
+            'message': 'सर्वर सामान्य रूप से चल रहा है'
+        }), 200
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'unhealthy',
+            'database': 'disconnected',
+            'error': str(e)
+        }), 503
+
+
+def initialize_app():
+    """एप्लिकेशन शुरू करने से पहले सेटअप"""
+    try:
+        logger.info("डेटाबेस सेटअप शुरू हो रहा है...")
+        db_manager.setup_database()
+        
+        logger.info("नमूना डेटा जोड़ा जा रहा है...")
+        db_manager.insert_sample_data()
+        
+        logger.info("एप्लिकेशन सफलतापूर्वक शुरू हुई")
+        
+    except Exception as e:
+        logger.error(f"एप्लिकेशन शुरू करने में त्रुटि: {e}")
+        raise
+
+
+def standalone_check(username):
+    """
+    Command line से username जाँच करने का फ़ंक्शन
+    
+    Args:
+        username (str): जाँचने के लिए username
+    """
+    print(f"\n{'='*50}")
+    print(f"Username जाँच: '{username}'")
+    print('='*50)
+    
+    # Validation
+    is_valid, error_msg = InputValidator.validate_username(username)
+    
+    if not is_valid:
+        print(f"❌ अमान्य Input: {error_msg}")
+        return
+    
+    clean_username = InputValidator.sanitize_username(username)
+    
+    try:
+        user_data = db_manager.check_user_exists(clean_username)
+        
+        if user_data:
+            print(f"✅ उपयोगकर्ता मौजूद है!")
+            print(f"   Username: {user_data['username']}")
+            print(f"   Email: {user_data.get('email', 'N/A')}")
+            print(f"   सक्रिय: {'हाँ' if user_data.get('is_active') else 'नहीं'}")
+            print(f"   बनाया गया: {user_data.get('created_at', 'N/A')}")
+        else:
+            print(f"❌ उपयोगकर्ता '{clean_username}' मौजूद नहीं है")
+            
+    except psycopg2.OperationalError:
+        print("❌ डेटाबेस से कनेक्ट नहीं हो सका!")
+    except Exception as e:
+        print(f"❌ त्रुटि: {e}")
+    
+    print('='*50)
+
+
+if __name__ == '__main__':
+    import sys
+    
+    # Command line argument से username लें
+    if len(sys.argv) > 1:
+        # Standalone mode - सीधे username जाँचें
+        test_username = sys.argv[1]
+        
+        try:
+            db_manager.setup_database()
+            db_manager.insert_sample_data()
+        except Exception as e:
+            print(f"डेटाबेस सेटअप त्रुटि: {e}")
+            sys.exit(1)
+        
+        standalone_check(test_username)
+        
+        # कुछ परीक्षण usernames
+        print("\n--- परीक्षण usernames ---")
+        test_cases = ['rahul_sharma', 'unknown_user', 'priya_singh', 'invalid user!']
+        for test in test_cases:
+            standalone_check(test)
+    
+    else:
+        # Web server mode
+        try:
+            initialize_app()
+        except Exception as e:
+            logger.error(f"शुरुआती सेटअप विफल: {e}")
+            sys.exit(1)
+        
+        print("\n" + "="*60)
+        print("🚀 वेब सर्वर शुरू हो रहा है...")
+        print("📌 URL: http://localhost:5000")
+        print("🔍 API: http://localhost:5000/check-user")
+        print("💚 Health: http://localhost:5000/health")
+        print("="*60 + "\n")
+        
+        app.run(
+            host='0.0.0.0',
+            port=5000,
+            debug=False  # Production में False रखें
+        )
+```
