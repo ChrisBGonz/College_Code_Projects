@@ -1,0 +1,370 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Log rotation script using Claude AI for intelligent log analysis and rotation decisions.
+This script rotates log files every 24 hours to prevent disk from filling up.
+"""
+
+import os
+import sys
+import time
+import gzip
+import shutil
+import logging
+import schedule
+import anthropic
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+# Configure basic logging for the script itself
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_disk_usage(path: str) -> dict:
+    """Get disk usage statistics for a given path."""
+    stat = shutil.disk_usage(path)
+    return {
+        'total': stat.total,
+        'used': stat.used,
+        'free': stat.free,
+        'percent_used': (stat.used / stat.total) * 100
+    }
+
+
+def get_log_files_info(log_directory: str) -> list:
+    """Get information about all log files in the directory."""
+    log_files = []
+    log_dir = Path(log_directory)
+    
+    if not log_dir.exists():
+        logger.warning(f"Log directory {log_directory} does not exist")
+        return log_files
+    
+    for file_path in log_dir.rglob('*.log'):
+        stat = file_path.stat()
+        log_files.append({
+            'path': str(file_path),
+            'name': file_path.name,
+            'size_bytes': stat.st_size,
+            'size_mb': stat.st_size / (1024 * 1024),
+            'last_modified': datetime.fromtimestamp(stat.st_mtime).isoformat(),
+            'age_hours': (time.time() - stat.st_mtime) / 3600
+        })
+    
+    return sorted(log_files, key=lambda x: x['size_bytes'], reverse=True)
+
+
+def compress_log_file(file_path: str) -> str:
+    """Compress a log file using gzip."""
+    compressed_path = f"{file_path}.gz"
+    
+    with open(file_path, 'rb') as f_in:
+        with gzip.open(compressed_path, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    
+    # Remove original file after compression
+    os.remove(file_path)
+    logger.info(f"Compressed {file_path} to {compressed_path}")
+    return compressed_path
+
+
+def rotate_log_file(file_path: str, max_backups: int = 5) -> None:
+    """Rotate a log file by renaming it with a timestamp."""
+    path = Path(file_path)
+    
+    if not path.exists():
+        logger.warning(f"File {file_path} does not exist")
+        return
+    
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    backup_path = path.parent / f"{path.stem}_{timestamp}{path.suffix}"
+    
+    # Rename current log file
+    shutil.move(str(path), str(backup_path))
+    logger.info(f"Rotated {file_path} to {backup_path}")
+    
+    # Compress the rotated file
+    compress_log_file(str(backup_path))
+    
+    # Clean up old backups
+    cleanup_old_backups(str(path.parent), path.stem, max_backups)
+    
+    # Create new empty log file
+    path.touch()
+    logger.info(f"Created new empty log file: {file_path}")
+
+
+def cleanup_old_backups(directory: str, base_name: str, max_backups: int) -> None:
+    """Remove old backup files exceeding the maximum number of backups."""
+    dir_path = Path(directory)
+    
+    # Find all backup files for this log
+    backup_files = sorted(
+        dir_path.glob(f"{base_name}_*.log.gz"),
+        key=lambda x: x.stat().st_mtime
+    )
+    
+    # Remove oldest backups if exceeding max_backups
+    while len(backup_files) > max_backups:
+        oldest = backup_files.pop(0)
+        oldest.unlink()
+        logger.info(f"Removed old backup: {oldest}")
+
+
+def analyze_logs_with_claude(log_files_info: list, disk_usage: dict) -> dict:
+    """Use Claude AI to analyze log files and provide rotation recommendations."""
+    client = anthropic.Anthropic()
+    
+    # Prepare the analysis prompt
+    log_summary = "\n".join([
+        f"- {f['name']}: {f['size_mb']:.2f} MB, {f['age_hours']:.1f} hours old, last modified: {f['last_modified']}"
+        for f in log_files_info[:20]  # Limit to top 20 files
+    ])
+    
+    prompt = f"""Analyze the following log files and disk usage information, then provide specific rotation recommendations.
+
+Disk Usage:
+- Total: {disk_usage['total'] / (1024**3):.2f} GB
+- Used: {disk_usage['used'] / (1024**3):.2f} GB
+- Free: {disk_usage['free'] / (1024**3):.2f} GB
+- Percent Used: {disk_usage['percent_used']:.1f}%
+
+Log Files (sorted by size, largest first):
+{log_summary}
+
+Total log files found: {len(log_files_info)}
+
+Please provide:
+1. An assessment of the current disk usage situation (critical/warning/normal)
+2. Which specific log files should be rotated immediately (list their names)
+3. Which log files can wait for the next scheduled rotation
+4. Any specific recommendations for log management
+5. Estimated disk space that would be freed by rotating the recommended files
+
+Format your response as a structured analysis with clear sections."""
+
+    logger.info("Sending log analysis request to Claude AI...")
+    
+    # Use streaming for the Claude API call
+    analysis_result = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            analysis_result += text
+            print(text, end="", flush=True)
+    
+    print()  # New line after streaming
+    
+    # Parse the response to extract actionable recommendations
+    recommendations = {
+        'analysis': analysis_result,
+        'rotate_immediately': [],
+        'status': 'normal'
+    }
+    
+    # Simple parsing to extract file names mentioned for immediate rotation
+    lines = analysis_result.lower().split('\n')
+    for file_info in log_files_info:
+        file_name_lower = file_info['name'].lower()
+        for line in lines:
+            if file_name_lower in line and ('immediate' in line or 'now' in line or 'critical' in line):
+                if file_info['path'] not in recommendations['rotate_immediately']:
+                    recommendations['rotate_immediately'].append(file_info['path'])
+    
+    # Determine status based on disk usage
+    if disk_usage['percent_used'] > 90:
+        recommendations['status'] = 'critical'
+    elif disk_usage['percent_used'] > 75:
+        recommendations['status'] = 'warning'
+    
+    return recommendations
+
+
+def perform_log_rotation(log_directory: str, max_backups: int = 5, 
+                          force_rotate_age_hours: int = 24,
+                          force_rotate_size_mb: float = 100.0) -> None:
+    """Main function to perform log rotation with AI assistance."""
+    logger.info("=" * 60)
+    logger.info("Starting log rotation process")
+    logger.info(f"Log directory: {log_directory}")
+    logger.info("=" * 60)
+    
+    # Get current disk usage
+    disk_usage = get_disk_usage(log_directory)
+    logger.info(f"Disk usage: {disk_usage['percent_used']:.1f}% ({disk_usage['used'] / (1024**3):.2f} GB used)")
+    
+    # Get log files information
+    log_files = get_log_files_info(log_directory)
+    
+    if not log_files:
+        logger.info("No log files found in the specified directory")
+        return
+    
+    logger.info(f"Found {len(log_files)} log files")
+    
+    # Get AI analysis and recommendations
+    logger.info("\n--- Claude AI Analysis ---")
+    recommendations = analyze_logs_with_claude(log_files, disk_usage)
+    logger.info("--- End of Analysis ---\n")
+    
+    # Perform rotations based on criteria
+    rotated_files = []
+    
+    # Rotate files recommended by Claude for immediate rotation
+    for file_path in recommendations['rotate_immediately']:
+        if os.path.exists(file_path):
+            logger.info(f"Rotating file (AI recommended): {file_path}")
+            rotate_log_file(file_path, max_backups)
+            rotated_files.append(file_path)
+    
+    # Rotate files based on age and size criteria
+    for file_info in log_files:
+        file_path = file_info['path']
+        
+        # Skip if already rotated
+        if file_path in rotated_files:
+            continue
+        
+        should_rotate = False
+        reason = ""
+        
+        # Check age
+        if file_info['age_hours'] >= force_rotate_age_hours:
+            should_rotate = True
+            reason = f"age ({file_info['age_hours']:.1f} hours >= {force_rotate_age_hours} hours)"
+        
+        # Check size
+        if file_info['size_mb'] >= force_rotate_size_mb:
+            should_rotate = True
+            reason = f"size ({file_info['size_mb']:.2f} MB >= {force_rotate_size_mb} MB)"
+        
+        # Force rotation if disk is critical
+        if recommendations['status'] == 'critical' and file_info['size_mb'] > 10:
+            should_rotate = True
+            reason = "disk usage critical"
+        
+        if should_rotate:
+            logger.info(f"Rotating file ({reason}): {file_path}")
+            rotate_log_file(file_path, max_backups)
+            rotated_files.append(file_path)
+    
+    # Summary
+    logger.info("=" * 60)
+    logger.info(f"Log rotation completed. Rotated {len(rotated_files)} files")
+    
+    # Get updated disk usage
+    new_disk_usage = get_disk_usage(log_directory)
+    freed_space = disk_usage['used'] - new_disk_usage['used']
+    logger.info(f"Disk usage after rotation: {new_disk_usage['percent_used']:.1f}%")
+    if freed_space > 0:
+        logger.info(f"Freed disk space: {freed_space / (1024**2):.2f} MB")
+    logger.info("=" * 60)
+
+
+def create_sample_logs(log_directory: str) -> None:
+    """Create sample log files for testing purposes."""
+    log_dir = Path(log_directory)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    
+    sample_logs = [
+        ('application.log', 50),
+        ('error.log', 25),
+        ('access.log', 100),
+        ('debug.log', 75),
+        ('system.log', 30)
+    ]
+    
+    for log_name, size_kb in sample_logs:
+        log_path = log_dir / log_name
+        if not log_path.exists():
+            # Create log file with sample content
+            with open(log_path, 'w') as f:
+                timestamp = datetime.now().isoformat()
+                for i in range(size_kb * 10):  # Approximate size
+                    f.write(f"{timestamp} - INFO - Sample log entry {i}: This is a test log message for rotation testing\n")
+            logger.info(f"Created sample log file: {log_path}")
+
+
+def main():
+    """Main entry point for the log rotation script."""
+    # Configuration
+    LOG_DIRECTORY = os.environ.get('LOG_DIRECTORY', '/tmp/test_logs')
+    MAX_BACKUPS = int(os.environ.get('MAX_BACKUPS', '5'))
+    ROTATION_INTERVAL_HOURS = int(os.environ.get('ROTATION_INTERVAL_HOURS', '24'))
+    FORCE_ROTATE_AGE_HOURS = int(os.environ.get('FORCE_ROTATE_AGE_HOURS', '24'))
+    FORCE_ROTATE_SIZE_MB = float(os.environ.get('FORCE_ROTATE_SIZE_MB', '100'))
+    CREATE_SAMPLE_LOGS = os.environ.get('CREATE_SAMPLE_LOGS', 'true').lower() == 'true'
+    RUN_ONCE = os.environ.get('RUN_ONCE', 'true').lower() == 'true'
+    
+    logger.info("Log Rotation Script with Claude AI")
+    logger.info(f"Configuration:")
+    logger.info(f"  - Log Directory: {LOG_DIRECTORY}")
+    logger.info(f"  - Max Backups: {MAX_BACKUPS}")
+    logger.info(f"  - Rotation Interval: {ROTATION_INTERVAL_HOURS} hours")
+    logger.info(f"  - Force Rotate Age: {FORCE_ROTATE_AGE_HOURS} hours")
+    logger.info(f"  - Force Rotate Size: {FORCE_ROTATE_SIZE_MB} MB")
+    
+    # Create sample logs for testing if requested
+    if CREATE_SAMPLE_LOGS:
+        logger.info("Creating sample log files for testing...")
+        create_sample_logs(LOG_DIRECTORY)
+    
+    if RUN_ONCE:
+        # Run once immediately
+        logger.info("Running log rotation once...")
+        perform_log_rotation(
+            LOG_DIRECTORY,
+            MAX_BACKUPS,
+            FORCE_ROTATE_AGE_HOURS,
+            FORCE_ROTATE_SIZE_MB
+        )
+    else:
+        # Schedule rotation
+        logger.info(f"Scheduling log rotation every {ROTATION_INTERVAL_HOURS} hours")
+        
+        # Run immediately on start
+        perform_log_rotation(
+            LOG_DIRECTORY,
+            MAX_BACKUPS,
+            FORCE_ROTATE_AGE_HOURS,
+            FORCE_ROTATE_SIZE_MB
+        )
+        
+        # Schedule future rotations
+        schedule.every(ROTATION_INTERVAL_HOURS).hours.do(
+            perform_log_rotation,
+            LOG_DIRECTORY,
+            MAX_BACKUPS,
+            FORCE_ROTATE_AGE_HOURS,
+            FORCE_ROTATE_SIZE_MB
+        )
+        
+        logger.info("Log rotation scheduler started. Press Ctrl+C to stop.")
+        
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(60)  # Check every minute
+        except KeyboardInterrupt:
+            logger.info("Log rotation scheduler stopped by user")
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+```

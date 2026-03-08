@@ -1,0 +1,255 @@
+
+```python
+import os
+import anthropic
+import json
+import re
+from datetime import datetime
+
+client = anthropic.Anthropic()
+
+PAYMENT_DATABASE = {}
+
+def process_payment_with_claude(payment_data: dict) -> dict:
+    """Use Claude to process payment logic and generate response."""
+    
+    system_prompt = """You are a payment gateway assistant. Your role is to:
+1. Validate payment information
+2. Process payment requests
+3. Generate appropriate responses for success or failure scenarios
+4. Provide transaction IDs and status updates
+
+When processing payments, you should:
+- Validate card numbers (basic Luhn algorithm check)
+- Verify expiry dates
+- Check CVV format
+- Validate amount (must be positive)
+- Generate realistic transaction IDs
+
+Respond in JSON format with the following structure:
+{
+    "status": "success" or "failed",
+    "transaction_id": "unique transaction ID",
+    "message": "descriptive message",
+    "timestamp": "ISO format timestamp",
+    "amount_processed": amount in cents,
+    "currency": "currency code",
+    "redirect_url": "the success_url or failure_url based on status"
+}"""
+
+    user_message = f"""Process this payment request:
+Payment Data: {json.dumps(payment_data, indent=2)}
+
+Validate the payment information and process it. If valid, mark as success and use the success_url for redirect.
+If invalid, mark as failed and use the failure_url for redirect (or append ?error=true to success_url if no failure_url provided)."""
+
+    print("\n🔄 Processing payment with Claude AI...")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=[
+            {"role": "user", "content": user_message}
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    
+    json_match = re.search(r'\{.*\}', full_response, re.DOTALL)
+    if json_match:
+        result = json.loads(json_match.group())
+    else:
+        result = json.loads(full_response)
+    
+    return result
+
+def create_payment_session(payment_request: dict) -> dict:
+    """Create a payment session and return session details."""
+    
+    required_fields = ['amount', 'currency', 'success_url']
+    for field in required_fields:
+        if field not in payment_request:
+            raise ValueError(f"Missing required field: {field}")
+    
+    session_id = f"sess_{datetime.now().strftime('%Y%m%d%H%M%S')}_{hash(str(payment_request)) % 10000:04d}"
+    
+    session = {
+        'session_id': session_id,
+        'status': 'pending',
+        'created_at': datetime.now().isoformat(),
+        'payment_request': payment_request
+    }
+    
+    PAYMENT_DATABASE[session_id] = session
+    
+    return {
+        'session_id': session_id,
+        'payment_url': f"https://payment-gateway.example.com/pay/{session_id}",
+        'status': 'pending',
+        'expires_at': datetime.now().isoformat()
+    }
+
+def process_payment(session_id: str, card_details: dict) -> dict:
+    """Process payment for a given session."""
+    
+    if session_id not in PAYMENT_DATABASE:
+        raise ValueError(f"Session not found: {session_id}")
+    
+    session = PAYMENT_DATABASE[session_id]
+    payment_request = session['payment_request']
+    
+    payment_data = {
+        **payment_request,
+        **card_details,
+        'session_id': session_id
+    }
+    
+    result = process_payment_with_claude(payment_data)
+    
+    session['status'] = result.get('status', 'failed')
+    session['transaction_id'] = result.get('transaction_id')
+    session['processed_at'] = datetime.now().isoformat()
+    session['result'] = result
+    
+    PAYMENT_DATABASE[session_id] = session
+    
+    return result
+
+def get_redirect_url(result: dict, payment_request: dict) -> str:
+    """Get the appropriate redirect URL based on payment result."""
+    
+    if result.get('status') == 'success':
+        success_url = payment_request.get('success_url', '')
+        transaction_id = result.get('transaction_id', '')
+        
+        if '?' in success_url:
+            redirect_url = f"{success_url}&transaction_id={transaction_id}&status=success"
+        else:
+            redirect_url = f"{success_url}?transaction_id={transaction_id}&status=success"
+    else:
+        failure_url = payment_request.get('failure_url', '')
+        if failure_url:
+            redirect_url = f"{failure_url}?error={result.get('message', 'Payment failed')}"
+        else:
+            success_url = payment_request.get('success_url', '')
+            redirect_url = f"{success_url}?status=failed&error={result.get('message', 'Payment failed')}"
+    
+    return redirect_url
+
+def simulate_payment_flow():
+    """Simulate a complete payment flow."""
+    
+    print("=" * 60)
+    print("💳 PAYMENT GATEWAY INTEGRATION DEMO")
+    print("=" * 60)
+    
+    payment_request = {
+        'amount': 9999,
+        'currency': 'USD',
+        'description': 'Premium Subscription - Monthly',
+        'customer_email': 'customer@example.com',
+        'customer_name': 'John Doe',
+        'success_url': 'https://myapp.com/payment/success',
+        'failure_url': 'https://myapp.com/payment/failed',
+        'metadata': {
+            'order_id': 'ORD-2024-001',
+            'product_id': 'PREMIUM-MONTHLY'
+        }
+    }
+    
+    print("\n📋 STEP 1: Creating Payment Session")
+    print("-" * 40)
+    print(f"Amount: ${payment_request['amount']/100:.2f} {payment_request['currency']}")
+    print(f"Description: {payment_request['description']}")
+    print(f"Success URL: {payment_request['success_url']}")
+    
+    session = create_payment_session(payment_request)
+    print(f"\n✅ Session Created: {session['session_id']}")
+    print(f"Payment URL: {session['payment_url']}")
+    
+    print("\n💳 STEP 2: Processing Payment with Card Details")
+    print("-" * 40)
+    
+    card_details = {
+        'card_number': '4532015112830366',
+        'expiry_month': '12',
+        'expiry_year': '2025',
+        'cvv': '123',
+        'cardholder_name': 'John Doe'
+    }
+    
+    print(f"Card: **** **** **** {card_details['card_number'][-4:]}")
+    print(f"Expiry: {card_details['expiry_month']}/{card_details['expiry_year']}")
+    
+    result = process_payment(session['session_id'], card_details)
+    
+    print("\n📊 STEP 3: Payment Result")
+    print("-" * 40)
+    print(f"Status: {'✅ SUCCESS' if result.get('status') == 'success' else '❌ FAILED'}")
+    print(f"Transaction ID: {result.get('transaction_id', 'N/A')}")
+    print(f"Message: {result.get('message', 'N/A')}")
+    
+    redirect_url = get_redirect_url(result, payment_request)
+    
+    print("\n🔀 STEP 4: Redirect URL")
+    print("-" * 40)
+    print(f"Redirecting to: {redirect_url}")
+    
+    print("\n" + "=" * 60)
+    print("🔄 TESTING FAILED PAYMENT SCENARIO")
+    print("=" * 60)
+    
+    failed_payment_request = {
+        'amount': 5000,
+        'currency': 'EUR',
+        'description': 'Test Product',
+        'customer_email': 'test@example.com',
+        'success_url': 'https://myapp.com/checkout/success',
+        'failure_url': 'https://myapp.com/checkout/failed'
+    }
+    
+    failed_session = create_payment_session(failed_payment_request)
+    
+    invalid_card = {
+        'card_number': '1234567890123456',
+        'expiry_month': '01',
+        'expiry_year': '2020',
+        'cvv': '99',
+        'cardholder_name': 'Test User'
+    }
+    
+    print(f"\nTesting with invalid card: **** **** **** {invalid_card['card_number'][-4:]}")
+    
+    failed_result = process_payment(failed_session['session_id'], invalid_card)
+    
+    print("\n📊 Failed Payment Result")
+    print("-" * 40)
+    print(f"Status: {'✅ SUCCESS' if failed_result.get('status') == 'success' else '❌ FAILED'}")
+    print(f"Message: {failed_result.get('message', 'N/A')}")
+    
+    failed_redirect = get_redirect_url(failed_result, failed_payment_request)
+    print(f"\nRedirecting to: {failed_redirect}")
+    
+    print("\n" + "=" * 60)
+    print("📈 PAYMENT SESSION SUMMARY")
+    print("=" * 60)
+    
+    for session_id, session_data in PAYMENT_DATABASE.items():
+        print(f"\nSession: {session_id}")
+        print(f"  Status: {session_data['status']}")
+        print(f"  Created: {session_data['created_at']}")
+        if 'transaction_id' in session_data:
+            print(f"  Transaction ID: {session_data['transaction_id']}")
+        if 'processed_at' in session_data:
+            print(f"  Processed: {session_data['processed_at']}")
+
+if __name__ == "__main__":
+    simulate_payment_flow()
+```

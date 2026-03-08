@@ -1,0 +1,494 @@
+<?php
+
+session_start();
+
+// Simulated database of users
+$users_db = [
+    'joao@example.com' => [
+        'username'       => 'joao',
+        'password'       => password_hash('senha123', PASSWORD_BCRYPT),
+        'secret_question' => 'Qual é o nome de solteira da sua mãe?',
+        'secret_answer'  => strtolower(trim('Silva')),
+        'new_password'   => null,
+    ],
+    'maria@example.com' => [
+        'username'       => 'maria',
+        'password'       => password_hash('abc456', PASSWORD_BCRYPT),
+        'secret_question' => 'Qual era o nome do seu primeiro animal de estimação?',
+        'secret_answer'  => strtolower(trim('Rex')),
+        'new_password'   => null,
+    ],
+];
+
+// Available secret questions
+$available_questions = [
+    'Qual é o nome de solteira da sua mãe?',
+    'Qual era o nome do seu primeiro animal de estimação?',
+    'Qual é o nome da cidade onde você nasceu?',
+    'Qual era o nome da sua escola primária?',
+    'Qual é o apelido do seu melhor amigo de infância?',
+];
+
+// Helper: get user by email (simulates DB lookup)
+function get_user(string $email, array &$db): ?array
+{
+    return $db[$email] ?? null;
+}
+
+// Helper: sanitize output
+function h(string $str): string
+{
+    return htmlspecialchars($str, ENT_QUOTES, 'UTF-8');
+}
+
+// Determine current step
+$step    = $_SESSION['recovery_step'] ?? 'email';
+$error   = '';
+$success = '';
+
+// ─── STEP 1: Receive email ────────────────────────────────────────────────────
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+
+    if ($_POST['action'] === 'submit_email') {
+        $email = strtolower(trim($_POST['email'] ?? ''));
+
+        if (empty($email) || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $error = 'Por favor, informe um endereço de e-mail válido.';
+            $step  = 'email';
+        } elseif (!isset($users_db[$email])) {
+            // Generic message to avoid user enumeration
+            $error = 'Se esse e-mail estiver cadastrado, você receberá as instruções.';
+            $step  = 'email';
+        } else {
+            $_SESSION['recovery_email'] = $email;
+            $_SESSION['recovery_step']  = 'question';
+            $step = 'question';
+        }
+    }
+
+    // ─── STEP 2: Validate secret answer ──────────────────────────────────────
+    elseif ($_POST['action'] === 'submit_answer') {
+        $email  = $_SESSION['recovery_email'] ?? '';
+        $answer = strtolower(trim($_POST['answer'] ?? ''));
+        $user   = get_user($email, $users_db);
+
+        if (!$user) {
+            $error = 'Sessão inválida. Reinicie o processo.';
+            unset($_SESSION['recovery_email'], $_SESSION['recovery_step']);
+            $step = 'email';
+        } elseif (empty($answer)) {
+            $error = 'Por favor, informe a resposta.';
+            $step  = 'question';
+        } elseif (!hash_equals($user['secret_answer'], $answer)) {
+            // Brute-force protection: count attempts
+            $_SESSION['recovery_attempts'] = ($_SESSION['recovery_attempts'] ?? 0) + 1;
+
+            if ($_SESSION['recovery_attempts'] >= 3) {
+                $error = 'Número máximo de tentativas atingido. Reinicie o processo.';
+                unset($_SESSION['recovery_email'], $_SESSION['recovery_step'], $_SESSION['recovery_attempts']);
+                $step = 'email';
+            } else {
+                $remaining = 3 - $_SESSION['recovery_attempts'];
+                $error     = "Resposta incorreta. Você tem mais {$remaining} tentativa(s).";
+                $step      = 'question';
+            }
+        } else {
+            unset($_SESSION['recovery_attempts']);
+            $_SESSION['recovery_step'] = 'reset';
+            $step = 'reset';
+        }
+    }
+
+    // ─── STEP 3: Reset password ───────────────────────────────────────────────
+    elseif ($_POST['action'] === 'reset_password') {
+        $email    = $_SESSION['recovery_email'] ?? '';
+        $new_pass = $_POST['new_password']     ?? '';
+        $confirm  = $_POST['confirm_password'] ?? '';
+        $user     = get_user($email, $users_db);
+
+        if (!$user || ($_SESSION['recovery_step'] ?? '') !== 'reset') {
+            $error = 'Sessão inválida. Reinicie o processo.';
+            unset($_SESSION['recovery_email'], $_SESSION['recovery_step']);
+            $step = 'email';
+        } elseif (strlen($new_pass) < 8) {
+            $error = 'A senha deve ter pelo menos 8 caracteres.';
+            $step  = 'reset';
+        } elseif ($new_pass !== $confirm) {
+            $error = 'As senhas não coincidem.';
+            $step  = 'reset';
+        } else {
+            // In a real app: UPDATE users SET password = ? WHERE email = ?
+            $users_db[$email]['password'] = password_hash($new_pass, PASSWORD_BCRYPT);
+
+            // Clear recovery session
+            unset($_SESSION['recovery_email'], $_SESSION['recovery_step']);
+
+            $success = 'Senha redefinida com sucesso! Você já pode fazer login.';
+            $step    = 'done';
+        }
+    }
+} else {
+    // First access or page refresh — keep current step from session
+    $step = $_SESSION['recovery_step'] ?? 'email';
+}
+
+// Fetch question for current user (if in question/reset step)
+$current_question = '';
+if (in_array($step, ['question', 'reset'], true) && isset($_SESSION['recovery_email'])) {
+    $u = get_user($_SESSION['recovery_email'], $users_db);
+    $current_question = $u['secret_question'] ?? '';
+}
+
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Recuperação de Senha — Pergunta Secreta</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .card {
+            background: #ffffff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.4);
+            padding: 40px;
+            width: 100%;
+            max-width: 460px;
+        }
+
+        .card-header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .card-header .icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+        }
+
+        .card-header h1 {
+            font-size: 1.6rem;
+            color: #1a1a2e;
+            margin-bottom: 6px;
+        }
+
+        .card-header p {
+            color: #666;
+            font-size: 0.9rem;
+        }
+
+        /* Progress bar */
+        .progress {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 32px;
+            position: relative;
+        }
+
+        .progress::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 2px;
+            background: #e0e0e0;
+            transform: translateY(-50%);
+            z-index: 0;
+        }
+
+        .progress-step {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #e0e0e0;
+            color: #999;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: 700;
+            position: relative;
+            z-index: 1;
+            transition: background 0.3s, color 0.3s;
+        }
+
+        .progress-step.active {
+            background: #0f3460;
+            color: #fff;
+        }
+
+        .progress-step.done {
+            background: #27ae60;
+            color: #fff;
+        }
+
+        /* Alerts */
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+        }
+
+        .alert-error {
+            background: #fdecea;
+            color: #c0392b;
+            border-left: 4px solid #c0392b;
+        }
+
+        .alert-success {
+            background: #eafaf1;
+            color: #1e8449;
+            border-left: 4px solid #27ae60;
+        }
+
+        /* Form elements */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 6px;
+        }
+
+        input[type="email"],
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 14px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 0.95rem;
+            color: #333;
+            transition: border-color 0.2s;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #0f3460;
+        }
+
+        .question-box {
+            background: #f0f4ff;
+            border: 1px solid #c5d3f0;
+            border-radius: 8px;
+            padding: 14px;
+            font-size: 0.95rem;
+            color: #1a1a2e;
+            margin-bottom: 20px;
+            font-style: italic;
+        }
+
+        .btn {
+            display: block;
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+        }
+
+        .btn:active { transform: scale(0.98); }
+
+        .btn-primary {
+            background: #0f3460;
+            color: #fff;
+        }
+
+        .btn-primary:hover { background: #16213e; }
+
+        .btn-success {
+            background: #27ae60;
+            color: #fff;
+        }
+
+        .btn-success:hover { background: #1e8449; }
+
+        .back-link {
+            display: block;
+            text-align: center;
+            margin-top: 16px;
+            font-size: 0.85rem;
+            color: #0f3460;
+            text-decoration: none;
+        }
+
+        .back-link:hover { text-decoration: underline; }
+
+        .password-hint {
+            font-size: 0.78rem;
+            color: #888;
+            margin-top: 4px;
+        }
+
+        /* Done state */
+        .done-icon {
+            text-align: center;
+            font-size: 64px;
+            margin-bottom: 16px;
+        }
+
+        .done-text {
+            text-align: center;
+            color: #333;
+            margin-bottom: 24px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+
+    <!-- Header -->
+    <div class="card-header">
+        <div class="icon">🔐</div>
+        <h1>Recuperar Senha</h1>
+        <p>Responda à sua pergunta secreta para redefinir a senha.</p>
+    </div>
+
+    <!-- Progress indicator -->
+    <?php if ($step !== 'done'): ?>
+    <div class="progress">
+        <div class="progress-step <?= in_array($step, ['email']) ? 'active' : 'done' ?>">1</div>
+        <div class="progress-step <?= $step === 'question' ? 'active' : ($step === 'reset' ? 'done' : '') ?>">2</div>
+        <div class="progress-step <?= $step === 'reset' ? 'active' : '' ?>">3</div>
+    </div>
+    <?php endif; ?>
+
+    <!-- Error / Success alerts -->
+    <?php if ($error): ?>
+        <div class="alert alert-error"><?= h($error) ?></div>
+    <?php endif; ?>
+
+    <?php if ($success): ?>
+        <div class="alert alert-success"><?= h($success) ?></div>
+    <?php endif; ?>
+
+    <!-- ── STEP 1: Email ─────────────────────────────────────────────────── -->
+    <?php if ($step === 'email'): ?>
+        <form method="POST" novalidate>
+            <input type="hidden" name="action" value="submit_email">
+
+            <div class="form-group">
+                <label for="email">Endereço de e-mail cadastrado</label>
+                <input
+                    type="email"
+                    id="email"
+                    name="email"
+                    placeholder="seu@email.com"
+                    value="<?= h($_POST['email'] ?? '') ?>"
+                    required
+                    autofocus
+                >
+            </div>
+
+            <button type="submit" class="btn btn-primary">Continuar →</button>
+        </form>
+
+        <a href="login.php" class="back-link">← Voltar ao login</a>
+
+    <!-- ── STEP 2: Secret question ───────────────────────────────────────── -->
+    <?php elseif ($step === 'question'): ?>
+        <form method="POST" novalidate>
+            <input type="hidden" name="action" value="submit_answer">
+
+            <div class="form-group">
+                <label>Sua pergunta secreta</label>
+                <div class="question-box"><?= h($current_question) ?></div>
+
+                <label for="answer">Sua resposta</label>
+                <input
+                    type="text"
+                    id="answer"
+                    name="answer"
+                    placeholder="Digite sua resposta..."
+                    autocomplete="off"
+                    required
+                    autofocus
+                >
+                <p class="password-hint">A resposta não diferencia maiúsculas de minúsculas.</p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">Verificar resposta →</button>
+        </form>
+
+        <a href="?restart=1" class="back-link">← Usar outro e-mail</a>
+
+    <!-- ── STEP 3: New password ──────────────────────────────────────────── -->
+    <?php elseif ($step === 'reset'): ?>
+        <form method="POST" novalidate>
+            <input type="hidden" name="action" value="reset_password">
+
+            <div class="form-group">
+                <label for="new_password">Nova senha</label>
+                <input
+                    type="password"
+                    id="new_password"
+                    name="new_password"
+                    placeholder="Mínimo 8 caracteres"
+                    required
+                    autofocus
+                >
+                <p class="password-hint">Use letras, números e símbolos para maior segurança.</p>
+            </div>
+
+            <div class="form-group">
+                <label for="confirm_password">Confirmar nova senha</label>
+                <input
+                    type="password"
+                    id="confirm_password"
+                    name="confirm_password"
+                    placeholder="Repita a nova senha"
+                    required
+                >
+            </div>
+
+            <button type="submit" class="btn btn-success">Redefinir senha ✓</button>
+        </form>
+
+    <!-- ── DONE ──────────────────────────────────────────────────────────── -->
+    <?php elseif ($step === 'done'): ?>
+        <div class="done-icon">✅</div>
+        <div class="done-text">
+            <p>Sua senha foi redefinida com sucesso.<br>Você já pode fazer login com a nova senha.</p>
+        </div>
+        <a href="login.php" class="btn btn-primary" style="text-align:center; text-decoration:none; display:block;">
+            Ir para o login
+        </a>
+
+    <?php endif; ?>
+
+</div>
+
+<?php
+// Allow user to restart the flow
+if (isset($_GET['restart'])) {
+    unset($_SESSION['recovery_email'], $_SESSION['recovery_step'], $_SESSION['recovery_attempts']);
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+?>
+
+</body>
+</html>

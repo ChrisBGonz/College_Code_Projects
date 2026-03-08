@@ -1,0 +1,219 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Middleware to log all requests
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Route that intentionally throws an error for testing
+app.get("/test-error", (req, res) => {
+  throw new Error("This is a test error!");
+});
+
+// Route that throws an async error
+app.get("/test-async-error", async (req, res, next) => {
+  try {
+    throw new Error("This is an async test error!");
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Main route that uses Claude to analyze errors
+app.post("/analyze-error", async (req, res, next) => {
+  try {
+    const { errorMessage, errorStack } = req.body;
+
+    if (!errorMessage) {
+      throw new Error("errorMessage is required in the request body");
+    }
+
+    console.log("Analyzing error with Claude...");
+
+    // Use streaming to get error analysis from Claude
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `Please analyze the following error and provide:
+1. A brief explanation of what the error means
+2. Possible causes
+3. Suggested solutions
+
+Error Message: ${errorMessage}
+${errorStack ? `Error Stack: ${errorStack}` : ""}
+
+Please be concise and helpful.`,
+        },
+      ],
+    });
+
+    // Set headers for streaming response
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    // Stream the response
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
+      }
+    }
+
+    // Send completion signal
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Route to simulate various types of errors
+app.get("/simulate/:errorType", (req, res, next) => {
+  const { errorType } = req.params;
+
+  switch (errorType) {
+    case "type":
+      null.property; // TypeError
+      break;
+    case "reference":
+      undefinedVariable; // ReferenceError
+      break;
+    case "range":
+      new Array(-1); // RangeError
+      break;
+    case "syntax":
+      eval("invalid syntax }{"); // SyntaxError
+      break;
+    case "custom":
+      const customError = new Error("Custom application error");
+      customError.statusCode = 422;
+      customError.code = "CUSTOM_ERROR";
+      throw customError;
+    default:
+      throw new Error(`Unknown error type: ${errorType}`);
+  }
+});
+
+// 404 handler - must be before error handler
+app.use((req, res, next) => {
+  const error = new Error(`Route not found: ${req.method} ${req.path}`);
+  error.statusCode = 404;
+  next(error);
+});
+
+// Global error handler middleware - must have 4 parameters
+app.use(async (err, req, res, next) => {
+  console.error("Error caught by global handler:");
+  console.error("Message:", err.message);
+  console.error("Stack:", err.stack);
+
+  const statusCode = err.statusCode || err.status || 500;
+  const errorCode = err.code || "INTERNAL_SERVER_ERROR";
+
+  // Prepare error response
+  const errorResponse = {
+    success: false,
+    error: {
+      message: err.message || "An unexpected error occurred",
+      code: errorCode,
+      statusCode: statusCode,
+      timestamp: new Date().toISOString(),
+      path: req.path,
+      method: req.method,
+    },
+  };
+
+  // Add stack trace in development mode
+  if (process.env.NODE_ENV === "development") {
+    errorResponse.error.stack = err.stack;
+  }
+
+  // Try to get AI analysis for the error
+  try {
+    console.log("Getting AI analysis for error...");
+
+    const analysisStream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 512,
+      messages: [
+        {
+          role: "user",
+          content: `Briefly analyze this error in 2-3 sentences and suggest a quick fix:
+Error: ${err.message}
+Type: ${err.constructor.name}
+Status: ${statusCode}`,
+        },
+      ],
+    });
+
+    let aiAnalysis = "";
+    for await (const chunk of analysisStream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        aiAnalysis += chunk.delta.text;
+      }
+    }
+
+    errorResponse.error.aiAnalysis = aiAnalysis;
+  } catch (aiError) {
+    console.error("Failed to get AI analysis:", aiError.message);
+    errorResponse.error.aiAnalysis =
+      "AI analysis unavailable at this time. Please check the error details above.";
+  }
+
+  res.status(statusCode).json(errorResponse);
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:");
+  console.error(error);
+  process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise);
+  console.error("Reason:", reason);
+  process.exit(1);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log("\nAvailable routes:");
+  console.log("  GET  /test-error          - Test synchronous error");
+  console.log("  GET  /test-async-error    - Test asynchronous error");
+  console.log(
+    "  POST /analyze-error       - Analyze error with Claude (streaming)"
+  );
+  console.log(
+    "  GET  /simulate/:errorType - Simulate errors (type, reference, range, syntax, custom)"
+  );
+  console.log("\nExample usage:");
+  console.log("  curl http://localhost:3000/test-error");
+  console.log(
+    '  curl -X POST http://localhost:3000/analyze-error -H "Content-Type: application/json" -d \'{"errorMessage": "Cannot read property of undefined"}\''
+  );
+  console.log("  curl http://localhost:3000/simulate/type");
+});
+
+module.exports = app;
+```

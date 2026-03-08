@@ -1,0 +1,228 @@
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "verify_password",
+        "description": "Verifies if the provided password is correct for the given username",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username attempting to login"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "The password to verify"
+                }
+            },
+            "required": ["username", "password"]
+        }
+    },
+    {
+        "name": "generate_auth_response",
+        "description": "Generates an authentication response based on verification result",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "success": {
+                    "type": "boolean",
+                    "description": "Whether authentication was successful"
+                },
+                "username": {
+                    "type": "string",
+                    "description": "The username that attempted to login"
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Additional message about the authentication result"
+                }
+            },
+            "required": ["success", "username"]
+        }
+    }
+]
+
+VALID_CREDENTIALS = {
+    "admin": "secure_password_123",
+    "user1": "mypassword456",
+    "john_doe": "john_secret_789"
+}
+
+def verify_password(username: str, password: str) -> dict:
+    """Simulates password verification against a database"""
+    if username in VALID_CREDENTIALS:
+        if VALID_CREDENTIALS[username] == password:
+            return {
+                "verified": True,
+                "username": username,
+                "message": "Password verified successfully"
+            }
+        else:
+            return {
+                "verified": False,
+                "username": username,
+                "message": "Invalid password"
+            }
+    else:
+        return {
+            "verified": False,
+            "username": username,
+            "message": "User not found"
+        }
+
+def generate_auth_response(success: bool, username: str, message: str = "") -> dict:
+    """Generates the HTTP-like authentication response"""
+    if success:
+        return {
+            "status_code": 200,
+            "status": "OK",
+            "message": f"Welcome, {username}! Login successful.",
+            "token": f"auth_token_{username}_xyz123",
+            "details": message
+        }
+    else:
+        return {
+            "status_code": 401,
+            "status": "Unauthorized",
+            "message": "401 Unauthorized: Authentication failed",
+            "error": "Invalid credentials provided",
+            "details": message
+        }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results"""
+    if tool_name == "verify_password":
+        result = verify_password(tool_input["username"], tool_input["password"])
+        return json.dumps(result)
+    elif tool_name == "generate_auth_response":
+        result = generate_auth_response(
+            tool_input["success"],
+            tool_input["username"],
+            tool_input.get("message", "")
+        )
+        return json.dumps(result)
+    else:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def login(username: str, password: str) -> dict:
+    """
+    Main login function that uses Claude to verify credentials
+    Returns authentication response
+    """
+    print(f"\n{'='*50}")
+    print(f"Login attempt for user: {username}")
+    print(f"{'='*50}")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please verify the login credentials for username '{username}' with password '{password}'. First verify the password, then generate an appropriate authentication response based on the result."
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"\nClaude's response (stop_reason: {response.stop_reason}):")
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"\nTool called: {tool_name}")
+                    print(f"Tool input: {json.dumps(tool_input, indent=2)}")
+                    
+                    tool_result = process_tool_call(tool_name, tool_input)
+                    
+                    print(f"Tool result: {tool_result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            final_response = None
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    print(f"\nFinal message from Claude: {content_block.text}")
+            
+            for message in messages:
+                if message["role"] == "user" and isinstance(message["content"], list):
+                    for item in message["content"]:
+                        if item.get("type") == "tool_result":
+                            result_data = json.loads(item["content"])
+                            if "status_code" in result_data:
+                                final_response = result_data
+            
+            if final_response:
+                return final_response
+            else:
+                return {
+                    "status_code": 500,
+                    "status": "Internal Server Error",
+                    "message": "Authentication process failed unexpectedly"
+                }
+        else:
+            break
+    
+    return {
+        "status_code": 500,
+        "status": "Internal Server Error",
+        "message": "Unexpected error during authentication"
+    }
+
+def main():
+    """Test the login function with various scenarios"""
+    
+    print("\n" + "="*60)
+    print("TEST 1: Valid credentials")
+    print("="*60)
+    result = login("admin", "secure_password_123")
+    print(f"\nFinal Response:")
+    print(json.dumps(result, indent=2))
+    
+    print("\n" + "="*60)
+    print("TEST 2: Invalid password")
+    print("="*60)
+    result = login("admin", "wrong_password")
+    print(f"\nFinal Response:")
+    print(json.dumps(result, indent=2))
+    
+    print("\n" + "="*60)
+    print("TEST 3: Non-existent user")
+    print("="*60)
+    result = login("unknown_user", "some_password")
+    print(f"\nFinal Response:")
+    print(json.dumps(result, indent=2))
+    
+    print("\n" + "="*60)
+    print("TEST 4: Another valid user")
+    print("="*60)
+    result = login("user1", "mypassword456")
+    print(f"\nFinal Response:")
+    print(json.dumps(result, indent=2))
+
+if __name__ == "__main__":
+    main()
+```

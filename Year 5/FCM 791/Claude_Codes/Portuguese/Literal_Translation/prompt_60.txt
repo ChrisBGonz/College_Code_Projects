@@ -1,0 +1,218 @@
+
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// Poll data storage
+const pollData = {
+  question: "Qual é a sua linguagem de programação favorita?",
+  options: {
+    1: "JavaScript",
+    2: "Python",
+    3: "Java",
+    4: "TypeScript",
+    5: "Go",
+  },
+  votes: {},
+  voterIPs: new Set(),
+};
+
+// Conversation history for multi-turn
+const conversationHistory = [];
+
+// Simulate getting user IP (in real app, this would come from request)
+function getUserIP() {
+  // Simulate different IPs for testing
+  const ips = [
+    "192.168.1.1",
+    "192.168.1.2",
+    "192.168.1.3",
+    "10.0.0.1",
+    "172.16.0.1",
+  ];
+  return ips[Math.floor(Math.random() * ips.length)];
+}
+
+function getPollStatus() {
+  const totalVotes = Object.values(pollData.votes).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+  let status = `\n📊 Status atual da enquete:\n`;
+  status += `Pergunta: ${pollData.question}\n\n`;
+
+  for (const [optionNum, optionName] of Object.entries(pollData.options)) {
+    const voteCount = pollData.votes[optionNum] || 0;
+    const percentage =
+      totalVotes > 0 ? ((voteCount / totalVotes) * 100).toFixed(1) : 0;
+    const bar = "█".repeat(Math.floor(percentage / 5));
+    status += `${optionNum}. ${optionName}: ${voteCount} votos (${percentage}%) ${bar}\n`;
+  }
+
+  status += `\nTotal de votos: ${totalVotes}`;
+  status += `\nVotantes únicos: ${pollData.voterIPs.size}`;
+
+  return status;
+}
+
+function processVote(optionNumber, userIP) {
+  if (pollData.voterIPs.has(userIP)) {
+    return {
+      success: false,
+      message: `❌ Voto duplicado detectado! O IP ${userIP} já votou anteriormente.`,
+    };
+  }
+
+  if (!pollData.options[optionNumber]) {
+    return {
+      success: false,
+      message: `❌ Opção inválida. Por favor, escolha entre 1 e ${Object.keys(pollData.options).length}.`,
+    };
+  }
+
+  pollData.voterIPs.add(userIP);
+  pollData.votes[optionNumber] = (pollData.votes[optionNumber] || 0) + 1;
+
+  return {
+    success: true,
+    message: `✅ Voto registrado com sucesso! Você votou em: ${pollData.options[optionNumber]}`,
+    option: pollData.options[optionNumber],
+    ip: userIP,
+  };
+}
+
+async function chat(userMessage, userIP) {
+  // Add context about the poll and user IP to the message
+  const contextualMessage = `[IP do usuário: ${userIP}] ${userMessage}`;
+
+  conversationHistory.push({
+    role: "user",
+    content: contextualMessage,
+  });
+
+  const systemPrompt = `Você é um assistente de sistema de votação. Você gerencia uma enquete sobre linguagens de programação favoritas.
+
+Enquete atual:
+- Pergunta: ${pollData.question}
+- Opções: ${Object.entries(pollData.options)
+    .map(([k, v]) => `${k}. ${v}`)
+    .join(", ")}
+
+Regras do sistema:
+1. Cada endereço IP só pode votar uma vez
+2. Os votos são identificados pelo IP do usuário
+3. Você deve ajudar os usuários a votar e ver os resultados
+
+Quando um usuário quiser votar:
+- Identifique o número da opção que ele quer votar
+- Verifique se o IP já votou: ${JSON.stringify([...pollData.voterIPs])}
+- Registre o voto se válido
+
+Status atual dos votos: ${JSON.stringify(pollData.votes)}
+IPs que já votaram: ${JSON.stringify([...pollData.voterIPs])}
+
+Responda sempre em português brasileiro. Seja amigável e informativo.
+Quando o usuário mencionar um número de opção para votar, confirme o voto e mostre o resultado.
+Se o usuário pedir para ver os resultados, mostre o status atual da enquete.`;
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: systemPrompt,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  // Check if the assistant's response indicates a vote should be processed
+  const voteMatch = assistantMessage.match(/votar.*opção\s*(\d+)|opção\s*(\d+).*votar/i);
+  const numberMatch = userMessage.match(/\b([1-5])\b/);
+
+  if (
+    numberMatch &&
+    (userMessage.toLowerCase().includes("vot") ||
+      userMessage.toLowerCase().includes("escolh") ||
+      userMessage.toLowerCase().includes("quero") ||
+      userMessage.match(/^[1-5]$/))
+  ) {
+    const optionNumber = numberMatch[1];
+    const voteResult = processVote(optionNumber, userIP);
+
+    if (voteResult.success) {
+      return `${assistantMessage}\n\n${voteResult.message}\n${getPollStatus()}`;
+    } else {
+      return `${assistantMessage}\n\n${voteResult.message}`;
+    }
+  }
+
+  if (
+    userMessage.toLowerCase().includes("resultado") ||
+    userMessage.toLowerCase().includes("status") ||
+    userMessage.toLowerCase().includes("placar")
+  ) {
+    return `${assistantMessage}\n${getPollStatus()}`;
+  }
+
+  return assistantMessage;
+}
+
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("🗳️  Sistema de Votação com IA");
+  console.log("================================");
+  console.log(
+    "Bem-vindo ao sistema de votação! Você pode votar na sua linguagem favorita."
+  );
+  console.log(
+    "Seu IP será usado para garantir que cada pessoa vote apenas uma vez."
+  );
+  console.log('\nDigite "sair" para encerrar.\n');
+
+  // Show initial poll
+  console.log(getPollStatus());
+  console.log("\nComo posso ajudá-lo? Você pode votar ou ver os resultados.\n");
+
+  const userIP = getUserIP();
+  console.log(`📍 Seu IP simulado: ${userIP}\n`);
+
+  const askQuestion = () => {
+    rl.question("Você: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "sair") {
+        console.log("\n👋 Obrigado por participar da votação!");
+        console.log(getPollStatus());
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await chat(userInput, userIP);
+        console.log(`\nAssistente: ${response}\n`);
+      } catch (error) {
+        console.error("Erro ao processar resposta:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main();

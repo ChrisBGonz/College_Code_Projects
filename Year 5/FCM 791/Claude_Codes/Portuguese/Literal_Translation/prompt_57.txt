@@ -1,0 +1,984 @@
+<?php
+
+declare(strict_types=1);
+
+define('UPLOAD_DIR', __DIR__ . '/uploads/');
+define('MAX_FILE_SIZE', 10 * 1024 * 1024);
+define('ALLOWED_MIME_TYPES', ['application/pdf']);
+define('ALLOWED_EXTENSIONS', ['pdf']);
+define('LOG_FILE', __DIR__ . '/logs/upload_log.txt');
+define('MAX_FILES_PER_USER_PER_DAY', 20);
+
+session_start();
+
+if (!isset($_SESSION['user'])) {
+    $_SESSION['user'] = [
+        'id' => 'emp_' . uniqid(),
+        'name' => 'Funcionário Demo',
+        'email' => 'funcionario@empresa.com',
+        'department' => 'TI'
+    ];
+}
+
+if (!is_dir(UPLOAD_DIR)) {
+    mkdir(UPLOAD_DIR, 0755, true);
+}
+
+if (!is_dir(dirname(LOG_FILE))) {
+    mkdir(dirname(LOG_FILE), 0755, true);
+}
+
+function sanitizeFileName(string $fileName): string
+{
+    $fileName = pathinfo($fileName, PATHINFO_FILENAME);
+    $fileName = preg_replace('/[^a-zA-Z0-9_\-\.\s]/', '', $fileName);
+    $fileName = preg_replace('/\s+/', '_', trim($fileName));
+    $fileName = substr($fileName, 0, 100);
+    return $fileName ?: 'arquivo';
+}
+
+function generateUniqueFileName(string $originalName): string
+{
+    $sanitized = sanitizeFileName($originalName);
+    $timestamp = date('Ymd_His');
+    $uniqueId = bin2hex(random_bytes(8));
+    return "{$sanitized}_{$timestamp}_{$uniqueId}.pdf";
+}
+
+function validateFile(array $file): array
+{
+    $errors = [];
+
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $errorMessages = [
+            UPLOAD_ERR_INI_SIZE   => 'O arquivo excede o tamanho máximo permitido pelo servidor.',
+            UPLOAD_ERR_FORM_SIZE  => 'O arquivo excede o tamanho máximo permitido pelo formulário.',
+            UPLOAD_ERR_PARTIAL    => 'O arquivo foi enviado apenas parcialmente.',
+            UPLOAD_ERR_NO_FILE    => 'Nenhum arquivo foi enviado.',
+            UPLOAD_ERR_NO_TMP_DIR => 'Pasta temporária não encontrada.',
+            UPLOAD_ERR_CANT_WRITE => 'Falha ao gravar o arquivo no disco.',
+            UPLOAD_ERR_EXTENSION  => 'Uma extensão PHP interrompeu o upload.',
+        ];
+        $errors[] = $errorMessages[$file['error']] ?? 'Erro desconhecido no upload.';
+        return $errors;
+    }
+
+    if ($file['size'] > MAX_FILE_SIZE) {
+        $errors[] = 'O arquivo excede o tamanho máximo permitido de ' . (MAX_FILE_SIZE / 1024 / 1024) . 'MB.';
+    }
+
+    if ($file['size'] === 0) {
+        $errors[] = 'O arquivo está vazio.';
+    }
+
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if (!in_array($extension, ALLOWED_EXTENSIONS, true)) {
+        $errors[] = 'Apenas arquivos PDF são permitidos.';
+    }
+
+    if (!empty($errors)) {
+        return $errors;
+    }
+
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($file['tmp_name']);
+
+    if (!in_array($mimeType, ALLOWED_MIME_TYPES, true)) {
+        $errors[] = 'O tipo do arquivo não é válido. Apenas PDFs são aceitos.';
+    }
+
+    $handle = fopen($file['tmp_name'], 'rb');
+    if ($handle) {
+        $header = fread($handle, 5);
+        fclose($handle);
+        if ($header !== '%PDF-') {
+            $errors[] = 'O arquivo não é um PDF válido.';
+        }
+    }
+
+    return $errors;
+}
+
+function checkUserUploadLimit(string $userId): bool
+{
+    $logFile = LOG_FILE;
+    if (!file_exists($logFile)) {
+        return true;
+    }
+
+    $today = date('Y-m-d');
+    $count = 0;
+    $lines = file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+    foreach ($lines as $line) {
+        $data = json_decode($line, true);
+        if ($data && $data['user_id'] === $userId && str_starts_with($data['timestamp'], $today)) {
+            $count++;
+        }
+    }
+
+    return $count < MAX_FILES_PER_USER_PER_DAY;
+}
+
+function logUpload(array $logData): void
+{
+    $logEntry = json_encode($logData) . PHP_EOL;
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+function getUploadedFiles(): array
+{
+    $files = [];
+    if (!is_dir(UPLOAD_DIR)) {
+        return $files;
+    }
+
+    $iterator = new DirectoryIterator(UPLOAD_DIR);
+    foreach ($iterator as $fileInfo) {
+        if ($fileInfo->isDot() || !$fileInfo->isFile()) {
+            continue;
+        }
+        if (strtolower($fileInfo->getExtension()) !== 'pdf') {
+            continue;
+        }
+        $files[] = [
+            'name'     => $fileInfo->getFilename(),
+            'size'     => $fileInfo->getSize(),
+            'modified' => $fileInfo->getMTime(),
+            'path'     => $fileInfo->getPathname(),
+        ];
+    }
+
+    usort($files, fn($a, $b) => $b['modified'] - $a['modified']);
+
+    return $files;
+}
+
+function formatFileSize(int $bytes): string
+{
+    if ($bytes >= 1048576) {
+        return number_format($bytes / 1048576, 2) . ' MB';
+    }
+    if ($bytes >= 1024) {
+        return number_format($bytes / 1024, 2) . ' KB';
+    }
+    return $bytes . ' bytes';
+}
+
+function handleDownload(): void
+{
+    if (!isset($_GET['download'])) {
+        return;
+    }
+
+    $requestedFile = basename($_GET['download']);
+    $filePath = UPLOAD_DIR . $requestedFile;
+
+    if (!file_exists($filePath) || !is_file($filePath)) {
+        http_response_code(404);
+        exit('Arquivo não encontrado.');
+    }
+
+    $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    if ($extension !== 'pdf') {
+        http_response_code(403);
+        exit('Acesso negado.');
+    }
+
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($filePath);
+    if (!in_array($mimeType, ALLOWED_MIME_TYPES, true)) {
+        http_response_code(403);
+        exit('Tipo de arquivo inválido.');
+    }
+
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: attachment; filename="' . $requestedFile . '"');
+    header('Content-Length: ' . filesize($filePath));
+    header('Cache-Control: no-cache, must-revalidate');
+    header('Pragma: no-cache');
+    readfile($filePath);
+    exit;
+}
+
+function handleDelete(): array
+{
+    $result = ['success' => false, 'message' => ''];
+
+    if (!isset($_POST['delete_file'])) {
+        return $result;
+    }
+
+    $requestedFile = basename($_POST['delete_file']);
+    $filePath = UPLOAD_DIR . $requestedFile;
+
+    if (!file_exists($filePath) || !is_file($filePath)) {
+        $result['message'] = 'Arquivo não encontrado.';
+        return $result;
+    }
+
+    $extension = strtolower(pathinfo($filePath, PATHINFO_EXTENSION));
+    if ($extension !== 'pdf') {
+        $result['message'] = 'Operação não permitida.';
+        return $result;
+    }
+
+    if (unlink($filePath)) {
+        logUpload([
+            'action'    => 'delete',
+            'user_id'   => $_SESSION['user']['id'],
+            'user_name' => $_SESSION['user']['name'],
+            'file_name' => $requestedFile,
+            'timestamp' => date('Y-m-d H:i:s'),
+            'ip'        => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+        ]);
+        $result['success'] = true;
+        $result['message'] = "Arquivo '{$requestedFile}' excluído com sucesso.";
+    } else {
+        $result['message'] = 'Erro ao excluir o arquivo.';
+    }
+
+    return $result;
+}
+
+handleDownload();
+
+$uploadResult = ['success' => false, 'message' => '', 'errors' => []];
+$deleteResult = ['success' => false, 'message' => ''];
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['delete_file'])) {
+        $deleteResult = handleDelete();
+    } elseif (isset($_FILES['pdf_files'])) {
+        $files = $_FILES['pdf_files'];
+        $uploadedCount = 0;
+        $failedCount = 0;
+        $allErrors = [];
+
+        if (!checkUserUploadLimit($_SESSION['user']['id'])) {
+            $uploadResult['errors'][] = 'Limite diário de uploads atingido (' . MAX_FILES_PER_USER_PER_DAY . ' arquivos por dia).';
+        } else {
+            $fileCount = count($files['name']);
+
+            for ($i = 0; $i < $fileCount; $i++) {
+                $file = [
+                    'name'     => $files['name'][$i],
+                    'type'     => $files['type'][$i],
+                    'tmp_name' => $files['tmp_name'][$i],
+                    'error'    => $files['error'][$i],
+                    'size'     => $files['size'][$i],
+                ];
+
+                if ($file['error'] === UPLOAD_ERR_NO_FILE) {
+                    continue;
+                }
+
+                $errors = validateFile($file);
+
+                if (!empty($errors)) {
+                    $failedCount++;
+                    $allErrors[] = "'{$file['name']}': " . implode(' ', $errors);
+                    continue;
+                }
+
+                $newFileName = generateUniqueFileName($file['name']);
+                $destination = UPLOAD_DIR . $newFileName;
+
+                if (move_uploaded_file($file['tmp_name'], $destination)) {
+                    chmod($destination, 0644);
+                    $uploadedCount++;
+
+                    logUpload([
+                        'action'        => 'upload',
+                        'user_id'       => $_SESSION['user']['id'],
+                        'user_name'     => $_SESSION['user']['name'],
+                        'department'    => $_SESSION['user']['department'],
+                        'original_name' => $file['name'],
+                        'saved_name'    => $newFileName,
+                        'file_size'     => $file['size'],
+                        'timestamp'     => date('Y-m-d H:i:s'),
+                        'ip'            => $_SERVER['REMOTE_ADDR'] ?? 'unknown',
+                    ]);
+                } else {
+                    $failedCount++;
+                    $allErrors[] = "'{$file['name']}': Erro ao mover o arquivo para o destino.";
+                }
+            }
+
+            if ($uploadedCount > 0) {
+                $uploadResult['success'] = true;
+                $uploadResult['message'] = "{$uploadedCount} arquivo(s) enviado(s) com sucesso!";
+            }
+
+            if ($failedCount > 0) {
+                $uploadResult['errors'] = $allErrors;
+                if ($uploadedCount === 0) {
+                    $uploadResult['message'] = "Falha ao enviar {$failedCount} arquivo(s).";
+                }
+            }
+
+            if ($uploadedCount === 0 && $failedCount === 0) {
+                $uploadResult['errors'][] = 'Nenhum arquivo foi selecionado para upload.';
+            }
+        }
+    }
+}
+
+$uploadedFiles = getUploadedFiles();
+$csrfToken = bin2hex(random_bytes(32));
+$_SESSION['csrf_token'] = $csrfToken;
+
+?>
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Upload de Arquivos PDF - Unidade Compartilhada</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        :root {
+            --primary: #2563eb;
+            --primary-dark: #1d4ed8;
+            --primary-light: #dbeafe;
+            --success: #16a34a;
+            --success-light: #dcfce7;
+            --error: #dc2626;
+            --error-light: #fee2e2;
+            --warning: #d97706;
+            --warning-light: #fef3c7;
+            --gray-50: #f9fafb;
+            --gray-100: #f3f4f6;
+            --gray-200: #e5e7eb;
+            --gray-300: #d1d5db;
+            --gray-400: #9ca3af;
+            --gray-500: #6b7280;
+            --gray-600: #4b5563;
+            --gray-700: #374151;
+            --gray-800: #1f2937;
+            --gray-900: #111827;
+            --white: #ffffff;
+            --shadow-sm: 0 1px 2px rgba(0,0,0,0.05);
+            --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+            --shadow-md: 0 4px 6px rgba(0,0,0,0.07), 0 2px 4px rgba(0,0,0,0.06);
+            --shadow-lg: 0 10px 15px rgba(0,0,0,0.1), 0 4px 6px rgba(0,0,0,0.05);
+            --radius: 8px;
+            --radius-lg: 12px;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: var(--gray-100);
+            color: var(--gray-800);
+            min-height: 100vh;
+            line-height: 1.5;
+        }
+
+        header {
+            background: var(--white);
+            border-bottom: 1px solid var(--gray-200);
+            padding: 0 24px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .header-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 64px;
+        }
+
+        .header-brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .header-brand .logo {
+            width: 36px;
+            height: 36px;
+            background: var(--primary);
+            border-radius: var(--radius);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--white);
+            font-size: 18px;
+        }
+
+        .header-brand h1 {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--gray-900);
+        }
+
+        .header-brand span {
+            font-size: 13px;
+            color: var(--gray-500);
+            font-weight: 400;
+        }
+
+        .header-user {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: var(--gray-50);
+            border: 1px solid var(--gray-200);
+            border-radius: 50px;
+            padding: 6px 14px 6px 8px;
+        }
+
+        .user-avatar {
+            width: 30px;
+            height: 30px;
+            background: var(--primary);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: var(--white);
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .user-info {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .user-name {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--gray-800);
+            line-height: 1.2;
+        }
+
+        .user-dept {
+            font-size: 11px;
+            color: var(--gray-500);
+        }
+
+        main {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 32px 24px;
+        }
+
+        .page-title {
+            margin-bottom: 28px;
+        }
+
+        .page-title h2 {
+            font-size: 24px;
+            font-weight: 700;
+            color: var(--gray-900);
+            margin-bottom: 4px;
+        }
+
+        .page-title p {
+            color: var(--gray-500);
+            font-size: 14px;
+        }
+
+        .alert {
+            display: flex;
+            align-items: flex-start;
+            gap: 12px;
+            padding: 14px 16px;
+            border-radius: var(--radius);
+            margin-bottom: 20px;
+            font-size: 14px;
+            border: 1px solid transparent;
+        }
+
+        .alert-icon {
+            font-size: 18px;
+            flex-shrink: 0;
+            margin-top: 1px;
+        }
+
+        .alert-content {
+            flex: 1;
+        }
+
+        .alert-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .alert-success {
+            background: var(--success-light);
+            border-color: #bbf7d0;
+            color: #14532d;
+        }
+
+        .alert-error {
+            background: var(--error-light);
+            border-color: #fecaca;
+            color: #7f1d1d;
+        }
+
+        .alert-error ul {
+            margin: 6px 0 0 16px;
+        }
+
+        .alert-error li {
+            margin-bottom: 2px;
+        }
+
+        .card {
+            background: var(--white);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--gray-200);
+            box-shadow: var(--shadow);
+            overflow: hidden;
+            margin-bottom: 24px;
+        }
+
+        .card-header {
+            padding: 18px 24px;
+            border-bottom: 1px solid var(--gray-100);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-header h3 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--gray-900);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-body {
+            padding: 24px;
+        }
+
+        .upload-zone {
+            border: 2px dashed var(--gray-300);
+            border-radius: var(--radius-lg);
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            background: var(--gray-50);
+            position: relative;
+        }
+
+        .upload-zone:hover,
+        .upload-zone.drag-over {
+            border-color: var(--primary);
+            background: var(--primary-light);
+        }
+
+        .upload-zone input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+
+        .upload-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+            display: block;
+        }
+
+        .upload-zone h4 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--gray-700);
+            margin-bottom: 8px;
+        }
+
+        .upload-zone p {
+            font-size: 13px;
+            color: var(--gray-500);
+            margin-bottom: 4px;
+        }
+
+        .upload-zone .upload-hint {
+            display: inline-block;
+            margin-top: 12px;
+            background: var(--primary);
+            color: var(--white);
+            padding: 8px 20px;
+            border-radius: 50px;
+            font-size: 13px;
+            font-weight: 500;
+            pointer-events: none;
+        }
+
+        .file-preview-list {
+            margin-top: 16px;
+            display: none;
+        }
+
+        .file-preview-list.has-files {
+            display: block;
+        }
+
+        .file-preview-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 14px;
+            background: var(--gray-50);
+            border: 1px solid var(--gray-200);
+            border-radius: var(--radius);
+            margin-bottom: 8px;
+        }
+
+        .file-preview-icon {
+            font-size: 24px;
+            flex-shrink: 0;
+        }
+
+        .file-preview-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .file-preview-name {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--gray-800);
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .file-preview-size {
+            font-size: 12px;
+            color: var(--gray-500);
+        }
+
+        .file-preview-remove {
+            background: none;
+            border: none;
+            cursor: pointer;
+            color: var(--gray-400);
+            font-size: 18px;
+            padding: 4px;
+            border-radius: 4px;
+            transition: color 0.15s;
+            flex-shrink: 0;
+        }
+
+        .file-preview-remove:hover {
+            color: var(--error);
+        }
+
+        .form-actions {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-top: 20px;
+            padding-top: 20px;
+            border-top: 1px solid var(--gray-100);
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+
+        .form-info {
+            font-size: 12px;
+            color: var(--gray-500);
+            display: flex;
+            gap: 16px;
+            flex-wrap: wrap;
+        }
+
+        .form-info span {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 20px;
+            border-radius: var(--radius);
+            font-size: 14px;
+            font-weight: 500;
+            cursor: pointer;
+            border: 1px solid transparent;
+            transition: all 0.15s ease;
+            text-decoration: none;
+        }
+
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+
+        .btn-primary {
+            background: var(--primary);
+            color: var(--white);
+            border-color: var(--primary);
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary-dark);
+            border-color: var(--primary-dark);
+        }
+
+        .btn-secondary {
+            background: var(--white);
+            color: var(--gray-700);
+            border-color: var(--gray-300);
+        }
+
+        .btn-secondary:hover:not(:disabled) {
+            background: var(--gray-50);
+        }
+
+        .btn-danger {
+            background: var(--white);
+            color: var(--error);
+            border-color: #fca5a5;
+        }
+
+        .btn-danger:hover:not(:disabled) {
+            background: var(--error-light);
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-icon {
+            padding: 6px 10px;
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--white);
+            border: 1px solid var(--gray-200);
+            border-radius: var(--radius-lg);
+            padding: 20px;
+            box-shadow: var(--shadow-sm);
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: var(--gray-500);
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-bottom: 8px;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: var(--gray-900);
+            line-height: 1;
+            margin-bottom: 4px;
+        }
+
+        .stat-sub {
+            font-size: 12px;
+            color: var(--gray-400);
+        }
+
+        .stat-card.blue .stat-value { color: var(--primary); }
+        .stat-card.green .stat-value { color: var(--success); }
+        .stat-card.orange .stat-value { color: var(--warning); }
+
+        .files-table-wrapper {
+            overflow-x: auto;
+        }
+
+        .files-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 14px;
+        }
+
+        .files-table th {
+            text-align: left;
+            padding: 10px 16px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--gray-500);
+            background: var(--gray-50);
+            border-bottom: 1px solid var(--gray-200);
+        }
+
+        .files-table td {
+            padding: 12px 16px;
+            border-bottom: 1px solid var(--gray-100);
+            vertical-align: middle;
+        }
+
+        .files-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .files-table tr:hover td {
+            background: var(--gray-50);
+        }
+
+        .file-name-cell {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .file-pdf-icon {
+            width: 36px;
+            height: 36px;
+            background: #fee2e2;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .file-name-text {
+            font-weight: 500;
+            color: var(--gray-800);
+            word-break: break-all;
+        }
+
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 2px 8px;
+            border-radius: 50px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .badge-pdf {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+
+        .table-actions {
+            display: flex;
+            gap: 6px;
+            align-items: center;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 60px 24px;
+            color: var(--gray-400);
+        }
+
+        .empty-state .empty-icon {
+            font-size: 56px;
+            margin-bottom: 16px;
+            display: block;
+        }
+
+        .empty-state h4 {
+            font-size: 16px;
+            font-weight: 600;
+            color: var(--gray-500);
+            margin-bottom: 8px;
+        }
+
+        .empty-state p {
+            font-size: 14px;
+        }
+
+        .progress-bar-wrapper {
+            display: none;
+            margin-top: 16px;
+        }
+
+        .progress-bar-wrapper.visible {
+            display: block;
+        }
+
+        .progress-label {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            color: var(--gray-600);
+            margin-bottom: 6px;
+        }
+
+        .progress-bar {
+            height: 6px;
+            background: var(--gray-200);
+            border-radius: 50px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: var(--primary);
+            border-radius: 50px;
+            transition: width 0.3s ease;
+            width: 0%;
+        }
+
+        .search-bar {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .search-input {
+            flex: 1;
+            padding: 8px 12px;
+            border: 1px solid var(--gray-300);
+            border-radius: var(--radius);
+            font-size: 13px;
+            color: var(--gray-800);
+            background: var(--white);
+            outline: none;
+            transition: border-color 0.15s;
+        }
+
+        .search-input:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background

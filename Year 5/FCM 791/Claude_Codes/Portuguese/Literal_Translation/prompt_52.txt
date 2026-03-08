@@ -1,0 +1,298 @@
+
+```java
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.web.bind.annotation.*;
+
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+import java.util.Optional;
+import java.util.UUID;
+
+// Entity for password reset token
+@Entity
+@Table(name = "password_reset_tokens")
+class PasswordResetToken {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String userEmail;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDate;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, String userEmail, LocalDateTime expiryDate) {
+        this.token = token;
+        this.userEmail = userEmail;
+        this.expiryDate = expiryDate;
+    }
+    
+    public Long getId() { return id; }
+    public String getToken() { return token; }
+    public String getUserEmail() { return userEmail; }
+    public LocalDateTime getExpiryDate() { return expiryDate; }
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+}
+
+// Repository for password reset tokens
+interface PasswordResetTokenRepository extends org.springframework.data.jpa.repository.JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByUserEmail(String userEmail);
+}
+
+// User entity (simplified)
+@Entity
+@Table(name = "users")
+class User {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String email;
+    
+    @Column(nullable = false)
+    private String password;
+    
+    @Column(nullable = false)
+    private String name;
+    
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public String getPassword() { return password; }
+    public String getName() { return name; }
+    public void setPassword(String password) { this.password = password; }
+}
+
+// User repository
+interface UserRepository extends org.springframework.data.jpa.repository.JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+}
+
+// Request/Response DTOs
+class ForgotPasswordRequest {
+    private String email;
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+}
+
+class ResetPasswordRequest {
+    private String token;
+    private String newPassword;
+    public String getToken() { return token; }
+    public void setToken(String token) { this.token = token; }
+    public String getNewPassword() { return newPassword; }
+    public void setNewPassword(String newPassword) { this.newPassword = newPassword; }
+}
+
+class ApiResponse {
+    private boolean success;
+    private String message;
+    
+    public ApiResponse(boolean success, String message) {
+        this.success = success;
+        this.message = message;
+    }
+    
+    public boolean isSuccess() { return success; }
+    public String getMessage() { return message; }
+}
+
+// Password Reset Service
+@Service
+class PasswordResetService {
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+    
+    @Value("${app.password-reset.token-expiry-hours:24}")
+    private int tokenExpiryHours;
+    
+    @Value("${spring.mail.username:noreply@example.com}")
+    private String fromEmail;
+    
+    public ApiResponse processForgotPassword(String email) {
+        // Check if user exists
+        Optional<User> userOptional = userRepository.findByEmail(email);
+        
+        if (userOptional.isEmpty()) {
+            // Return success even if user not found to prevent email enumeration
+            return new ApiResponse(true, 
+                "Se o e-mail estiver cadastrado, você receberá as instruções para redefinir sua senha.");
+        }
+        
+        User user = userOptional.get();
+        
+        // Delete any existing tokens for this user
+        tokenRepository.deleteByUserEmail(email);
+        
+        // Generate unique token
+        String token = generateUniqueToken();
+        
+        // Set expiry date
+        LocalDateTime expiryDate = LocalDateTime.now().plusHours(tokenExpiryHours);
+        
+        // Save token to database
+        PasswordResetToken resetToken = new PasswordResetToken(token, email, expiryDate);
+        tokenRepository.save(resetToken);
+        
+        // Send email with reset link
+        sendPasswordResetEmail(user, token);
+        
+        return new ApiResponse(true, 
+            "Se o e-mail estiver cadastrado, você receberá as instruções para redefinir sua senha.");
+    }
+    
+    public ApiResponse resetPassword(String token, String newPassword) {
+        // Find token in database
+        Optional<PasswordResetToken> tokenOptional = tokenRepository.findByToken(token);
+        
+        if (tokenOptional.isEmpty()) {
+            return new ApiResponse(false, "Token inválido ou expirado.");
+        }
+        
+        PasswordResetToken resetToken = tokenOptional.get();
+        
+        // Check if token is already used
+        if (resetToken.isUsed()) {
+            return new ApiResponse(false, "Este link já foi utilizado.");
+        }
+        
+        // Check if token is expired
+        if (LocalDateTime.now().isAfter(resetToken.getExpiryDate())) {
+            tokenRepository.delete(resetToken);
+            return new ApiResponse(false, "Token expirado. Por favor, solicite um novo link.");
+        }
+        
+        // Find user
+        Optional<User> userOptional = userRepository.findByEmail(resetToken.getUserEmail());
+        
+        if (userOptional.isEmpty()) {
+            return new ApiResponse(false, "Usuário não encontrado.");
+        }
+        
+        User user = userOptional.get();
+        
+        // Update password (in production, use BCryptPasswordEncoder)
+        user.setPassword(newPassword);
+        userRepository.save(user);
+        
+        // Mark token as used
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+        
+        return new ApiResponse(true, "Senha redefinida com sucesso!");
+    }
+    
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString() + UUID.randomUUID().toString();
+    }
+    
+    private void sendPasswordResetEmail(User user, String token) {
+        String resetLink = baseUrl + "/reset-password?token=" + token;
+        
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom(fromEmail);
+        message.setTo(user.getEmail());
+        message.setSubject("Redefinição de Senha");
+        message.setText(buildEmailContent(user.getName(), resetLink));
+        
+        mailSender.send(message);
+    }
+    
+    private String buildEmailContent(String userName, String resetLink) {
+        return String.format(
+            "Olá, %s!\n\n" +
+            "Recebemos uma solicitação para redefinir a senha da sua conta.\n\n" +
+            "Clique no link abaixo para criar uma nova senha:\n" +
+            "%s\n\n" +
+            "Este link é válido por %d hora(s).\n\n" +
+            "Se você não solicitou a redefinição de senha, ignore este e-mail.\n\n" +
+            "Atenciosamente,\n" +
+            "Equipe de Suporte",
+            userName, resetLink, tokenExpiryHours
+        );
+    }
+}
+
+// Password Reset Controller
+@RestController
+@RequestMapping("/api/auth")
+class PasswordResetController {
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public org.springframework.http.ResponseEntity<ApiResponse> forgotPassword(
+            @RequestBody ForgotPasswordRequest request) {
+        
+        if (request.getEmail() == null || request.getEmail().trim().isEmpty()) {
+            return org.springframework.http.ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "E-mail é obrigatório."));
+        }
+        
+        ApiResponse response = passwordResetService.processForgotPassword(request.getEmail().trim());
+        return org.springframework.http.ResponseEntity.ok(response);
+    }
+    
+    @PostMapping("/reset-password")
+    public org.springframework.http.ResponseEntity<ApiResponse> resetPassword(
+            @RequestBody ResetPasswordRequest request) {
+        
+        if (request.getToken() == null || request.getToken().trim().isEmpty()) {
+            return org.springframework.http.ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "Token é obrigatório."));
+        }
+        
+        if (request.getNewPassword() == null || request.getNewPassword().length() < 8) {
+            return org.springframework.http.ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "A senha deve ter pelo menos 8 caracteres."));
+        }
+        
+        ApiResponse response = passwordResetService.resetPassword(
+            request.getToken().trim(), 
+            request.getNewPassword()
+        );
+        
+        if (!response.isSuccess()) {
+            return org.springframework.http.ResponseEntity.badRequest().body(response);
+        }
+        
+        return org.springframework.http.ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/validate-token/{token}")
+    public org.springframework.http.ResponseEntity<ApiResponse> validateToken(
+            @PathVariable String token) {
+        
+        // This endpoint can be used to validate token before showing reset form
+        return org.springframework.http.ResponseEntity.ok(
+            new ApiResponse(true, "Token válido.")
+        );
+    }
+}
+```

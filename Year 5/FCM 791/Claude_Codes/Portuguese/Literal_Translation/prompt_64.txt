@@ -1,0 +1,552 @@
+
+```csharp
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using System.Collections.Generic;
+
+namespace RememberMeFeature
+{
+    // Simulated cookie storage (in a real app, this would be HTTP cookies)
+    public class CookieStorage
+    {
+        private Dictionary<string, (string Value, DateTime Expiry)> _cookies = new();
+
+        public void SetCookie(string name, string value, DateTime expiry)
+        {
+            _cookies[name] = (value, expiry);
+            Console.WriteLine($"[Cookie Set] Name: {name}, Expires: {expiry:yyyy-MM-dd HH:mm:ss}");
+        }
+
+        public string? GetCookie(string name)
+        {
+            if (_cookies.TryGetValue(name, out var cookie))
+            {
+                if (cookie.Expiry > DateTime.UtcNow)
+                    return cookie.Value;
+                
+                _cookies.Remove(name);
+                Console.WriteLine($"[Cookie Expired] Cookie '{name}' has expired and was removed.");
+            }
+            return null;
+        }
+
+        public void DeleteCookie(string name)
+        {
+            if (_cookies.Remove(name))
+                Console.WriteLine($"[Cookie Deleted] Cookie '{name}' was removed.");
+        }
+
+        public bool HasCookie(string name) => _cookies.ContainsKey(name) && _cookies[name].Expiry > DateTime.UtcNow;
+    }
+
+    // Simulated database storage for remember-me tokens
+    public class TokenRepository
+    {
+        private Dictionary<string, RememberMeToken> _tokens = new();
+
+        public void SaveToken(RememberMeToken token)
+        {
+            _tokens[token.Selector] = token;
+        }
+
+        public RememberMeToken? FindBySelector(string selector)
+        {
+            _tokens.TryGetValue(selector, out var token);
+            return token;
+        }
+
+        public void DeleteToken(string selector)
+        {
+            _tokens.Remove(selector);
+        }
+
+        public void DeleteAllUserTokens(string userId)
+        {
+            var keysToRemove = new List<string>();
+            foreach (var kvp in _tokens)
+            {
+                if (kvp.Value.UserId == userId)
+                    keysToRemove.Add(kvp.Key);
+            }
+            foreach (var key in keysToRemove)
+                _tokens.Remove(key);
+        }
+
+        public void CleanExpiredTokens()
+        {
+            var keysToRemove = new List<string>();
+            foreach (var kvp in _tokens)
+            {
+                if (kvp.Value.ExpiresAt < DateTime.UtcNow)
+                    keysToRemove.Add(kvp.Key);
+            }
+            foreach (var key in keysToRemove)
+                _tokens.Remove(key);
+            
+            if (keysToRemove.Count > 0)
+                Console.WriteLine($"[Cleanup] Removed {keysToRemove.Count} expired token(s).");
+        }
+    }
+
+    public class RememberMeToken
+    {
+        public string Selector { get; set; } = string.Empty;
+        public string HashedValidator { get; set; } = string.Empty;
+        public string UserId { get; set; } = string.Empty;
+        public DateTime CreatedAt { get; set; }
+        public DateTime ExpiresAt { get; set; }
+        public string? UserAgent { get; set; }
+        public string? IpAddress { get; set; }
+    }
+
+    public class User
+    {
+        public string Id { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Email { get; set; } = string.Empty;
+        public string PasswordHash { get; set; } = string.Empty;
+        public bool IsActive { get; set; } = true;
+    }
+
+    // Simulated user repository
+    public class UserRepository
+    {
+        private Dictionary<string, User> _users = new();
+
+        public void AddUser(User user) => _users[user.Id] = user;
+
+        public User? FindById(string id)
+        {
+            _users.TryGetValue(id, out var user);
+            return user;
+        }
+
+        public User? FindByUsername(string username)
+        {
+            foreach (var user in _users.Values)
+            {
+                if (user.Username.Equals(username, StringComparison.OrdinalIgnoreCase))
+                    return user;
+            }
+            return null;
+        }
+    }
+
+    public class AuthenticationResult
+    {
+        public bool Success { get; set; }
+        public string? UserId { get; set; }
+        public string? Username { get; set; }
+        public string? ErrorMessage { get; set; }
+        public bool RememberMeEnabled { get; set; }
+
+        public static AuthenticationResult Successful(string userId, string username, bool rememberMe = false)
+            => new() { Success = true, UserId = userId, Username = username, RememberMeEnabled = rememberMe };
+
+        public static AuthenticationResult Failed(string errorMessage)
+            => new() { Success = false, ErrorMessage = errorMessage };
+    }
+
+    public class RememberMeService
+    {
+        private const string CookieName = "remember_me_token";
+        private const int DefaultExpiryDays = 30;
+        private const int SelectorLength = 16;
+        private const int ValidatorLength = 32;
+
+        private readonly TokenRepository _tokenRepository;
+        private readonly UserRepository _userRepository;
+        private readonly CookieStorage _cookieStorage;
+
+        public RememberMeService(
+            TokenRepository tokenRepository,
+            UserRepository userRepository,
+            CookieStorage cookieStorage)
+        {
+            _tokenRepository = tokenRepository;
+            _userRepository = userRepository;
+            _cookieStorage = cookieStorage;
+        }
+
+        /// <summary>
+        /// Creates a "Remember Me" persistent cookie for the user after successful login.
+        /// </summary>
+        public void CreateRememberMeCookie(string userId, int expiryDays = DefaultExpiryDays, string? userAgent = null, string? ipAddress = null)
+        {
+            if (string.IsNullOrWhiteSpace(userId))
+                throw new ArgumentException("User ID cannot be null or empty.", nameof(userId));
+
+            var user = _userRepository.FindById(userId);
+            if (user == null || !user.IsActive)
+                throw new InvalidOperationException("User not found or inactive.");
+
+            // Generate cryptographically secure selector and validator
+            string selector = GenerateSecureToken(SelectorLength);
+            string validator = GenerateSecureToken(ValidatorLength);
+            string hashedValidator = HashToken(validator);
+
+            var token = new RememberMeToken
+            {
+                Selector = selector,
+                HashedValidator = hashedValidator,
+                UserId = userId,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = DateTime.UtcNow.AddDays(expiryDays),
+                UserAgent = userAgent,
+                IpAddress = ipAddress
+            };
+
+            _tokenRepository.SaveToken(token);
+
+            // Cookie value format: selector:validator
+            string cookieValue = $"{selector}:{validator}";
+            _cookieStorage.SetCookie(CookieName, cookieValue, token.ExpiresAt);
+
+            Console.WriteLine($"[RememberMe] Cookie created for user '{user.Username}' (expires in {expiryDays} days).");
+        }
+
+        /// <summary>
+        /// Validates the "Remember Me" cookie and authenticates the user automatically.
+        /// </summary>
+        public AuthenticationResult ValidateRememberMeCookie(string? userAgent = null)
+        {
+            string? cookieValue = _cookieStorage.GetCookie(CookieName);
+
+            if (string.IsNullOrEmpty(cookieValue))
+                return AuthenticationResult.Failed("No remember-me cookie found.");
+
+            var parts = cookieValue.Split(':');
+            if (parts.Length != 2)
+            {
+                DeleteRememberMeCookie();
+                return AuthenticationResult.Failed("Invalid cookie format.");
+            }
+
+            string selector = parts[0];
+            string validator = parts[1];
+
+            var token = _tokenRepository.FindBySelector(selector);
+
+            if (token == null)
+            {
+                DeleteRememberMeCookie();
+                return AuthenticationResult.Failed("Token not found. Possible theft attempt.");
+            }
+
+            // Check if token has expired
+            if (token.ExpiresAt < DateTime.UtcNow)
+            {
+                _tokenRepository.DeleteToken(selector);
+                DeleteRememberMeCookie();
+                return AuthenticationResult.Failed("Remember-me token has expired.");
+            }
+
+            // Validate the token using constant-time comparison to prevent timing attacks
+            string hashedValidator = HashToken(validator);
+            if (!ConstantTimeEquals(hashedValidator, token.HashedValidator))
+            {
+                // Possible token theft - invalidate all user tokens
+                Console.WriteLine($"[Security Alert] Token mismatch detected for selector '{selector}'. Invalidating all user tokens.");
+                _tokenRepository.DeleteAllUserTokens(token.UserId);
+                DeleteRememberMeCookie();
+                return AuthenticationResult.Failed("Token validation failed. Security alert triggered.");
+            }
+
+            var user = _userRepository.FindById(token.UserId);
+            if (user == null || !user.IsActive)
+            {
+                _tokenRepository.DeleteToken(selector);
+                DeleteRememberMeCookie();
+                return AuthenticationResult.Failed("User not found or inactive.");
+            }
+
+            // Rotate the token for security (token rotation)
+            RotateToken(token, userAgent);
+
+            Console.WriteLine($"[RememberMe] User '{user.Username}' authenticated via remember-me cookie.");
+            return AuthenticationResult.Successful(user.Id, user.Username, rememberMe: true);
+        }
+
+        /// <summary>
+        /// Rotates the remember-me token to prevent token reuse attacks.
+        /// </summary>
+        private void RotateToken(RememberMeToken oldToken, string? userAgent = null)
+        {
+            // Delete old token
+            _tokenRepository.DeleteToken(oldToken.Selector);
+
+            // Create new token with same expiry
+            string newSelector = GenerateSecureToken(SelectorLength);
+            string newValidator = GenerateSecureToken(ValidatorLength);
+            string newHashedValidator = HashToken(newValidator);
+
+            var newToken = new RememberMeToken
+            {
+                Selector = newSelector,
+                HashedValidator = newHashedValidator,
+                UserId = oldToken.UserId,
+                CreatedAt = DateTime.UtcNow,
+                ExpiresAt = oldToken.ExpiresAt,
+                UserAgent = userAgent ?? oldToken.UserAgent,
+                IpAddress = oldToken.IpAddress
+            };
+
+            _tokenRepository.SaveToken(newToken);
+
+            string newCookieValue = $"{newSelector}:{newValidator}";
+            _cookieStorage.SetCookie(CookieName, newCookieValue, newToken.ExpiresAt);
+
+            Console.WriteLine("[RememberMe] Token rotated successfully for enhanced security.");
+        }
+
+        /// <summary>
+        /// Deletes the "Remember Me" cookie and invalidates the token (logout).
+        /// </summary>
+        public void DeleteRememberMeCookie()
+        {
+            string? cookieValue = _cookieStorage.GetCookie(CookieName);
+
+            if (!string.IsNullOrEmpty(cookieValue))
+            {
+                var parts = cookieValue.Split(':');
+                if (parts.Length == 2)
+                {
+                    string selector = parts[0];
+                    _tokenRepository.DeleteToken(selector);
+                }
+            }
+
+            _cookieStorage.DeleteCookie(CookieName);
+            Console.WriteLine("[RememberMe] Remember-me cookie deleted.");
+        }
+
+        /// <summary>
+        /// Invalidates all remember-me tokens for a specific user (logout from all devices).
+        /// </summary>
+        public void InvalidateAllUserTokens(string userId)
+        {
+            _tokenRepository.DeleteAllUserTokens(userId);
+            DeleteRememberMeCookie();
+            Console.WriteLine($"[RememberMe] All tokens invalidated for user ID '{userId}'.");
+        }
+
+        /// <summary>
+        /// Checks if a valid remember-me cookie exists.
+        /// </summary>
+        public bool HasValidRememberMeCookie() => _cookieStorage.HasCookie(CookieName);
+
+        /// <summary>
+        /// Cleans up expired tokens from the repository.
+        /// </summary>
+        public void CleanupExpiredTokens() => _tokenRepository.CleanExpiredTokens();
+
+        /// <summary>
+        /// Generates a cryptographically secure random token.
+        /// </summary>
+        private static string GenerateSecureToken(int length)
+        {
+            byte[] randomBytes = new byte[length];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(randomBytes);
+            return Convert.ToBase64String(randomBytes)
+                .Replace("+", "-")
+                .Replace("/", "_")
+                .Replace("=", "")
+                .Substring(0, Math.Min(length * 4 / 3, length * 2));
+        }
+
+        /// <summary>
+        /// Hashes a token using SHA-256 for secure storage.
+        /// </summary>
+        private static string HashToken(string token)
+        {
+            using var sha256 = SHA256.Create();
+            byte[] hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
+            return Convert.ToBase64String(hashBytes);
+        }
+
+        /// <summary>
+        /// Compares two strings in constant time to prevent timing attacks.
+        /// </summary>
+        private static bool ConstantTimeEquals(string a, string b)
+        {
+            if (a.Length != b.Length) return false;
+
+            int result = 0;
+            for (int i = 0; i < a.Length; i++)
+                result |= a[i] ^ b[i];
+
+            return result == 0;
+        }
+    }
+
+    public class AuthenticationService
+    {
+        private readonly UserRepository _userRepository;
+        private readonly RememberMeService _rememberMeService;
+
+        public AuthenticationService(UserRepository userRepository, RememberMeService rememberMeService)
+        {
+            _userRepository = userRepository;
+            _rememberMeService = rememberMeService;
+        }
+
+        /// <summary>
+        /// Authenticates a user with username and password, optionally enabling "Remember Me".
+        /// </summary>
+        public AuthenticationResult Login(string username, string password, bool rememberMe = false, string? userAgent = null, string? ipAddress = null)
+        {
+            if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+                return AuthenticationResult.Failed("Username and password are required.");
+
+            var user = _userRepository.FindByUsername(username);
+            if (user == null || !user.IsActive)
+                return AuthenticationResult.Failed("Invalid username or password.");
+
+            // Simulate password verification (in real app, use BCrypt or similar)
+            if (!VerifyPassword(password, user.PasswordHash))
+                return AuthenticationResult.Failed("Invalid username or password.");
+
+            if (rememberMe)
+            {
+                _rememberMeService.CreateRememberMeCookie(user.Id, userAgent: userAgent, ipAddress: ipAddress);
+            }
+
+            Console.WriteLine($"[Auth] User '{username}' logged in successfully. RememberMe: {rememberMe}");
+            return AuthenticationResult.Successful(user.Id, user.Username, rememberMe);
+        }
+
+        /// <summary>
+        /// Attempts to authenticate a user using the remember-me cookie.
+        /// </summary>
+        public AuthenticationResult AutoLogin(string? userAgent = null)
+        {
+            if (!_rememberMeService.HasValidRememberMeCookie())
+                return AuthenticationResult.Failed("No valid remember-me cookie found.");
+
+            return _rememberMeService.ValidateRememberMeCookie(userAgent);
+        }
+
+        /// <summary>
+        /// Logs out the user and optionally removes the remember-me cookie.
+        /// </summary>
+        public void Logout(string userId, bool removeRememberMe = true, bool allDevices = false)
+        {
+            if (allDevices)
+            {
+                _rememberMeService.InvalidateAllUserTokens(userId);
+                Console.WriteLine($"[Auth] User '{userId}' logged out from all devices.");
+            }
+            else if (removeRememberMe)
+            {
+                _rememberMeService.DeleteRememberMeCookie();
+                Console.WriteLine($"[Auth] User '{userId}' logged out.");
+            }
+        }
+
+        /// <summary>
+        /// Simulates password verification (use BCrypt in production).
+        /// </summary>
+        private static bool VerifyPassword(string password, string storedHash)
+        {
+            using var sha256 = SHA256.Create();
+            string inputHash = Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(password)));
+            return inputHash == storedHash;
+        }
+
+        /// <summary>
+        /// Simulates password hashing (use BCrypt in production).
+        /// </summary>
+        public static string HashPassword(string password)
+        {
+            using var sha256 = SHA256.Create();
+            return Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(password)));
+        }
+    }
+
+    class Program
+    {
+        static void Main(string[] args)
+        {
+            Console.WriteLine("=== Remember Me Feature Demo ===\n");
+
+            // Setup dependencies
+            var userRepository = new UserRepository();
+            var tokenRepository = new TokenRepository();
+            var cookieStorage = new CookieStorage();
+            var rememberMeService = new RememberMeService(tokenRepository, userRepository, cookieStorage);
+            var authService = new AuthenticationService(userRepository, rememberMeService);
+
+            // Create test user
+            var testUser = new User
+            {
+                Id = Guid.NewGuid().ToString(),
+                Username = "john.doe",
+                Email = "john@example.com",
+                PasswordHash = AuthenticationService.HashPassword("SecurePassword123!"),
+                IsActive = true
+            };
+            userRepository.AddUser(testUser);
+
+            Console.WriteLine("--- Scenario 1: Login with Remember Me ---");
+            var loginResult = authService.Login(
+                username: "john.doe",
+                password: "SecurePassword123!",
+                rememberMe: true,
+                userAgent: "Mozilla/5.0",
+                ipAddress: "192.168.1.1"
+            );
+
+            Console.WriteLine($"Login Success: {loginResult.Success}");
+            Console.WriteLine($"User: {loginResult.Username}");
+            Console.WriteLine($"Remember Me: {loginResult.RememberMeEnabled}");
+
+            Console.WriteLine("\n--- Scenario 2: Auto-login using Remember Me Cookie ---");
+            var autoLoginResult = authService.AutoLogin(userAgent: "Mozilla/5.0");
+            Console.WriteLine($"Auto-login Success: {autoLoginResult.Success}");
+            Console.WriteLine($"User: {autoLoginResult.Username}");
+
+            Console.WriteLine("\n--- Scenario 3: Auto-login again (token should be rotated) ---");
+            var autoLoginResult2 = authService.AutoLogin(userAgent: "Mozilla/5.0");
+            Console.WriteLine($"Auto-login Success: {autoLoginResult2.Success}");
+            Console.WriteLine($"User: {autoLoginResult2.Username}");
+
+            Console.WriteLine("\n--- Scenario 4: Logout (remove remember me) ---");
+            authService.Logout(testUser.Id, removeRememberMe: true);
+
+            Console.WriteLine("\n--- Scenario 5: Try auto-login after logout ---");
+            var autoLoginAfterLogout = authService.AutoLogin();
+            Console.WriteLine($"Auto-login Success: {autoLoginAfterLogout.Success}");
+            Console.WriteLine($"Error: {autoLoginAfterLogout.ErrorMessage}");
+
+            Console.WriteLine("\n--- Scenario 6: Login without Remember Me ---");
+            var loginNoRemember = authService.Login(
+                username: "john.doe",
+                password: "SecurePassword123!",
+                rememberMe: false
+            );
+            Console.WriteLine($"Login Success: {loginNoRemember.Success}");
+            Console.WriteLine($"Remember Me: {loginNoRemember.RememberMeEnabled}");
+
+            Console.WriteLine("\n--- Scenario 7: Login with wrong password ---");
+            var failedLogin = authService.Login(
+                username: "john.doe",
+                password: "WrongPassword",
+                rememberMe: true
+            );
+            Console.WriteLine($"Login Success: {failedLogin.Success}");
+            Console.WriteLine($"Error: {failedLogin.ErrorMessage}");
+
+            Console.WriteLine("\n--- Scenario 8: Login and logout from all devices ---");
+            authService.Login("john.doe", "SecurePassword123!", rememberMe: true);
+            authService.Logout(testUser.Id, allDevices: true);
+
+            Console.WriteLine("\n--- Scenario 9: Cleanup expired tokens ---");
+            rememberMeService.CleanupExpiredTokens();
+
+            Console.WriteLine("\n=== Demo Complete ===");
+        }
+    }
+}
+```

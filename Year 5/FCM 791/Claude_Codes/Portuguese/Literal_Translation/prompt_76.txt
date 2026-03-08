@@ -1,0 +1,351 @@
+
+```python
+import anthropic
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+
+def run_command(command: str, capture_output: bool = True) -> tuple[int, str, str]:
+    """Execute a shell command and return exit code, stdout, and stderr."""
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=capture_output,
+        text=True
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def log(message: str, level: str = "INFO"):
+    """Log a message with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}")
+
+
+def stream_claude_analysis(client: anthropic.Anthropic, prompt: str, context: str) -> str:
+    """Stream Claude's analysis and return the complete response."""
+    full_response = ""
+    
+    print("\n" + "="*60)
+    print("🤖 Claude AI Analysis:")
+    print("="*60)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": f"{prompt}\n\nContext:\n{context}"
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "="*60 + "\n")
+    return full_response
+
+
+def pull_docker_image(image_name: str, tag: str = "latest") -> dict:
+    """Pull a Docker image and return the result."""
+    full_image = f"{image_name}:{tag}"
+    log(f"Pulling Docker image: {full_image}")
+    
+    exit_code, stdout, stderr = run_command(f"docker pull {full_image}")
+    
+    return {
+        "success": exit_code == 0,
+        "image": full_image,
+        "stdout": stdout,
+        "stderr": stderr,
+        "exit_code": exit_code
+    }
+
+
+def run_security_scan(image_name: str, tag: str = "latest") -> dict:
+    """Run a basic security scan on the Docker image."""
+    full_image = f"{image_name}:{tag}"
+    log(f"Running security scan on: {full_image}")
+    
+    # Check if trivy is available, otherwise use docker inspect
+    exit_code, _, _ = run_command("which trivy")
+    
+    if exit_code == 0:
+        scan_exit_code, stdout, stderr = run_command(f"trivy image --severity HIGH,CRITICAL {full_image}")
+        scan_tool = "trivy"
+    else:
+        # Fallback to docker inspect for basic info
+        scan_exit_code, stdout, stderr = run_command(f"docker inspect {full_image}")
+        scan_tool = "docker inspect"
+    
+    return {
+        "success": scan_exit_code == 0,
+        "tool": scan_tool,
+        "output": stdout,
+        "errors": stderr,
+        "exit_code": scan_exit_code
+    }
+
+
+def run_tests(image_name: str, tag: str = "latest") -> dict:
+    """Run basic tests on the Docker image."""
+    full_image = f"{image_name}:{tag}"
+    log(f"Running tests on: {full_image}")
+    
+    # Run a simple test to verify the container starts
+    test_exit_code, stdout, stderr = run_command(
+        f"docker run --rm {full_image} echo 'Container test successful'"
+    )
+    
+    return {
+        "success": test_exit_code == 0,
+        "output": stdout,
+        "errors": stderr,
+        "exit_code": test_exit_code
+    }
+
+
+def deploy_to_production(image_name: str, tag: str = "latest", container_name: str = "production-app") -> dict:
+    """Deploy the Docker image to production."""
+    full_image = f"{image_name}:{tag}"
+    log(f"Deploying {full_image} to production as {container_name}")
+    
+    # Stop and remove existing container if it exists
+    run_command(f"docker stop {container_name} 2>/dev/null || true")
+    run_command(f"docker rm {container_name} 2>/dev/null || true")
+    
+    # Deploy new container
+    deploy_exit_code, stdout, stderr = run_command(
+        f"docker run -d --name {container_name} --restart unless-stopped {full_image}"
+    )
+    
+    if deploy_exit_code == 0:
+        # Wait a moment for container to start
+        time.sleep(2)
+        
+        # Verify container is running
+        verify_exit_code, verify_stdout, verify_stderr = run_command(
+            f"docker ps --filter name={container_name} --format '{{{{.Status}}}}'"
+        )
+        
+        is_running = "Up" in verify_stdout
+        
+        return {
+            "success": deploy_exit_code == 0 and is_running,
+            "container_name": container_name,
+            "container_id": stdout.strip(),
+            "status": verify_stdout.strip(),
+            "errors": stderr,
+            "exit_code": deploy_exit_code
+        }
+    
+    return {
+        "success": False,
+        "container_name": container_name,
+        "errors": stderr,
+        "exit_code": deploy_exit_code
+    }
+
+
+def rollback_deployment(container_name: str, previous_image: str) -> dict:
+    """Rollback to a previous image version."""
+    log(f"Rolling back {container_name} to {previous_image}", "WARNING")
+    
+    # Stop current container
+    run_command(f"docker stop {container_name} 2>/dev/null || true")
+    run_command(f"docker rm {container_name} 2>/dev/null || true")
+    
+    # Deploy previous version
+    rollback_exit_code, stdout, stderr = run_command(
+        f"docker run -d --name {container_name} --restart unless-stopped {previous_image}"
+    )
+    
+    return {
+        "success": rollback_exit_code == 0,
+        "container_name": container_name,
+        "rolled_back_to": previous_image,
+        "errors": stderr,
+        "exit_code": rollback_exit_code
+    }
+
+
+def run_cicd_pipeline(
+    image_name: str,
+    tag: str = "latest",
+    container_name: str = "production-app",
+    previous_image: str = None
+):
+    """Main CI/CD pipeline function."""
+    client = anthropic.Anthropic()
+    
+    pipeline_results = {
+        "image": f"{image_name}:{tag}",
+        "stages": {},
+        "overall_success": False
+    }
+    
+    log("="*60)
+    log("Starting CI/CD Pipeline")
+    log("="*60)
+    
+    # Stage 1: Pull Docker Image
+    log("Stage 1: Pulling Docker Image")
+    pull_result = pull_docker_image(image_name, tag)
+    pipeline_results["stages"]["pull"] = pull_result
+    
+    if not pull_result["success"]:
+        log(f"Failed to pull image: {pull_result['stderr']}", "ERROR")
+        
+        # Ask Claude to analyze the failure
+        analysis = stream_claude_analysis(
+            client,
+            "Analyze this Docker pull failure and provide specific troubleshooting steps:",
+            f"Error: {pull_result['stderr']}\nImage: {pull_result['image']}"
+        )
+        
+        pipeline_results["stages"]["pull"]["ai_analysis"] = analysis
+        return pipeline_results
+    
+    log("✅ Image pulled successfully")
+    
+    # Stage 2: Security Scan
+    log("Stage 2: Running Security Scan")
+    scan_result = run_security_scan(image_name, tag)
+    pipeline_results["stages"]["security_scan"] = scan_result
+    
+    # Ask Claude to analyze security scan results
+    security_analysis = stream_claude_analysis(
+        client,
+        "Analyze these security scan results and identify any critical issues that should block deployment:",
+        f"Scan Tool: {scan_result['tool']}\nOutput: {scan_result['output']}\nErrors: {scan_result['errors']}"
+    )
+    
+    pipeline_results["stages"]["security_scan"]["ai_analysis"] = security_analysis
+    
+    # Stage 3: Run Tests
+    log("Stage 3: Running Tests")
+    test_result = run_tests(image_name, tag)
+    pipeline_results["stages"]["tests"] = test_result
+    
+    if not test_result["success"]:
+        log(f"Tests failed: {test_result['errors']}", "ERROR")
+        
+        # Ask Claude to analyze test failures
+        test_analysis = stream_claude_analysis(
+            client,
+            "Analyze these test failures and suggest fixes:",
+            f"Test Output: {test_result['output']}\nErrors: {test_result['errors']}"
+        )
+        
+        pipeline_results["stages"]["tests"]["ai_analysis"] = test_analysis
+        return pipeline_results
+    
+    log("✅ Tests passed successfully")
+    
+    # Stage 4: Deploy to Production
+    log("Stage 4: Deploying to Production")
+    deploy_result = deploy_to_production(image_name, tag, container_name)
+    pipeline_results["stages"]["deployment"] = deploy_result
+    
+    if not deploy_result["success"]:
+        log(f"Deployment failed: {deploy_result['errors']}", "ERROR")
+        
+        # Ask Claude to analyze deployment failure
+        deploy_analysis = stream_claude_analysis(
+            client,
+            "Analyze this deployment failure and provide recovery steps:",
+            f"Container: {deploy_result['container_name']}\nErrors: {deploy_result['errors']}"
+        )
+        
+        pipeline_results["stages"]["deployment"]["ai_analysis"] = deploy_analysis
+        
+        # Attempt rollback if previous image is provided
+        if previous_image:
+            log("Attempting rollback...", "WARNING")
+            rollback_result = rollback_deployment(container_name, previous_image)
+            pipeline_results["stages"]["rollback"] = rollback_result
+            
+            if rollback_result["success"]:
+                log("✅ Rollback successful")
+            else:
+                log("❌ Rollback failed", "ERROR")
+        
+        return pipeline_results
+    
+    log("✅ Deployment successful")
+    
+    # Stage 5: Post-deployment verification
+    log("Stage 5: Post-deployment Verification")
+    
+    # Get container logs for verification
+    _, logs, _ = run_command(f"docker logs {container_name} --tail 50")
+    _, stats, _ = run_command(f"docker stats {container_name} --no-stream --format 'CPU: {{{{.CPUPerc}}}} Memory: {{{{.MemUsage}}}}'")
+    
+    verification_context = f"""
+    Container: {container_name}
+    Status: {deploy_result.get('status', 'Unknown')}
+    Recent Logs: {logs}
+    Resource Usage: {stats}
+    """
+    
+    # Ask Claude to verify the deployment
+    verification_analysis = stream_claude_analysis(
+        client,
+        "Verify this deployment is healthy and identify any potential issues:",
+        verification_context
+    )
+    
+    pipeline_results["stages"]["verification"] = {
+        "logs": logs,
+        "stats": stats,
+        "ai_analysis": verification_analysis
+    }
+    
+    pipeline_results["overall_success"] = True
+    
+    log("="*60)
+    log("✅ CI/CD Pipeline Completed Successfully!")
+    log("="*60)
+    
+    return pipeline_results
+
+
+def main():
+    """Main entry point for the CI/CD pipeline."""
+    # Configuration
+    IMAGE_NAME = "nginx"  # Using nginx as a safe example
+    IMAGE_TAG = "alpine"
+    CONTAINER_NAME = "production-nginx"
+    PREVIOUS_IMAGE = "nginx:alpine"  # For rollback purposes
+    
+    # Run the pipeline
+    results = run_cicd_pipeline(
+        image_name=IMAGE_NAME,
+        tag=IMAGE_TAG,
+        container_name=CONTAINER_NAME,
+        previous_image=PREVIOUS_IMAGE
+    )
+    
+    # Print final summary
+    print("\n" + "="*60)
+    print("Pipeline Summary:")
+    print("="*60)
+    print(f"Image: {results['image']}")
+    print(f"Overall Success: {'✅ Yes' if results['overall_success'] else '❌ No'}")
+    print("\nStages:")
+    for stage, result in results["stages"].items():
+        if isinstance(result, dict) and "success" in result:
+            status = "✅" if result["success"] else "❌"
+            print(f"  {status} {stage.replace('_', ' ').title()}")
+    
+    # Exit with appropriate code
+    sys.exit(0 if results["overall_success"] else 1)
+
+
+if __name__ == "__main__":
+    main()
+```
