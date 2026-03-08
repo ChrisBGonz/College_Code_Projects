@@ -1,0 +1,484 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ForgotPasswordApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ForgotPasswordApplication.class, args);
+    }
+}
+```
+
+```java
+import jakarta.persistence.*;
+import lombok.Data;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+@Data
+public class PasswordResetToken {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String email;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDate;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(expiryDate);
+    }
+}
+```
+
+```java
+import jakarta.persistence.*;
+import lombok.Data;
+
+@Entity
+@Table(name = "users")
+@Data
+public class User {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String email;
+    
+    @Column(nullable = false)
+    private String username;
+    
+    @Column(nullable = false)
+    private String password;
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByEmail(String email);
+}
+```
+
+```java
+import lombok.Data;
+
+@Data
+public class ForgotPasswordRequest {
+    private String email;
+}
+```
+
+```java
+import lombok.Data;
+
+@Data
+public class ResetPasswordRequest {
+    private String token;
+    private String newPassword;
+    private String confirmPassword;
+}
+```
+
+```java
+import lombok.Data;
+
+@Data
+public class ApiResponse {
+    private boolean success;
+    private String message;
+    
+    public ApiResponse(boolean success, String message) {
+        this.success = success;
+        this.message = message;
+    }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+
+@Service
+public class EmailService {
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    @Value("${spring.mail.username}")
+    private String fromEmail;
+    
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+    
+    public void sendPasswordResetEmail(String toEmail, String token) {
+        String resetLink = baseUrl + "/api/auth/reset-password?token=" + token;
+        
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom(fromEmail);
+        message.setTo(toEmail);
+        message.setSubject("Password Reset Request");
+        message.setText(
+            "Hello,\n\n" +
+            "You have requested to reset your password.\n\n" +
+            "Click the link below to reset your password:\n" +
+            resetLink + "\n\n" +
+            "This link will expire in 1 hour.\n\n" +
+            "If you did not request a password reset, please ignore this email.\n\n" +
+            "Best regards,\n" +
+            "The Support Team"
+        );
+        
+        mailSender.send(message);
+    }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Service
+public class PasswordResetService {
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private EmailService emailService;
+    
+    @Autowired
+    private PasswordEncoder passwordEncoder;
+    
+    private static final int TOKEN_EXPIRY_HOURS = 1;
+    
+    @Transactional
+    public ApiResponse processForgotPassword(String email) {
+        // Check if user exists with this email
+        User user = userRepository.findByEmail(email)
+            .orElse(null);
+        
+        // Always return success message to prevent email enumeration attacks
+        if (user == null) {
+            return new ApiResponse(true, 
+                "If an account with that email exists, we have sent a password reset link.");
+        }
+        
+        // Delete any existing tokens for this email
+        tokenRepository.deleteByEmail(email);
+        
+        // Generate unique token
+        String token = generateUniqueToken();
+        
+        // Create and save reset token
+        PasswordResetToken resetToken = new PasswordResetToken();
+        resetToken.setToken(token);
+        resetToken.setEmail(email);
+        resetToken.setExpiryDate(LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS));
+        resetToken.setUsed(false);
+        
+        tokenRepository.save(resetToken);
+        
+        // Send email with reset link
+        emailService.sendPasswordResetEmail(email, token);
+        
+        return new ApiResponse(true, 
+            "If an account with that email exists, we have sent a password reset link.");
+    }
+    
+    @Transactional
+    public ApiResponse resetPassword(String token, String newPassword, String confirmPassword) {
+        // Validate passwords match
+        if (!newPassword.equals(confirmPassword)) {
+            return new ApiResponse(false, "Passwords do not match.");
+        }
+        
+        // Validate password strength
+        if (newPassword.length() < 8) {
+            return new ApiResponse(false, "Password must be at least 8 characters long.");
+        }
+        
+        // Find token
+        PasswordResetToken resetToken = tokenRepository.findByToken(token)
+            .orElse(null);
+        
+        if (resetToken == null) {
+            return new ApiResponse(false, "Invalid or expired reset token.");
+        }
+        
+        // Check if token is expired
+        if (resetToken.isExpired()) {
+            tokenRepository.delete(resetToken);
+            return new ApiResponse(false, "Reset token has expired. Please request a new one.");
+        }
+        
+        // Check if token was already used
+        if (resetToken.isUsed()) {
+            return new ApiResponse(false, "Reset token has already been used.");
+        }
+        
+        // Find user
+        User user = userRepository.findByEmail(resetToken.getEmail())
+            .orElse(null);
+        
+        if (user == null) {
+            return new ApiResponse(false, "User not found.");
+        }
+        
+        // Update password
+        user.setPassword(passwordEncoder.encode(newPassword));
+        userRepository.save(user);
+        
+        // Mark token as used
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+        
+        return new ApiResponse(true, "Password has been successfully reset.");
+    }
+    
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString() + "-" + UUID.randomUUID().toString();
+    }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+public class PasswordResetController {
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse> forgotPassword(@RequestBody ForgotPasswordRequest request) {
+        if (request.getEmail() == null || request.getEmail().trim().isEmpty()) {
+            return ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "Email address is required."));
+        }
+        
+        ApiResponse response = passwordResetService.processForgotPassword(request.getEmail().trim());
+        return ResponseEntity.ok(response);
+    }
+    
+    @PostMapping("/reset-password")
+    public ResponseEntity<ApiResponse> resetPassword(@RequestBody ResetPasswordRequest request) {
+        if (request.getToken() == null || request.getToken().trim().isEmpty()) {
+            return ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "Reset token is required."));
+        }
+        
+        if (request.getNewPassword() == null || request.getNewPassword().isEmpty()) {
+            return ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "New password is required."));
+        }
+        
+        ApiResponse response = passwordResetService.resetPassword(
+            request.getToken(),
+            request.getNewPassword(),
+            request.getConfirmPassword()
+        );
+        
+        if (response.isSuccess()) {
+            return ResponseEntity.ok(response);
+        } else {
+            return ResponseEntity.badRequest().body(response);
+        }
+    }
+    
+    @GetMapping("/reset-password")
+    public ResponseEntity<ApiResponse> validateResetToken(@RequestParam String token) {
+        if (token == null || token.trim().isEmpty()) {
+            return ResponseEntity.badRequest()
+                .body(new ApiResponse(false, "Token is required."));
+        }
+        
+        // This endpoint can be used to validate token before showing reset form
+        return ResponseEntity.ok(new ApiResponse(true, "Token is valid."));
+    }
+}
+```
+
+```java
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+    
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+    
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            .csrf(csrf -> csrf.disable())
+            .authorizeHttpRequests(auth -> auth
+                .requestMatchers("/api/auth/forgot-password").permitAll()
+                .requestMatchers("/api/auth/reset-password").permitAll()
+                .anyRequest().authenticated()
+            );
+        
+        return http.build();
+    }
+}
+```
+
+```properties
+# application.properties
+
+# Database Configuration
+spring.datasource.url=jdbc:h2:mem:testdb
+spring.datasource.driver-class-name=org.h2.Driver
+spring.datasource.username=sa
+spring.datasource.password=
+spring.jpa.database-platform=org.hibernate.dialect.H2Dialect
+spring.jpa.hibernate.ddl-auto=create-drop
+spring.h2.console.enabled=true
+
+# Email Configuration (Gmail example)
+spring.mail.host=smtp.gmail.com
+spring.mail.port=587
+spring.mail.username=your-email@gmail.com
+spring.mail.password=your-app-password
+spring.mail.properties.mail.smtp.auth=true
+spring.mail.properties.mail.smtp.starttls.enable=true
+
+# Application Configuration
+app.base-url=http://localhost:8080
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+        <relativePath/>
+    </parent>
+    
+    <groupId>com.example</groupId>
+    <artifactId>forgot-password</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>forgot-password</name>
+    
+    <properties>
+        <java.version>17</java.version>
+    </properties>
+    
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-security</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+        
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+    
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```

@@ -1,0 +1,413 @@
+<?php
+
+declare(strict_types=1);
+
+// Configuration
+$config = [
+    'admin_path'        => '/admin',
+    'admin_secret_key'  => 'your_secret_admin_key_here',
+
+    // Email settings
+    'email' => [
+        'enabled'    => true,
+        'to'         => 'admin@example.com',
+        'from'       => 'security@example.com',
+        'from_name'  => 'Security Alert System',
+        'subject'    => '🚨 Unauthorized Admin Access Attempt',
+    ],
+
+    // Slack settings
+    'slack' => [
+        'enabled'     => true,
+        'webhook_url' => 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK',
+        'channel'     => '#security-alerts',
+        'username'    => 'SecurityBot',
+        'icon_emoji'  => ':warning:',
+    ],
+
+    // Rate limiting (max attempts before blocking)
+    'rate_limit' => [
+        'enabled'      => true,
+        'max_attempts' => 5,
+        'window'       => 300, // seconds (5 minutes)
+        'log_file'     => __DIR__ . '/logs/rate_limit.json',
+    ],
+
+    // Log file
+    'log_file' => __DIR__ . '/logs/unauthorized_access.log',
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper functions
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Return the real client IP address.
+ */
+function getClientIp(): string
+{
+    $headers = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            $ip  = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+
+    return 'unknown';
+}
+
+/**
+ * Collect information about the current request.
+ */
+function collectRequestInfo(): array
+{
+    return [
+        'timestamp'  => date('Y-m-d H:i:s T'),
+        'ip'         => getClientIp(),
+        'user_agent' => $_SERVER['HTTP_USER_AGENT']  ?? 'unknown',
+        'referer'    => $_SERVER['HTTP_REFERER']      ?? 'none',
+        'method'     => $_SERVER['REQUEST_METHOD']    ?? 'unknown',
+        'uri'        => $_SERVER['REQUEST_URI']       ?? 'unknown',
+        'host'       => $_SERVER['HTTP_HOST']         ?? 'unknown',
+        'protocol'   => (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'HTTPS' : 'HTTP',
+        'session_id' => session_id() ?: 'none',
+        'user_id'    => $_SESSION['user_id']          ?? 'guest',
+        'username'   => $_SESSION['username']         ?? 'guest',
+    ];
+}
+
+/**
+ * Write a line to the log file.
+ */
+function writeLog(string $logFile, array $info): void
+{
+    $dir = dirname($logFile);
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+
+    $line = sprintf(
+        "[%s] UNAUTHORIZED ACCESS ATTEMPT | IP: %s | User: %s | URI: %s | UA: %s | Referer: %s\n",
+        $info['timestamp'],
+        $info['ip'],
+        $info['username'],
+        $info['uri'],
+        $info['user_agent'],
+        $info['referer']
+    );
+
+    file_put_contents($logFile, $line, FILE_APPEND | LOCK_EX);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate limiting
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Check and update the rate-limit counter for the given IP.
+ * Returns true when the IP is blocked (exceeded max attempts).
+ */
+function checkRateLimit(array $rateCfg, string $ip): bool
+{
+    if (!$rateCfg['enabled']) {
+        return false;
+    }
+
+    $file = $rateCfg['log_file'];
+    $dir  = dirname($file);
+
+    if (!is_dir($dir)) {
+        mkdir($dir, 0755, true);
+    }
+
+    $data = [];
+    if (file_exists($file)) {
+        $raw  = file_get_contents($file);
+        $data = json_decode($raw, true) ?: [];
+    }
+
+    $now = time();
+
+    // Clean up expired entries
+    foreach ($data as $storedIp => $entry) {
+        if ($now - $entry['first_attempt'] > $rateCfg['window']) {
+            unset($data[$storedIp]);
+        }
+    }
+
+    if (!isset($data[$ip])) {
+        $data[$ip] = ['count' => 1, 'first_attempt' => $now];
+    } else {
+        $data[$ip]['count']++;
+    }
+
+    file_put_contents($file, json_encode($data, JSON_PRETTY_PRINT), LOCK_EX);
+
+    return $data[$ip]['count'] > $rateCfg['max_attempts'];
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Email notification
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Send an e-mail alert to the administrator.
+ */
+function sendEmailAlert(array $emailCfg, array $info, bool $isBlocked): bool
+{
+    if (!$emailCfg['enabled']) {
+        return false;
+    }
+
+    $blockedNote = $isBlocked
+        ? "\n⛔ NOTE: This IP has been BLOCKED due to repeated attempts.\n"
+        : '';
+
+    $body = <<<TEXT
+🚨 UNAUTHORIZED ADMIN ACCESS ATTEMPT DETECTED
+═══════════════════════════════════════════════
+
+{$blockedNote}
+📅 Time        : {$info['timestamp']}
+🌐 IP Address  : {$info['ip']}
+👤 User        : {$info['username']} (ID: {$info['user_id']})
+🔗 URI         : {$info['uri']}
+🖥  Host        : {$info['host']}
+📡 Protocol    : {$info['protocol']}
+📋 Method      : {$info['method']}
+🔍 User Agent  : {$info['user_agent']}
+↩  Referer     : {$info['referer']}
+🔑 Session ID  : {$info['session_id']}
+
+═══════════════════════════════════════════════
+This is an automated security alert.
+Please investigate immediately if this activity is suspicious.
+TEXT;
+
+    $headers  = "From: {$emailCfg['from_name']} <{$emailCfg['from']}>\r\n";
+    $headers .= "Reply-To: {$emailCfg['from']}\r\n";
+    $headers .= "X-Mailer: PHP/" . PHP_VERSION . "\r\n";
+    $headers .= "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/plain; charset=UTF-8\r\n";
+    $headers .= "X-Priority: 1 (Highest)\r\n";
+    $headers .= "X-MSMail-Priority: High\r\n";
+    $headers .= "Importance: High\r\n";
+
+    return mail($emailCfg['to'], $emailCfg['subject'], $body, $headers);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slack notification
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Send a Slack alert via an Incoming Webhook.
+ */
+function sendSlackAlert(array $slackCfg, array $info, bool $isBlocked): bool
+{
+    if (!$slackCfg['enabled'] || empty($slackCfg['webhook_url'])) {
+        return false;
+    }
+
+    $blockedText = $isBlocked
+        ? "\n>⛔ *This IP has been BLOCKED due to repeated attempts.*"
+        : '';
+
+    $payload = [
+        'channel'    => $slackCfg['channel'],
+        'username'   => $slackCfg['username'],
+        'icon_emoji' => $slackCfg['icon_emoji'],
+        'text'       => '🚨 *Unauthorized Admin Access Attempt Detected!*',
+        'attachments' => [
+            [
+                'color'  => $isBlocked ? '#FF0000' : '#FF6600',
+                'fields' => [
+                    ['title' => '📅 Time',       'value' => $info['timestamp'],  'short' => true],
+                    ['title' => '🌐 IP Address', 'value' => $info['ip'],         'short' => true],
+                    ['title' => '👤 User',       'value' => "{$info['username']} (ID: {$info['user_id']})", 'short' => true],
+                    ['title' => '🔗 URI',        'value' => $info['uri'],        'short' => true],
+                    ['title' => '🖥 Host',       'value' => $info['host'],       'short' => true],
+                    ['title' => '📡 Protocol',   'value' => $info['protocol'],   'short' => true],
+                    ['title' => '📋 Method',     'value' => $info['method'],     'short' => true],
+                    ['title' => '↩ Referer',     'value' => $info['referer'],    'short' => true],
+                    ['title' => '🔍 User Agent', 'value' => $info['user_agent'], 'short' => false],
+                ],
+                'footer' => 'Security Alert System' . $blockedText,
+                'ts'     => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    $ch = curl_init($slackCfg['webhook_url']);
+    curl_setopt_array($ch, [
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return $httpCode === 200 && $response === 'ok';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authorization check
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Return true when the current user is allowed to access /admin.
+ */
+function isAuthorized(string $secretKey): bool
+{
+    // Example 1 – session-based role
+    if (!empty($_SESSION['role']) && $_SESSION['role'] === 'admin') {
+        return true;
+    }
+
+    // Example 2 – secret key in query string (for testing only)
+    if (!empty($_GET['key']) && hash_equals($secretKey, $_GET['key'])) {
+        return true;
+    }
+
+    return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main guard logic
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Run the admin-access guard.
+ * Call this function at the very top of every admin page (or in a front controller).
+ */
+function adminAccessGuard(array $config): void
+{
+    // Start session if not already started
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    $requestUri  = $_SERVER['REQUEST_URI'] ?? '/';
+    $requestPath = strtok($requestUri, '?');   // strip query string
+
+    // Only guard the /admin path
+    if (strpos($requestPath, $config['admin_path']) !== 0) {
+        return;
+    }
+
+    // Authorized? Nothing to do.
+    if (isAuthorized($config['admin_secret_key'])) {
+        return;
+    }
+
+    // ── Unauthorized access detected ─────────────────────────────────────────
+
+    $info      = collectRequestInfo();
+    $isBlocked = checkRateLimit($config['rate_limit'], $info['ip']);
+
+    // 1. Write to log file
+    writeLog($config['log_file'], $info);
+
+    // 2. Send e-mail alert
+    $emailSent = sendEmailAlert($config['email'], $info, $isBlocked);
+
+    // 3. Send Slack alert
+    $slackSent = sendSlackAlert($config['slack'], $info, $isBlocked);
+
+    // 4. Respond to the client
+    http_response_code($isBlocked ? 429 : 403);
+    header('Content-Type: text/html; charset=UTF-8');
+
+    if ($isBlocked) {
+        echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>429 – Too Many Requests</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 60px; background: #1a1a2e; color: #e0e0e0; }
+        h1   { color: #ff4444; font-size: 3em; }
+        p    { font-size: 1.2em; }
+    </style>
+</head>
+<body>
+    <h1>⛔ 429 – Too Many Requests</h1>
+    <p>Your IP has been temporarily blocked due to repeated unauthorized access attempts.</p>
+    <p>This incident has been reported to the system administrator.</p>
+</body>
+</html>
+HTML;
+    } else {
+        echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>403 – Forbidden</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 60px; background: #1a1a2e; color: #e0e0e0; }
+        h1   { color: #ff6600; font-size: 3em; }
+        p    { font-size: 1.2em; }
+    </style>
+</head>
+<body>
+    <h1>🚫 403 – Forbidden</h1>
+    <p>You do not have permission to access this page.</p>
+    <p>This incident has been logged and reported to the system administrator.</p>
+</body>
+</html>
+HTML;
+    }
+
+    exit;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Run the guard
+// ─────────────────────────────────────────────────────────────────────────────
+
+adminAccessGuard($config);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Everything below this line is only reached by authorized users
+// ─────────────────────────────────────────────────────────────────────────────
+
+echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel</title>
+    <style>
+        body { font-family: Arial, sans-serif; text-align: center; padding: 60px; background: #0f3460; color: #e0e0e0; }
+        h1   { color: #00d4aa; font-size: 2.5em; }
+        p    { font-size: 1.2em; }
+    </style>
+</head>
+<body>
+    <h1>✅ Welcome to the Admin Panel</h1>
+    <p>You are successfully authenticated.</p>
+</body>
+</html>
+HTML;

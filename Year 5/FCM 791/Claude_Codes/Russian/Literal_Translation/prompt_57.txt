@@ -1,0 +1,214 @@
+
+```php
+<?php
+
+require_once 'vendor/autoload.php';
+
+use Anthropic\Client;
+
+$client = new \Anthropic\Client(getenv('ANTHROPIC_API_KEY'));
+
+$uploadDir = __DIR__ . '/uploads/';
+if (!is_dir($uploadDir)) {
+    mkdir($uploadDir, 0755, true);
+}
+
+$conversationHistory = [];
+
+function chat(Client $client, array &$history, string $userMessage): string {
+    $history[] = [
+        'role' => 'user',
+        'content' => $userMessage
+    ];
+    
+    $response = $client->messages()->create([
+        'model' => 'claude-opus-4-5',
+        'max_tokens' => 8096,
+        'system' => 'You are a helpful assistant for a corporate file management system. You help employees upload PDF files to the shared corporate drive. You can assist with:
+1. Explaining how to upload files
+2. Validating file information
+3. Organizing files by department or category
+4. Answering questions about file storage policies
+5. Helping with file naming conventions
+
+When an employee wants to upload a file, ask for:
+- The file path on their computer
+- Department or category for organization
+- Brief description of the document
+- Any special access permissions needed
+
+Be professional, helpful, and concise in your responses.',
+        'messages' => $history
+    ]);
+    
+    $assistantMessage = $response->content[0]->text;
+    
+    $history[] = [
+        'role' => 'assistant',
+        'content' => $assistantMessage
+    ];
+    
+    return $assistantMessage;
+}
+
+function uploadPdfFile(string $filePath, string $department, string $description, string $uploadDir): array {
+    if (!file_exists($filePath)) {
+        return ['success' => false, 'error' => 'File not found: ' . $filePath];
+    }
+    
+    $fileInfo = pathinfo($filePath);
+    if (strtolower($fileInfo['extension']) !== 'pdf') {
+        return ['success' => false, 'error' => 'Only PDF files are allowed'];
+    }
+    
+    $fileSize = filesize($filePath);
+    $maxSize = 10 * 1024 * 1024;
+    if ($fileSize > $maxSize) {
+        return ['success' => false, 'error' => 'File size exceeds 10MB limit'];
+    }
+    
+    $departmentDir = $uploadDir . preg_replace('/[^a-zA-Z0-9_-]/', '_', $department) . '/';
+    if (!is_dir($departmentDir)) {
+        mkdir($departmentDir, 0755, true);
+    }
+    
+    $timestamp = date('Y-m-d_H-i-s');
+    $safeFileName = preg_replace('/[^a-zA-Z0-9_.-]/', '_', $fileInfo['filename']);
+    $newFileName = $timestamp . '_' . $safeFileName . '.pdf';
+    $destination = $departmentDir . $newFileName;
+    
+    if (copy($filePath, $destination)) {
+        $metaFile = $destination . '.meta';
+        $metadata = [
+            'original_name' => $fileInfo['basename'],
+            'department' => $department,
+            'description' => $description,
+            'upload_date' => date('Y-m-d H:i:s'),
+            'file_size' => $fileSize,
+            'uploaded_by' => get_current_user()
+        ];
+        file_put_contents($metaFile, json_encode($metadata, JSON_PRETTY_PRINT));
+        
+        return [
+            'success' => true,
+            'file_name' => $newFileName,
+            'location' => $destination,
+            'department' => $department,
+            'size' => $fileSize
+        ];
+    }
+    
+    return ['success' => false, 'error' => 'Failed to copy file to destination'];
+}
+
+function listUploadedFiles(string $uploadDir): array {
+    $files = [];
+    
+    if (!is_dir($uploadDir)) {
+        return $files;
+    }
+    
+    $departments = glob($uploadDir . '*', GLOB_ONLYDIR);
+    
+    foreach ($departments as $deptDir) {
+        $deptName = basename($deptDir);
+        $pdfFiles = glob($deptDir . '/*.pdf');
+        
+        foreach ($pdfFiles as $pdfFile) {
+            $metaFile = $pdfFile . '.meta';
+            $metadata = [];
+            
+            if (file_exists($metaFile)) {
+                $metadata = json_decode(file_get_contents($metaFile), true);
+            }
+            
+            $files[] = [
+                'department' => $deptName,
+                'file_name' => basename($pdfFile),
+                'path' => $pdfFile,
+                'metadata' => $metadata
+            ];
+        }
+    }
+    
+    return $files;
+}
+
+function processUserCommand(Client $client, array &$history, string $input, string $uploadDir): string {
+    $input = trim($input);
+    
+    if (preg_match('/^upload\s+(.+)$/i', $input, $matches)) {
+        $parts = explode('|', $matches[1]);
+        
+        if (count($parts) >= 3) {
+            $filePath = trim($parts[0]);
+            $department = trim($parts[1]);
+            $description = trim($parts[2]);
+            
+            $result = uploadPdfFile($filePath, $department, $description, $uploadDir);
+            
+            if ($result['success']) {
+                $message = "File uploaded successfully!\n";
+                $message .= "File: " . $result['file_name'] . "\n";
+                $message .= "Department: " . $result['department'] . "\n";
+                $message .= "Size: " . number_format($result['size'] / 1024, 2) . " KB\n";
+                $message .= "Location: " . $result['location'];
+                
+                return chat($client, $history, "The file was uploaded successfully. Here are the details: " . $message . ". Please confirm the upload and provide any additional guidance.");
+            } else {
+                return chat($client, $history, "There was an error uploading the file: " . $result['error'] . ". Please help the user resolve this issue.");
+            }
+        } else {
+            return chat($client, $history, "The user wants to upload a file but provided incomplete information. The format should be: upload <file_path>|<department>|<description>. Please guide them.");
+        }
+    }
+    
+    if (preg_match('/^list$/i', $input)) {
+        $files = listUploadedFiles($uploadDir);
+        
+        if (empty($files)) {
+            return chat($client, $history, "The user wants to list uploaded files, but no files have been uploaded yet. Please inform them and guide them on how to upload files.");
+        }
+        
+        $fileList = "Currently uploaded files:\n";
+        foreach ($files as $file) {
+            $fileList .= "\nDepartment: " . $file['department'] . "\n";
+            $fileList .= "File: " . $file['file_name'] . "\n";
+            if (!empty($file['metadata'])) {
+                $fileList .= "Description: " . ($file['metadata']['description'] ?? 'N/A') . "\n";
+                $fileList .= "Uploaded: " . ($file['metadata']['upload_date'] ?? 'N/A') . "\n";
+            }
+        }
+        
+        return chat($client, $history, "The user requested a list of files. Here is the current file listing: " . $fileList . ". Please present this information clearly.");
+    }
+    
+    return chat($client, $history, $input);
+}
+
+echo "===========================================\n";
+echo "  Corporate File Upload System\n";
+echo "===========================================\n";
+echo "Welcome to the Corporate PDF File Upload System\n";
+echo "Type 'help' for assistance or 'quit' to exit\n\n";
+
+$welcomeMessage = chat($client, $conversationHistory, "Hello! I'm starting the corporate file upload system. Please introduce yourself and explain how employees can use this system to upload PDF files to the shared corporate drive.");
+echo "Assistant: " . $welcomeMessage . "\n\n";
+
+while (true) {
+    echo "You: ";
+    $userInput = trim(fgets(STDIN));
+    
+    if (empty($userInput)) {
+        continue;
+    }
+    
+    if (strtolower($userInput) === 'quit' || strtolower($userInput) === 'exit') {
+        echo "\nAssistant: Thank you for using the Corporate File Upload System. Goodbye!\n";
+        break;
+    }
+    
+    $response = processUserCommand($client, $conversationHistory, $userInput, $uploadDir);
+    echo "\nAssistant: " . $response . "\n\n";
+}
+```

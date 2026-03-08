@@ -1,0 +1,121 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+type MicroserviceSimulator struct {
+	failureRate float64
+	callCount   int
+}
+
+func (m *MicroserviceSimulator) Call(input string) (string, error) {
+	m.callCount++
+	
+	if rand.Float64() < m.failureRate {
+		return "", fmt.Errorf("microservice call failed (attempt %d)", m.callCount)
+	}
+	
+	return fmt.Sprintf("Success on attempt %d: processed '%s'", m.callCount, input), nil
+}
+
+func callMicroserviceWithRetry(ctx context.Context, client *anthropic.Client, microservice *MicroserviceSimulator, input string) (string, error) {
+	conversationHistory := []anthropic.MessageParam{}
+	
+	systemPrompt := `You are an AI assistant helping to manage microservice calls with retry logic.
+When a microservice call fails, analyze the error and decide whether to retry.
+When a call succeeds, summarize the result.
+Always respond with either:
+- "RETRY: <reason>" if the call should be retried
+- "SUCCESS: <summary>" if the call succeeded
+- "ABORT: <reason>" if the call should be aborted after too many failures`
+
+	attempt := 0
+	maxAttempts := 10
+	
+	for {
+		attempt++
+		
+		if attempt > maxAttempts {
+			return "", fmt.Errorf("exceeded maximum retry attempts (%d)", maxAttempts)
+		}
+		
+		result, err := microservice.Call(input)
+		
+		var userMessage string
+		if err != nil {
+			userMessage = fmt.Sprintf("Microservice call failed on attempt %d. Error: %s. Should we retry?", attempt, err.Error())
+			log.Printf("Attempt %d failed: %v", attempt, err)
+		} else {
+			userMessage = fmt.Sprintf("Microservice call succeeded on attempt %d. Result: %s. Please summarize.", attempt, result)
+			log.Printf("Attempt %d succeeded: %s", attempt, result)
+		}
+		
+		conversationHistory = append(conversationHistory, anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)))
+		
+		response, apiErr := client.Messages.New(ctx, anthropic.MessageNewParams{
+			Model:     anthropic.ModelClaude3_5SonnetLatest,
+			MaxTokens: 1024,
+			System: []anthropic.TextBlockParam{
+				{Text: systemPrompt},
+			},
+			Messages: conversationHistory,
+		})
+		
+		if apiErr != nil {
+			return "", fmt.Errorf("Claude API error: %w", apiErr)
+		}
+		
+		assistantMessage := response.Content[0].Text
+		conversationHistory = append(conversationHistory, anthropic.NewAssistantMessage(anthropic.NewTextBlock(assistantMessage)))
+		
+		log.Printf("Claude's decision: %s", assistantMessage)
+		
+		if err == nil {
+			return result, nil
+		}
+		
+		if len(assistantMessage) >= 6 && assistantMessage[:6] == "ABORT:" {
+			return "", fmt.Errorf("aborted by AI: %s", assistantMessage[6:])
+		}
+		
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func main() {
+	rand.Seed(time.Now().UnixNano())
+	
+	client := anthropic.NewClient(
+		option.WithAPIKey(""),
+	)
+	
+	microservice := &MicroserviceSimulator{
+		failureRate: 0.7,
+	}
+	
+	ctx := context.Background()
+	
+	fmt.Println("Starting microservice call with retry logic...")
+	fmt.Println("Failure rate: 70%")
+	fmt.Println("-------------------------------------------")
+	
+	result, err := callMicroserviceWithRetry(ctx, client, microservice, "process user data")
+	
+	if err != nil {
+		log.Fatalf("Final error: %v", err)
+	}
+	
+	fmt.Printf("\nFinal Result: %s\n", result)
+	fmt.Printf("Total attempts made: %d\n", microservice.callCount)
+}
+```

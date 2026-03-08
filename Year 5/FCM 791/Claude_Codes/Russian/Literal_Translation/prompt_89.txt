@@ -1,0 +1,252 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeErrorWithClaude(errorInfo) {
+  // Add user message to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this production error and provide insights:
+    
+Error Type: ${errorInfo.type}
+Error Message: ${errorInfo.message}
+Stack Trace: ${errorInfo.stack || "Not available"}
+Timestamp: ${errorInfo.timestamp}
+Environment: ${errorInfo.environment}
+Request Path: ${errorInfo.requestPath || "Not available"}
+User Agent: ${errorInfo.userAgent || "Not available"}
+
+Please provide:
+1. Error severity assessment
+2. Potential root causes
+3. Recommended immediate actions
+4. Prevention strategies`,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are an expert system reliability engineer specializing in production error analysis. Provide concise, actionable insights for system errors.",
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to conversation history
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+async function logProductionError(error, req = null) {
+  const isProduction = process.env.NODE_ENV === "production";
+
+  const errorInfo = {
+    type: error.name || "Error",
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+    requestPath: req ? req.path : null,
+    userAgent: req ? req.headers["user-agent"] : null,
+  };
+
+  // Always log basic error info
+  console.log("=== SYSTEM ERROR DETECTED ===");
+  console.log(`Timestamp: ${errorInfo.timestamp}`);
+  console.log(`Environment: ${errorInfo.environment}`);
+  console.log(`Error Type: ${errorInfo.type}`);
+  console.log(`Error Message: ${errorInfo.message}`);
+
+  if (errorInfo.requestPath) {
+    console.log(`Request Path: ${errorInfo.requestPath}`);
+  }
+
+  if (isProduction) {
+    console.log("\n--- Production Error Analysis ---");
+    console.log("Initiating AI-powered error analysis...");
+
+    try {
+      const analysis = await analyzeErrorWithClaude(errorInfo);
+      console.log("\nAI Error Analysis:");
+      console.log(analysis);
+      console.log("--- End of Analysis ---\n");
+
+      return {
+        logged: true,
+        errorInfo,
+        analysis,
+        conversationId: conversationHistory.length,
+      };
+    } catch (analysisError) {
+      console.log(
+        "Warning: Could not perform AI analysis:",
+        analysisError.message
+      );
+      console.log("Stack Trace:", error.stack);
+
+      return {
+        logged: true,
+        errorInfo,
+        analysis: null,
+        error: "AI analysis unavailable",
+      };
+    }
+  } else {
+    // In development, just log the full stack trace
+    console.log("Stack Trace:", error.stack);
+    console.log("=== END OF ERROR LOG ===\n");
+
+    return {
+      logged: true,
+      errorInfo,
+      analysis: null,
+    };
+  }
+}
+
+async function askFollowUpQuestion(question) {
+  conversationHistory.push({
+    role: "user",
+    content: question,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are an expert system reliability engineer specializing in production error analysis. Provide concise, actionable insights for system errors.",
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+// Express middleware for error handling
+app.use(async (err, req, res, next) => {
+  const result = await logProductionError(err, req);
+
+  res.status(500).json({
+    error: "Internal Server Error",
+    message:
+      process.env.NODE_ENV === "production"
+        ? "An error occurred"
+        : err.message,
+    logged: result.logged,
+  });
+});
+
+// Test route that simulates an error
+app.get("/test-error", async (req, res, next) => {
+  const testError = new Error("Database connection timeout");
+  testError.name = "DatabaseError";
+  next(testError);
+});
+
+// Route to demonstrate multi-turn conversation
+app.post("/analyze-error", async (req, res) => {
+  const { error, followUp } = req.body;
+
+  if (followUp && conversationHistory.length > 0) {
+    // Continue existing conversation
+    const response = await askFollowUpQuestion(followUp);
+    res.json({ response, conversationLength: conversationHistory.length });
+  } else if (error) {
+    // Start new error analysis
+    const errorObj = new Error(error.message);
+    errorObj.name = error.type || "Error";
+    errorObj.stack = error.stack;
+
+    const result = await logProductionError(errorObj, req);
+    res.json(result);
+  } else {
+    res.status(400).json({ error: "Please provide error details or followUp" });
+  }
+});
+
+// Main demonstration function
+async function demonstrateErrorLogging() {
+  console.log("Starting Production Error Logging Demonstration\n");
+  console.log("=".repeat(50));
+
+  // Simulate production environment
+  process.env.NODE_ENV = "production";
+
+  // Test Case 1: Database Error
+  console.log("\nTest Case 1: Database Connection Error");
+  console.log("-".repeat(40));
+
+  const dbError = new Error("Connection refused: Unable to connect to database");
+  dbError.name = "DatabaseConnectionError";
+  dbError.stack = `DatabaseConnectionError: Connection refused: Unable to connect to database
+    at Database.connect (/app/db/connection.js:45:11)
+    at async UserService.getUser (/app/services/user.js:23:5)
+    at async UserController.getProfile (/app/controllers/user.js:15:3)`;
+
+  const mockReq = {
+    path: "/api/users/profile",
+    headers: { "user-agent": "Mozilla/5.0 (Production Server)" },
+  };
+
+  const result1 = await logProductionError(dbError, mockReq);
+
+  // Test Case 2: Follow-up question using multi-turn conversation
+  if (result1.analysis) {
+    console.log("\nTest Case 2: Follow-up Question (Multi-turn Conversation)");
+    console.log("-".repeat(40));
+
+    const followUpResponse = await askFollowUpQuestion(
+      "What specific database connection pool settings should we check first?"
+    );
+
+    console.log("Follow-up Response:");
+    console.log(followUpResponse);
+  }
+
+  // Test Case 3: Memory Error
+  console.log("\n\nTest Case 3: Memory Overflow Error");
+  console.log("-".repeat(40));
+
+  const memError = new Error("JavaScript heap out of memory");
+  memError.name = "MemoryError";
+
+  await logProductionError(memError);
+
+  console.log("\n" + "=".repeat(50));
+  console.log("Demonstration Complete");
+  console.log(`Total conversation turns: ${conversationHistory.length}`);
+}
+
+// Start the server and run demonstration
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  console.log(`Express server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}\n`);
+
+  // Run the demonstration
+  await demonstrateErrorLogging();
+});
+
+module.exports = { logProductionError, askFollowUpQuestion, app };
+```

@@ -1,0 +1,208 @@
+
+```python
+import anthropic
+import time
+import re
+import os
+import tempfile
+import threading
+from datetime import datetime, timedelta
+from collections import deque
+
+client = anthropic.Anthropic()
+
+failed_login_timestamps = deque()
+monitoring_active = True
+log_file_path = None
+
+
+def analyze_log_with_claude(failed_logins_count: int, time_window: int, recent_entries: list[str]) -> str:
+    """Use Claude to analyze the security situation and provide recommendations."""
+    
+    recent_entries_text = "\n".join(recent_entries[-10:]) if recent_entries else "No recent entries"
+    
+    prompt = f"""You are a security analyst. Analyze the following security situation:
+
+- {failed_logins_count} failed login attempts detected in the last {time_window} seconds
+- This exceeds the threshold of 10 failed logins per minute
+- Recent log entries:
+{recent_entries_text}
+
+Provide a brief security assessment and recommendations. Be concise and actionable."""
+
+    full_response = ""
+    
+    print("\n🤖 Claude Security Analysis:")
+    print("-" * 40)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 40)
+    return full_response
+
+
+def check_failed_logins(line: str, current_time: datetime) -> bool:
+    """Check if a log line contains a failed login message."""
+    failed_login_patterns = [
+        r"Failed Login",
+        r"Failed login",
+        r"failed login",
+        r"Authentication failure",
+        r"Invalid password",
+        r"Login failed"
+    ]
+    
+    for pattern in failed_login_patterns:
+        if re.search(pattern, line, re.IGNORECASE):
+            return True
+    return False
+
+
+def monitor_log_file(file_path: str, check_interval: float = 0.5):
+    """Monitor a log file for failed login attempts."""
+    global failed_login_timestamps, monitoring_active
+    
+    print(f"🔍 Starting log file monitoring: {file_path}")
+    print(f"⚠️  Alert threshold: More than 10 failed logins per minute")
+    print(f"📊 Check interval: {check_interval} seconds")
+    print("-" * 50)
+    
+    alert_triggered = False
+    recent_failed_entries = []
+    
+    try:
+        with open(file_path, 'r') as f:
+            f.seek(0, 2)
+            
+            while monitoring_active:
+                line = f.readline()
+                
+                if line:
+                    line = line.strip()
+                    current_time = datetime.now()
+                    
+                    if check_failed_logins(line, current_time):
+                        failed_login_timestamps.append(current_time)
+                        recent_failed_entries.append(f"[{current_time.strftime('%H:%M:%S')}] {line}")
+                        print(f"⚠️  Failed login detected: {line[:80]}...")
+                    
+                    one_minute_ago = current_time - timedelta(minutes=1)
+                    while failed_login_timestamps and failed_login_timestamps[0] < one_minute_ago:
+                        failed_login_timestamps.popleft()
+                    
+                    current_count = len(failed_login_timestamps)
+                    
+                    if current_count > 10 and not alert_triggered:
+                        alert_triggered = True
+                        print(f"\n🚨 SECURITY ALERT! 🚨")
+                        print(f"Detected {current_count} failed login attempts in the last minute!")
+                        print(f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        
+                        analyze_log_with_claude(current_count, 60, recent_failed_entries)
+                        
+                    elif current_count <= 10 and alert_triggered:
+                        alert_triggered = False
+                        print(f"\n✅ Alert cleared. Failed login count dropped to {current_count}")
+                        
+                else:
+                    time.sleep(check_interval)
+                    
+    except FileNotFoundError:
+        print(f"❌ Error: Log file not found: {file_path}")
+    except KeyboardInterrupt:
+        print("\n\n⛔ Monitoring stopped by user")
+    except Exception as e:
+        print(f"❌ Error monitoring log file: {e}")
+
+
+def simulate_log_entries(file_path: str):
+    """Simulate log entries for testing purposes."""
+    print("📝 Starting log simulation (for testing)...")
+    
+    normal_entries = [
+        "User john logged in successfully",
+        "System backup completed",
+        "User alice logged in successfully",
+        "Database connection established",
+        "Service started successfully"
+    ]
+    
+    failed_entries = [
+        "Failed Login attempt for user admin from IP 192.168.1.100",
+        "Failed Login: Invalid password for user root",
+        "Authentication failure for user test from 10.0.0.1",
+        "Failed Login attempt detected for user admin",
+        "Invalid password provided for user administrator"
+    ]
+    
+    with open(file_path, 'a') as f:
+        for i in range(3):
+            entry = normal_entries[i % len(normal_entries)]
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {entry}\n")
+            f.flush()
+            time.sleep(0.5)
+        
+        print("💉 Injecting failed login attempts...")
+        for i in range(12):
+            entry = failed_entries[i % len(failed_entries)]
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {entry}\n")
+            f.flush()
+            time.sleep(0.3)
+        
+        time.sleep(5)
+        
+        for i in range(3):
+            entry = normal_entries[i % len(normal_entries)]
+            f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {entry}\n")
+            f.flush()
+            time.sleep(0.5)
+
+
+def main():
+    """Main function to run the log monitor."""
+    global monitoring_active, log_file_path
+    
+    print("=" * 60)
+    print("🛡️  Log File Security Monitor")
+    print("=" * 60)
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        log_file_path = f.name
+        f.write(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} Log monitoring started\n")
+    
+    print(f"📁 Using temporary log file: {log_file_path}")
+    
+    simulation_thread = threading.Thread(
+        target=simulate_log_entries,
+        args=(log_file_path,),
+        daemon=True
+    )
+    simulation_thread.start()
+    
+    time.sleep(0.5)
+    
+    try:
+        monitor_log_file(log_file_path)
+    finally:
+        monitoring_active = False
+        
+        if os.path.exists(log_file_path):
+            os.unlink(log_file_path)
+            print(f"\n🧹 Cleaned up temporary log file: {log_file_path}")
+
+
+if __name__ == "__main__":
+    main()
+```

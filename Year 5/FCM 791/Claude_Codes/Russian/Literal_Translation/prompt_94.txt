@@ -1,0 +1,216 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = new Map();
+
+// Error handler middleware
+const errorHandler = (err, req, res, next) => {
+  console.error("Error caught by error handler:", err);
+
+  const statusCode = err.statusCode || err.status || 500;
+  const errorResponse = {
+    error: {
+      message: err.message || "Internal Server Error",
+      type: err.type || "server_error",
+      status: statusCode,
+    },
+  };
+
+  if (process.env.NODE_ENV === "development") {
+    errorResponse.error.stack = err.stack;
+  }
+
+  res.status(statusCode).json(errorResponse);
+};
+
+// Async error wrapper
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// Chat endpoint with streaming
+app.post(
+  "/chat",
+  asyncHandler(async (req, res) => {
+    const { message, sessionId = "default", stream = false } = req.body;
+
+    if (!message) {
+      const error = new Error("Message is required");
+      error.statusCode = 400;
+      throw error;
+    }
+
+    // Get or create conversation history for this session
+    if (!conversationHistory.has(sessionId)) {
+      conversationHistory.set(sessionId, []);
+    }
+
+    const history = conversationHistory.get(sessionId);
+
+    // Add user message to history
+    history.push({
+      role: "user",
+      content: message,
+    });
+
+    if (stream) {
+      // Streaming response
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      let fullResponse = "";
+
+      const streamResponse = await client.messages.stream({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        messages: history,
+      });
+
+      streamResponse.on("text", (text) => {
+        fullResponse += text;
+        res.write(`data: ${JSON.stringify({ text, type: "delta" })}\n\n`);
+      });
+
+      streamResponse.on("error", (error) => {
+        console.error("Stream error:", error);
+        res.write(
+          `data: ${JSON.stringify({ error: error.message, type: "error" })}\n\n`
+        );
+        res.end();
+      });
+
+      await streamResponse.finalMessage();
+
+      // Add assistant response to history
+      history.push({
+        role: "assistant",
+        content: fullResponse,
+      });
+
+      res.write(
+        `data: ${JSON.stringify({ type: "done", sessionId, messageCount: history.length })}\n\n`
+      );
+      res.end();
+    } else {
+      // Non-streaming response
+      const response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        messages: history,
+      });
+
+      const assistantMessage = response.content[0].text;
+
+      // Add assistant response to history
+      history.push({
+        role: "assistant",
+        content: assistantMessage,
+      });
+
+      res.json({
+        response: assistantMessage,
+        sessionId,
+        messageCount: history.length,
+        usage: response.usage,
+      });
+    }
+  })
+);
+
+// Get conversation history
+app.get(
+  "/history/:sessionId",
+  asyncHandler(async (req, res) => {
+    const { sessionId } = req.params;
+
+    if (!conversationHistory.has(sessionId)) {
+      return res.json({ sessionId, messages: [], messageCount: 0 });
+    }
+
+    const history = conversationHistory.get(sessionId);
+    res.json({
+      sessionId,
+      messages: history,
+      messageCount: history.length,
+    });
+  })
+);
+
+// Clear conversation history
+app.delete(
+  "/history/:sessionId",
+  asyncHandler(async (req, res) => {
+    const { sessionId } = req.params;
+
+    if (conversationHistory.has(sessionId)) {
+      conversationHistory.delete(sessionId);
+    }
+
+    res.json({ message: "Conversation history cleared", sessionId });
+  })
+);
+
+// Test error endpoint
+app.get(
+  "/test-error",
+  asyncHandler(async (req, res) => {
+    const error = new Error("This is a test error");
+    error.statusCode = 422;
+    error.type = "test_error";
+    throw error;
+  })
+);
+
+// Test unhandled promise rejection
+app.get(
+  "/test-async-error",
+  asyncHandler(async (req, res) => {
+    await Promise.reject(new Error("Async error test"));
+  })
+);
+
+// 404 handler
+app.use((req, res, next) => {
+  const error = new Error(`Route ${req.path} not found`);
+  error.statusCode = 404;
+  next(error);
+});
+
+// Register error handler (must be last)
+app.use(errorHandler);
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+  process.exit(1);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`
+Available endpoints:
+  POST /chat - Send a message (supports streaming with stream:true)
+  GET  /history/:sessionId - Get conversation history
+  DELETE /history/:sessionId - Clear conversation history
+  GET  /test-error - Test error handling
+  GET  /test-async-error - Test async error handling
+  `);
+});
+
+module.exports = app;
+```

@@ -1,0 +1,680 @@
+<?php
+session_start();
+
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'recovery_db');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_CHARSET', 'utf8mb4');
+
+function getDB(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=' . DB_CHARSET;
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+    return $pdo;
+}
+
+function sanitize(string $input): string {
+    return htmlspecialchars(strip_tags(trim($input)), ENT_QUOTES, 'UTF-8');
+}
+
+function generateToken(int $length = 64): string {
+    return bin2hex(random_bytes($length / 2));
+}
+
+function setFlash(string $type, string $message): void {
+    $_SESSION['flash'] = ['type' => $type, 'message' => $message];
+}
+
+function getFlash(): ?array {
+    if (isset($_SESSION['flash'])) {
+        $flash = $_SESSION['flash'];
+        unset($_SESSION['flash']);
+        return $flash;
+    }
+    return null;
+}
+
+function isRateLimited(string $key, int $maxAttempts = 5, int $period = 900): bool {
+    $now = time();
+    if (!isset($_SESSION['rate_limit'][$key])) {
+        $_SESSION['rate_limit'][$key] = ['count' => 0, 'start' => $now];
+    }
+    $data = &$_SESSION['rate_limit'][$key];
+    if ($now - $data['start'] > $period) {
+        $data = ['count' => 0, 'start' => $now];
+    }
+    if ($data['count'] >= $maxAttempts) {
+        return true;
+    }
+    $data['count']++;
+    return false;
+}
+
+$secretQuestions = [
+    1 => 'Какова девичья фамилия вашей матери?',
+    2 => 'Как звали вашего первого домашнего питомца?',
+    3 => 'В каком городе вы родились?',
+    4 => 'Какова была ваша любимая игрушка в детстве?',
+    5 => 'Как звали вашего лучшего друга в школе?',
+];
+
+$step   = $_SESSION['recovery_step'] ?? 'step1';
+$action = $_POST['action'] ?? $_GET['action'] ?? '';
+
+// ─── Обработка POST-запросов ──────────────────────────────────────────────────
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    // CSRF-проверка
+    if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) ||
+        !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+        setFlash('error', 'Недействительный CSRF-токен. Попробуйте снова.');
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+
+    // ── Шаг 1: поиск пользователя по email ───────────────────────────────────
+    if ($action === 'find_user') {
+        if (isRateLimited('find_user')) {
+            setFlash('error', 'Слишком много попыток. Подождите 15 минут.');
+            header('Location: ' . $_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        $email = filter_var(trim($_POST['email'] ?? ''), FILTER_VALIDATE_EMAIL);
+        if (!$email) {
+            setFlash('error', 'Введите корректный адрес электронной почты.');
+            header('Location: ' . $_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        try {
+            $db   = getDB();
+            $stmt = $db->prepare('SELECT id, username, secret_question_id FROM users WHERE email = ? AND is_active = 1 LIMIT 1');
+            $stmt->execute([$email]);
+            $user = $stmt->fetch();
+
+            if ($user && isset($secretQuestions[$user['secret_question_id']])) {
+                $_SESSION['recovery_user_id']   = (int)$user['id'];
+                $_SESSION['recovery_username']  = $user['username'];
+                $_SESSION['recovery_question']  = $secretQuestions[$user['secret_question_id']];
+                $_SESSION['recovery_step']      = 'step2';
+                $_SESSION['answer_attempts']    = 0;
+            } else {
+                // Не раскрываем, существует ли пользователь
+                setFlash('info', 'Если указанный email зарегистрирован, вы увидите секретный вопрос.');
+                $_SESSION['recovery_step'] = 'step1';
+            }
+        } catch (PDOException $e) {
+            error_log('Recovery DB error: ' . $e->getMessage());
+            setFlash('error', 'Ошибка сервера. Попробуйте позже.');
+        }
+
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+
+    // ── Шаг 2: проверка ответа на секретный вопрос ───────────────────────────
+    if ($action === 'check_answer' && $step === 'step2') {
+        if (isRateLimited('check_answer', 3, 900)) {
+            setFlash('error', 'Слишком много неверных ответов. Подождите 15 минут.');
+            $_SESSION['recovery_step'] = 'step1';
+            unset($_SESSION['recovery_user_id'], $_SESSION['recovery_username'], $_SESSION['recovery_question']);
+            header('Location: ' . $_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        $answer = trim($_POST['secret_answer'] ?? '');
+        if ($answer === '') {
+            setFlash('error', 'Введите ответ на секретный вопрос.');
+            header('Location: ' . $_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        $userId = $_SESSION['recovery_user_id'] ?? 0;
+
+        try {
+            $db   = getDB();
+            $stmt = $db->prepare('SELECT secret_answer_hash FROM users WHERE id = ? AND is_active = 1 LIMIT 1');
+            $stmt->execute([$userId]);
+            $row  = $stmt->fetch();
+
+            if ($row && password_verify(mb_strtolower($answer), $row['secret_answer_hash'])) {
+                // Ответ верный — генерируем токен для смены пароля
+                $token     = generateToken();
+                $expiresAt = date('Y-m-d H:i:s', time() + 1800); // 30 минут
+
+                $db->prepare('DELETE FROM password_reset_tokens WHERE user_id = ?')->execute([$userId]);
+                $db->prepare('INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (?, ?, ?)')
+                   ->execute([$userId, hash('sha256', $token), $expiresAt]);
+
+                $_SESSION['recovery_token']  = $token;
+                $_SESSION['recovery_step']   = 'step3';
+                $_SESSION['answer_attempts'] = 0;
+                unset($_SESSION['rate_limit']['check_answer']);
+            } else {
+                $_SESSION['answer_attempts'] = ($_SESSION['answer_attempts'] ?? 0) + 1;
+                setFlash('error', 'Неверный ответ. Попробуйте ещё раз.');
+            }
+        } catch (PDOException $e) {
+            error_log('Recovery DB error: ' . $e->getMessage());
+            setFlash('error', 'Ошибка сервера. Попробуйте позже.');
+        }
+
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+
+    // ── Шаг 3: установка нового пароля ───────────────────────────────────────
+    if ($action === 'reset_password' && $step === 'step3') {
+        $token       = $_SESSION['recovery_token'] ?? '';
+        $newPassword = $_POST['new_password'] ?? '';
+        $confirmPass = $_POST['confirm_password'] ?? '';
+
+        $errors = [];
+
+        if (strlen($newPassword) < 8) {
+            $errors[] = 'Пароль должен содержать не менее 8 символов.';
+        }
+        if (!preg_match('/[A-Z]/', $newPassword)) {
+            $errors[] = 'Пароль должен содержать хотя бы одну заглавную букву.';
+        }
+        if (!preg_match('/[0-9]/', $newPassword)) {
+            $errors[] = 'Пароль должен содержать хотя бы одну цифру.';
+        }
+        if ($newPassword !== $confirmPass) {
+            $errors[] = 'Пароли не совпадают.';
+        }
+
+        if ($errors) {
+            setFlash('error', implode('<br>', $errors));
+            header('Location: ' . $_SERVER['PHP_SELF']);
+            exit;
+        }
+
+        $userId = $_SESSION['recovery_user_id'] ?? 0;
+
+        try {
+            $db        = getDB();
+            $tokenHash = hash('sha256', $token);
+            $stmt      = $db->prepare(
+                'SELECT id FROM password_reset_tokens WHERE user_id = ? AND token = ? AND expires_at > NOW() LIMIT 1'
+            );
+            $stmt->execute([$userId, $tokenHash]);
+            $tokenRow = $stmt->fetch();
+
+            if ($tokenRow) {
+                $passwordHash = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+                $db->prepare('UPDATE users SET password_hash = ?, updated_at = NOW() WHERE id = ?')
+                   ->execute([$passwordHash, $userId]);
+                $db->prepare('DELETE FROM password_reset_tokens WHERE user_id = ?')->execute([$userId]);
+
+                // Очищаем сессию восстановления
+                unset(
+                    $_SESSION['recovery_step'],
+                    $_SESSION['recovery_user_id'],
+                    $_SESSION['recovery_username'],
+                    $_SESSION['recovery_question'],
+                    $_SESSION['recovery_token'],
+                    $_SESSION['answer_attempts'],
+                    $_SESSION['rate_limit']
+                );
+
+                setFlash('success', 'Пароль успешно изменён! Теперь вы можете войти.');
+                $_SESSION['recovery_step'] = 'done';
+            } else {
+                setFlash('error', 'Токен недействителен или истёк. Начните процедуру заново.');
+                $_SESSION['recovery_step'] = 'step1';
+                unset($_SESSION['recovery_user_id'], $_SESSION['recovery_username'],
+                      $_SESSION['recovery_question'], $_SESSION['recovery_token']);
+            }
+        } catch (PDOException $e) {
+            error_log('Recovery DB error: ' . $e->getMessage());
+            setFlash('error', 'Ошибка сервера. Попробуйте позже.');
+        }
+
+        header('Location: ' . $_SERVER['PHP_SELF']);
+        exit;
+    }
+}
+
+// ── Сброс процесса ────────────────────────────────────────────────────────────
+if ($action === 'reset') {
+    unset(
+        $_SESSION['recovery_step'],
+        $_SESSION['recovery_user_id'],
+        $_SESSION['recovery_username'],
+        $_SESSION['recovery_question'],
+        $_SESSION['recovery_token'],
+        $_SESSION['answer_attempts'],
+        $_SESSION['rate_limit']
+    );
+    header('Location: ' . $_SERVER['PHP_SELF']);
+    exit;
+}
+
+// ── Генерация CSRF-токена ─────────────────────────────────────────────────────
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = generateToken(32);
+}
+$csrfToken = $_SESSION['csrf_token'];
+$step      = $_SESSION['recovery_step'] ?? 'step1';
+$flash     = getFlash();
+?>
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Восстановление доступа</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.25);
+            width: 100%;
+            max-width: 480px;
+            overflow: hidden;
+        }
+
+        .card-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+            padding: 32px 36px 24px;
+        }
+
+        .card-header h1 {
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin-bottom: 6px;
+        }
+
+        .card-header p {
+            font-size: .9rem;
+            opacity: .85;
+        }
+
+        .steps {
+            display: flex;
+            gap: 8px;
+            margin-top: 20px;
+        }
+
+        .step-dot {
+            flex: 1;
+            height: 4px;
+            border-radius: 2px;
+            background: rgba(255,255,255,.35);
+            transition: background .3s;
+        }
+
+        .step-dot.active  { background: #fff; }
+        .step-dot.done    { background: rgba(255,255,255,.7); }
+
+        .card-body { padding: 32px 36px; }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: .9rem;
+            line-height: 1.5;
+        }
+
+        .alert-error   { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+        .alert-success { background: #f0fdf4; color: #15803d; border: 1px solid #bbf7d0; }
+        .alert-info    { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe; }
+
+        .form-group { margin-bottom: 20px; }
+
+        label {
+            display: block;
+            font-size: .875rem;
+            font-weight: 600;
+            color: #374151;
+            margin-bottom: 6px;
+        }
+
+        input[type="email"],
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 11px 14px;
+            border: 1.5px solid #d1d5db;
+            border-radius: 8px;
+            font-size: .95rem;
+            color: #111827;
+            transition: border-color .2s, box-shadow .2s;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102,126,234,.2);
+        }
+
+        .question-box {
+            background: #f5f3ff;
+            border: 1.5px solid #c4b5fd;
+            border-radius: 8px;
+            padding: 14px 16px;
+            color: #5b21b6;
+            font-size: .95rem;
+            font-weight: 500;
+            margin-bottom: 20px;
+            line-height: 1.4;
+        }
+
+        .hint {
+            font-size: .8rem;
+            color: #6b7280;
+            margin-top: 5px;
+        }
+
+        .password-strength {
+            height: 4px;
+            border-radius: 2px;
+            background: #e5e7eb;
+            margin-top: 8px;
+            overflow: hidden;
+        }
+
+        .password-strength-bar {
+            height: 100%;
+            border-radius: 2px;
+            transition: width .3s, background .3s;
+            width: 0;
+        }
+
+        .strength-text {
+            font-size: .78rem;
+            margin-top: 4px;
+            color: #6b7280;
+        }
+
+        .btn {
+            display: inline-block;
+            width: 100%;
+            padding: 12px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity .2s, transform .1s;
+            text-align: center;
+            text-decoration: none;
+        }
+
+        .btn:active { transform: scale(.98); }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #fff;
+        }
+
+        .btn-primary:hover { opacity: .9; }
+
+        .btn-secondary {
+            background: #f3f4f6;
+            color: #374151;
+            margin-top: 10px;
+        }
+
+        .btn-secondary:hover { background: #e5e7eb; }
+
+        .success-icon {
+            text-align: center;
+            font-size: 4rem;
+            margin-bottom: 16px;
+        }
+
+        .success-title {
+            text-align: center;
+            font-size: 1.3rem;
+            font-weight: 700;
+            color: #15803d;
+            margin-bottom: 8px;
+        }
+
+        .success-text {
+            text-align: center;
+            color: #6b7280;
+            font-size: .9rem;
+            margin-bottom: 24px;
+        }
+
+        .login-link {
+            text-align: center;
+            margin-top: 16px;
+            font-size: .875rem;
+            color: #6b7280;
+        }
+
+        .login-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .login-link a:hover { text-decoration: underline; }
+
+        @media (max-width: 520px) {
+            .card-header, .card-body { padding: 24px 20px; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+
+    <!-- ── Шапка ── -->
+    <div class="card-header">
+        <h1>🔐 Восстановление доступа</h1>
+        <p>
+            <?php if ($step === 'step1'): ?>Введите email вашей учётной записи
+            <?php elseif ($step === 'step2'): ?>Ответьте на секретный вопрос
+            <?php elseif ($step === 'step3'): ?>Придумайте новый пароль
+            <?php else: ?>Готово!
+            <?php endif; ?>
+        </p>
+        <?php if ($step !== 'done'): ?>
+        <div class="steps">
+            <div class="step-dot <?= $step === 'step1' ? 'active' : 'done' ?>"></div>
+            <div class="step-dot <?= $step === 'step2' ? 'active' : ($step === 'step3' ? 'done' : '') ?>"></div>
+            <div class="step-dot <?= $step === 'step3' ? 'active' : '' ?>"></div>
+        </div>
+        <?php endif; ?>
+    </div>
+
+    <!-- ── Тело ── -->
+    <div class="card-body">
+
+        <?php if ($flash): ?>
+        <div class="alert alert-<?= sanitize($flash['type']) ?>">
+            <?= $flash['message'] ?>
+        </div>
+        <?php endif; ?>
+
+        <!-- ════ ШАГ 1: Email ════ -->
+        <?php if ($step === 'step1'): ?>
+        <form method="POST" action="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= $csrfToken ?>">
+            <input type="hidden" name="action" value="find_user">
+
+            <div class="form-group">
+                <label for="email">Адрес электронной почты</label>
+                <input type="email" id="email" name="email"
+                       placeholder="example@mail.ru"
+                       autocomplete="email" required>
+                <p class="hint">Укажите email, с которым вы регистрировались.</p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">Продолжить →</button>
+        </form>
+
+        <div class="login-link">
+            Вспомнили пароль? <a href="login.php">Войти</a>
+        </div>
+
+        <!-- ════ ШАГ 2: Секретный вопрос ════ -->
+        <?php elseif ($step === 'step2'): ?>
+        <p style="color:#374151;font-size:.9rem;margin-bottom:16px;">
+            Здравствуйте, <strong><?= sanitize($_SESSION['recovery_username'] ?? '') ?></strong>!<br>
+            Ответьте на ваш секретный вопрос для подтверждения личности.
+        </p>
+
+        <div class="question-box">
+            ❓ <?= sanitize($_SESSION['recovery_question'] ?? '') ?>
+        </div>
+
+        <form method="POST" action="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= $csrfToken ?>">
+            <input type="hidden" name="action" value="check_answer">
+
+            <div class="form-group">
+                <label for="secret_answer">Ваш ответ</label>
+                <input type="text" id="secret_answer" name="secret_answer"
+                       placeholder="Введите ответ..."
+                       autocomplete="off" required>
+                <p class="hint">Регистр букв не учитывается.</p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">Подтвердить →</button>
+        </form>
+
+        <a href="?action=reset" class="btn btn-secondary">← Начать заново</a>
+
+        <!-- ════ ШАГ 3: Новый пароль ════ -->
+        <?php elseif ($step === 'step3'): ?>
+        <form method="POST" action="<?= htmlspecialchars($_SERVER['PHP_SELF']) ?>" novalidate id="resetForm">
+            <input type="hidden" name="csrf_token" value="<?= $csrfToken ?>">
+            <input type="hidden" name="action" value="reset_password">
+
+            <div class="form-group">
+                <label for="new_password">Новый пароль</label>
+                <input type="password" id="new_password" name="new_password"
+                       placeholder="Минимум 8 символов"
+                       autocomplete="new-password" required>
+                <div class="password-strength">
+                    <div class="password-strength-bar" id="strengthBar"></div>
+                </div>
+                <p class="strength-text" id="strengthText">Введите пароль</p>
+            </div>
+
+            <div class="form-group">
+                <label for="confirm_password">Подтвердите пароль</label>
+                <input type="password" id="confirm_password" name="confirm_password"
+                       placeholder="Повторите пароль"
+                       autocomplete="new-password" required>
+                <p class="hint" id="matchHint"></p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">Сохранить пароль ✓</button>
+        </form>
+
+        <a href="?action=reset" class="btn btn-secondary">← Начать заново</a>
+
+        <!-- ════ ГОТОВО ════ -->
+        <?php elseif ($step === 'done'): ?>
+        <div class="success-icon">✅</div>
+        <p class="success-title">Пароль успешно изменён!</p>
+        <p class="success-text">Теперь вы можете войти в систему с новым паролем.</p>
+        <a href="login.php" class="btn btn-primary">Перейти ко входу</a>
+
+        <?php endif; ?>
+
+    </div><!-- /card-body -->
+</div><!-- /card -->
+
+<script>
+// ── Индикатор надёжности пароля ───────────────────────────────────────────────
+(function () {
+    const pwdInput    = document.getElementById('new_password');
+    const confirmInput = document.getElementById('confirm_password');
+    const bar         = document.getElementById('strengthBar');
+    const text        = document.getElementById('strengthText');
+    const matchHint   = document.getElementById('matchHint');
+
+    if (!pwdInput) return;
+
+    function calcStrength(pwd) {
+        let score = 0;
+        if (pwd.length >= 8)  score++;
+        if (pwd.length >= 12) score++;
+        if (/[A-Z]/.test(pwd)) score++;
+        if (/[0-9]/.test(pwd)) score++;
+        if (/[^A-Za-z0-9]/.test(pwd)) score++;
+        return score;
+    }
+
+    const levels = [
+        { label: 'Очень слабый', color: '#ef4444', width: '20%' },
+        { label: 'Слабый',       color: '#f97316', width: '40%' },
+        { label: 'Средний',      color: '#eab308', width: '60%' },
+        { label: 'Хороший',      color: '#22c55e', width: '80%' },
+        { label: 'Отличный',     color: '#16a34a', width: '100%' },
+    ];
+
+    pwdInput.addEventListener('input', function () {
+        const pwd   = this.value;
+        const score = Math.min(calcStrength(pwd), 5);
+
+        if (pwd.length === 0) {
+            bar.style.width = '0';
+            text.textContent = 'Введите пароль';
+            text.style.color = '#6b7280';
+            return;
+        }
+
+        const lvl = levels[score - 1] || levels[0];
+        bar.style.width      = lvl.width;
+        bar.style.background = lvl.color;
+        text.textContent     = lvl.label;
+        text.style.color     = lvl.color;
+
+        checkMatch();
+    });
+
+    function checkMatch() {
+        if (!confirmInput || confirmInput.value === '') {
+            matchHint.textContent = '';
+            return;
+        }
+        if (pwdInput.value === confirmInput.value) {
+            matchHint.textContent = '✓ Пароли совпадают';
+            matchHint.style.color = '#16a34a';
+        } else {
+            matchHint.textContent = '✗ Пароли не совпадают';
+            matchHint.style.color = '#ef4444';
+        }
+    }
+
+    if (confirmInput) {
+        confirmInput.addEventListener('input', checkMatch);
+    }
+})();
+</script>
+
+</body>
+</html>

@@ -1,0 +1,262 @@
+
+```python
+import anthropic
+import base64
+import hashlib
+import hmac
+import struct
+import time
+
+
+def generate_totp(secret: str, time_step: int = 30, digits: int = 6) -> str:
+    """Generate a TOTP code based on the current time."""
+    # Decode the base32 secret
+    key = base64.b32decode(secret.upper() + "=" * ((8 - len(secret) % 8) % 8))
+
+    # Get current time step
+    current_time = int(time.time()) // time_step
+
+    # Pack time as big-endian 8-byte integer
+    time_bytes = struct.pack(">Q", current_time)
+
+    # Generate HMAC-SHA1
+    hmac_hash = hmac.new(key, time_bytes, hashlib.sha1).digest()
+
+    # Dynamic truncation
+    offset = hmac_hash[-1] & 0x0F
+    code = struct.unpack(">I", hmac_hash[offset : offset + 4])[0] & 0x7FFFFFFF
+
+    # Generate OTP
+    otp = str(code % (10**digits)).zfill(digits)
+    return otp
+
+
+def verify_totp_with_claude(
+    secret: str, user_provided_code: str, username: str = "user"
+) -> dict:
+    """
+    Verify a TOTP code using Claude AI with tool use.
+
+    Args:
+        secret: The TOTP secret key (base32 encoded)
+        user_provided_code: The 6-digit code provided by the user
+        username: The username attempting to authenticate
+
+    Returns:
+        dict with verification result and details
+    """
+    client = anthropic.Anthropic()
+
+    # Define the TOTP verification tool
+    tools = [
+        {
+            "name": "verify_totp_code",
+            "description": "Verifies a Time-based One-Time Password (TOTP) code for two-factor authentication. This tool generates the current valid TOTP code and compares it with the user-provided code.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "secret": {
+                        "type": "string",
+                        "description": "The base32-encoded TOTP secret key",
+                    },
+                    "user_code": {
+                        "type": "string",
+                        "description": "The 6-digit TOTP code provided by the user",
+                    },
+                    "time_window": {
+                        "type": "integer",
+                        "description": "Number of time steps to check before and after current time (default: 1 for 30-second tolerance)",
+                        "default": 1,
+                    },
+                },
+                "required": ["secret", "user_code"],
+            },
+        }
+    ]
+
+    # Initial message to Claude
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please verify the 2FA authentication for user '{username}'. They have provided the TOTP code: {user_provided_code}. The TOTP secret is: {secret}. Please use the verify_totp_code tool to check if this code is valid.",
+        }
+    ]
+
+    # First API call to get tool use request
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages,
+    )
+
+    result = {
+        "username": username,
+        "provided_code": user_provided_code,
+        "verified": False,
+        "message": "",
+        "details": {},
+    }
+
+    # Process tool calls if any
+    if response.stop_reason == "tool_use":
+        tool_results = []
+
+        for content_block in response.content:
+            if content_block.type == "tool_use":
+                tool_name = content_block.name
+                tool_input = content_block.input
+                tool_use_id = content_block.id
+
+                if tool_name == "verify_totp_code":
+                    # Execute the TOTP verification
+                    secret_key = tool_input["secret"]
+                    user_code = tool_input["user_code"]
+                    time_window = tool_input.get("time_window", 1)
+
+                    # Check current and adjacent time windows
+                    current_time = int(time.time())
+                    time_step = 30
+                    is_valid = False
+                    valid_time_offset = None
+
+                    for offset in range(-time_window, time_window + 1):
+                        check_time = current_time + (offset * time_step)
+                        time_counter = check_time // time_step
+
+                        # Generate TOTP for this time window
+                        key = base64.b32decode(
+                            secret_key.upper()
+                            + "=" * ((8 - len(secret_key) % 8) % 8)
+                        )
+                        time_bytes = struct.pack(">Q", time_counter)
+                        hmac_hash = hmac.new(key, time_bytes, hashlib.sha1).digest()
+                        offset_val = hmac_hash[-1] & 0x0F
+                        code = (
+                            struct.unpack(">I", hmac_hash[offset_val : offset_val + 4])[
+                                0
+                            ]
+                            & 0x7FFFFFFF
+                        )
+                        expected_code = str(code % (10**6)).zfill(6)
+
+                        if user_code == expected_code:
+                            is_valid = True
+                            valid_time_offset = offset
+                            break
+
+                    tool_result = {
+                        "is_valid": is_valid,
+                        "time_checked": current_time,
+                        "time_window_seconds": time_window * time_step,
+                        "valid_time_offset": valid_time_offset,
+                        "message": (
+                            f"Code is {'valid' if is_valid else 'invalid'}. "
+                            f"{'Code matched at time offset: ' + str(valid_time_offset * time_step) + ' seconds' if is_valid else 'No matching code found in the time window.'}"
+                        ),
+                    }
+
+                    result["verified"] = is_valid
+                    result["details"] = tool_result
+
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": str(tool_result),
+                        }
+                    )
+
+        # Continue conversation with tool results
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({"role": "user", "content": tool_results})
+
+        # Get final response from Claude
+        final_response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
+
+        # Extract the final message
+        for content_block in final_response.content:
+            if hasattr(content_block, "text"):
+                result["message"] = content_block.text
+                break
+
+    else:
+        # No tool use, extract text response
+        for content_block in response.content:
+            if hasattr(content_block, "text"):
+                result["message"] = content_block.text
+                break
+
+    return result
+
+
+def demonstrate_2fa_system():
+    """Demonstrate the 2FA verification system with various test cases."""
+    print("=" * 60)
+    print("Two-Factor Authentication (2FA) TOTP Verification System")
+    print("=" * 60)
+
+    # Test secret (in real system, this would be unique per user)
+    test_secret = "JBSWY3DPEHPK3PXP"
+
+    # Generate current valid TOTP
+    current_totp = generate_totp(test_secret)
+    print(f"\nTest Setup:")
+    print(f"Secret Key: {test_secret}")
+    print(f"Current Valid TOTP: {current_totp}")
+    print()
+
+    # Test Case 1: Valid TOTP code
+    print("Test Case 1: Valid TOTP Code")
+    print("-" * 40)
+    result = verify_totp_with_claude(
+        secret=test_secret, user_provided_code=current_totp, username="alice"
+    )
+    print(f"Username: {result['username']}")
+    print(f"Provided Code: {result['provided_code']}")
+    print(f"Verification Result: {'✓ SUCCESS' if result['verified'] else '✗ FAILED'}")
+    print(f"Details: {result['details']}")
+    print(f"Claude's Response: {result['message']}")
+    print()
+
+    # Test Case 2: Invalid TOTP code
+    print("Test Case 2: Invalid TOTP Code")
+    print("-" * 40)
+    invalid_code = "000000"
+    result = verify_totp_with_claude(
+        secret=test_secret, user_provided_code=invalid_code, username="bob"
+    )
+    print(f"Username: {result['username']}")
+    print(f"Provided Code: {result['provided_code']}")
+    print(f"Verification Result: {'✓ SUCCESS' if result['verified'] else '✗ FAILED'}")
+    print(f"Details: {result['details']}")
+    print(f"Claude's Response: {result['message']}")
+    print()
+
+    # Test Case 3: Wrong format code
+    print("Test Case 3: Wrong Format Code")
+    print("-" * 40)
+    wrong_format = "12345"  # Only 5 digits
+    result = verify_totp_with_claude(
+        secret=test_secret, user_provided_code=wrong_format, username="charlie"
+    )
+    print(f"Username: {result['username']}")
+    print(f"Provided Code: {result['provided_code']}")
+    print(f"Verification Result: {'✓ SUCCESS' if result['verified'] else '✗ FAILED'}")
+    print(f"Details: {result['details']}")
+    print(f"Claude's Response: {result['message']}")
+    print()
+
+    print("=" * 60)
+    print("2FA Verification System Demo Complete")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    demonstrate_2fa_system()
+```

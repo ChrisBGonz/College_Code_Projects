@@ -1,0 +1,331 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const https = require("https");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const client = new Anthropic();
+
+const tools = [
+  {
+    name: "download_file",
+    description:
+      "Downloads a file from a URL and saves it to a local path. Returns success status and file size.",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "The URL to download the file from",
+        },
+        destination: {
+          type: "string",
+          description: "The local file path where the downloaded file will be saved",
+        },
+      },
+      required: ["url", "destination"],
+    },
+  },
+  {
+    name: "extract_zip",
+    description:
+      "Extracts a ZIP archive to a specified directory. Returns success status and list of extracted files.",
+    input_schema: {
+      type: "object",
+      properties: {
+        zip_path: {
+          type: "string",
+          description: "Path to the ZIP file to extract",
+        },
+        destination_dir: {
+          type: "string",
+          description: "Directory where the ZIP contents will be extracted",
+        },
+      },
+      required: ["zip_path", "destination_dir"],
+    },
+  },
+  {
+    name: "create_directory",
+    description:
+      "Creates a directory and all necessary parent directories. Returns success status.",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "The directory path to create",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "cleanup_file",
+    description: "Removes a temporary file. Returns success status.",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_path: {
+          type: "string",
+          description: "Path to the file to remove",
+        },
+      },
+      required: ["file_path"],
+    },
+  },
+];
+
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith("https://") ? https : http;
+    const dir = path.dirname(destination);
+
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    const file = fs.createWriteStream(destination);
+
+    protocol
+      .get(url, (response) => {
+        if (response.statusCode === 301 || response.statusCode === 302) {
+          file.close();
+          fs.unlinkSync(destination);
+          downloadFile(response.headers.location, destination)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          file.close();
+          fs.unlinkSync(destination);
+          reject(new Error(`Failed to download: HTTP ${response.statusCode}`));
+          return;
+        }
+
+        response.pipe(file);
+
+        file.on("finish", () => {
+          file.close();
+          const stats = fs.statSync(destination);
+          resolve({
+            success: true,
+            file_size: stats.size,
+            destination: destination,
+          });
+        });
+      })
+      .on("error", (err) => {
+        file.close();
+        if (fs.existsSync(destination)) {
+          fs.unlinkSync(destination);
+        }
+        reject(err);
+      });
+  });
+}
+
+function extractZip(zipPath, destinationDir) {
+  try {
+    if (!fs.existsSync(destinationDir)) {
+      fs.mkdirSync(destinationDir, { recursive: true });
+    }
+
+    execSync(`unzip -o "${zipPath}" -d "${destinationDir}"`, {
+      stdio: "pipe",
+    });
+
+    const extractedFiles = [];
+    function listFiles(dir) {
+      const items = fs.readdirSync(dir);
+      items.forEach((item) => {
+        const fullPath = path.join(dir, item);
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          listFiles(fullPath);
+        } else {
+          extractedFiles.push(fullPath);
+        }
+      });
+    }
+    listFiles(destinationDir);
+
+    return {
+      success: true,
+      extracted_files: extractedFiles,
+      file_count: extractedFiles.length,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+}
+
+function createDirectory(dirPath) {
+  try {
+    fs.mkdirSync(dirPath, { recursive: true });
+    return {
+      success: true,
+      path: dirPath,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+}
+
+function cleanupFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      return {
+        success: true,
+        message: `File ${filePath} removed successfully`,
+      };
+    }
+    return {
+      success: true,
+      message: `File ${filePath} does not exist`,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+}
+
+async function processToolCall(toolName, toolInput) {
+  console.log(`\nExecuting tool: ${toolName}`);
+  console.log("Input:", JSON.stringify(toolInput, null, 2));
+
+  let result;
+
+  switch (toolName) {
+    case "download_file":
+      try {
+        result = await downloadFile(toolInput.url, toolInput.destination);
+      } catch (error) {
+        result = {
+          success: false,
+          error: error.message,
+        };
+      }
+      break;
+
+    case "extract_zip":
+      result = extractZip(toolInput.zip_path, toolInput.destination_dir);
+      break;
+
+    case "create_directory":
+      result = createDirectory(toolInput.path);
+      break;
+
+    case "cleanup_file":
+      result = cleanupFile(toolInput.file_path);
+      break;
+
+    default:
+      result = {
+        success: false,
+        error: `Unknown tool: ${toolName}`,
+      };
+  }
+
+  console.log("Result:", JSON.stringify(result, null, 2));
+  return result;
+}
+
+async function downloadAndExtractUpdate(updateUrl, extractDir = "/app") {
+  console.log(`\nStarting update download from: ${updateUrl}`);
+  console.log(`Extraction directory: ${extractDir}`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please download a ZIP update file from the following URL and extract it to the ${extractDir} directory:
+
+URL: ${updateUrl}
+
+Steps to follow:
+1. Create the destination directory ${extractDir} if it doesn't exist
+2. Download the ZIP file to a temporary location (use /tmp/update.zip)
+3. Extract the ZIP file to ${extractDir}
+4. Clean up the temporary ZIP file after extraction
+5. Report the results
+
+Please proceed with these steps.`,
+    },
+  ];
+
+  let continueLoop = true;
+
+  while (continueLoop) {
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      tools: tools,
+      messages: messages,
+    });
+
+    console.log(`\nAssistant response (stop_reason: ${response.stop_reason}):`);
+
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    if (response.stop_reason === "tool_use") {
+      const toolResults = [];
+
+      for (const block of response.content) {
+        if (block.type === "tool_use") {
+          const toolResult = await processToolCall(block.name, block.input);
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(toolResult),
+          });
+        } else if (block.type === "text" && block.text) {
+          console.log("Assistant:", block.text);
+        }
+      }
+
+      messages.push({
+        role: "user",
+        content: toolResults,
+      });
+    } else if (response.stop_reason === "end_turn") {
+      for (const block of response.content) {
+        if (block.type === "text") {
+          console.log("\nFinal response:", block.text);
+        }
+      }
+      continueLoop = false;
+    } else {
+      console.log("Unexpected stop reason:", response.stop_reason);
+      continueLoop = false;
+    }
+  }
+
+  console.log("\nUpdate process completed!");
+}
+
+const updateUrl =
+  process.argv[2] || "https://example.com/updates/latest-update.zip";
+const extractDir = process.argv[3] || "/app";
+
+downloadAndExtractUpdate(updateUrl, extractDir).catch((error) => {
+  console.error("Error during update process:", error);
+  process.exit(1);
+});
+```

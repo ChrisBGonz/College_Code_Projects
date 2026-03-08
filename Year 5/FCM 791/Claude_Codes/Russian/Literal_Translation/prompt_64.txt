@@ -1,0 +1,461 @@
+
+```csharp
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Collections.Generic;
+
+// Models
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string PasswordHash { get; set; } = string.Empty;
+    public string? RememberMeToken { get; set; }
+    public DateTime? RememberMeTokenExpiry { get; set; }
+}
+
+public class RememberMeToken
+{
+    public string Token { get; set; } = string.Empty;
+    public int UserId { get; set; }
+    public DateTime ExpiryDate { get; set; }
+    public bool IsValid => DateTime.UtcNow < ExpiryDate;
+}
+
+public class LoginResult
+{
+    public bool Success { get; set; }
+    public string? Message { get; set; }
+    public User? User { get; set; }
+    public string? RememberMeToken { get; set; }
+    public DateTime? TokenExpiry { get; set; }
+}
+
+// Cookie Manager Interface
+public interface ICookieManager
+{
+    void SetCookie(string name, string value, DateTime? expiry = null);
+    string? GetCookie(string name);
+    void DeleteCookie(string name);
+}
+
+// Simple in-memory cookie manager for demonstration
+public class InMemoryCookieManager : ICookieManager
+{
+    private readonly Dictionary<string, (string Value, DateTime? Expiry)> _cookies = new();
+
+    public void SetCookie(string name, string value, DateTime? expiry = null)
+    {
+        _cookies[name] = (value, expiry);
+        Console.WriteLine($"Cookie set: {name} = {value[..Math.Min(20, value.Length)]}... (expires: {expiry?.ToString() ?? "session"})");
+    }
+
+    public string? GetCookie(string name)
+    {
+        if (_cookies.TryGetValue(name, out var cookie))
+        {
+            if (cookie.Expiry.HasValue && DateTime.UtcNow > cookie.Expiry.Value)
+            {
+                _cookies.Remove(name);
+                return null;
+            }
+            return cookie.Value;
+        }
+        return null;
+    }
+
+    public void DeleteCookie(string name)
+    {
+        _cookies.Remove(name);
+        Console.WriteLine($"Cookie deleted: {name}");
+    }
+}
+
+// User Repository Interface
+public interface IUserRepository
+{
+    User? GetUserByUsername(string username);
+    User? GetUserByRememberMeToken(string token);
+    void UpdateRememberMeToken(int userId, string? token, DateTime? expiry);
+    bool ValidatePassword(User user, string password);
+}
+
+// In-memory user repository for demonstration
+public class InMemoryUserRepository : IUserRepository
+{
+    private readonly List<User> _users = new()
+    {
+        new User
+        {
+            Id = 1,
+            Username = "john_doe",
+            Email = "john@example.com",
+            PasswordHash = HashPassword("password123")
+        },
+        new User
+        {
+            Id = 2,
+            Username = "jane_smith",
+            Email = "jane@example.com",
+            PasswordHash = HashPassword("securepass456")
+        }
+    };
+
+    private static string HashPassword(string password)
+    {
+        using var sha256 = SHA256.Create();
+        var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password + "salt_value"));
+        return Convert.ToBase64String(bytes);
+    }
+
+    public User? GetUserByUsername(string username)
+    {
+        return _users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public User? GetUserByRememberMeToken(string token)
+    {
+        return _users.FirstOrDefault(u => 
+            u.RememberMeToken == token && 
+            u.RememberMeTokenExpiry.HasValue && 
+            DateTime.UtcNow < u.RememberMeTokenExpiry.Value);
+    }
+
+    public void UpdateRememberMeToken(int userId, string? token, DateTime? expiry)
+    {
+        var user = _users.FirstOrDefault(u => u.Id == userId);
+        if (user != null)
+        {
+            user.RememberMeToken = token;
+            user.RememberMeTokenExpiry = expiry;
+        }
+    }
+
+    public bool ValidatePassword(User user, string password)
+    {
+        var hashedPassword = HashPassword(password);
+        return user.PasswordHash == hashedPassword;
+    }
+}
+
+// Authentication Service
+public class AuthenticationService
+{
+    private readonly IUserRepository _userRepository;
+    private readonly ICookieManager _cookieManager;
+    private const string RememberMeCookieName = "remember_me_token";
+    private const int RememberMeDurationDays = 30;
+
+    public AuthenticationService(IUserRepository userRepository, ICookieManager cookieManager)
+    {
+        _userRepository = userRepository;
+        _cookieManager = cookieManager;
+    }
+
+    // Login with optional "Remember Me" functionality
+    public LoginResult Login(string username, string password, bool rememberMe = false)
+    {
+        Console.WriteLine($"\n=== Login Attempt for: {username} ===");
+
+        // Validate input
+        if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+        {
+            return new LoginResult
+            {
+                Success = false,
+                Message = "Username and password are required."
+            };
+        }
+
+        // Find user
+        var user = _userRepository.GetUserByUsername(username);
+        if (user == null)
+        {
+            return new LoginResult
+            {
+                Success = false,
+                Message = "Invalid username or password."
+            };
+        }
+
+        // Validate password
+        if (!_userRepository.ValidatePassword(user, password))
+        {
+            return new LoginResult
+            {
+                Success = false,
+                Message = "Invalid username or password."
+            };
+        }
+
+        var result = new LoginResult
+        {
+            Success = true,
+            Message = "Login successful.",
+            User = user
+        };
+
+        // Handle "Remember Me" functionality
+        if (rememberMe)
+        {
+            var token = GenerateSecureToken();
+            var expiry = DateTime.UtcNow.AddDays(RememberMeDurationDays);
+
+            // Store token in database
+            _userRepository.UpdateRememberMeToken(user.Id, token, expiry);
+
+            // Create cookie data
+            var cookieData = CreateCookieData(user.Id, token);
+
+            // Set persistent cookie
+            _cookieManager.SetCookie(RememberMeCookieName, cookieData, expiry);
+
+            result.RememberMeToken = token;
+            result.TokenExpiry = expiry;
+
+            Console.WriteLine($"Remember Me token created, expires: {expiry}");
+        }
+
+        Console.WriteLine($"Login successful for user: {user.Username}");
+        return result;
+    }
+
+    // Auto-login using Remember Me cookie
+    public LoginResult AutoLogin()
+    {
+        Console.WriteLine("\n=== Auto-Login Attempt ===");
+
+        var cookieValue = _cookieManager.GetCookie(RememberMeCookieName);
+        if (string.IsNullOrEmpty(cookieValue))
+        {
+            Console.WriteLine("No Remember Me cookie found.");
+            return new LoginResult
+            {
+                Success = false,
+                Message = "No Remember Me cookie found."
+            };
+        }
+
+        // Parse cookie data
+        var (userId, token) = ParseCookieData(cookieValue);
+        if (userId == 0 || string.IsNullOrEmpty(token))
+        {
+            Console.WriteLine("Invalid cookie format.");
+            _cookieManager.DeleteCookie(RememberMeCookieName);
+            return new LoginResult
+            {
+                Success = false,
+                Message = "Invalid Remember Me cookie."
+            };
+        }
+
+        // Find user by token
+        var user = _userRepository.GetUserByRememberMeToken(token);
+        if (user == null || user.Id != userId)
+        {
+            Console.WriteLine("Token not found or expired.");
+            _cookieManager.DeleteCookie(RememberMeCookieName);
+            return new LoginResult
+            {
+                Success = false,
+                Message = "Remember Me token is invalid or expired."
+            };
+        }
+
+        // Rotate token for security (token rotation)
+        var newToken = GenerateSecureToken();
+        var newExpiry = DateTime.UtcNow.AddDays(RememberMeDurationDays);
+
+        _userRepository.UpdateRememberMeToken(user.Id, newToken, newExpiry);
+
+        var newCookieData = CreateCookieData(user.Id, newToken);
+        _cookieManager.SetCookie(RememberMeCookieName, newCookieData, newExpiry);
+
+        Console.WriteLine($"Auto-login successful for user: {user.Username}");
+        Console.WriteLine("Token rotated for security.");
+
+        return new LoginResult
+        {
+            Success = true,
+            Message = "Auto-login successful.",
+            User = user,
+            RememberMeToken = newToken,
+            TokenExpiry = newExpiry
+        };
+    }
+
+    // Logout - clear Remember Me token
+    public void Logout(int userId, bool clearRememberMe = true)
+    {
+        Console.WriteLine($"\n=== Logout for User ID: {userId} ===");
+
+        if (clearRememberMe)
+        {
+            // Remove token from database
+            _userRepository.UpdateRememberMeToken(userId, null, null);
+
+            // Delete cookie
+            _cookieManager.DeleteCookie(RememberMeCookieName);
+
+            Console.WriteLine("Remember Me token cleared.");
+        }
+
+        Console.WriteLine("Logout successful.");
+    }
+
+    // Check if user has valid Remember Me cookie
+    public bool HasValidRememberMeCookie()
+    {
+        var cookieValue = _cookieManager.GetCookie(RememberMeCookieName);
+        if (string.IsNullOrEmpty(cookieValue))
+            return false;
+
+        var (userId, token) = ParseCookieData(cookieValue);
+        if (userId == 0 || string.IsNullOrEmpty(token))
+            return false;
+
+        var user = _userRepository.GetUserByRememberMeToken(token);
+        return user != null && user.Id == userId;
+    }
+
+    // Generate cryptographically secure token
+    private static string GenerateSecureToken()
+    {
+        var tokenBytes = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(tokenBytes);
+        return Convert.ToBase64String(tokenBytes)
+            .Replace("+", "-")
+            .Replace("/", "_")
+            .Replace("=", "");
+    }
+
+    // Create cookie data with HMAC signature
+    private static string CreateCookieData(int userId, string token)
+    {
+        var data = new { UserId = userId, Token = token };
+        var json = JsonSerializer.Serialize(data);
+        var base64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(json));
+        var signature = ComputeHmac(base64);
+        return $"{base64}.{signature}";
+    }
+
+    // Parse and validate cookie data
+    private static (int UserId, string Token) ParseCookieData(string cookieValue)
+    {
+        try
+        {
+            var parts = cookieValue.Split('.');
+            if (parts.Length != 2)
+                return (0, string.Empty);
+
+            var base64Data = parts[0];
+            var signature = parts[1];
+
+            // Verify signature
+            var expectedSignature = ComputeHmac(base64Data);
+            if (!CryptographicEquals(signature, expectedSignature))
+            {
+                Console.WriteLine("Cookie signature validation failed!");
+                return (0, string.Empty);
+            }
+
+            var json = Encoding.UTF8.GetString(Convert.FromBase64String(base64Data));
+            var data = JsonSerializer.Deserialize<JsonElement>(json);
+
+            var userId = data.GetProperty("UserId").GetInt32();
+            var token = data.GetProperty("Token").GetString() ?? string.Empty;
+
+            return (userId, token);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error parsing cookie: {ex.Message}");
+            return (0, string.Empty);
+        }
+    }
+
+    // Compute HMAC for cookie integrity
+    private static string ComputeHmac(string data)
+    {
+        var key = Encoding.UTF8.GetBytes("your-secret-key-should-be-stored-securely");
+        using var hmac = new HMACSHA256(key);
+        var hash = hmac.ComputeHash(Encoding.UTF8.GetBytes(data));
+        return Convert.ToBase64String(hash)
+            .Replace("+", "-")
+            .Replace("/", "_")
+            .Replace("=", "");
+    }
+
+    // Constant-time string comparison to prevent timing attacks
+    private static bool CryptographicEquals(string a, string b)
+    {
+        if (a.Length != b.Length)
+            return false;
+
+        var result = 0;
+        for (var i = 0; i < a.Length; i++)
+            result |= a[i] ^ b[i];
+
+        return result == 0;
+    }
+}
+
+// Demo Program
+class Program
+{
+    static void Main(string[] args)
+    {
+        Console.WriteLine("=== Remember Me Authentication Demo ===\n");
+
+        var userRepository = new InMemoryUserRepository();
+        var cookieManager = new InMemoryCookieManager();
+        var authService = new AuthenticationService(userRepository, cookieManager);
+
+        // Test 1: Login without Remember Me
+        Console.WriteLine("--- Test 1: Login without Remember Me ---");
+        var result1 = authService.Login("john_doe", "password123", rememberMe: false);
+        Console.WriteLine($"Result: {result1.Message}");
+        Console.WriteLine($"Has valid cookie: {authService.HasValidRememberMeCookie()}");
+
+        // Test 2: Login with Remember Me
+        Console.WriteLine("\n--- Test 2: Login with Remember Me ---");
+        var result2 = authService.Login("jane_smith", "securepass456", rememberMe: true);
+        Console.WriteLine($"Result: {result2.Message}");
+        Console.WriteLine($"Token expires: {result2.TokenExpiry}");
+        Console.WriteLine($"Has valid cookie: {authService.HasValidRememberMeCookie()}");
+
+        // Test 3: Auto-login using Remember Me cookie
+        Console.WriteLine("\n--- Test 3: Auto-login with Remember Me cookie ---");
+        var autoLoginResult = authService.AutoLogin();
+        Console.WriteLine($"Result: {autoLoginResult.Message}");
+        if (autoLoginResult.Success)
+        {
+            Console.WriteLine($"Auto-logged in as: {autoLoginResult.User?.Username}");
+        }
+
+        // Test 4: Invalid credentials
+        Console.WriteLine("\n--- Test 4: Invalid credentials ---");
+        var result4 = authService.Login("john_doe", "wrongpassword", rememberMe: true);
+        Console.WriteLine($"Result: {result4.Message}");
+
+        // Test 5: Logout with Remember Me cleanup
+        Console.WriteLine("\n--- Test 5: Logout with Remember Me cleanup ---");
+        if (autoLoginResult.User != null)
+        {
+            authService.Logout(autoLoginResult.User.Id, clearRememberMe: true);
+            Console.WriteLine($"Has valid cookie after logout: {authService.HasValidRememberMeCookie()}");
+        }
+
+        // Test 6: Auto-login after logout (should fail)
+        Console.WriteLine("\n--- Test 6: Auto-login after logout (should fail) ---");
+        var failedAutoLogin = authService.AutoLogin();
+        Console.WriteLine($"Result: {failedAutoLogin.Message}");
+
+        Console.WriteLine("\n=== Demo Complete ===");
+    }
+}
+```
