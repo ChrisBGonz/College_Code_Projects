@@ -1,0 +1,355 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+
+const client = new Anthropic();
+
+// Circuit Breaker States
+const CircuitState = {
+  CLOSED: "CLOSED", // Normal operation
+  OPEN: "OPEN", // Circuit is open, requests blocked
+  HALF_OPEN: "HALF_OPEN", // Testing if backend is recovered
+};
+
+// Circuit Breaker Implementation
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 60000; // 60 seconds
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.requestHistory = [];
+  }
+
+  async execute(request) {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() - this.lastFailureTime >= this.timeout) {
+        this.state = CircuitState.HALF_OPEN;
+        console.log("Circuit Breaker: Moving to HALF_OPEN state");
+      } else {
+        throw new Error(
+          `Circuit Breaker is OPEN. Backend is unavailable. Retry after ${Math.ceil((this.timeout - (Date.now() - this.lastFailureTime)) / 1000)} seconds`
+        );
+      }
+    }
+
+    try {
+      const result = await request();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0;
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount++;
+      if (this.successCount >= this.successThreshold) {
+        this.state = CircuitState.CLOSED;
+        this.successCount = 0;
+        console.log("Circuit Breaker: Moving to CLOSED state - Backend recovered!");
+      }
+    }
+    this.requestHistory.push({
+      timestamp: new Date().toISOString(),
+      status: "SUCCESS",
+      state: this.state,
+    });
+  }
+
+  onFailure() {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    this.successCount = 0;
+
+    this.requestHistory.push({
+      timestamp: new Date().toISOString(),
+      status: "FAILURE",
+      state: this.state,
+    });
+
+    if (
+      this.state === CircuitState.HALF_OPEN ||
+      this.failureCount >= this.failureThreshold
+    ) {
+      this.state = CircuitState.OPEN;
+      console.log(
+        `Circuit Breaker: Moving to OPEN state after ${this.failureCount} failures`
+      );
+    }
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime
+        ? new Date(this.lastFailureTime).toISOString()
+        : null,
+      recentHistory: this.requestHistory.slice(-10),
+    };
+  }
+}
+
+// AI-Powered Circuit Breaker Advisor using Claude
+async function getCircuitBreakerAdvice(circuitBreaker, errorLog) {
+  const status = circuitBreaker.getStatus();
+
+  const conversationHistory = [];
+
+  // Initial system context
+  conversationHistory.push({
+    role: "user",
+    content: `You are a Circuit Breaker Pattern expert for frontend applications. 
+    
+Current Circuit Breaker Status:
+- State: ${status.state}
+- Failure Count: ${status.failureCount}
+- Success Count: ${status.successCount}
+- Last Failure: ${status.lastFailureTime || "None"}
+- Recent History: ${JSON.stringify(status.recentHistory, null, 2)}
+
+Error Log: ${errorLog}
+
+Please analyze this situation and provide:
+1. What is happening with the backend?
+2. Should we adjust the circuit breaker settings?
+3. What should the frontend do while the circuit is open?
+4. When should we expect recovery?`,
+  });
+
+  console.log("\n🤖 Consulting AI Circuit Breaker Advisor...\n");
+
+  // First response - Analysis
+  const analysisResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: conversationHistory,
+  });
+
+  const analysisText =
+    analysisResponse.content[0].type === "text"
+      ? analysisResponse.content[0].text
+      : "";
+
+  console.log("📊 Initial Analysis:");
+  console.log(analysisText);
+
+  conversationHistory.push({
+    role: "assistant",
+    content: analysisText,
+  });
+
+  // Follow-up question about recovery strategies
+  conversationHistory.push({
+    role: "user",
+    content:
+      "Based on this analysis, what specific recovery strategies should we implement? Please provide code examples for the frontend.",
+  });
+
+  const strategyResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: conversationHistory,
+  });
+
+  const strategyText =
+    strategyResponse.content[0].type === "text"
+      ? strategyResponse.content[0].text
+      : "";
+
+  console.log("\n💡 Recovery Strategies:");
+  console.log(strategyText);
+
+  conversationHistory.push({
+    role: "assistant",
+    content: strategyText,
+  });
+
+  // Final question about monitoring
+  conversationHistory.push({
+    role: "user",
+    content:
+      "What metrics should we monitor to prevent this situation in the future? Give me a brief summary.",
+  });
+
+  const monitoringResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 512,
+    messages: conversationHistory,
+  });
+
+  const monitoringText =
+    monitoringResponse.content[0].type === "text"
+      ? monitoringResponse.content[0].text
+      : "";
+
+  console.log("\n📈 Monitoring Recommendations:");
+  console.log(monitoringText);
+
+  return {
+    analysis: analysisText,
+    strategies: strategyText,
+    monitoring: monitoringText,
+  };
+}
+
+// Simulate Backend API calls
+async function simulateBackendCall(shouldFail = false, delay = 100) {
+  return new Promise((resolve, reject) => {
+    setTimeout(() => {
+      if (shouldFail) {
+        reject(new Error("Backend service unavailable: Connection timeout"));
+      } else {
+        resolve({ data: "Success response from backend", timestamp: new Date().toISOString() });
+      }
+    }, delay);
+  });
+}
+
+// Frontend API Service with Circuit Breaker
+class FrontendAPIService {
+  constructor() {
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: 3,
+      successThreshold: 2,
+      timeout: 30000, // 30 seconds for demo
+    });
+    this.errorLog = [];
+  }
+
+  async fetchData(endpoint, shouldFail = false) {
+    try {
+      const result = await this.circuitBreaker.execute(() =>
+        simulateBackendCall(shouldFail)
+      );
+
+      console.log(`✅ Request to ${endpoint} succeeded:`, result.data);
+      return result;
+    } catch (error) {
+      const errorEntry = {
+        timestamp: new Date().toISOString(),
+        endpoint,
+        error: error.message,
+        circuitState: this.circuitBreaker.state,
+      };
+
+      this.errorLog.push(errorEntry);
+      console.error(`❌ Request to ${endpoint} failed:`, error.message);
+
+      // If circuit is open, show user-friendly message
+      if (this.circuitBreaker.state === CircuitState.OPEN) {
+        console.log(
+          "🔴 Circuit Breaker is OPEN - Showing cached data or error page to user"
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  getErrorLog() {
+    return this.errorLog.slice(-20); // Last 20 errors
+  }
+}
+
+// Main Demo
+async function runCircuitBreakerDemo() {
+  console.log("🚀 Circuit Breaker Pattern Demo\n");
+  console.log("=".repeat(50));
+
+  const apiService = new FrontendAPIService();
+
+  // Phase 1: Normal operation
+  console.log("\n📡 Phase 1: Normal Backend Operation");
+  console.log("-".repeat(40));
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      await apiService.fetchData("/api/users", false);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch (error) {
+      // Continue
+    }
+  }
+
+  // Phase 2: Backend starts failing
+  console.log("\n⚠️  Phase 2: Backend Starting to Fail");
+  console.log("-".repeat(40));
+
+  for (let i = 0; i < 5; i++) {
+    try {
+      await apiService.fetchData("/api/users", true);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } catch (error) {
+      // Continue
+    }
+  }
+
+  // Phase 3: Circuit is open, requests blocked
+  console.log("\n🔴 Phase 3: Circuit Open - Requests Blocked");
+  console.log("-".repeat(40));
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      await apiService.fetchData("/api/users", false);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    } catch (error) {
+      // Continue
+    }
+  }
+
+  // Show Circuit Breaker Status
+  console.log("\n📊 Circuit Breaker Status:");
+  console.log(JSON.stringify(apiService.circuitBreaker.getStatus(), null, 2));
+
+  // Get AI Advice
+  const errorLogString = JSON.stringify(apiService.getErrorLog(), null, 2);
+
+  try {
+    const advice = await getCircuitBreakerAdvice(
+      apiService.circuitBreaker,
+      errorLogString
+    );
+
+    console.log("\n" + "=".repeat(50));
+    console.log("✅ Circuit Breaker Analysis Complete!");
+    console.log(
+      "The AI advisor has provided recommendations for handling the backend failure."
+    );
+  } catch (error) {
+    console.error("Error getting AI advice:", error.message);
+  }
+
+  // Phase 4: Simulate recovery
+  console.log("\n🟡 Phase 4: Simulating Backend Recovery (after timeout)");
+  console.log("-".repeat(40));
+
+  // Manually set to HALF_OPEN for demo
+  apiService.circuitBreaker.state = CircuitState.HALF_OPEN;
+  apiService.circuitBreaker.lastFailureTime =
+    Date.now() - apiService.circuitBreaker.timeout;
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      await apiService.fetchData("/api/users", false);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    } catch (error) {
+      // Continue
+    }
+  }
+
+  console.log("\n📊 Final Circuit Breaker Status:");
+  console.log(JSON.stringify(apiService.circuitBreaker.getStatus(), null, 2));
+}
+
+// Run the demo
+runCircuitBreakerDemo().catch(console.error);
+```

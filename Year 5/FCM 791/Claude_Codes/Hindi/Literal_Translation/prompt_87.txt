@@ -1,0 +1,272 @@
+
+```python
+import anthropic
+import time
+import re
+import os
+import tempfile
+import threading
+from datetime import datetime, timedelta
+from collections import deque
+
+# Initialize the Anthropic client
+client = anthropic.Anthropic()
+
+# Store failed login timestamps
+failed_login_times = deque()
+alert_sent = False
+last_alert_time = None
+
+def analyze_log_with_claude(log_content: str, failed_count: int) -> str:
+    """Use Claude to analyze the log content and provide security insights."""
+    
+    prompt = f"""आपको एक सुरक्षा विश्लेषक के रूप में कार्य करना है। 
+    
+निम्नलिखित लॉग डेटा का विश्लेषण करें:
+
+{log_content}
+
+पिछले 1 मिनट में {failed_count} Failed Login प्रयास पाए गए हैं।
+
+कृपया निम्नलिखित जानकारी प्रदान करें:
+1. यह कितना गंभीर खतरा है?
+2. संभावित कारण क्या हो सकते हैं?
+3. तुरंत क्या कदम उठाने चाहिए?
+4. भविष्य में इसे रोकने के लिए क्या करें?
+
+हिंदी में जवाब दें।"""
+
+    print("\n🤖 Claude AI सुरक्षा विश्लेषण:")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    # Use streaming for real-time response
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    return full_response
+
+def check_failed_logins(log_line: str, current_time: datetime) -> bool:
+    """Check if the log line contains a failed login attempt."""
+    failed_patterns = [
+        r'Failed Login',
+        r'Failed login',
+        r'failed login',
+        r'FAILED LOGIN',
+        r'Authentication failed',
+        r'Login failed',
+        r'Invalid password',
+        r'Wrong password'
+    ]
+    
+    for pattern in failed_patterns:
+        if re.search(pattern, log_line, re.IGNORECASE):
+            return True
+    return False
+
+def monitor_log_file(log_file_path: str, check_interval: float = 1.0):
+    """Monitor the log file for failed login attempts."""
+    global failed_login_times, alert_sent, last_alert_time
+    
+    print(f"📊 लॉग फ़ाइल की निगरानी शुरू: {log_file_path}")
+    print(f"⏰ जाँच अंतराल: {check_interval} सेकंड")
+    print(f"🚨 अलर्ट सीमा: 1 मिनट में 10 से अधिक Failed Login")
+    print("=" * 60)
+    
+    # Track file position
+    file_position = 0
+    recent_logs = []
+    
+    while True:
+        try:
+            # Check if file exists
+            if not os.path.exists(log_file_path):
+                print(f"⚠️  लॉग फ़ाइल नहीं मिली: {log_file_path}")
+                time.sleep(check_interval)
+                continue
+            
+            # Read new lines from the log file
+            with open(log_file_path, 'r', encoding='utf-8') as f:
+                f.seek(file_position)
+                new_lines = f.readlines()
+                file_position = f.tell()
+            
+            current_time = datetime.now()
+            
+            # Process new lines
+            for line in new_lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Check for failed login
+                if check_failed_logins(line, current_time):
+                    failed_login_times.append(current_time)
+                    recent_logs.append(line)
+                    print(f"🔴 Failed Login पाया: {line[:100]}...")
+                
+                # Keep only last 50 log lines for analysis
+                if len(recent_logs) > 50:
+                    recent_logs.pop(0)
+            
+            # Remove timestamps older than 1 minute
+            one_minute_ago = current_time - timedelta(minutes=1)
+            while failed_login_times and failed_login_times[0] < one_minute_ago:
+                failed_login_times.popleft()
+            
+            # Check if threshold exceeded
+            failed_count = len(failed_login_times)
+            
+            if failed_count > 10:
+                # Check if we should send a new alert (avoid spam)
+                should_alert = False
+                if last_alert_time is None:
+                    should_alert = True
+                elif (current_time - last_alert_time).seconds >= 60:
+                    should_alert = True
+                
+                if should_alert:
+                    print("\n" + "🚨" * 20)
+                    print("⚠️  चेतावनी: सुरक्षा खतरा पाया गया!")
+                    print(f"📈 पिछले 1 मिनट में {failed_count} Failed Login प्रयास!")
+                    print(f"⏰ समय: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print("🚨" * 20)
+                    
+                    # Analyze with Claude
+                    log_content = "\n".join(recent_logs[-20:]) if recent_logs else "कोई लॉग उपलब्ध नहीं"
+                    analyze_log_with_claude(log_content, failed_count)
+                    
+                    last_alert_time = current_time
+                    alert_sent = True
+            
+            # Show status every 10 seconds
+            if int(time.time()) % 10 == 0:
+                print(f"✅ स्थिति: {current_time.strftime('%H:%M:%S')} | "
+                      f"पिछले 1 मिनट में Failed Logins: {failed_count}/10")
+            
+            time.sleep(check_interval)
+            
+        except KeyboardInterrupt:
+            print("\n\n⛔ निगरानी बंद की गई।")
+            break
+        except Exception as e:
+            print(f"❌ त्रुटि: {e}")
+            time.sleep(check_interval)
+
+def generate_test_logs(log_file_path: str):
+    """Generate test log entries to simulate failed logins."""
+    print(f"\n🔧 परीक्षण लॉग फ़ाइल बना रहे हैं: {log_file_path}")
+    
+    # Create initial log file
+    with open(log_file_path, 'w', encoding='utf-8') as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] System started\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log monitoring initialized\n")
+    
+    print("✅ लॉग फ़ाइल बनाई गई")
+    
+    # Simulate log entries in a separate thread
+    def add_log_entries():
+        time.sleep(3)  # Wait for monitor to start
+        
+        print("\n📝 परीक्षण लॉग प्रविष्टियाँ जोड़ रहे हैं...")
+        
+        # Add some normal entries
+        for i in range(3):
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                       f"User 'admin' logged in successfully from 192.168.1.{i+1}\n")
+            time.sleep(1)
+        
+        print("✅ सामान्य लॉगिन प्रविष्टियाँ जोड़ी गईं")
+        time.sleep(2)
+        
+        # Add failed login attempts (more than 10 in a minute)
+        print("🔴 Failed Login प्रयास सिमुलेट कर रहे हैं...")
+        
+        ip_addresses = [
+            "10.0.0.1", "10.0.0.2", "192.168.100.50", 
+            "172.16.0.1", "10.10.10.10", "192.168.1.100",
+            "10.0.0.5", "172.16.1.1", "192.168.2.50",
+            "10.0.1.1", "172.16.2.1", "192.168.3.50"
+        ]
+        
+        usernames = ["admin", "root", "user", "test", "administrator", 
+                    "guest", "oracle", "postgres", "mysql", "ftp",
+                    "www", "backup"]
+        
+        for i in range(15):  # Add 15 failed logins
+            ip = ip_addresses[i % len(ip_addresses)]
+            username = usernames[i % len(usernames)]
+            
+            with open(log_file_path, 'a', encoding='utf-8') as f:
+                f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                       f"Failed Login attempt for user '{username}' from {ip} "
+                       f"- Invalid password (attempt {i+1})\n")
+            
+            print(f"  ➕ Failed Login #{i+1} जोड़ा: {username}@{ip}")
+            time.sleep(2)  # Add entries every 2 seconds
+        
+        print("\n✅ सभी परीक्षण प्रविष्टियाँ जोड़ी गईं")
+        print("📊 अब निगरानी जारी रहेगी... (Ctrl+C दबाएँ बंद करने के लिए)")
+    
+    # Start log generation in background
+    log_thread = threading.Thread(target=add_log_entries, daemon=True)
+    log_thread.start()
+    
+    return log_file_path
+
+def main():
+    """Main function to run the log monitor."""
+    print("=" * 60)
+    print("🛡️  लॉग फ़ाइल सुरक्षा निगरानी प्रणाली")
+    print("   (Log File Security Monitoring System)")
+    print("=" * 60)
+    
+    # Create a temporary log file for testing
+    temp_dir = tempfile.gettempdir()
+    log_file_path = os.path.join(temp_dir, "security_monitor_test.log")
+    
+    print(f"\n📁 लॉग फ़ाइल पथ: {log_file_path}")
+    print("\nविकल्प:")
+    print("1. परीक्षण मोड (स्वचालित लॉग प्रविष्टियाँ)")
+    print("2. वास्तविक लॉग फ़ाइल निगरानी")
+    
+    choice = input("\nविकल्प चुनें (1 या 2): ").strip()
+    
+    if choice == "2":
+        custom_path = input("लॉग फ़ाइल का पूरा पथ दर्ज करें: ").strip()
+        if custom_path:
+            log_file_path = custom_path
+        
+        if not os.path.exists(log_file_path):
+            print(f"❌ फ़ाइल नहीं मिली: {log_file_path}")
+            return
+        
+        print(f"\n✅ वास्तविक लॉग फ़ाइल निगरानी शुरू: {log_file_path}")
+        monitor_log_file(log_file_path)
+    else:
+        # Test mode - generate test logs
+        generate_test_logs(log_file_path)
+        
+        print("\n🚀 निगरानी शुरू हो रही है...")
+        print("💡 टिप: Ctrl+C दबाएँ बंद करने के लिए\n")
+        
+        # Start monitoring
+        monitor_log_file(log_file_path, check_interval=1.0)
+
+if __name__ == "__main__":
+    main()
+```

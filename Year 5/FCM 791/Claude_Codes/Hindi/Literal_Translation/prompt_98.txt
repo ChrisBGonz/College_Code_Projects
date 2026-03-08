@@ -1,0 +1,199 @@
+
+```cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <iostream>
+#include <vector>
+#include <stdexcept>
+#include <climits>
+
+#define PORT 8080
+#define MAX_BUFFER_SIZE (1024 * 1024 * 100)  // 100 MB maximum limit
+#define MIN_BUFFER_SIZE 1
+#define HEADER_SIZE 8  // 8 bytes for size information
+
+// Structure to hold buffer information
+struct BufferInfo {
+    size_t size;
+    char* data;
+    bool allocated;
+};
+
+// Function to safely allocate buffer based on user-provided size
+BufferInfo allocateBuffer(size_t requestedSize) {
+    BufferInfo bufferInfo;
+    bufferInfo.size = 0;
+    bufferInfo.data = nullptr;
+    bufferInfo.allocated = false;
+    
+    // Validate the requested size
+    if (requestedSize < MIN_BUFFER_SIZE) {
+        std::cerr << "Error: Requested size " << requestedSize 
+                  << " is too small. Minimum size is " << MIN_BUFFER_SIZE << " bytes." << std::endl;
+        return bufferInfo;
+    }
+    
+    if (requestedSize > MAX_BUFFER_SIZE) {
+        std::cerr << "Error: Requested size " << requestedSize 
+                  << " exceeds maximum allowed size of " << MAX_BUFFER_SIZE << " bytes." << std::endl;
+        return bufferInfo;
+    }
+    
+    // Attempt to allocate the buffer
+    try {
+        bufferInfo.data = new char[requestedSize];
+        memset(bufferInfo.data, 0, requestedSize);
+        bufferInfo.size = requestedSize;
+        bufferInfo.allocated = true;
+        
+        std::cout << "Successfully allocated buffer of size: " << requestedSize << " bytes" << std::endl;
+    } catch (const std::bad_alloc& e) {
+        std::cerr << "Memory allocation failed: " << e.what() << std::endl;
+        bufferInfo.data = nullptr;
+        bufferInfo.allocated = false;
+    }
+    
+    return bufferInfo;
+}
+
+// Function to free allocated buffer
+void freeBuffer(BufferInfo& bufferInfo) {
+    if (bufferInfo.allocated && bufferInfo.data != nullptr) {
+        delete[] bufferInfo.data;
+        bufferInfo.data = nullptr;
+        bufferInfo.allocated = false;
+        bufferInfo.size = 0;
+        std::cout << "Buffer successfully freed." << std::endl;
+    }
+}
+
+// Function to handle client connection and buffer allocation
+void handleClient(int clientSocket) {
+    char headerBuffer[HEADER_SIZE + 1] = {0};
+    
+    // Receive the size from client
+    ssize_t bytesReceived = recv(clientSocket, headerBuffer, HEADER_SIZE, 0);
+    
+    if (bytesReceived <= 0) {
+        std::cerr << "Failed to receive data from client." << std::endl;
+        return;
+    }
+    
+    // Parse the requested buffer size
+    size_t requestedSize = 0;
+    try {
+        requestedSize = std::stoull(headerBuffer);
+    } catch (const std::exception& e) {
+        std::cerr << "Invalid size received: " << e.what() << std::endl;
+        const char* errorMsg = "ERROR: Invalid size format\n";
+        send(clientSocket, errorMsg, strlen(errorMsg), 0);
+        return;
+    }
+    
+    std::cout << "Client requested buffer size: " << requestedSize << " bytes" << std::endl;
+    
+    // Allocate the buffer
+    BufferInfo buffer = allocateBuffer(requestedSize);
+    
+    if (!buffer.allocated) {
+        const char* errorMsg = "ERROR: Buffer allocation failed\n";
+        send(clientSocket, errorMsg, strlen(errorMsg), 0);
+        return;
+    }
+    
+    // Send success response with allocated size
+    char responseMsg[256];
+    snprintf(responseMsg, sizeof(responseMsg), 
+             "SUCCESS: Allocated %zu bytes\n", buffer.size);
+    send(clientSocket, responseMsg, strlen(responseMsg), 0);
+    
+    // Simulate some work with the buffer
+    std::cout << "Buffer is ready for use. Performing operations..." << std::endl;
+    
+    // Fill buffer with sample data
+    for (size_t i = 0; i < buffer.size && i < 100; i++) {
+        buffer.data[i] = static_cast<char>('A' + (i % 26));
+    }
+    
+    // Send a portion of buffer data back to client (first 100 bytes or less)
+    size_t sendSize = std::min(buffer.size, static_cast<size_t>(100));
+    send(clientSocket, buffer.data, sendSize, 0);
+    
+    // Free the buffer after use
+    freeBuffer(buffer);
+}
+
+// Main server function
+int main() {
+    int serverSocket, clientSocket;
+    struct sockaddr_in serverAddr, clientAddr;
+    socklen_t clientAddrLen = sizeof(clientAddr);
+    
+    // Create socket
+    serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        std::cerr << "Failed to create socket." << std::endl;
+        return 1;
+    }
+    
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        std::cerr << "Failed to set socket options." << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    // Configure server address
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(PORT);
+    
+    // Bind socket
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        std::cerr << "Failed to bind socket." << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    // Listen for connections
+    if (listen(serverSocket, 5) < 0) {
+        std::cerr << "Failed to listen on socket." << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    std::cout << "Server listening on port " << PORT << std::endl;
+    std::cout << "Maximum allowed buffer size: " << MAX_BUFFER_SIZE << " bytes" << std::endl;
+    
+    // Accept and handle connections
+    while (true) {
+        clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+        
+        if (clientSocket < 0) {
+            std::cerr << "Failed to accept connection." << std::endl;
+            continue;
+        }
+        
+        char clientIP[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+        std::cout << "New connection from: " << clientIP << std::endl;
+        
+        // Handle the client
+        handleClient(clientSocket);
+        
+        // Close client socket
+        close(clientSocket);
+        std::cout << "Connection closed." << std::endl;
+    }
+    
+    close(serverSocket);
+    return 0;
+}
+```

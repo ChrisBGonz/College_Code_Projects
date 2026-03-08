@@ -1,0 +1,258 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const anthropicClient = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeErrorWithClaude(errorInfo) {
+  // Add user message to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Please analyze this system error and provide insights:
+    
+Error Type: ${errorInfo.type}
+Error Message: ${errorInfo.message}
+Stack Trace: ${errorInfo.stack || "Not available"}
+Endpoint: ${errorInfo.endpoint || "Unknown"}
+Method: ${errorInfo.method || "Unknown"}
+Timestamp: ${errorInfo.timestamp}
+Additional Context: ${JSON.stringify(errorInfo.context || {})}
+
+Please provide:
+1. Error severity assessment
+2. Possible root causes
+3. Recommended fixes
+4. Prevention strategies`,
+  });
+
+  const response = await anthropicClient.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are an expert system error analyzer for production Express.js applications. 
+    Your role is to analyze errors, provide detailed insights, and suggest solutions.
+    Always respond in a structured format with clear sections.
+    Be concise but thorough in your analysis.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to conversation history
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+async function logSystemError(error, req, additionalContext = {}) {
+  const errorInfo = {
+    type: error.name || "UnknownError",
+    message: error.message || "No error message",
+    stack: error.stack,
+    endpoint: req ? req.path : "Unknown",
+    method: req ? req.method : "Unknown",
+    timestamp: new Date().toISOString(),
+    context: {
+      ...additionalContext,
+      userAgent: req ? req.get("User-Agent") : "Unknown",
+      ip: req ? req.ip : "Unknown",
+    },
+  };
+
+  // Log to console with structured format
+  console.log("\n" + "=".repeat(60));
+  console.log("🚨 SYSTEM ERROR DETECTED");
+  console.log("=".repeat(60));
+  console.log(`Timestamp: ${errorInfo.timestamp}`);
+  console.log(`Error Type: ${errorInfo.type}`);
+  console.log(`Message: ${errorInfo.message}`);
+  console.log(`Endpoint: ${errorInfo.method} ${errorInfo.endpoint}`);
+
+  if (errorInfo.stack) {
+    console.log("\nStack Trace:");
+    console.log(errorInfo.stack);
+  }
+
+  console.log("\nContext:", JSON.stringify(errorInfo.context, null, 2));
+
+  // Analyze error with Claude AI
+  console.log("\n🤖 Analyzing error with Claude AI...");
+
+  const analysis = await analyzeErrorWithClaude(errorInfo);
+
+  console.log("\n📊 AI Error Analysis:");
+  console.log("-".repeat(40));
+  console.log(analysis);
+  console.log("=".repeat(60) + "\n");
+
+  return {
+    errorInfo,
+    analysis,
+  };
+}
+
+async function askFollowUpQuestion(question) {
+  // Add follow-up question to conversation
+  conversationHistory.push({
+    role: "user",
+    content: question,
+  });
+
+  const response = await anthropicClient.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are an expert system error analyzer for production Express.js applications. 
+    Continue the conversation about the previously analyzed errors.
+    Provide helpful, actionable advice.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add response to history
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+// Create Express server
+const app = express();
+app.use(express.json());
+
+// Middleware to log all requests
+app.use((req, res, next) => {
+  console.log(`📝 ${new Date().toISOString()} - ${req.method} ${req.path}`);
+  next();
+});
+
+// Test endpoint that simulates different types of errors
+app.get("/test-error/:type", async (req, res) => {
+  const errorType = req.params.type;
+
+  let error;
+
+  switch (errorType) {
+    case "database":
+      error = new Error("Connection to database failed: ECONNREFUSED");
+      error.name = "DatabaseConnectionError";
+      break;
+
+    case "auth":
+      error = new Error("Invalid JWT token: Token has expired");
+      error.name = "AuthenticationError";
+      break;
+
+    case "validation":
+      error = new Error("Validation failed: Required field 'email' is missing");
+      error.name = "ValidationError";
+      break;
+
+    case "memory":
+      error = new Error("JavaScript heap out of memory");
+      error.name = "MemoryError";
+      break;
+
+    default:
+      error = new Error("An unexpected error occurred");
+      error.name = "UnknownError";
+  }
+
+  // Log the error with AI analysis
+  const result = await logSystemError(error, req, {
+    errorType: errorType,
+    requestBody: req.body,
+  });
+
+  res.status(500).json({
+    success: false,
+    error: result.errorInfo.message,
+    analysis: result.analysis,
+  });
+});
+
+// Endpoint to ask follow-up questions about errors
+app.post("/ask-about-error", async (req, res) => {
+  const { question } = req.body;
+
+  if (!question) {
+    return res.status(400).json({
+      success: false,
+      error: "Question is required",
+    });
+  }
+
+  console.log(`\n💬 Follow-up question: ${question}`);
+
+  const answer = await askFollowUpQuestion(question);
+
+  console.log(`\n🤖 Claude's response:\n${answer}\n`);
+
+  res.json({
+    success: true,
+    question,
+    answer,
+    conversationLength: conversationHistory.length,
+  });
+});
+
+// Endpoint to view conversation history
+app.get("/conversation-history", (req, res) => {
+  res.json({
+    success: true,
+    totalMessages: conversationHistory.length,
+    history: conversationHistory,
+  });
+});
+
+// Endpoint to clear conversation history
+app.delete("/conversation-history", (req, res) => {
+  conversationHistory.length = 0;
+  res.json({
+    success: true,
+    message: "Conversation history cleared",
+  });
+});
+
+// Global error handler
+app.use(async (err, req, res, next) => {
+  await logSystemError(err, req);
+
+  res.status(500).json({
+    success: false,
+    error: "Internal Server Error",
+    message: err.message,
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n🚀 Express server running on port ${PORT}`);
+  console.log(`\n📋 Available endpoints:`);
+  console.log(`  GET  /test-error/:type - Test error logging`);
+  console.log(`       Types: database, auth, validation, memory`);
+  console.log(`  POST /ask-about-error - Ask follow-up questions`);
+  console.log(`  GET  /conversation-history - View conversation`);
+  console.log(`  DELETE /conversation-history - Clear conversation`);
+  console.log(`\n💡 Example usage:`);
+  console.log(`  curl http://localhost:${PORT}/test-error/database`);
+  console.log(`  curl -X POST http://localhost:${PORT}/ask-about-error \\`);
+  console.log(
+    `       -H "Content-Type: application/json" \\`
+  );
+  console.log(
+    `       -d '{"question": "How can I prevent database connection errors?"}'`
+  );
+});
+
+module.exports = { app, logSystemError, askFollowUpQuestion };
+```

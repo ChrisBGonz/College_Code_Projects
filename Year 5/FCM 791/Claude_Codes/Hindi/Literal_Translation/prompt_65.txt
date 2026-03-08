@@ -1,0 +1,789 @@
+<?php
+session_start();
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_NAME', 'user_auth');
+
+// Create database connection
+function getDBConnection() {
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+    if ($conn->connect_error) {
+        die("Connection failed: " . $conn->connect_error);
+    }
+    return $conn;
+}
+
+// Security functions
+function sanitizeInput($data) {
+    return htmlspecialchars(strip_tags(trim($data)));
+}
+
+function generateCSRFToken() {
+    if (!isset($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function validateCSRFToken($token) {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function generateResetToken() {
+    return bin2hex(random_bytes(32));
+}
+
+// Rate limiting
+function checkRateLimit($identifier) {
+    if (!isset($_SESSION['rate_limit'])) {
+        $_SESSION['rate_limit'] = [];
+    }
+    
+    $key = 'recovery_' . md5($identifier);
+    $currentTime = time();
+    $windowTime = 900; // 15 minutes
+    $maxAttempts = 5;
+    
+    if (!isset($_SESSION['rate_limit'][$key])) {
+        $_SESSION['rate_limit'][$key] = ['count' => 0, 'first_attempt' => $currentTime];
+    }
+    
+    $rateData = &$_SESSION['rate_limit'][$key];
+    
+    // Reset window if expired
+    if ($currentTime - $rateData['first_attempt'] > $windowTime) {
+        $rateData = ['count' => 0, 'first_attempt' => $currentTime];
+    }
+    
+    if ($rateData['count'] >= $maxAttempts) {
+        $remainingTime = $windowTime - ($currentTime - $rateData['first_attempt']);
+        return ['allowed' => false, 'remaining_time' => $remainingTime];
+    }
+    
+    $rateData['count']++;
+    return ['allowed' => true, 'remaining_time' => 0];
+}
+
+// Step 1: Find user by username/email
+function findUser($identifier) {
+    $conn = getDBConnection();
+    $stmt = $conn->prepare("SELECT id, username, email, security_question, security_answer_hash FROM users WHERE username = ? OR email = ?");
+    $stmt->bind_param("ss", $identifier, $identifier);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $user = $result->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    return $user;
+}
+
+// Step 2: Verify security answer
+function verifySecurityAnswer($userId, $answer) {
+    $conn = getDBConnection();
+    $stmt = $conn->prepare("SELECT security_answer_hash FROM users WHERE id = ?");
+    $stmt->bind_param("i", $userId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $user = $result->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    
+    if (!$user) {
+        return false;
+    }
+    
+    // Normalize answer: lowercase and trim
+    $normalizedAnswer = strtolower(trim($answer));
+    return password_verify($normalizedAnswer, $user['security_answer_hash']);
+}
+
+// Step 3: Create password reset token
+function createResetToken($userId) {
+    $conn = getDBConnection();
+    $token = generateResetToken();
+    $hashedToken = hash('sha256', $token);
+    $expiry = date('Y-m-d H:i:s', time() + 3600); // 1 hour expiry
+    
+    // Delete existing tokens for this user
+    $stmt = $conn->prepare("DELETE FROM password_reset_tokens WHERE user_id = ?");
+    $stmt->bind_param("i", $userId);
+    $stmt->execute();
+    $stmt->close();
+    
+    // Insert new token
+    $stmt = $conn->prepare("INSERT INTO password_reset_tokens (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, NOW())");
+    $stmt->bind_param("iss", $userId, $hashedToken, $expiry);
+    $stmt->execute();
+    $stmt->close();
+    $conn->close();
+    
+    return $token;
+}
+
+// Step 4: Reset password
+function resetPassword($token, $newPassword) {
+    $conn = getDBConnection();
+    $hashedToken = hash('sha256', $token);
+    
+    $stmt = $conn->prepare("SELECT user_id, expires_at FROM password_reset_tokens WHERE token_hash = ? AND used = 0");
+    $stmt->bind_param("s", $hashedToken);
+    $stmt->execute();
+    $result = $stmt->get_result();
+    $tokenData = $result->fetch_assoc();
+    $stmt->close();
+    
+    if (!$tokenData) {
+        $conn->close();
+        return ['success' => false, 'message' => 'अमान्य या समाप्त टोकन।'];
+    }
+    
+    if (strtotime($tokenData['expires_at']) < time()) {
+        $conn->close();
+        return ['success' => false, 'message' => 'रीसेट टोकन की समय-सीमा समाप्त हो गई है।'];
+    }
+    
+    // Validate password strength
+    $passwordValidation = validatePasswordStrength($newPassword);
+    if (!$passwordValidation['valid']) {
+        $conn->close();
+        return ['success' => false, 'message' => $passwordValidation['message']];
+    }
+    
+    $hashedPassword = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+    
+    // Update password
+    $stmt = $conn->prepare("UPDATE users SET password_hash = ?, updated_at = NOW() WHERE id = ?");
+    $stmt->bind_param("si", $hashedPassword, $tokenData['user_id']);
+    $stmt->execute();
+    $stmt->close();
+    
+    // Mark token as used
+    $stmt = $conn->prepare("UPDATE password_reset_tokens SET used = 1 WHERE token_hash = ?");
+    $stmt->bind_param("s", $hashedToken);
+    $stmt->execute();
+    $stmt->close();
+    
+    // Log the password reset
+    logActivity($tokenData['user_id'], 'password_reset', 'Password reset via security question');
+    
+    $conn->close();
+    return ['success' => true, 'message' => 'पासवर्ड सफलतापूर्वक रीसेट किया गया।'];
+}
+
+function validatePasswordStrength($password) {
+    if (strlen($password) < 8) {
+        return ['valid' => false, 'message' => 'पासवर्ड कम से कम 8 अक्षर का होना चाहिए।'];
+    }
+    if (!preg_match('/[A-Z]/', $password)) {
+        return ['valid' => false, 'message' => 'पासवर्ड में कम से कम एक बड़ा अक्षर होना चाहिए।'];
+    }
+    if (!preg_match('/[a-z]/', $password)) {
+        return ['valid' => false, 'message' => 'पासवर्ड में कम से कम एक छोटा अक्षर होना चाहिए।'];
+    }
+    if (!preg_match('/[0-9]/', $password)) {
+        return ['valid' => false, 'message' => 'पासवर्ड में कम से कम एक अंक होना चाहिए।'];
+    }
+    if (!preg_match('/[^A-Za-z0-9]/', $password)) {
+        return ['valid' => false, 'message' => 'पासवर्ड में कम से कम एक विशेष अक्षर होना चाहिए।'];
+    }
+    return ['valid' => true, 'message' => ''];
+}
+
+function logActivity($userId, $action, $details) {
+    $conn = getDBConnection();
+    $ipAddress = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $userAgent = $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+    
+    $stmt = $conn->prepare("INSERT INTO activity_logs (user_id, action, details, ip_address, user_agent, created_at) VALUES (?, ?, ?, ?, ?, NOW())");
+    $stmt->bind_param("issss", $userId, $action, $details, $ipAddress, $userAgent);
+    $stmt->execute();
+    $stmt->close();
+    $conn->close();
+}
+
+// Available security questions
+function getSecurityQuestions() {
+    return [
+        1 => 'आपकी माँ का विवाह-पूर्व उपनाम क्या है?',
+        2 => 'आप किस शहर में पैदा हुए थे?',
+        3 => 'आपके पहले पालतू जानवर का नाम क्या था?',
+        4 => 'आपने किस प्राथमिक विद्यालय में पढ़ाई की?',
+        5 => 'आपकी माँ का जन्म किस शहर में हुआ था?',
+        6 => 'आपके सबसे पुराने भाई-बहन का मध्य नाम क्या है?',
+        7 => 'आपके बचपन का उपनाम क्या था?',
+        8 => 'आप किस सड़क पर बड़े हुए?',
+    ];
+}
+
+// Process form submissions
+$step = isset($_GET['step']) ? (int)$_GET['step'] : 1;
+$error = '';
+$success = '';
+$csrfToken = generateCSRFToken();
+
+// Handle Step 1: Username/Email submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'find_user') {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        $error = 'अमान्य अनुरोध। कृपया पुनः प्रयास करें।';
+    } else {
+        $identifier = sanitizeInput($_POST['identifier'] ?? '');
+        
+        if (empty($identifier)) {
+            $error = 'कृपया उपयोगकर्ता नाम या ईमेल दर्ज करें।';
+        } else {
+            $rateCheck = checkRateLimit($identifier);
+            if (!$rateCheck['allowed']) {
+                $minutes = ceil($rateCheck['remaining_time'] / 60);
+                $error = "बहुत अधिक प्रयास। कृपया {$minutes} मिनट बाद पुनः प्रयास करें।";
+            } else {
+                $user = findUser($identifier);
+                
+                if ($user) {
+                    $_SESSION['recovery_user_id'] = $user['id'];
+                    $_SESSION['recovery_username'] = $user['username'];
+                    $_SESSION['recovery_question'] = $user['security_question'];
+                    $_SESSION['recovery_step'] = 2;
+                    $_SESSION['recovery_timestamp'] = time();
+                    header('Location: ?step=2');
+                    exit;
+                } else {
+                    // Don't reveal if user exists or not
+                    $error = 'यदि यह खाता मौजूद है, तो आप सुरक्षा प्रश्न के साथ आगे बढ़ सकते हैं।';
+                    // Simulate user found for demo (remove in production)
+                    $_SESSION['recovery_user_id'] = 0;
+                    $_SESSION['recovery_step'] = 2;
+                }
+            }
+        }
+    }
+}
+
+// Handle Step 2: Security answer verification
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'verify_answer') {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        $error = 'अमान्य अनुरोध। कृपया पुनः प्रयास करें।';
+    } elseif (!isset($_SESSION['recovery_step']) || $_SESSION['recovery_step'] !== 2) {
+        $error = 'अमान्य सत्र। कृपया पुनः शुरू करें।';
+        $step = 1;
+    } elseif (time() - ($_SESSION['recovery_timestamp'] ?? 0) > 1800) {
+        // Session expired after 30 minutes
+        unset($_SESSION['recovery_user_id'], $_SESSION['recovery_step'], $_SESSION['recovery_timestamp']);
+        $error = 'सत्र समाप्त हो गया। कृपया पुनः शुरू करें।';
+        $step = 1;
+    } else {
+        $answer = $_POST['security_answer'] ?? '';
+        $userId = $_SESSION['recovery_user_id'];
+        
+        if (empty($answer)) {
+            $error = 'कृपया सुरक्षा प्रश्न का उत्तर दर्ज करें।';
+            $step = 2;
+        } else {
+            $rateCheck = checkRateLimit('answer_' . $userId);
+            if (!$rateCheck['allowed']) {
+                $minutes = ceil($rateCheck['remaining_time'] / 60);
+                $error = "बहुत अधिक गलत प्रयास। कृपया {$minutes} मिनट बाद पुनः प्रयास करें।";
+                $step = 2;
+            } else {
+                if (verifySecurityAnswer($userId, $answer)) {
+                    $resetToken = createResetToken($userId);
+                    $_SESSION['recovery_reset_token'] = $resetToken;
+                    $_SESSION['recovery_step'] = 3;
+                    unset($_SESSION['recovery_question']);
+                    header('Location: ?step=3');
+                    exit;
+                } else {
+                    $error = 'गलत उत्तर। कृपया पुनः प्रयास करें।';
+                    $step = 2;
+                }
+            }
+        }
+    }
+}
+
+// Handle Step 3: New password submission
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action']) && $_POST['action'] === 'reset_password') {
+    if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+        $error = 'अमान्य अनुरोध। कृपया पुनः प्रयास करें।';
+    } elseif (!isset($_SESSION['recovery_step']) || $_SESSION['recovery_step'] !== 3) {
+        $error = 'अमान्य सत्र। कृपया पुनः शुरू करें।';
+        $step = 1;
+    } else {
+        $newPassword = $_POST['new_password'] ?? '';
+        $confirmPassword = $_POST['confirm_password'] ?? '';
+        $resetToken = $_SESSION['recovery_reset_token'] ?? '';
+        
+        if (empty($newPassword) || empty($confirmPassword)) {
+            $error = 'कृपया सभी फ़ील्ड भरें।';
+            $step = 3;
+        } elseif ($newPassword !== $confirmPassword) {
+            $error = 'पासवर्ड मेल नहीं खाते।';
+            $step = 3;
+        } else {
+            $result = resetPassword($resetToken, $newPassword);
+            if ($result['success']) {
+                // Clear recovery session data
+                unset($_SESSION['recovery_user_id'], $_SESSION['recovery_step'], 
+                      $_SESSION['recovery_reset_token'], $_SESSION['recovery_timestamp']);
+                $success = $result['message'];
+                $step = 4;
+            } else {
+                $error = $result['message'];
+                $step = 3;
+            }
+        }
+    }
+}
+
+// Determine current step from session
+if (isset($_SESSION['recovery_step'])) {
+    if ($step < $_SESSION['recovery_step']) {
+        $step = $_SESSION['recovery_step'];
+    }
+}
+
+$securityQuestions = getSecurityQuestions();
+$currentQuestion = '';
+if ($step === 2 && isset($_SESSION['recovery_question'])) {
+    $questionId = $_SESSION['recovery_question'];
+    $currentQuestion = $securityQuestions[$questionId] ?? 'आपकी माँ का विवाह-पूर्व उपनाम क्या है?';
+}
+?>
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>खाता पुनर्प्राप्ति - सुरक्षा प्रश्न</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            width: 100%;
+            max-width: 480px;
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 30px;
+            text-align: center;
+            color: white;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+
+        .header p {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+
+        .progress-bar {
+            display: flex;
+            padding: 20px 30px;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+
+        .progress-step {
+            flex: 1;
+            text-align: center;
+            position: relative;
+        }
+
+        .progress-step:not(:last-child)::after {
+            content: '';
+            position: absolute;
+            top: 15px;
+            right: -50%;
+            width: 100%;
+            height: 2px;
+            background: #dee2e6;
+            z-index: 0;
+        }
+
+        .progress-step.completed:not(:last-child)::after {
+            background: #28a745;
+        }
+
+        .step-circle {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: #dee2e6;
+            color: #6c757d;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 12px;
+            font-weight: bold;
+            margin: 0 auto 5px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .progress-step.active .step-circle {
+            background: #667eea;
+            color: white;
+        }
+
+        .progress-step.completed .step-circle {
+            background: #28a745;
+            color: white;
+        }
+
+        .step-label {
+            font-size: 11px;
+            color: #6c757d;
+        }
+
+        .progress-step.active .step-label {
+            color: #667eea;
+            font-weight: bold;
+        }
+
+        .form-container {
+            padding: 30px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+            font-size: 14px;
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
+            font-size: 15px;
+            transition: border-color 0.3s, box-shadow 0.3s;
+            outline: none;
+            font-family: inherit;
+        }
+
+        input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+
+        .security-question-box {
+            background: #f0f4ff;
+            border: 2px solid #667eea;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+
+        .security-question-box .question-label {
+            font-size: 12px;
+            color: #667eea;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+
+        .security-question-box .question-text {
+            font-size: 15px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        .btn {
+            width: 100%;
+            padding: 14px;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-family: inherit;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.4);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+            color: white;
+        }
+
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(40, 167, 69, 0.4);
+        }
+
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+        }
+
+        .alert-error {
+            background: #fff5f5;
+            border: 1px solid #fed7d7;
+            color: #c53030;
+        }
+
+        .alert-success {
+            background: #f0fff4;
+            border: 1px solid #c6f6d5;
+            color: #276749;
+        }
+
+        .alert-info {
+            background: #ebf8ff;
+            border: 1px solid #bee3f8;
+            color: #2b6cb0;
+        }
+
+        .alert-icon {
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+
+        .password-strength {
+            margin-top: 8px;
+        }
+
+        .strength-bar {
+            height: 4px;
+            border-radius: 2px;
+            background: #e9ecef;
+            overflow: hidden;
+            margin-bottom: 5px;
+        }
+
+        .strength-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s, background 0.3s;
+            width: 0%;
+        }
+
+        .strength-text {
+            font-size: 12px;
+            color: #6c757d;
+        }
+
+        .password-requirements {
+            background: #f8f9fa;
+            border-radius: 8px;
+            padding: 12px;
+            margin-top: 10px;
+        }
+
+        .requirement {
+            font-size: 12px;
+            color: #6c757d;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .requirement.met {
+            color: #28a745;
+        }
+
+        .requirement-icon {
+            font-size: 14px;
+        }
+
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-size: 14px;
+        }
+
+        .back-link a:hover {
+            text-decoration: underline;
+        }
+
+        .success-container {
+            text-align: center;
+            padding: 20px 0;
+        }
+
+        .success-icon {
+            font-size: 60px;
+            margin-bottom: 20px;
+        }
+
+        .success-container h2 {
+            color: #28a745;
+            margin-bottom: 10px;
+        }
+
+        .success-container p {
+            color: #6c757d;
+            margin-bottom: 25px;
+            font-size: 15px;
+        }
+
+        .hint-text {
+            font-size: 12px;
+            color: #6c757d;
+            margin-top: 6px;
+        }
+
+        .toggle-password {
+            position: relative;
+        }
+
+        .toggle-password input {
+            padding-right: 45px;
+        }
+
+        .toggle-btn {
+            position: absolute;
+            right: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 18px;
+            color: #6c757d;
+            padding: 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 खाता पुनर्प्राप्ति</h1>
+            <p>सुरक्षा प्रश्न के माध्यम से पासवर्ड रीसेट करें</p>
+        </div>
+
+        <!-- Progress Bar -->
+        <?php if ($step < 4): ?>
+        <div class="progress-bar">
+            <div class="progress-step <?php echo $step >= 1 ? ($step > 1 ? 'completed' : 'active') : ''; ?>">
+                <div class="step-circle"><?php echo $step > 1 ? '✓' : '1'; ?></div>
+                <div class="step-label">खाता खोजें</div>
+            </div>
+            <div class="progress-step <?php echo $step >= 2 ? ($step > 2 ? 'completed' : 'active') : ''; ?>">
+                <div class="step-circle"><?php echo $step > 2 ? '✓' : '2'; ?></div>
+                <div class="step-label">सुरक्षा प्रश्न</div>
+            </div>
+            <div class="progress-step <?php echo $step >= 3 ? ($step > 3 ? 'completed' : 'active') : ''; ?>">
+                <div class="step-circle"><?php echo $step > 3 ? '✓' : '3'; ?></div>
+                <div class="step-label">नया पासवर्ड</div>
+            </div>
+        </div>
+        <?php endif; ?>
+
+        <div class="form-container">
+            <?php if (!empty($error)): ?>
+                <div class="alert alert-error">
+                    <span class="alert-icon">⚠️</span>
+                    <span><?php echo htmlspecialchars($error); ?></span>
+                </div>
+            <?php endif; ?>
+
+            <?php if (!empty($success) && $step !== 4): ?>
+                <div class="alert alert-success">
+                    <span class="alert-icon">✅</span>
+                    <span><?php echo htmlspecialchars($success); ?></span>
+                </div>
+            <?php endif; ?>
+
+            <!-- Step 1: Find User -->
+            <?php if ($step === 1): ?>
+                <div class="alert alert-info">
+                    <span class="alert-icon">ℹ️</span>
+                    <span>अपना उपयोगकर्ता नाम या ईमेल पता दर्ज करें जिससे हम आपका खाता खोज सकें।</span>
+                </div>
+
+                <form method="POST" action="?step=1">
+                    <input type="hidden" name="csrf_token" value="<?php echo $csrfToken; ?>">
+                    <input type="hidden" name="action" value="find_user">
+
+                    <div class="form-group">
+                        <label for="identifier">उपयोगकर्ता नाम या ईमेल</label>
+                        <input 
+                            type="text" 
+                            id="identifier" 
+                            name="identifier" 
+                            placeholder="अपना उपयोगकर्ता नाम या ईमेल दर्ज करें"
+                            autocomplete="username"
+                            required
+                        >
+                        <p class="hint-text">उदाहरण: user@example.com या myusername</p>
+                    </div>
+
+                    <button type="submit" class="btn btn-primary">
+                        आगे बढ़ें →
+                    </button>
+                </form>
+
+                <div class="back-link">
+                    <a href="login.php">← लॉगिन पेज पर वापस जाएं</a>
+                </div>
+
+            <!-- Step 2: Security Question -->
+            <?php elseif ($step === 2): ?>
+                <div class="alert alert-info">
+                    <span class="alert-icon">🔑</span>
+                    <span>नीचे दिए गए सुरक्षा प्रश्न का उत्तर दें। उत्तर केस-इनसेंसिटिव है।</span>
+                </div>
+
+                <div class="security-question-box">
+                    <div class="question-label">सुरक्षा प्रश्न</div>
+                    <div class="question-text">
+                        <?php echo htmlspecialchars($currentQuestion ?: 'आपकी माँ का विवाह-पूर्व उपनाम क्या है?'); ?>
+                    </div>
+                </div>
+
+                <form method="POST" action="?step=2">
+                    <input type="hidden" name="

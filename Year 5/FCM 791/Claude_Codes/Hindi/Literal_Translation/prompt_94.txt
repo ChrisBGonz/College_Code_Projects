@@ -1,0 +1,220 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = new Map();
+
+// Function to get or create conversation history for a session
+function getConversationHistory(sessionId) {
+  if (!conversationHistory.has(sessionId)) {
+    conversationHistory.set(sessionId, []);
+  }
+  return conversationHistory.get(sessionId);
+}
+
+// Main chat endpoint with streaming
+app.post("/chat", async (req, res) => {
+  const { message, sessionId = "default" } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Set headers for streaming
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+
+  const history = getConversationHistory(sessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  let fullResponse = "";
+
+  try {
+    // Create streaming message with conversation history
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      system:
+        "You are a helpful assistant. You help users understand and handle errors in Node.js Express applications. Provide clear, concise explanations and code examples when appropriate.",
+      messages: history,
+    });
+
+    // Stream the response
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        const text = chunk.delta.text;
+        fullResponse += text;
+
+        // Send chunk to client
+        res.write(`data: ${JSON.stringify({ text, type: "chunk" })}\n\n`);
+      }
+    }
+
+    // Add assistant response to history
+    history.push({
+      role: "assistant",
+      content: fullResponse,
+    });
+
+    // Send completion signal
+    res.write(
+      `data: ${JSON.stringify({ type: "done", fullResponse })}\n\n`
+    );
+    res.end();
+  } catch (error) {
+    // Send error to client via stream
+    const errorMessage = {
+      type: "error",
+      error: {
+        message: error.message,
+        name: error.name,
+        stack:
+          process.env.NODE_ENV === "development" ? error.stack : undefined,
+      },
+    };
+
+    res.write(`data: ${JSON.stringify(errorMessage)}\n\n`);
+    res.end();
+  }
+});
+
+// Endpoint to clear conversation history
+app.delete("/chat/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  conversationHistory.delete(sessionId);
+  res.json({ message: `Conversation history cleared for session: ${sessionId}` });
+});
+
+// Endpoint to get conversation history
+app.get("/chat/:sessionId/history", (req, res) => {
+  const { sessionId } = req.params;
+  const history = getConversationHistory(sessionId);
+  res.json({ sessionId, history });
+});
+
+// Test endpoint to simulate various errors
+app.get("/test-error/:type", (req, res, next) => {
+  const { type } = req.params;
+
+  switch (type) {
+    case "sync":
+      throw new Error("Synchronous error occurred!");
+
+    case "async":
+      Promise.reject(new Error("Async error occurred!")).catch(next);
+      break;
+
+    case "timeout":
+      setTimeout(() => {
+        throw new Error("Timeout error occurred!");
+      }, 100);
+      break;
+
+    case "custom":
+      const customError = new Error("Custom error with status code");
+      customError.statusCode = 422;
+      customError.details = { field: "email", message: "Invalid email format" };
+      next(customError);
+      break;
+
+    default:
+      res.json({ message: "No error triggered" });
+  }
+});
+
+// 404 handler for undefined routes
+app.use((req, res, next) => {
+  const error = new Error(`Route not found: ${req.method} ${req.path}`);
+  error.statusCode = 404;
+  next(error);
+});
+
+// Global error handler middleware
+app.use((err, req, res, next) => {
+  console.error("Error caught by global handler:", {
+    name: err.name,
+    message: err.message,
+    stack: err.stack,
+    timestamp: new Date().toISOString(),
+    path: req.path,
+    method: req.method,
+  });
+
+  const statusCode = err.statusCode || err.status || 500;
+  const errorResponse = {
+    error: {
+      message: err.message || "Internal Server Error",
+      name: err.name || "Error",
+      statusCode,
+      timestamp: new Date().toISOString(),
+      path: req.path,
+      method: req.method,
+    },
+  };
+
+  // Include additional error details if available
+  if (err.details) {
+    errorResponse.error.details = err.details;
+  }
+
+  // Include stack trace in development mode
+  if (process.env.NODE_ENV === "development") {
+    errorResponse.error.stack = err.stack;
+  }
+
+  res.status(statusCode).json(errorResponse);
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Promise Rejection:", {
+    reason: reason instanceof Error ? reason.message : reason,
+    stack: reason instanceof Error ? reason.stack : undefined,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Gracefully shutdown the server
+  process.exit(1);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log("\nAvailable endpoints:");
+  console.log("  POST /chat - Send a message (streaming)");
+  console.log("  GET /chat/:sessionId/history - Get conversation history");
+  console.log("  DELETE /chat/:sessionId - Clear conversation history");
+  console.log("  GET /test-error/:type - Test error handling");
+  console.log("    Types: sync, async, timeout, custom");
+});
+
+module.exports = app;
+```

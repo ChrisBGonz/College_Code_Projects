@@ -1,0 +1,719 @@
+```php
+<?php
+
+// Configuration
+define('ADMIN_EMAIL', 'admin@example.com');
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK');
+define('SMTP_HOST', 'smtp.example.com');
+define('SMTP_PORT', 587);
+define('SMTP_USERNAME', 'alerts@example.com');
+define('SMTP_PASSWORD', 'your_smtp_password');
+define('SMTP_FROM_EMAIL', 'alerts@example.com');
+define('SMTP_FROM_NAME', 'Security Alert System');
+define('LOG_FILE', __DIR__ . '/security_alerts.log');
+define('MAX_ATTEMPTS_BEFORE_BLOCK', 5);
+define('BLOCK_DURATION_MINUTES', 30);
+define('RATE_LIMIT_WINDOW_MINUTES', 10);
+
+// Session start
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
+
+/**
+ * मुख्य Security Alert Class
+ */
+class AdminAccessAlert
+{
+    private $db;
+    private $config;
+
+    public function __construct()
+    {
+        $this->config = [
+            'admin_email'       => ADMIN_EMAIL,
+            'slack_webhook'     => SLACK_WEBHOOK_URL,
+            'log_file'          => LOG_FILE,
+            'max_attempts'      => MAX_ATTEMPTS_BEFORE_BLOCK,
+            'block_duration'    => BLOCK_DURATION_MINUTES,
+            'rate_limit_window' => RATE_LIMIT_WINDOW_MINUTES,
+        ];
+
+        $this->initDatabase();
+    }
+
+    /**
+     * SQLite Database Initialize करें
+     */
+    private function initDatabase(): void
+    {
+        try {
+            $this->db = new PDO('sqlite:' . __DIR__ . '/security_alerts.db');
+            $this->db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+
+            $this->db->exec("
+                CREATE TABLE IF NOT EXISTS access_attempts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_address TEXT NOT NULL,
+                    user_agent TEXT,
+                    request_uri TEXT,
+                    request_method TEXT,
+                    user_id TEXT,
+                    username TEXT,
+                    attempt_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    is_blocked INTEGER DEFAULT 0,
+                    alert_sent INTEGER DEFAULT 0,
+                    additional_info TEXT
+                )
+            ");
+
+            $this->db->exec("
+                CREATE TABLE IF NOT EXISTS blocked_ips (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ip_address TEXT NOT NULL UNIQUE,
+                    blocked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    blocked_until DATETIME,
+                    reason TEXT,
+                    attempt_count INTEGER DEFAULT 0
+                )
+            ");
+
+            $this->db->exec("
+                CREATE INDEX IF NOT EXISTS idx_ip_address ON access_attempts(ip_address)
+            ");
+
+            $this->db->exec("
+                CREATE INDEX IF NOT EXISTS idx_attempt_time ON access_attempts(attempt_time)
+            ");
+        } catch (PDOException $e) {
+            $this->logToFile("Database Error: " . $e->getMessage(), 'ERROR');
+        }
+    }
+
+    /**
+     * Unauthorized Access Check और Alert भेजें
+     */
+    public function handleUnauthorizedAccess(array $userInfo = []): void
+    {
+        $ipAddress   = $this->getClientIP();
+        $userAgent   = $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown';
+        $requestUri  = $_SERVER['REQUEST_URI'] ?? '/admin';
+        $requestMethod = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+        $timestamp   = date('Y-m-d H:i:s');
+
+        // IP Block है या नहीं check करें
+        if ($this->isIPBlocked($ipAddress)) {
+            $this->sendBlockedIPResponse($ipAddress);
+            return;
+        }
+
+        // Attempt को database में save करें
+        $attemptId = $this->logAttemptToDatabase(
+            $ipAddress,
+            $userAgent,
+            $requestUri,
+            $requestMethod,
+            $userInfo
+        );
+
+        // Recent attempts count करें
+        $recentAttempts = $this->getRecentAttemptsCount($ipAddress);
+
+        // Alert Data तैयार करें
+        $alertData = [
+            'attempt_id'     => $attemptId,
+            'ip_address'     => $ipAddress,
+            'user_agent'     => $userAgent,
+            'request_uri'    => $requestUri,
+            'request_method' => $requestMethod,
+            'timestamp'      => $timestamp,
+            'recent_attempts'=> $recentAttempts,
+            'user_info'      => $userInfo,
+            'geo_info'       => $this->getGeoInfo($ipAddress),
+            'referer'        => $_SERVER['HTTP_REFERER'] ?? 'Direct Access',
+            'session_id'     => session_id(),
+        ];
+
+        // Log file में लिखें
+        $this->logToFile($this->formatLogMessage($alertData));
+
+        // पहली बार या हर attempt पर email भेजें
+        if ($recentAttempts === 1 || $recentAttempts % 5 === 0) {
+            $this->sendEmailAlert($alertData);
+        }
+
+        // Slack notification भेजें
+        $this->sendSlackAlert($alertData);
+
+        // Maximum attempts exceed होने पर IP block करें
+        if ($recentAttempts >= $this->config['max_attempts']) {
+            $this->blockIP($ipAddress, $recentAttempts);
+            $this->sendBlockingAlert($alertData, $recentAttempts);
+        }
+
+        // 403 Response भेजें
+        $this->send403Response($alertData);
+    }
+
+    /**
+     * Client का Real IP Address प्राप्त करें
+     */
+    private function getClientIP(): string
+    {
+        $ipHeaders = [
+            'HTTP_CF_CONNECTING_IP',
+            'HTTP_X_FORWARDED_FOR',
+            'HTTP_X_FORWARDED',
+            'HTTP_X_CLUSTER_CLIENT_IP',
+            'HTTP_FORWARDED_FOR',
+            'HTTP_FORWARDED',
+            'REMOTE_ADDR',
+        ];
+
+        foreach ($ipHeaders as $header) {
+            if (!empty($_SERVER[$header])) {
+                $ips = explode(',', $_SERVER[$header]);
+                $ip  = trim($ips[0]);
+
+                if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                    return $ip;
+                }
+            }
+        }
+
+        return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    }
+
+    /**
+     * IP Block है या नहीं check करें
+     */
+    private function isIPBlocked(string $ipAddress): bool
+    {
+        try {
+            $stmt = $this->db->prepare("
+                SELECT blocked_until 
+                FROM blocked_ips 
+                WHERE ip_address = ? AND blocked_until > datetime('now')
+            ");
+            $stmt->execute([$ipAddress]);
+            return $stmt->fetchColumn() !== false;
+        } catch (PDOException $e) {
+            $this->logToFile("DB Error in isIPBlocked: " . $e->getMessage(), 'ERROR');
+            return false;
+        }
+    }
+
+    /**
+     * IP को Block करें
+     */
+    private function blockIP(string $ipAddress, int $attemptCount): void
+    {
+        try {
+            $blockedUntil = date('Y-m-d H:i:s', strtotime("+{$this->config['block_duration']} minutes"));
+
+            $stmt = $this->db->prepare("
+                INSERT OR REPLACE INTO blocked_ips 
+                (ip_address, blocked_at, blocked_until, reason, attempt_count)
+                VALUES (?, datetime('now'), ?, ?, ?)
+            ");
+            $stmt->execute([
+                $ipAddress,
+                $blockedUntil,
+                "Multiple unauthorized admin access attempts ({$attemptCount} times)",
+                $attemptCount,
+            ]);
+
+            $this->logToFile("IP BLOCKED: {$ipAddress} until {$blockedUntil} after {$attemptCount} attempts", 'BLOCK');
+        } catch (PDOException $e) {
+            $this->logToFile("DB Error in blockIP: " . $e->getMessage(), 'ERROR');
+        }
+    }
+
+    /**
+     * Database में Attempt Log करें
+     */
+    private function logAttemptToDatabase(
+        string $ipAddress,
+        string $userAgent,
+        string $requestUri,
+        string $requestMethod,
+        array $userInfo
+    ): int {
+        try {
+            $stmt = $this->db->prepare("
+                INSERT INTO access_attempts 
+                (ip_address, user_agent, request_uri, request_method, user_id, username, additional_info)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ");
+
+            $additionalInfo = json_encode([
+                'referer'    => $_SERVER['HTTP_REFERER'] ?? null,
+                'session_id' => session_id(),
+                'post_data'  => $this->sanitizePostData($_POST),
+                'cookies'    => array_keys($_COOKIE),
+            ]);
+
+            $stmt->execute([
+                $ipAddress,
+                $userAgent,
+                $requestUri,
+                $requestMethod,
+                $userInfo['user_id'] ?? null,
+                $userInfo['username'] ?? null,
+                $additionalInfo,
+            ]);
+
+            return (int) $this->db->lastInsertId();
+        } catch (PDOException $e) {
+            $this->logToFile("DB Error in logAttemptToDatabase: " . $e->getMessage(), 'ERROR');
+            return 0;
+        }
+    }
+
+    /**
+     * Recent Attempts Count करें
+     */
+    private function getRecentAttemptsCount(string $ipAddress): int
+    {
+        try {
+            $windowMinutes = $this->config['rate_limit_window'];
+            $stmt          = $this->db->prepare("
+                SELECT COUNT(*) 
+                FROM access_attempts 
+                WHERE ip_address = ? 
+                AND attempt_time > datetime('now', '-{$windowMinutes} minutes')
+            ");
+            $stmt->execute([$ipAddress]);
+            return (int) $stmt->fetchColumn();
+        } catch (PDOException $e) {
+            $this->logToFile("DB Error in getRecentAttemptsCount: " . $e->getMessage(), 'ERROR');
+            return 0;
+        }
+    }
+
+    /**
+     * Geo Information प्राप्त करें (IP-API का उपयोग)
+     */
+    private function getGeoInfo(string $ipAddress): array
+    {
+        // Private IP के लिए skip करें
+        if (filter_var($ipAddress, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false) {
+            return ['country' => 'Local/Private Network', 'city' => 'N/A', 'isp' => 'N/A'];
+        }
+
+        try {
+            $context = stream_context_create([
+                'http' => [
+                    'timeout' => 3,
+                    'method'  => 'GET',
+                ],
+            ]);
+
+            $response = @file_get_contents(
+                "http://ip-api.com/json/{$ipAddress}?fields=country,city,isp,org,as,query",
+                false,
+                $context
+            );
+
+            if ($response) {
+                $data = json_decode($response, true);
+                return [
+                    'country' => $data['country'] ?? 'Unknown',
+                    'city'    => $data['city'] ?? 'Unknown',
+                    'isp'     => $data['isp'] ?? 'Unknown',
+                    'org'     => $data['org'] ?? 'Unknown',
+                ];
+            }
+        } catch (Exception $e) {
+            // Geo lookup fail होने पर continue करें
+        }
+
+        return ['country' => 'Unknown', 'city' => 'Unknown', 'isp' => 'Unknown'];
+    }
+
+    /**
+     * Email Alert भेजें (PHPMailer के बिना native mail())
+     */
+    private function sendEmailAlert(array $alertData): bool
+    {
+        $subject = "🚨 [SECURITY ALERT] Unauthorized Admin Access Attempt - " . date('Y-m-d H:i:s');
+
+        $htmlBody = $this->buildEmailHTML($alertData);
+        $textBody = $this->buildEmailText($alertData);
+
+        $boundary = md5(time());
+
+        $headers  = "From: " . SMTP_FROM_NAME . " <" . SMTP_FROM_EMAIL . ">\r\n";
+        $headers .= "Reply-To: " . SMTP_FROM_EMAIL . "\r\n";
+        $headers .= "X-Mailer: PHP/" . phpversion() . "\r\n";
+        $headers .= "X-Priority: 1 (Highest)\r\n";
+        $headers .= "X-MSMail-Priority: High\r\n";
+        $headers .= "Importance: High\r\n";
+        $headers .= "MIME-Version: 1.0\r\n";
+        $headers .= "Content-Type: multipart/alternative; boundary=\"{$boundary}\"\r\n";
+
+        $message  = "--{$boundary}\r\n";
+        $message .= "Content-Type: text/plain; charset=UTF-8\r\n\r\n";
+        $message .= $textBody . "\r\n\r\n";
+        $message .= "--{$boundary}\r\n";
+        $message .= "Content-Type: text/html; charset=UTF-8\r\n\r\n";
+        $message .= $htmlBody . "\r\n\r\n";
+        $message .= "--{$boundary}--";
+
+        $result = mail($this->config['admin_email'], $subject, $message, $headers);
+
+        if ($result) {
+            $this->logToFile("Email alert sent successfully to " . $this->config['admin_email']);
+            $this->updateAlertSentStatus($alertData['attempt_id']);
+        } else {
+            $this->logToFile("Failed to send email alert", 'ERROR');
+        }
+
+        return $result;
+    }
+
+    /**
+     * Email HTML Body बनाएँ
+     */
+    private function buildEmailHTML(array $data): string
+    {
+        $geoInfo        = $data['geo_info'];
+        $recentAttempts = $data['recent_attempts'];
+        $userInfo       = $data['user_info'];
+
+        $warningColor = $recentAttempts >= $this->config['max_attempts'] ? '#dc3545' : '#fd7e14';
+        $statusText   = $recentAttempts >= $this->config['max_attempts']
+            ? "⛔ IP BLOCKED"
+            : "⚠️ WARNING";
+
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Security Alert</title>
+</head>
+<body style="font-family: Arial, sans-serif; background-color: #f4f4f4; margin: 0; padding: 20px;">
+    <div style="max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1);">
+        
+        <!-- Header -->
+        <div style="background-color: {$warningColor}; padding: 20px; text-align: center;">
+            <h1 style="color: #ffffff; margin: 0; font-size: 24px;">🚨 Security Alert</h1>
+            <p style="color: #ffffff; margin: 5px 0 0 0; font-size: 16px;">{$statusText}</p>
+        </div>
+        
+        <!-- Alert Summary -->
+        <div style="padding: 20px; background-color: #fff3cd; border-left: 4px solid {$warningColor};">
+            <h2 style="color: #856404; margin: 0 0 10px 0;">Unauthorized Admin Access Attempt Detected!</h2>
+            <p style="color: #856404; margin: 0;">
+                किसी ने बिना अनुमति के <strong>/admin</strong> पेज तक पहुँचने की कोशिश की है।
+                यह attempt <strong>{$data['timestamp']}</strong> पर हुई।
+            </p>
+        </div>
+        
+        <!-- Details Table -->
+        <div style="padding: 20px;">
+            <h3 style="color: #333; border-bottom: 2px solid #dee2e6; padding-bottom: 10px;">📋 Attempt Details</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057; width: 40%;">Attempt ID</td>
+                    <td style="padding: 10px; color: #212529;">#{$data['attempt_id']}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">IP Address</td>
+                    <td style="padding: 10px; color: #dc3545; font-weight: bold;">{$data['ip_address']}</td>
+                </tr>
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">Date & Time</td>
+                    <td style="padding: 10px; color: #212529;">{$data['timestamp']}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">Request URI</td>
+                    <td style="padding: 10px; color: #212529;">{$data['request_uri']}</td>
+                </tr>
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">HTTP Method</td>
+                    <td style="padding: 10px; color: #212529;">{$data['request_method']}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">Referer</td>
+                    <td style="padding: 10px; color: #212529;">{$data['referer']}</td>
+                </tr>
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">Recent Attempts</td>
+                    <td style="padding: 10px; color: {$warningColor}; font-weight: bold;">{$recentAttempts} attempts (last {$this->config['rate_limit_window']} min)</td>
+                </tr>
+            </table>
+            
+            <h3 style="color: #333; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; margin-top: 20px;">🌍 Geographic Information</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057; width: 40%;">Country</td>
+                    <td style="padding: 10px; color: #212529;">{$geoInfo['country']}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">City</td>
+                    <td style="padding: 10px; color: #212529;">{$geoInfo['city']}</td>
+                </tr>
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">ISP</td>
+                    <td style="padding: 10px; color: #212529;">{$geoInfo['isp']}</td>
+                </tr>
+            </table>
+            
+            <h3 style="color: #333; border-bottom: 2px solid #dee2e6; padding-bottom: 10px; margin-top: 20px;">🖥️ Browser Information</h3>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr style="background-color: #f8f9fa;">
+                    <td style="padding: 10px; font-weight: bold; color: #495057; width: 40%;">User Agent</td>
+                    <td style="padding: 10px; color: #212529; font-size: 12px;">{$data['user_agent']}</td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; font-weight: bold; color: #495057;">Session ID</td>
+                    <td style="padding: 10px; color: #212529; font-size: 12px;">{$data['session_id']}</td>
+                </tr>
+            </table>
+        </div>
+        
+        <!-- Action Required -->
+        <div style="padding: 20px; background-color: #f8d7da; border-left: 4px solid #dc3545;">
+            <h3 style="color: #721c24; margin: 0 0 10px 0;">⚡ Recommended Actions</h3>
+            <ul style="color: #721c24; margin: 0; padding-left: 20px;">
+                <li>IP Address <strong>{$data['ip_address']}</strong> को firewall में block करें</li>
+                <li>Server logs की जाँच करें</li>
+                <li>यदि यह legitimate user है तो उन्हें proper access दें</li>
+                <li>Security audit करें</li>
+            </ul>
+        </div>
+        
+        <!-- Footer -->
+        <div style="padding: 15px; background-color: #6c757d; text-align: center;">
+            <p style="color: #ffffff; margin: 0; font-size: 12px;">
+                यह alert automatically generated है | Server: {$_SERVER['SERVER_NAME']} | 
+                Generated at: {$data['timestamp']}
+            </p>
+        </div>
+    </div>
+</body>
+</html>
+HTML;
+    }
+
+    /**
+     * Email Plain Text Body बनाएँ
+     */
+    private function buildEmailText(array $data): string
+    {
+        $geoInfo = $data['geo_info'];
+        return <<<TEXT
+🚨 SECURITY ALERT - Unauthorized Admin Access Attempt
+
+Attempt ID: #{$data['attempt_id']}
+IP Address: {$data['ip_address']}
+Date & Time: {$data['timestamp']}
+Request URI: {$data['request_uri']}
+HTTP Method: {$data['request_method']}
+Referer: {$data['referer']}
+Recent Attempts: {$data['recent_attempts']} (last {$this->config['rate_limit_window']} min)
+
+Geographic Info:
+- Country: {$geoInfo['country']}
+- City: {$geoInfo['city']}
+- ISP: {$geoInfo['isp']}
+
+User Agent: {$data['user_agent']}
+Session ID: {$data['session_id']}
+
+Recommended Actions:
+1. IP {$data['ip_address']} को block करें
+2. Server logs check करें
+3. Security audit करें
+
+Server: {$_SERVER['SERVER_NAME']}
+TEXT;
+    }
+
+    /**
+     * Slack Alert भेजें
+     */
+    private function sendSlackAlert(array $alertData): bool
+    {
+        if (empty($this->config['slack_webhook']) || 
+            $this->config['slack_webhook'] === 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK') {
+            $this->logToFile("Slack webhook not configured, skipping Slack alert");
+            return false;
+        }
+
+        $geoInfo        = $alertData['geo_info'];
+        $recentAttempts = $alertData['recent_attempts'];
+        $isBlocked      = $recentAttempts >= $this->config['max_attempts'];
+        $color          = $isBlocked ? 'danger' : 'warning';
+        $statusEmoji    = $isBlocked ? '⛔' : '⚠️';
+
+        $payload = [
+            'username'   => 'Security Alert Bot',
+            'icon_emoji' => ':rotating_light:',
+            'text'       => "{$statusEmoji} *Unauthorized Admin Access Attempt Detected!*",
+            'attachments' => [
+                [
+                    'color'  => $color,
+                    'title'  => "Security Alert #{$alertData['attempt_id']}",
+                    'fields' => [
+                        [
+                            'title' => '🌐 IP Address',
+                            'value' => "`{$alertData['ip_address']}`",
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '⏰ Time',
+                            'value' => $alertData['timestamp'],
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '🔗 Request URI',
+                            'value' => $alertData['request_uri'],
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '📊 Recent Attempts',
+                            'value' => "{$recentAttempts} (last {$this->config['rate_limit_window']} min)",
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '🌍 Location',
+                            'value' => "{$geoInfo['country']}, {$geoInfo['city']}",
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '🏢 ISP',
+                            'value' => $geoInfo['isp'],
+                            'short' => true,
+                        ],
+                        [
+                            'title' => '🖥️ User Agent',
+                            'value' => substr($alertData['user_agent'], 0, 100) . '...',
+                            'short' => false,
+                        ],
+                    ],
+                    'footer'      => "Security Alert System | " . $_SERVER['SERVER_NAME'],
+                    'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                    'ts'          => time(),
+                ],
+            ],
+        ];
+
+        if ($isBlocked) {
+            $payload['attachments'][] = [
+                'color' => 'danger',
+                'text'  => "⛔ *IP `{$alertData['ip_address']}` को {$this->config['block_duration']} minutes के लिए BLOCK कर दिया गया है!*",
+            ];
+        }
+
+        return $this->sendSlackWebhook($payload);
+    }
+
+    /**
+     * IP Blocking Alert Slack पर भेजें
+     */
+    private function sendBlockingAlert(array $alertData, int $attemptCount): void
+    {
+        $subject = "⛔ [CRITICAL] IP BLOCKED - {$alertData['ip_address']}";
+
+        $message = "IP Address {$alertData['ip_address']} को {$attemptCount} unauthorized attempts के बाद "
+            . "{$this->config['block_duration']} minutes के लिए block कर दिया गया है।\n\n"
+            . "Time: {$alertData['timestamp']}\n"
+            . "Location: {$alertData['geo_info']['country']}, {$alertData['geo_info']['city']}";
+
+        $headers  = "From: " . SMTP_FROM_NAME . " <" . SMTP_FROM_EMAIL . ">\r\n";
+        $headers .= "X-Priority: 1 (Highest)\r\n";
+        $headers .= "Content-Type: text/plain; charset=UTF-8\r\n";
+
+        mail($this->config['admin_email'], $subject, $message, $headers);
+
+        $this->logToFile("IP BLOCKING ALERT sent for {$alertData['ip_address']}", 'CRITICAL');
+    }
+
+    /**
+     * Slack Webhook Request भेजें
+     */
+    private function sendSlackWebhook(array $payload): bool
+    {
+        $jsonPayload = json_encode($payload);
+
+        $context = stream_context_create([
+            'http' => [
+                'method'  => 'POST',
+                'header'  => "Content-Type: application/json\r\nContent-Length: " . strlen($jsonPayload) . "\r\n",
+                'content' => $jsonPayload,
+                'timeout' => 10,
+            ],
+        ]);
+
+        $result = @file_get_contents($this->config['slack_webhook'], false, $context);
+
+        if ($result === 'ok') {
+            $this->logToFile("Slack alert sent successfully");
+            return true;
+        }
+
+        $this->logToFile("Failed to send Slack alert. Response: " . ($result ?: 'No response'), 'ERROR');
+        return false;
+    }
+
+    /**
+     * Log Message Format करें
+     */
+    private function formatLogMessage(array $data): string
+    {
+        $geoInfo = $data['geo_info'];
+        return sprintf(
+            "[%s] UNAUTHORIZED_ACCESS | ID:%d | IP:%s | URI:%s | Method:%s | Attempts:%d | Location:%s,%s | UA:%s",
+            $data['timestamp'],
+            $data['attempt_id'],
+            $data['ip_address'],
+            $data['request_uri'],
+            $data['request_method'],
+            $data['recent_attempts'],
+            $geoInfo['country'],
+            $geoInfo['city'],
+            substr($data['user_agent'], 0, 80)
+        );
+    }
+
+    /**
+     * File में Log करें
+     */
+    private function logToFile(string $message, string $level = 'ALERT'): void
+    {
+        $logEntry = sprintf(
+            "[%s] [%s] %s\n",
+            date('Y-m-d H:i:s'),
+            $level,
+            $message
+        );
+
+        $logDir = dirname($this->config['log_file']);
+        if (!is_dir($logDir)) {
+            mkdir($logDir, 0755, true);
+        }
+
+        file_put_contents($this->config['log_file'], $logEntry, FILE_APPEND | LOCK_EX);
+    }
+
+    /**
+     * Alert Sent Status Update करें
+     */
+    private function updateAlertSentStatus(int $attemptId): void
+    {
+        try {
+            $stmt = $this->db->prepare("UPDATE access_attempts SET alert_sent = 1 WHERE id = ?");
+            $stmt->execute([$attemptId]);
+        } catch (PDOException $e) {
+            $this->logToFile("DB Error in updateAlertSentStatus: " . $e->getMessage(), 'ERROR');
+        }
+    }
+
+    /**
+     * POST Data Sanitize करें (sensitive data remove)
+     */
+    private function sanitizePostData(array $postData

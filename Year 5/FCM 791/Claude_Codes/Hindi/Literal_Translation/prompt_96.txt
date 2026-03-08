@@ -1,0 +1,161 @@
+```go
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"time"
+)
+
+type RetryConfig struct {
+	MaxRetries      int
+	RetryDelay      time.Duration
+	BackoffFactor   float64
+	MaxDelay        time.Duration
+	TimeoutPerCall  time.Duration
+}
+
+type ServiceResponse struct {
+	StatusCode int
+	Body       string
+	Attempt    int
+}
+
+func DefaultRetryConfig() RetryConfig {
+	return RetryConfig{
+		MaxRetries:     -1,
+		RetryDelay:     1 * time.Second,
+		BackoffFactor:  2.0,
+		MaxDelay:       30 * time.Second,
+		TimeoutPerCall: 10 * time.Second,
+	}
+}
+
+func CallMicroserviceWithRetry(serviceURL string, config RetryConfig) (*ServiceResponse, error) {
+	client := &http.Client{
+		Timeout: config.TimeoutPerCall,
+	}
+
+	attempt := 0
+	currentDelay := config.RetryDelay
+
+	for {
+		attempt++
+		log.Printf("प्रयास #%d: %s को कॉल कर रहे हैं...", attempt, serviceURL)
+
+		resp, err := client.Get(serviceURL)
+		if err != nil {
+			log.Printf("प्रयास #%d विफल: नेटवर्क त्रुटि - %v", attempt, err)
+		} else {
+			defer resp.Body.Close()
+
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				log.Printf("प्रयास #%d विफल: रिस्पॉन्स पढ़ने में त्रुटि - %v", attempt, readErr)
+			} else if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				log.Printf("प्रयास #%d सफल! स्टेटस कोड: %d", attempt, resp.StatusCode)
+				return &ServiceResponse{
+					StatusCode: resp.StatusCode,
+					Body:       string(body),
+					Attempt:    attempt,
+				}, nil
+			} else {
+				log.Printf("प्रयास #%d विफल: HTTP स्टेटस %d - %s", attempt, resp.StatusCode, string(body))
+			}
+		}
+
+		if config.MaxRetries > 0 && attempt >= config.MaxRetries {
+			return nil, fmt.Errorf("अधिकतम %d प्रयासों के बाद भी सेवा उपलब्ध नहीं", config.MaxRetries)
+		}
+
+		log.Printf("%.0f सेकंड बाद पुनः प्रयास करेंगे...", currentDelay.Seconds())
+		time.Sleep(currentDelay)
+
+		if config.BackoffFactor > 1.0 {
+			currentDelay = time.Duration(float64(currentDelay) * config.BackoffFactor)
+			if currentDelay > config.MaxDelay {
+				currentDelay = config.MaxDelay
+			}
+		}
+	}
+}
+
+func CallMicroserviceInfinitely(serviceURL string) (*ServiceResponse, error) {
+	config := RetryConfig{
+		MaxRetries:     -1,
+		RetryDelay:     500 * time.Millisecond,
+		BackoffFactor:  1.0,
+		MaxDelay:       500 * time.Millisecond,
+		TimeoutPerCall: 5 * time.Second,
+	}
+	return CallMicroserviceWithRetry(serviceURL, config)
+}
+
+func CallMicroserviceWithExponentialBackoff(serviceURL string, maxRetries int) (*ServiceResponse, error) {
+	config := RetryConfig{
+		MaxRetries:     maxRetries,
+		RetryDelay:     1 * time.Second,
+		BackoffFactor:  2.0,
+		MaxDelay:       60 * time.Second,
+		TimeoutPerCall: 10 * time.Second,
+	}
+	return CallMicroserviceWithRetry(serviceURL, config)
+}
+
+func main() {
+	fmt.Println("=== माइक्रोसर्विस रिट्री डेमो ===")
+	fmt.Println()
+
+	serviceURL := "https://httpbin.org/get"
+
+	fmt.Println("--- टेस्ट 1: अनंत रिट्री (तुरंत) ---")
+	response, err := CallMicroserviceInfinitely(serviceURL)
+	if err != nil {
+		log.Printf("त्रुटि: %v", err)
+	} else {
+		fmt.Printf("सफलता! प्रयास #%d में सफल\n", response.Attempt)
+		fmt.Printf("स्टेटस कोड: %d\n", response.StatusCode)
+		fmt.Printf("रिस्पॉन्स की लंबाई: %d बाइट्स\n", len(response.Body))
+	}
+
+	fmt.Println()
+	fmt.Println("--- टेस्ट 2: एक्सपोनेंशियल बैकऑफ के साथ (अधिकतम 5 प्रयास) ---")
+	response2, err2 := CallMicroserviceWithExponentialBackoff(serviceURL, 5)
+	if err2 != nil {
+		log.Printf("त्रुटि: %v", err2)
+	} else {
+		fmt.Printf("सफलता! प्रयास #%d में सफल\n", response2.Attempt)
+		fmt.Printf("स्टेटस कोड: %d\n", response2.StatusCode)
+	}
+
+	fmt.Println()
+	fmt.Println("--- टेस्ट 3: विफल URL के साथ (अधिकतम 3 प्रयास) ---")
+	failURL := "https://httpbin.org/status/500"
+	response3, err3 := CallMicroserviceWithExponentialBackoff(failURL, 3)
+	if err3 != nil {
+		log.Printf("अपेक्षित त्रुटि: %v", err3)
+	} else {
+		fmt.Printf("सफलता! प्रयास #%d में सफल\n", response3.Attempt)
+	}
+
+	fmt.Println()
+	fmt.Println("--- टेस्ट 4: कस्टम कॉन्फिग के साथ ---")
+	customConfig := RetryConfig{
+		MaxRetries:     10,
+		RetryDelay:     2 * time.Second,
+		BackoffFactor:  1.5,
+		MaxDelay:       15 * time.Second,
+		TimeoutPerCall: 8 * time.Second,
+	}
+
+	response4, err4 := CallMicroserviceWithRetry(serviceURL, customConfig)
+	if err4 != nil {
+		log.Printf("त्रुटि: %v", err4)
+	} else {
+		fmt.Printf("सफलता! प्रयास #%d में सफल\n", response4.Attempt)
+		fmt.Printf("स्टेटस कोड: %d\n", response4.StatusCode)
+	}
+}
+```

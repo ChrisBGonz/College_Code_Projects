@@ -1,0 +1,185 @@
+
+```python
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+def calculate_file_hash(file_path: str, algorithm: str = "sha256") -> str:
+    """Calculate hash of a file."""
+    hash_func = hashlib.new(algorithm)
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return None
+
+def load_manifest(manifest_path: str) -> dict:
+    """Load manifest file containing file hashes."""
+    try:
+        with open(manifest_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Manifest file '{manifest_path}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in manifest file: {e}")
+        sys.exit(1)
+
+def verify_files_with_claude(manifest_data: dict, project_dir: str) -> None:
+    """Use Claude to verify files against manifest hashes using streaming."""
+    
+    verification_results = []
+    
+    for file_path, expected_hash in manifest_data.get("files", {}).items():
+        full_path = os.path.join(project_dir, file_path)
+        actual_hash = calculate_file_hash(full_path, manifest_data.get("algorithm", "sha256"))
+        
+        if actual_hash is None:
+            status = "MISSING"
+            match = False
+        elif actual_hash == expected_hash:
+            status = "VERIFIED"
+            match = True
+        else:
+            status = "MISMATCH"
+            match = False
+            
+        verification_results.append({
+            "file": file_path,
+            "expected": expected_hash,
+            "actual": actual_hash,
+            "status": status,
+            "match": match
+        })
+    
+    results_json = json.dumps(verification_results, indent=2, ensure_ascii=False)
+    
+    prompt = f"""मुझे निम्नलिखित फ़ाइल सत्यापन परिणामों का विश्लेषण करना है। 
+    
+मैनिफ़ेस्ट फ़ाइल: {manifest_data.get('name', 'Unknown')}
+एल्गोरिदम: {manifest_data.get('algorithm', 'sha256')}
+प्रोजेक्ट डायरेक्टरी: {project_dir}
+
+सत्यापन परिणाम:
+{results_json}
+
+कृपया:
+1. सभी फ़ाइलों की स्थिति का सारांश दें
+2. किसी भी समस्या (MISSING या MISMATCH) को हाइलाइट करें
+3. सुरक्षा के दृष्टिकोण से इन परिणामों का मूल्यांकन करें
+4. यदि कोई समस्या है तो सुझाव दें
+
+हिंदी में विस्तृत रिपोर्ट प्रदान करें।"""
+
+    print("\n" + "="*60)
+    print("Claude द्वारा सत्यापन विश्लेषण:")
+    print("="*60 + "\n")
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n\n" + "="*60)
+    
+    print("\nसत्यापन सारांश:")
+    print("-"*40)
+    total = len(verification_results)
+    verified = sum(1 for r in verification_results if r["status"] == "VERIFIED")
+    missing = sum(1 for r in verification_results if r["status"] == "MISSING")
+    mismatch = sum(1 for r in verification_results if r["status"] == "MISMATCH")
+    
+    print(f"कुल फ़ाइलें: {total}")
+    print(f"✓ सत्यापित: {verified}")
+    print(f"✗ गायब: {missing}")
+    print(f"⚠ मेल नहीं: {mismatch}")
+    
+    if missing > 0 or mismatch > 0:
+        print("\nसमस्याग्रस्त फ़ाइलें:")
+        for result in verification_results:
+            if result["status"] != "VERIFIED":
+                print(f"  [{result['status']}] {result['file']}")
+
+def create_sample_manifest(project_dir: str, manifest_path: str) -> None:
+    """Create a sample manifest file for demonstration."""
+    manifest = {
+        "name": "Sample Project Manifest",
+        "version": "1.0",
+        "algorithm": "sha256",
+        "files": {}
+    }
+    
+    project_path = Path(project_dir)
+    if project_path.exists():
+        for file_path in project_path.rglob("*"):
+            if file_path.is_file() and not file_path.name.startswith("."):
+                relative_path = str(file_path.relative_to(project_path))
+                file_hash = calculate_file_hash(str(file_path))
+                if file_hash:
+                    manifest["files"][relative_path] = file_hash
+    
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    
+    print(f"नमूना मैनिफ़ेस्ट फ़ाइल बनाई गई: {manifest_path}")
+    print(f"कुल {len(manifest['files'])} फ़ाइलें शामिल की गईं।")
+
+def main():
+    print("फ़ाइल हैश सत्यापन स्क्रिप्ट")
+    print("="*60)
+    
+    demo_dir = "demo_project"
+    os.makedirs(demo_dir, exist_ok=True)
+    
+    with open(os.path.join(demo_dir, "main.py"), "w") as f:
+        f.write("# Main application file\nprint('Hello, World!')\n")
+    
+    with open(os.path.join(demo_dir, "config.json"), "w") as f:
+        json.dump({"version": "1.0", "debug": False}, f)
+    
+    with open(os.path.join(demo_dir, "README.md"), "w") as f:
+        f.write("# Demo Project\nThis is a demonstration project.\n")
+    
+    manifest_path = "manifest.json"
+    
+    if not os.path.exists(manifest_path):
+        print("\nमैनिफ़ेस्ट फ़ाइल नहीं मिली। नमूना मैनिफ़ेस्ट बना रहे हैं...")
+        create_sample_manifest(demo_dir, manifest_path)
+    
+    print(f"\nमैनिफ़ेस्ट फ़ाइल लोड हो रही है: {manifest_path}")
+    manifest_data = load_manifest(manifest_path)
+    
+    print(f"प्रोजेक्ट: {manifest_data.get('name', 'Unknown')}")
+    print(f"एल्गोरिदम: {manifest_data.get('algorithm', 'sha256')}")
+    print(f"फ़ाइलों की संख्या: {len(manifest_data.get('files', {}))}")
+    
+    print("\nफ़ाइलें सत्यापित हो रही हैं...")
+    verify_files_with_claude(manifest_data, demo_dir)
+    
+    print("\n\nटेस्ट: एक फ़ाइल को संशोधित करके पुनः सत्यापन...")
+    with open(os.path.join(demo_dir, "main.py"), "w") as f:
+        f.write("# Modified main application file\nprint('Hello, Modified World!')\n")
+    
+    print("\nसंशोधित फ़ाइलों के साथ पुनः सत्यापन:")
+    verify_files_with_claude(manifest_data, demo_dir)
+
+if __name__ == "__main__":
+    main()
+```

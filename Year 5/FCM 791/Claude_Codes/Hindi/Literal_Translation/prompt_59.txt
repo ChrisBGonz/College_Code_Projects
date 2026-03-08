@@ -1,0 +1,769 @@
+```python
+#!/usr/bin/env python3
+"""
+Third-Party Payment Gateway Integration Script
+Integrates a payment gateway that redirects users to success_url after payment
+"""
+
+import os
+import hmac
+import hashlib
+import json
+import logging
+import uuid
+from datetime import datetime
+from typing import Optional
+from urllib.parse import urlencode, urlparse
+
+import requests
+from flask import Flask, request, redirect, jsonify, render_template_string
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+app.secret_key = os.getenv('FLASK_SECRET_KEY', os.urandom(24))
+
+# ─────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────
+
+class PaymentConfig:
+    """Payment Gateway Configuration"""
+    GATEWAY_API_KEY    = os.getenv('PAYMENT_GATEWAY_API_KEY', 'your_api_key_here')
+    GATEWAY_SECRET_KEY = os.getenv('PAYMENT_GATEWAY_SECRET_KEY', 'your_secret_key_here')
+    GATEWAY_BASE_URL   = os.getenv('PAYMENT_GATEWAY_BASE_URL', 'https://api.paymentgateway.com')
+    GATEWAY_MERCHANT_ID = os.getenv('PAYMENT_MERCHANT_ID', 'your_merchant_id')
+    CURRENCY           = os.getenv('PAYMENT_CURRENCY', 'INR')
+    APP_BASE_URL       = os.getenv('APP_BASE_URL', 'http://localhost:5000')
+
+    # Allowed redirect domains (whitelist for security)
+    ALLOWED_REDIRECT_DOMAINS = [
+        'yourdomain.com',
+        'www.yourdomain.com',
+        'localhost',
+        '127.0.0.1',
+    ]
+
+# ─────────────────────────────────────────────
+# Security Utilities
+# ─────────────────────────────────────────────
+
+class SecurityUtils:
+    """Security utility functions"""
+
+    @staticmethod
+    def validate_redirect_url(url: str) -> bool:
+        """
+        Validate that the redirect URL is from an allowed domain.
+        Prevents open redirect vulnerabilities.
+        """
+        try:
+            parsed = urlparse(url)
+            hostname = parsed.hostname or ''
+            return hostname in PaymentConfig.ALLOWED_REDIRECT_DOMAINS
+        except Exception:
+            return False
+
+    @staticmethod
+    def generate_signature(data: dict, secret_key: str) -> str:
+        """Generate HMAC-SHA256 signature for request verification"""
+        sorted_data = '&'.join(
+            f"{k}={v}" for k, v in sorted(data.items())
+        )
+        signature = hmac.new(
+            secret_key.encode('utf-8'),
+            sorted_data.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+
+    @staticmethod
+    def verify_webhook_signature(payload: bytes, signature: str, secret: str) -> bool:
+        """Verify webhook signature from payment gateway"""
+        expected = hmac.new(
+            secret.encode('utf-8'),
+            payload,
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(expected, signature)
+
+    @staticmethod
+    def generate_order_id() -> str:
+        """Generate a unique order ID"""
+        return f"ORD-{uuid.uuid4().hex[:12].upper()}"
+
+# ─────────────────────────────────────────────
+# Payment Gateway Client
+# ─────────────────────────────────────────────
+
+class PaymentGatewayClient:
+    """Client for interacting with the payment gateway API"""
+
+    def __init__(self):
+        self.api_key    = PaymentConfig.GATEWAY_API_KEY
+        self.secret_key = PaymentConfig.GATEWAY_SECRET_KEY
+        self.base_url   = PaymentConfig.GATEWAY_BASE_URL
+        self.session    = requests.Session()
+        self.session.headers.update({
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {self.api_key}',
+            'X-Merchant-ID': PaymentConfig.GATEWAY_MERCHANT_ID,
+        })
+
+    def create_payment_session(
+        self,
+        amount: float,
+        currency: str,
+        order_id: str,
+        customer_info: dict,
+        success_url: str,
+        failure_url: str,
+        webhook_url: str,
+        metadata: Optional[dict] = None
+    ) -> dict:
+        """
+        Create a payment session with the gateway.
+        Returns payment session data including redirect URL.
+        """
+        payload = {
+            'order_id':    order_id,
+            'amount':      int(amount * 100),   # Convert to smallest currency unit (paise)
+            'currency':    currency,
+            'customer':    customer_info,
+            'success_url': success_url,
+            'failure_url': failure_url,
+            'webhook_url': webhook_url,
+            'metadata':    metadata or {},
+            'timestamp':   datetime.utcnow().isoformat(),
+        }
+
+        # Generate request signature
+        signature_data = {
+            'order_id':  order_id,
+            'amount':    str(int(amount * 100)),
+            'currency':  currency,
+            'timestamp': payload['timestamp'],
+        }
+        payload['signature'] = SecurityUtils.generate_signature(
+            signature_data, self.secret_key
+        )
+
+        logger.info(f"Creating payment session for order: {order_id}")
+
+        try:
+            response = self.session.post(
+                f"{self.base_url}/v1/payment/create",
+                json=payload,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.HTTPError as e:
+            logger.error(f"HTTP error creating payment session: {e}")
+            raise PaymentError(f"Gateway error: {e.response.status_code}")
+        except requests.exceptions.ConnectionError:
+            logger.error("Connection error to payment gateway")
+            raise PaymentError("Unable to connect to payment gateway")
+        except requests.exceptions.Timeout:
+            logger.error("Timeout connecting to payment gateway")
+            raise PaymentError("Payment gateway timeout")
+
+    def verify_payment(self, payment_id: str, order_id: str) -> dict:
+        """Verify payment status with the gateway"""
+        params = {
+            'payment_id': payment_id,
+            'order_id':   order_id,
+            'timestamp':  datetime.utcnow().isoformat(),
+        }
+        params['signature'] = SecurityUtils.generate_signature(
+            params, self.secret_key
+        )
+
+        try:
+            response = self.session.get(
+                f"{self.base_url}/v1/payment/verify",
+                params=params,
+                timeout=30
+            )
+            response.raise_for_status()
+            return response.json()
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error verifying payment: {e}")
+            raise PaymentError(f"Payment verification failed: {str(e)}")
+
+# ─────────────────────────────────────────────
+# Custom Exceptions
+# ─────────────────────────────────────────────
+
+class PaymentError(Exception):
+    """Custom exception for payment errors"""
+    pass
+
+class InvalidRedirectURLError(Exception):
+    """Exception for invalid redirect URLs"""
+    pass
+
+# ─────────────────────────────────────────────
+# Payment Service
+# ─────────────────────────────────────────────
+
+class PaymentService:
+    """High-level payment service"""
+
+    def __init__(self):
+        self.gateway_client = PaymentGatewayClient()
+        # In production, use a proper database
+        self.pending_payments: dict = {}
+
+    def initiate_payment(
+        self,
+        amount: float,
+        customer_info: dict,
+        success_url: str,
+        failure_url: Optional[str] = None,
+        metadata: Optional[dict] = None
+    ) -> dict:
+        """
+        Initiate a payment and return gateway redirect URL.
+        The user will be redirected to success_url after successful payment.
+        """
+        # Validate success_url
+        if not SecurityUtils.validate_redirect_url(success_url):
+            raise InvalidRedirectURLError(
+                f"Invalid success_url domain. "
+                f"Allowed domains: {PaymentConfig.ALLOWED_REDIRECT_DOMAINS}"
+            )
+
+        # Validate failure_url if provided
+        if failure_url and not SecurityUtils.validate_redirect_url(failure_url):
+            raise InvalidRedirectURLError("Invalid failure_url domain.")
+
+        # Generate order ID
+        order_id = SecurityUtils.generate_order_id()
+
+        # Set default failure URL
+        if not failure_url:
+            failure_url = f"{PaymentConfig.APP_BASE_URL}/payment/failure"
+
+        # Webhook URL for payment notifications
+        webhook_url = f"{PaymentConfig.APP_BASE_URL}/payment/webhook"
+
+        # Create payment session with gateway
+        session_data = self.gateway_client.create_payment_session(
+            amount=amount,
+            currency=PaymentConfig.CURRENCY,
+            order_id=order_id,
+            customer_info=customer_info,
+            success_url=f"{PaymentConfig.APP_BASE_URL}/payment/callback"
+                        f"?order_id={order_id}"
+                        f"&success_url={success_url}",
+            failure_url=failure_url,
+            webhook_url=webhook_url,
+            metadata=metadata
+        )
+
+        # Store pending payment info
+        self.pending_payments[order_id] = {
+            'order_id':     order_id,
+            'amount':       amount,
+            'currency':     PaymentConfig.CURRENCY,
+            'customer':     customer_info,
+            'success_url':  success_url,
+            'failure_url':  failure_url,
+            'status':       'PENDING',
+            'created_at':   datetime.utcnow().isoformat(),
+            'session_id':   session_data.get('session_id'),
+        }
+
+        logger.info(f"Payment initiated: order_id={order_id}, amount={amount}")
+
+        return {
+            'order_id':       order_id,
+            'payment_url':    session_data.get('payment_url'),
+            'session_id':     session_data.get('session_id'),
+            'expires_at':     session_data.get('expires_at'),
+            'status':         'PENDING',
+        }
+
+    def process_callback(self, order_id: str, payment_data: dict) -> str:
+        """
+        Process payment callback from gateway.
+        Returns the success_url to redirect the user to.
+        """
+        if order_id not in self.pending_payments:
+            raise PaymentError(f"Order not found: {order_id}")
+
+        payment_info = self.pending_payments[order_id]
+
+        # Verify payment with gateway
+        try:
+            verification = self.gateway_client.verify_payment(
+                payment_id=payment_data.get('payment_id', ''),
+                order_id=order_id
+            )
+
+            if verification.get('status') == 'SUCCESS':
+                payment_info['status']     = 'SUCCESS'
+                payment_info['payment_id'] = payment_data.get('payment_id')
+                payment_info['paid_at']    = datetime.utcnow().isoformat()
+
+                logger.info(f"Payment successful: order_id={order_id}")
+
+                # Build success redirect URL with payment details
+                success_params = urlencode({
+                    'order_id':   order_id,
+                    'payment_id': payment_data.get('payment_id', ''),
+                    'status':     'success',
+                    'amount':     payment_info['amount'],
+                    'currency':   payment_info['currency'],
+                })
+                return f"{payment_info['success_url']}?{success_params}"
+
+            else:
+                payment_info['status'] = 'FAILED'
+                logger.warning(f"Payment failed: order_id={order_id}")
+                return payment_info['failure_url']
+
+        except PaymentError as e:
+            logger.error(f"Payment verification error: {e}")
+            payment_info['status'] = 'ERROR'
+            return payment_info['failure_url']
+
+    def handle_webhook(self, payload: bytes, signature: str) -> bool:
+        """Handle webhook notifications from payment gateway"""
+        # Verify webhook signature
+        if not SecurityUtils.verify_webhook_signature(
+            payload, signature, PaymentConfig.GATEWAY_SECRET_KEY
+        ):
+            logger.warning("Invalid webhook signature received")
+            return False
+
+        try:
+            data     = json.loads(payload)
+            order_id = data.get('order_id')
+            status   = data.get('status')
+
+            if order_id in self.pending_payments:
+                self.pending_payments[order_id]['status'] = status
+                logger.info(f"Webhook processed: order_id={order_id}, status={status}")
+
+            return True
+
+        except json.JSONDecodeError:
+            logger.error("Invalid webhook payload")
+            return False
+
+# ─────────────────────────────────────────────
+# Initialize Service
+# ─────────────────────────────────────────────
+
+payment_service = PaymentService()
+
+# ─────────────────────────────────────────────
+# HTML Templates
+# ─────────────────────────────────────────────
+
+CHECKOUT_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>भुगतान करें</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            width: 100%;
+            max-width: 480px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        h1 { color: #333; margin-bottom: 8px; font-size: 24px; }
+        .subtitle { color: #666; margin-bottom: 32px; font-size: 14px; }
+        .form-group { margin-bottom: 20px; }
+        label { display: block; color: #555; font-size: 13px; font-weight: 600;
+                margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+        input {
+            width: 100%; padding: 12px 16px; border: 2px solid #e1e5e9;
+            border-radius: 8px; font-size: 15px; transition: border-color 0.2s;
+        }
+        input:focus { outline: none; border-color: #667eea; }
+        .amount-display {
+            background: #f8f9ff; border: 2px solid #667eea;
+            border-radius: 8px; padding: 16px; text-align: center;
+            margin-bottom: 24px;
+        }
+        .amount-display .amount { font-size: 32px; font-weight: 700; color: #667eea; }
+        .amount-display .currency { font-size: 14px; color: #888; }
+        .btn {
+            width: 100%; padding: 14px; background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white; border: none; border-radius: 8px; font-size: 16px;
+            font-weight: 600; cursor: pointer; transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .secure-badge {
+            text-align: center; margin-top: 16px; color: #888; font-size: 12px;
+        }
+        .error { color: #e53e3e; background: #fff5f5; border: 1px solid #fed7d7;
+                 padding: 12px; border-radius: 8px; margin-bottom: 16px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>💳 भुगतान करें</h1>
+        <p class="subtitle">सुरक्षित भुगतान गेटवे</p>
+
+        {% if error %}
+        <div class="error">⚠️ {{ error }}</div>
+        {% endif %}
+
+        <div class="amount-display">
+            <div class="currency">भुगतान राशि (INR)</div>
+            <div class="amount">₹{{ "%.2f"|format(amount) }}</div>
+        </div>
+
+        <form method="POST" action="/payment/initiate">
+            <input type="hidden" name="amount" value="{{ amount }}">
+            <input type="hidden" name="success_url" value="{{ success_url }}">
+            <input type="hidden" name="failure_url" value="{{ failure_url }}">
+
+            <div class="form-group">
+                <label>पूरा नाम</label>
+                <input type="text" name="customer_name" placeholder="आपका नाम" required>
+            </div>
+            <div class="form-group">
+                <label>ईमेल पता</label>
+                <input type="email" name="customer_email" placeholder="email@example.com" required>
+            </div>
+            <div class="form-group">
+                <label>मोबाइल नंबर</label>
+                <input type="tel" name="customer_phone" placeholder="+91 XXXXX XXXXX" required>
+            </div>
+
+            <button type="submit" class="btn">🔒 सुरक्षित भुगतान करें</button>
+        </form>
+
+        <div class="secure-badge">
+            🔐 256-bit SSL एन्क्रिप्शन द्वारा सुरक्षित
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+    <meta charset="UTF-8">
+    <title>त्रुटि</title>
+    <style>
+        body { font-family: sans-serif; display: flex; align-items: center;
+               justify-content: center; min-height: 100vh;
+               background: #fff5f5; }
+        .card { background: white; padding: 40px; border-radius: 12px;
+                text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+        h1 { color: #e53e3e; }
+        p  { color: #666; margin-top: 12px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>❌ भुगतान त्रुटि</h1>
+        <p>{{ message }}</p>
+        <p><a href="/">वापस जाएं</a></p>
+    </div>
+</body>
+</html>
+"""
+
+# ─────────────────────────────────────────────
+# Flask Routes
+# ─────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    """Demo checkout page"""
+    return render_template_string(
+        CHECKOUT_TEMPLATE,
+        amount=999.00,
+        success_url=f"{PaymentConfig.APP_BASE_URL}/order/success",
+        failure_url=f"{PaymentConfig.APP_BASE_URL}/order/failure",
+        error=None
+    )
+
+
+@app.route('/checkout')
+def checkout():
+    """
+    Checkout page — accepts amount and success_url as query parameters.
+    Example: /checkout?amount=500&success_url=https://yourdomain.com/success
+    """
+    amount      = request.args.get('amount', 100.0, type=float)
+    success_url = request.args.get('success_url', f"{PaymentConfig.APP_BASE_URL}/order/success")
+    failure_url = request.args.get('failure_url', f"{PaymentConfig.APP_BASE_URL}/order/failure")
+
+    return render_template_string(
+        CHECKOUT_TEMPLATE,
+        amount=amount,
+        success_url=success_url,
+        failure_url=failure_url,
+        error=None
+    )
+
+
+@app.route('/payment/initiate', methods=['POST'])
+def initiate_payment():
+    """
+    Initiate payment — creates a gateway session and redirects to payment page.
+    The gateway will redirect back to success_url after successful payment.
+    """
+    try:
+        amount      = float(request.form.get('amount', 0))
+        success_url = request.form.get('success_url', '')
+        failure_url = request.form.get('failure_url', '')
+
+        if amount <= 0:
+            raise PaymentError("Invalid amount")
+
+        customer_info = {
+            'name':  request.form.get('customer_name', '').strip(),
+            'email': request.form.get('customer_email', '').strip(),
+            'phone': request.form.get('customer_phone', '').strip(),
+        }
+
+        if not all(customer_info.values()):
+            raise PaymentError("All customer fields are required")
+
+        # Initiate payment
+        payment_data = payment_service.initiate_payment(
+            amount=amount,
+            customer_info=customer_info,
+            success_url=success_url,
+            failure_url=failure_url,
+            metadata={'ip': request.remote_addr}
+        )
+
+        logger.info(
+            f"Redirecting to payment gateway: order_id={payment_data['order_id']}"
+        )
+
+        # Redirect user to payment gateway
+        return redirect(payment_data['payment_url'])
+
+    except InvalidRedirectURLError as e:
+        logger.warning(f"Invalid redirect URL: {e}")
+        return render_template_string(ERROR_TEMPLATE, message=str(e)), 400
+
+    except PaymentError as e:
+        logger.error(f"Payment initiation error: {e}")
+        return render_template_string(ERROR_TEMPLATE, message=str(e)), 400
+
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}")
+        return render_template_string(
+            ERROR_TEMPLATE, message="An unexpected error occurred"
+        ), 500
+
+
+@app.route('/payment/callback')
+def payment_callback():
+    """
+    Callback endpoint — called by payment gateway after payment attempt.
+    Verifies payment and redirects user to the original success_url.
+    """
+    order_id    = request.args.get('order_id', '')
+    success_url = request.args.get('success_url', '')
+    payment_id  = request.args.get('payment_id', '')
+    status      = request.args.get('status', '')
+
+    logger.info(
+        f"Payment callback received: order_id={order_id}, status={status}"
+    )
+
+    try:
+        payment_data = {
+            'payment_id': payment_id,
+            'status':     status,
+        }
+
+        # Process callback and get redirect URL
+        redirect_url = payment_service.process_callback(order_id, payment_data)
+
+        logger.info(f"Redirecting user to: {redirect_url}")
+
+        # Redirect user to success_url (or failure_url)
+        return redirect(redirect_url)
+
+    except PaymentError as e:
+        logger.error(f"Callback processing error: {e}")
+        return render_template_string(
+            ERROR_TEMPLATE, message=str(e)
+        ), 400
+
+    except Exception as e:
+        logger.error(f"Unexpected callback error: {e}")
+        return render_template_string(
+            ERROR_TEMPLATE, message="Payment processing error"
+        ), 500
+
+
+@app.route('/payment/webhook', methods=['POST'])
+def payment_webhook():
+    """
+    Webhook endpoint — receives payment status updates from gateway.
+    """
+    payload   = request.get_data()
+    signature = request.headers.get('X-Gateway-Signature', '')
+
+    if payment_service.handle_webhook(payload, signature):
+        return jsonify({'status': 'ok'}), 200
+    else:
+        return jsonify({'status': 'invalid signature'}), 400
+
+
+@app.route('/payment/status/<order_id>')
+def payment_status(order_id: str):
+    """Check payment status for an order"""
+    if order_id in payment_service.pending_payments:
+        payment = payment_service.pending_payments[order_id]
+        return jsonify({
+            'order_id': order_id,
+            'status':   payment['status'],
+            'amount':   payment['amount'],
+            'currency': payment['currency'],
+        })
+    return jsonify({'error': 'Order not found'}), 404
+
+
+@app.route('/order/success')
+def order_success():
+    """Demo success page"""
+    order_id   = request.args.get('order_id', 'N/A')
+    payment_id = request.args.get('payment_id', 'N/A')
+    amount     = request.args.get('amount', 'N/A')
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="hi">
+    <head>
+        <meta charset="UTF-8">
+        <title>भुगतान सफल</title>
+        <style>
+            body {{ font-family: sans-serif; display: flex; align-items: center;
+                   justify-content: center; min-height: 100vh;
+                   background: #f0fff4; }}
+            .card {{ background: white; padding: 40px; border-radius: 12px;
+                    text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }}
+            h1 {{ color: #38a169; }}
+            .detail {{ color: #555; margin: 8px 0; }}
+            .badge {{ background: #c6f6d5; color: #276749; padding: 4px 12px;
+                     border-radius: 20px; font-size: 13px; }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>✅ भुगतान सफल!</h1>
+            <p class="detail">ऑर्डर ID: <strong>{order_id}</strong></p>
+            <p class="detail">भुगतान ID: <strong>{payment_id}</strong></p>
+            <p class="detail">राशि: <strong>₹{amount}</strong></p>
+            <br>
+            <span class="badge">✓ पुष्टि हो गई</span>
+        </div>
+    </body>
+    </html>
+    """
+
+
+@app.route('/order/failure')
+def order_failure():
+    """Demo failure page"""
+    return """
+    <!DOCTYPE html>
+    <html lang="hi">
+    <head>
+        <meta charset="UTF-8">
+        <title>भुगतान विफल</title>
+        <style>
+            body { font-family: sans-serif; display: flex; align-items: center;
+                   justify-content: center; min-height: 100vh; background: #fff5f5; }
+            .card { background: white; padding: 40px; border-radius: 12px;
+                    text-align: center; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
+            h1 { color: #e53e3e; }
+            a { color: #667eea; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <h1>❌ भुगतान विफल</h1>
+            <p>आपका भुगतान पूरा नहीं हो सका।</p>
+            <br>
+            <a href="/">पुनः प्रयास करें</a>
+        </div>
+    </body>
+    </html>
+    """
+
+
+# ─────────────────────────────────────────────
+# Error Handlers
+# ─────────────────────────────────────────────
+
+@app.errorhandler(404)
+def not_found(e):
+    return jsonify({'error': 'Not found'}), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return jsonify({'error': 'Internal server error'}), 500
+
+
+# ─────────────────────────────────────────────
+# Main Entry Point
+# ─────────────────────────────────────────────
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("  Payment Gateway Integration Server")
+    print("=" * 60)
+    print(f"  Base URL    : {PaymentConfig.APP_BASE_URL}")
+    print(f"  Currency    : {PaymentConfig.CURRENCY}")
+    print(f"  Merchant ID : {PaymentConfig.GATEWAY_MERCHANT_ID}")
+    print("=" * 60)
+    print("  Endpoints:")
+    print("    GET  /                      - Checkout page")
+    print("    GET  /checkout              - Custom checkout")
+    print("    POST /payment/initiate      - Initiate payment")
+    print("    GET  /payment/callback      - Gateway callback")
+    print("    POST /payment/webhook       - Webhook handler")
+    print("    GET  /payment/status/<id>   - Payment status")
+    print("=" * 60)
+
+    app.run(
+        host='0.0.0.0',
+        port=int(os.getenv('PORT', 5000)),
+        debug=os.getenv('FLASK_DEBUG', 'false').lower() == 'true'
+    )
+```

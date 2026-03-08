@@ -1,0 +1,442 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = {};
+const votes = {}; // { pollId: { ip: option } }
+const conversationHistory = [];
+
+// Helper function to generate unique poll ID
+function generatePollId() {
+  return "poll_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+}
+
+// Helper function to get simulated IP (in real app, use req.ip)
+function getSimulatedIP() {
+  const ips = [
+    "192.168.1.1",
+    "192.168.1.2",
+    "10.0.0.1",
+    "172.16.0.1",
+    "192.168.2.1",
+  ];
+  return ips[Math.floor(Math.random() * ips.length)];
+}
+
+// Tool definitions for the voting system
+const tools = [
+  {
+    name: "create_poll",
+    description:
+      "Create a new poll with a question and multiple options. Returns the poll ID.",
+    input_schema: {
+      type: "object",
+      properties: {
+        question: {
+          type: "string",
+          description: "The poll question",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description: "Array of voting options (minimum 2)",
+        },
+      },
+      required: ["question", "options"],
+    },
+  },
+  {
+    name: "cast_vote",
+    description:
+      "Cast a vote for a specific option in a poll. Prevents duplicate votes from the same IP.",
+    input_schema: {
+      type: "object",
+      properties: {
+        poll_id: {
+          type: "string",
+          description: "The ID of the poll to vote in",
+        },
+        option_index: {
+          type: "number",
+          description: "The index of the option to vote for (0-based)",
+        },
+        voter_ip: {
+          type: "string",
+          description: "The IP address of the voter",
+        },
+      },
+      required: ["poll_id", "option_index", "voter_ip"],
+    },
+  },
+  {
+    name: "get_poll_results",
+    description: "Get the current results of a poll including vote counts.",
+    input_schema: {
+      type: "object",
+      properties: {
+        poll_id: {
+          type: "string",
+          description: "The ID of the poll to get results for",
+        },
+      },
+      required: ["poll_id"],
+    },
+  },
+  {
+    name: "list_polls",
+    description: "List all available polls with their basic information.",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "check_voter_status",
+    description: "Check if a specific IP has already voted in a poll.",
+    input_schema: {
+      type: "object",
+      properties: {
+        poll_id: {
+          type: "string",
+          description: "The ID of the poll to check",
+        },
+        voter_ip: {
+          type: "string",
+          description: "The IP address to check",
+        },
+      },
+      required: ["poll_id", "voter_ip"],
+    },
+  },
+];
+
+// Tool execution functions
+function executeTool(toolName, toolInput) {
+  switch (toolName) {
+    case "create_poll": {
+      const { question, options } = toolInput;
+
+      if (!question || !options || options.length < 2) {
+        return {
+          success: false,
+          error: "Poll must have a question and at least 2 options",
+        };
+      }
+
+      const pollId = generatePollId();
+      polls[pollId] = {
+        id: pollId,
+        question,
+        options,
+        votes: new Array(options.length).fill(0),
+        createdAt: new Date().toISOString(),
+        totalVotes: 0,
+      };
+      votes[pollId] = {};
+
+      return {
+        success: true,
+        poll_id: pollId,
+        message: `Poll created successfully with ID: ${pollId}`,
+        poll: polls[pollId],
+      };
+    }
+
+    case "cast_vote": {
+      const { poll_id, option_index, voter_ip } = toolInput;
+
+      if (!polls[poll_id]) {
+        return { success: false, error: `Poll with ID ${poll_id} not found` };
+      }
+
+      const poll = polls[poll_id];
+
+      if (option_index < 0 || option_index >= poll.options.length) {
+        return {
+          success: false,
+          error: `Invalid option index. Must be between 0 and ${poll.options.length - 1}`,
+        };
+      }
+
+      // Check for duplicate vote
+      if (votes[poll_id][voter_ip]) {
+        return {
+          success: false,
+          error: `IP ${voter_ip} has already voted in this poll`,
+          already_voted_for: votes[poll_id][voter_ip],
+        };
+      }
+
+      // Record the vote
+      votes[poll_id][voter_ip] = poll.options[option_index];
+      poll.votes[option_index]++;
+      poll.totalVotes++;
+
+      return {
+        success: true,
+        message: `Vote cast successfully for "${poll.options[option_index]}"`,
+        voter_ip,
+        voted_for: poll.options[option_index],
+        poll_id,
+      };
+    }
+
+    case "get_poll_results": {
+      const { poll_id } = toolInput;
+
+      if (!polls[poll_id]) {
+        return { success: false, error: `Poll with ID ${poll_id} not found` };
+      }
+
+      const poll = polls[poll_id];
+      const results = poll.options.map((option, index) => ({
+        option,
+        votes: poll.votes[index],
+        percentage:
+          poll.totalVotes > 0
+            ? ((poll.votes[index] / poll.totalVotes) * 100).toFixed(1)
+            : "0.0",
+      }));
+
+      const winner =
+        poll.totalVotes > 0
+          ? results.reduce((prev, current) =>
+              prev.votes > current.votes ? prev : current
+            )
+          : null;
+
+      return {
+        success: true,
+        poll_id,
+        question: poll.question,
+        total_votes: poll.totalVotes,
+        results,
+        winner: winner ? winner.option : "No votes yet",
+        created_at: poll.createdAt,
+      };
+    }
+
+    case "list_polls": {
+      const pollList = Object.values(polls).map((poll) => ({
+        id: poll.id,
+        question: poll.question,
+        options_count: poll.options.length,
+        total_votes: poll.totalVotes,
+        created_at: poll.createdAt,
+      }));
+
+      return {
+        success: true,
+        polls: pollList,
+        total_polls: pollList.length,
+      };
+    }
+
+    case "check_voter_status": {
+      const { poll_id, voter_ip } = toolInput;
+
+      if (!polls[poll_id]) {
+        return { success: false, error: `Poll with ID ${poll_id} not found` };
+      }
+
+      const hasVoted = votes[poll_id] && votes[poll_id][voter_ip];
+
+      return {
+        success: true,
+        poll_id,
+        voter_ip,
+        has_voted: !!hasVoted,
+        voted_for: hasVoted || null,
+      };
+    }
+
+    default:
+      return { success: false, error: `Unknown tool: ${toolName}` };
+  }
+}
+
+// Process tool calls from Claude's response
+async function processToolCalls(response) {
+  const toolResults = [];
+
+  for (const block of response.content) {
+    if (block.type === "tool_use") {
+      console.log(`\n🔧 Executing tool: ${block.name}`);
+      console.log("Input:", JSON.stringify(block.input, null, 2));
+
+      const result = executeTool(block.name, block.input);
+      console.log("Result:", JSON.stringify(result, null, 2));
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: block.id,
+        content: JSON.stringify(result),
+      });
+    }
+  }
+
+  return toolResults;
+}
+
+// Main chat function with agentic loop
+async function chat(userMessage) {
+  console.log(`\n👤 User: ${userMessage}`);
+
+  // Add user message to history
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    system: `You are a helpful voting system assistant. You help users create polls, cast votes, and view results.
+    
+    When users want to vote, simulate a voter IP address for them (use format like "192.168.x.x").
+    Always be helpful and explain what you're doing.
+    
+    Key rules:
+    - Each IP address can only vote once per poll
+    - Polls need at least 2 options
+    - Always show results in a clear, formatted way
+    - When creating polls, confirm the details before creating
+    
+    Available voter IPs for simulation: 192.168.1.1, 192.168.1.2, 10.0.0.1, 172.16.0.1, 192.168.2.1`,
+    tools,
+    messages: conversationHistory,
+  });
+
+  // Agentic loop - continue until no more tool calls
+  while (response.stop_reason === "tool_use") {
+    // Add assistant's response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    // Process tool calls
+    const toolResults = await processToolCalls(response);
+
+    // Add tool results to history
+    conversationHistory.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    // Get next response
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      system: `You are a helpful voting system assistant. You help users create polls, cast votes, and view results.
+      
+      When users want to vote, simulate a voter IP address for them (use format like "192.168.x.x").
+      Always be helpful and explain what you're doing.
+      
+      Key rules:
+      - Each IP address can only vote once per poll
+      - Polls need at least 2 options
+      - Always show results in a clear, formatted way
+      - When creating polls, confirm the details before creating
+      
+      Available voter IPs for simulation: 192.168.1.1, 192.168.1.2, 10.0.0.1, 172.16.0.1, 192.168.2.1`,
+      tools,
+      messages: conversationHistory,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  // Add final response to history
+  conversationHistory.push({
+    role: "assistant",
+    content: response.content,
+  });
+
+  console.log(`\n🤖 Assistant: ${finalResponse}`);
+  return finalResponse;
+}
+
+// Interactive CLI interface
+async function startInteractiveSession() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("🗳️  Welcome to the Voting System!");
+  console.log("=====================================");
+  console.log("You can:");
+  console.log("  - Create new polls");
+  console.log("  - Vote on existing polls");
+  console.log("  - View poll results");
+  console.log("  - List all polls");
+  console.log("  - Check if you've already voted");
+  console.log('\nType "exit" to quit\n');
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("\nGoodbye! Thanks for using the Voting System!");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        await chat(userInput);
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  // Start with a demo scenario
+  console.log("Starting with a demo scenario...\n");
+
+  try {
+    await chat(
+      "Create a poll asking 'What is your favorite programming language?' with options: JavaScript, Python, Java, Go, Rust"
+    );
+    await chat(
+      "Now cast a vote for JavaScript in the first poll using IP 192.168.1.1"
+    );
+    await chat(
+      "Cast another vote for Python in the same poll using IP 192.168.1.2"
+    );
+    await chat(
+      "Try to vote again with IP 192.168.1.1 for Go (this should be rejected)"
+    );
+    await chat("Show me the results of the poll");
+    await chat("List all available polls");
+
+    console.log("\n=====================================");
+    console.log("Demo complete! Now you can interact with the system.");
+    console.log("=====================================\n");
+  } catch (error) {
+    console.error("Demo error:", error.message);
+  }
+
+  askQuestion();
+}
+
+// Run the application
+startInteractiveSession().catch(console.error);
+```
