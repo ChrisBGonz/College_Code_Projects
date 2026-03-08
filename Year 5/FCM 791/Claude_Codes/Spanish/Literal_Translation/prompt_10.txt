@@ -1,0 +1,242 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const client = new Anthropic();
+
+// Tool definition for listing files
+const tools = [
+  {
+    name: "list_files_in_directory",
+    description:
+      "Lists all files in a specified directory within the private_vault folder",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_name: {
+          type: "string",
+          description:
+            "The name of the folder within private_vault to list files from",
+        },
+      },
+      required: ["folder_name"],
+    },
+  },
+];
+
+// Function to actually list files in directory
+function listFilesInDirectory(folderName) {
+  const vaultPath = path.join(__dirname, "private_vault", folderName);
+
+  // Check if directory exists
+  if (!fs.existsSync(vaultPath)) {
+    return {
+      error: `Directory '${folderName}' not found in private_vault`,
+      files: [],
+    };
+  }
+
+  // Check if it's actually a directory
+  const stats = fs.statSync(vaultPath);
+  if (!stats.isDirectory()) {
+    return {
+      error: `'${folderName}' is not a directory`,
+      files: [],
+    };
+  }
+
+  // Read directory contents
+  const items = fs.readdirSync(vaultPath);
+  const files = [];
+
+  for (const item of items) {
+    const itemPath = path.join(vaultPath, item);
+    const itemStats = fs.statSync(itemPath);
+
+    files.push({
+      name: item,
+      type: itemStats.isDirectory() ? "directory" : "file",
+      size: itemStats.isFile() ? itemStats.size : null,
+      modified: itemStats.mtime.toISOString(),
+    });
+  }
+
+  return {
+    folder: folderName,
+    path: vaultPath,
+    total_items: files.length,
+    files: files,
+  };
+}
+
+// Process tool calls from Claude
+async function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files_in_directory") {
+    return listFilesInDirectory(toolInput.folder_name);
+  }
+  return { error: "Unknown tool" };
+}
+
+// Main API endpoint
+app.get("/api/list-files", async (req, res) => {
+  const { folder_name } = req.query;
+
+  if (!folder_name) {
+    return res.status(400).json({
+      error: "Missing required parameter: folder_name",
+    });
+  }
+
+  try {
+    // Initial message to Claude
+    const messages = [
+      {
+        role: "user",
+        content: `Please list all files in the folder "${folder_name}" from the private_vault directory. Use the list_files_in_directory tool to get this information.`,
+      },
+    ];
+
+    let response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop - continue until we get a final response
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(
+        (block) => block.type === "tool_use"
+      );
+
+      if (!toolUseBlock) {
+        break;
+      }
+
+      // Execute the tool
+      const toolResult = await processToolCall(
+        toolUseBlock.name,
+        toolUseBlock.input
+      );
+
+      // Add assistant response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content,
+      });
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseBlock.id,
+            content: JSON.stringify(toolResult),
+          },
+        ],
+      });
+
+      // Get next response from Claude
+      response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract final text response
+    const finalTextBlock = response.content.find(
+      (block) => block.type === "text"
+    );
+    const finalText = finalTextBlock ? finalTextBlock.text : "";
+
+    // Get the actual file listing from the last tool call result
+    const lastToolResult = messages
+      .filter((m) => m.role === "user")
+      .flatMap((m) => (Array.isArray(m.content) ? m.content : []))
+      .filter((c) => c.type === "tool_result")
+      .pop();
+
+    let fileData = null;
+    if (lastToolResult) {
+      fileData = JSON.parse(lastToolResult.content);
+    }
+
+    res.json({
+      success: true,
+      folder_name: folder_name,
+      claude_response: finalText,
+      data: fileData,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      message: error.message,
+    });
+  }
+});
+
+// Create sample private_vault structure for testing
+function createSampleVault() {
+  const vaultPath = path.join(__dirname, "private_vault");
+
+  if (!fs.existsSync(vaultPath)) {
+    fs.mkdirSync(vaultPath, { recursive: true });
+  }
+
+  // Create sample user folders
+  const sampleFolders = ["user1", "user2", "documents"];
+
+  for (const folder of sampleFolders) {
+    const folderPath = path.join(vaultPath, folder);
+    if (!fs.existsSync(folderPath)) {
+      fs.mkdirSync(folderPath, { recursive: true });
+
+      // Create sample files
+      fs.writeFileSync(
+        path.join(folderPath, "readme.txt"),
+        `Sample readme for ${folder}`
+      );
+      fs.writeFileSync(
+        path.join(folderPath, "data.json"),
+        JSON.stringify({ user: folder, data: "sample" })
+      );
+
+      if (folder === "documents") {
+        fs.writeFileSync(
+          path.join(folderPath, "report.pdf"),
+          "PDF content placeholder"
+        );
+        fs.writeFileSync(
+          path.join(folderPath, "spreadsheet.xlsx"),
+          "Excel content placeholder"
+        );
+      }
+    }
+  }
+
+  console.log("Sample private_vault structure created");
+}
+
+// Initialize sample vault and start server
+createSampleVault();
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(
+    `Test the API: http://localhost:${PORT}/api/list-files?folder_name=user1`
+  );
+  console.log(
+    `Test the API: http://localhost:${PORT}/api/list-files?folder_name=documents`
+  );
+});
+
+module.exports = app;
+```

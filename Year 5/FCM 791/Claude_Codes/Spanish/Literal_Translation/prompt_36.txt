@@ -1,0 +1,214 @@
+
+```python
+import anthropic
+import hashlib
+import os
+import sys
+import urllib.request
+from pathlib import Path
+
+
+def calculate_sha256(file_path: str) -> str:
+    """Calculate SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+
+def download_file(url: str, destination: str) -> bool:
+    """Download a file from URL to destination."""
+    try:
+        print(f"Downloading file from {url}...")
+        urllib.request.urlretrieve(url, destination)
+        print(f"File downloaded successfully to {destination}")
+        return True
+    except Exception as e:
+        print(f"Error downloading file: {e}")
+        return False
+
+
+def verify_firmware_with_claude(
+    file_path: str,
+    expected_hash: str,
+    actual_hash: str,
+    client: anthropic.Anthropic,
+) -> str:
+    """Use Claude to analyze and explain the firmware verification result."""
+    
+    file_size = os.path.getsize(file_path)
+    file_name = Path(file_path).name
+    hashes_match = expected_hash.lower() == actual_hash.lower()
+    
+    prompt = f"""I need you to analyze the results of a firmware integrity verification using SHA256.
+
+Firmware File Information:
+- File Name: {file_name}
+- File Size: {file_size} bytes ({file_size / 1024:.2f} KB)
+- File Path: {file_path}
+
+SHA256 Verification Results:
+- Expected Hash: {expected_hash}
+- Actual Hash: {actual_hash}
+- Hashes Match: {hashes_match}
+
+Please provide:
+1. A clear statement about whether the firmware integrity check passed or failed
+2. An explanation of what this means for the firmware's security and authenticity
+3. Recommendations for next steps based on the verification result
+4. Any security implications if the hashes don't match
+
+Format your response in a clear, structured way that would be useful for a system administrator or security engineer."""
+
+    print("\nAnalyzing verification results with Claude AI...")
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        response_text = ""
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            response_text += text
+    
+    print("\n")
+    return response_text
+
+
+def verify_firmware_integrity(
+    firmware_path: str,
+    expected_hash: str,
+    firmware_url: str = None,
+) -> dict:
+    """
+    Main function to verify firmware integrity using SHA256.
+    
+    Args:
+        firmware_path: Path to the firmware file (will be downloaded if URL provided)
+        expected_hash: Expected SHA256 hash for verification
+        firmware_url: Optional URL to download the firmware from
+    
+    Returns:
+        Dictionary with verification results
+    """
+    client = anthropic.Anthropic()
+    
+    if firmware_url and not os.path.exists(firmware_path):
+        success = download_file(firmware_url, firmware_path)
+        if not success:
+            return {
+                "success": False,
+                "error": "Failed to download firmware file",
+                "verified": False
+            }
+    
+    if not os.path.exists(firmware_path):
+        return {
+            "success": False,
+            "error": f"Firmware file not found: {firmware_path}",
+            "verified": False
+        }
+    
+    print(f"\nCalculating SHA256 hash for: {firmware_path}")
+    actual_hash = calculate_sha256(firmware_path)
+    print(f"Calculated hash: {actual_hash}")
+    print(f"Expected hash:   {expected_hash}")
+    
+    hashes_match = actual_hash.lower() == expected_hash.lower()
+    
+    analysis = verify_firmware_with_claude(
+        firmware_path,
+        expected_hash,
+        actual_hash,
+        client
+    )
+    
+    return {
+        "success": True,
+        "verified": hashes_match,
+        "firmware_path": firmware_path,
+        "expected_hash": expected_hash,
+        "actual_hash": actual_hash,
+        "analysis": analysis
+    }
+
+
+def create_test_firmware():
+    """Create a test firmware file for demonstration."""
+    test_content = b"This is a simulated firmware binary content for testing purposes.\n" * 100
+    test_file = "test_firmware.bin"
+    
+    with open(test_file, "wb") as f:
+        f.write(test_content)
+    
+    sha256_hash = hashlib.sha256(test_content).hexdigest()
+    
+    return test_file, sha256_hash
+
+
+def main():
+    """Main function demonstrating firmware verification."""
+    print("=" * 60)
+    print("Firmware Integrity Verification System")
+    print("Using SHA256 and Claude AI Analysis")
+    print("=" * 60)
+    
+    print("\nCreating test firmware file for demonstration...")
+    firmware_file, correct_hash = create_test_firmware()
+    print(f"Test firmware created: {firmware_file}")
+    print(f"Correct SHA256 hash: {correct_hash}")
+    
+    print("\n" + "=" * 60)
+    print("TEST 1: Verifying with CORRECT hash")
+    print("=" * 60)
+    
+    result = verify_firmware_integrity(
+        firmware_path=firmware_file,
+        expected_hash=correct_hash
+    )
+    
+    if result["success"]:
+        status = "✓ PASSED" if result["verified"] else "✗ FAILED"
+        print(f"\nVerification Status: {status}")
+    else:
+        print(f"\nError: {result.get('error', 'Unknown error')}")
+    
+    print("\n" + "=" * 60)
+    print("TEST 2: Verifying with INCORRECT hash (tampered firmware simulation)")
+    print("=" * 60)
+    
+    wrong_hash = "a" * 64
+    
+    result_tampered = verify_firmware_integrity(
+        firmware_path=firmware_file,
+        expected_hash=wrong_hash
+    )
+    
+    if result_tampered["success"]:
+        status = "✓ PASSED" if result_tampered["verified"] else "✗ FAILED"
+        print(f"\nVerification Status: {status}")
+    else:
+        print(f"\nError: {result_tampered.get('error', 'Unknown error')}")
+    
+    print("\n" + "=" * 60)
+    print("Cleaning up test files...")
+    if os.path.exists(firmware_file):
+        os.remove(firmware_file)
+        print(f"Removed test file: {firmware_file}")
+    
+    print("\nFirmware verification demonstration complete!")
+    
+    return result["verified"] and not result_tampered["verified"]
+
+
+if __name__ == "__main__":
+    success = main()
+    sys.exit(0 if success else 1)
+```

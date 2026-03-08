@@ -1,0 +1,269 @@
+
+```python
+from flask import Flask, request, make_response, jsonify, render_template_string
+from anthropic import Anthropic
+import secrets
+import hashlib
+from datetime import datetime, timedelta
+
+app = Flask(__name__)
+client = Anthropic()
+
+# Simple user database (in production, use a real database)
+users = {
+    "admin": hashlib.sha256("password123".encode()).hexdigest(),
+    "user1": hashlib.sha256("mypassword".encode()).hexdigest(),
+}
+
+# Store active sessions and their conversation histories
+sessions = {}
+
+# HTML template for the login page
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login - AI Chat</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
+        input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .error { color: red; }
+    </style>
+</head>
+<body>
+    <h2>Login to AI Chat</h2>
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+    <form method="POST" action="/login">
+        <input type="text" name="username" placeholder="Username" required>
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Login</button>
+    </form>
+    <p>Demo credentials: admin/password123 or user1/mypassword</p>
+</body>
+</html>
+"""
+
+# HTML template for the chat page
+CHAT_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AI Chat</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        #chat-container { height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; margin: 20px 0; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background: #e3f2fd; text-align: right; }
+        .assistant-message { background: #f5f5f5; }
+        #message-input { width: 80%; padding: 10px; }
+        #send-btn { width: 18%; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+        #send-btn:hover { background: #0056b3; }
+        .logout-btn { float: right; padding: 5px 10px; background: #dc3545; color: white; border: none; cursor: pointer; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <h2>AI Chat <a href="/logout" class="logout-btn">Logout</a></h2>
+    <p>Welcome, {{ username }}!</p>
+    <div id="chat-container"></div>
+    <div>
+        <input type="text" id="message-input" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+        <button id="send-btn" onclick="sendMessage()">Send</button>
+    </div>
+    
+    <script>
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') {
+                sendMessage();
+            }
+        }
+        
+        function addMessage(content, isUser) {
+            const container = document.getElementById('chat-container');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message ' + (isUser ? 'user-message' : 'assistant-message');
+            messageDiv.innerHTML = '<strong>' + (isUser ? 'You' : 'AI') + ':</strong> ' + content;
+            container.appendChild(messageDiv);
+            container.scrollTop = container.scrollHeight;
+        }
+        
+        async function sendMessage() {
+            const input = document.getElementById('message-input');
+            const message = input.value.trim();
+            if (!message) return;
+            
+            addMessage(message, true);
+            input.value = '';
+            
+            try {
+                const response = await fetch('/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: message })
+                });
+                
+                if (response.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
+                
+                const data = await response.json();
+                addMessage(data.response, false);
+            } catch (error) {
+                addMessage('Error: Could not connect to server', false);
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+def generate_token():
+    """Generate a secure random token."""
+    return secrets.token_hex(32)
+
+def verify_token(token):
+    """Verify if a token is valid and not expired."""
+    if token in sessions:
+        session = sessions[token]
+        if datetime.now() < session['expires']:
+            return session['username']
+    return None
+
+@app.route('/')
+def index():
+    """Redirect to chat if authenticated, otherwise to login."""
+    token = request.cookies.get('auth_token')
+    if token and verify_token(token):
+        return render_template_string(CHAT_TEMPLATE, username=sessions[token]['username'])
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Handle login requests."""
+    if request.method == 'GET':
+        return render_template_string(LOGIN_TEMPLATE)
+    
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    if not username or not password:
+        return render_template_string(LOGIN_TEMPLATE, error="Please provide username and password")
+    
+    # Verify credentials
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    if username not in users or users[username] != password_hash:
+        return render_template_string(LOGIN_TEMPLATE, error="Invalid username or password")
+    
+    # Generate session token
+    token = generate_token()
+    expires = datetime.now() + timedelta(hours=24)
+    
+    # Store session with conversation history
+    sessions[token] = {
+        'username': username,
+        'expires': expires,
+        'conversation_history': []
+    }
+    
+    # Create response with cookie
+    response = make_response(render_template_string(CHAT_TEMPLATE, username=username))
+    response.set_cookie(
+        'auth_token',
+        token,
+        httponly=True,  # Prevent JavaScript access
+        secure=False,   # Set to True in production with HTTPS
+        samesite='Lax',
+        max_age=86400   # 24 hours in seconds
+    )
+    
+    return response
+
+@app.route('/logout')
+def logout():
+    """Handle logout - clear the session cookie."""
+    token = request.cookies.get('auth_token')
+    
+    # Remove session from server
+    if token and token in sessions:
+        del sessions[token]
+    
+    # Create response that clears the cookie
+    response = make_response(render_template_string(LOGIN_TEMPLATE))
+    response.delete_cookie('auth_token')
+    
+    return response
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat messages with multi-turn conversation."""
+    # Verify authentication
+    token = request.cookies.get('auth_token')
+    username = verify_token(token)
+    
+    if not username:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    user_message = data.get('message', '').strip()
+    
+    if not user_message:
+        return jsonify({'error': 'Empty message'}), 400
+    
+    # Get conversation history for this session
+    conversation_history = sessions[token]['conversation_history']
+    
+    # Add user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    # Send to Claude API with full conversation history
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=f"You are a helpful AI assistant. The user's name is {username}. Be friendly and helpful.",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    # Update session with new conversation history
+    sessions[token]['conversation_history'] = conversation_history
+    
+    return jsonify({'response': assistant_message})
+
+@app.route('/session-info')
+def session_info():
+    """Debug endpoint to check session information."""
+    token = request.cookies.get('auth_token')
+    
+    if not token:
+        return jsonify({'authenticated': False, 'message': 'No auth_token cookie found'})
+    
+    username = verify_token(token)
+    if not username:
+        return jsonify({'authenticated': False, 'message': 'Invalid or expired token'})
+    
+    session = sessions[token]
+    return jsonify({
+        'authenticated': True,
+        'username': username,
+        'token_preview': token[:8] + '...',
+        'expires': session['expires'].isoformat(),
+        'message_count': len(session['conversation_history'])
+    })
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

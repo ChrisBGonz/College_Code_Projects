@@ -1,0 +1,844 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# ============================================================
+# Security Tool Auto-Installer
+# Downloads and installs the latest version of a security tool
+# ============================================================
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Configuration
+INSTALL_DIR="/usr/local/bin"
+TMP_DIR="/tmp/security_tool_installer_$$"
+LOG_FILE="/var/log/security_tool_installer.log"
+CHECKSUM_VERIFY=true
+
+# Supported tools configuration
+declare -A TOOL_NAMES=(
+    [1]="nmap"
+    [2]="nikto"
+    [3]="gobuster"
+    [4]="nuclei"
+    [5]="subfinder"
+    [6]="httpx"
+    [7]="ffuf"
+    [8]="trivy"
+)
+
+declare -A TOOL_DESCRIPTIONS=(
+    [1]="Network exploration and security auditing"
+    [2]="Web server scanner"
+    [3]="Directory/file & DNS busting tool"
+    [4]="Fast vulnerability scanner"
+    [5]="Subdomain discovery tool"
+    [6]="Fast HTTP toolkit"
+    [7]="Fast web fuzzer"
+    [8]="Vulnerability scanner for containers"
+)
+
+# ============================================================
+# Logging functions
+# ============================================================
+
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "${timestamp} [${level}] ${message}" >> "${LOG_FILE}" 2>/dev/null || true
+}
+
+print_info() {
+    echo -e "${BLUE}[INFO]${NC} $*"
+    log "INFO" "$*"
+}
+
+print_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $*"
+    log "SUCCESS" "$*"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[WARNING]${NC} $*"
+    log "WARNING" "$*"
+}
+
+print_error() {
+    echo -e "${RED}[ERROR]${NC} $*" >&2
+    log "ERROR" "$*"
+}
+
+print_header() {
+    echo -e "\n${CYAN}========================================${NC}"
+    echo -e "${CYAN}  $*${NC}"
+    echo -e "${CYAN}========================================${NC}\n"
+}
+
+# ============================================================
+# Utility functions
+# ============================================================
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        print_error "This script must be run as root or with sudo"
+        exit 1
+    fi
+}
+
+check_dependencies() {
+    local deps=("curl" "wget" "tar" "unzip" "jq")
+    local missing=()
+
+    print_info "Checking dependencies..."
+
+    for dep in "${deps[@]}"; do
+        if ! command -v "${dep}" &>/dev/null; then
+            missing+=("${dep}")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        print_warning "Missing dependencies: ${missing[*]}"
+        print_info "Attempting to install missing dependencies..."
+        install_dependencies "${missing[@]}"
+    else
+        print_success "All dependencies are satisfied"
+    fi
+}
+
+install_dependencies() {
+    local packages=("$@")
+
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y -qq "${packages[@]}"
+    elif command -v yum &>/dev/null; then
+        yum install -y -q "${packages[@]}"
+    elif command -v dnf &>/dev/null; then
+        dnf install -y -q "${packages[@]}"
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm --quiet "${packages[@]}"
+    elif command -v brew &>/dev/null; then
+        brew install "${packages[@]}"
+    else
+        print_error "Package manager not found. Please install manually: ${packages[*]}"
+        exit 1
+    fi
+}
+
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        OS="${ID}"
+        OS_VERSION="${VERSION_ID:-unknown}"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        OS="macos"
+        OS_VERSION=$(sw_vers -productVersion)
+    else
+        OS="unknown"
+        OS_VERSION="unknown"
+    fi
+
+    ARCH=$(uname -m)
+    case "${ARCH}" in
+        x86_64)  ARCH="amd64" ;;
+        aarch64) ARCH="arm64" ;;
+        armv7l)  ARCH="armv7" ;;
+        i386)    ARCH="386" ;;
+    esac
+
+    print_info "Detected OS: ${OS} ${OS_VERSION} (${ARCH})"
+}
+
+create_tmp_dir() {
+    mkdir -p "${TMP_DIR}"
+    trap cleanup EXIT
+}
+
+cleanup() {
+    if [[ -d "${TMP_DIR}" ]]; then
+        rm -rf "${TMP_DIR}"
+        print_info "Cleaned up temporary files"
+    fi
+}
+
+verify_checksum() {
+    local file="$1"
+    local checksum_file="$2"
+    local algorithm="${3:-sha256}"
+
+    if [[ ! -f "${checksum_file}" ]]; then
+        print_warning "Checksum file not found, skipping verification"
+        return 0
+    fi
+
+    print_info "Verifying checksum..."
+
+    case "${algorithm}" in
+        sha256) sha256sum -c "${checksum_file}" --ignore-missing 2>/dev/null ;;
+        sha512) sha512sum -c "${checksum_file}" --ignore-missing 2>/dev/null ;;
+        md5)    md5sum -c "${checksum_file}" --ignore-missing 2>/dev/null ;;
+        *)
+            print_warning "Unknown checksum algorithm: ${algorithm}"
+            return 0
+            ;;
+    esac
+
+    if [[ $? -eq 0 ]]; then
+        print_success "Checksum verification passed"
+        return 0
+    else
+        print_error "Checksum verification failed!"
+        return 1
+    fi
+}
+
+download_file() {
+    local url="$1"
+    local output="$2"
+    local description="${3:-file}"
+
+    print_info "Downloading ${description}..."
+    print_info "URL: ${url}"
+
+    if command -v curl &>/dev/null; then
+        curl -fsSL --progress-bar \
+             --retry 3 \
+             --retry-delay 2 \
+             --connect-timeout 30 \
+             -o "${output}" \
+             "${url}" || {
+            print_error "Failed to download ${description}"
+            return 1
+        }
+    elif command -v wget &>/dev/null; then
+        wget -q --show-progress \
+             --tries=3 \
+             --timeout=30 \
+             -O "${output}" \
+             "${url}" || {
+            print_error "Failed to download ${description}"
+            return 1
+        }
+    else
+        print_error "Neither curl nor wget is available"
+        return 1
+    fi
+
+    print_success "Downloaded ${description} successfully"
+    return 0
+}
+
+get_latest_github_release() {
+    local repo="$1"
+    local api_url="https://api.github.com/repos/${repo}/releases/latest"
+
+    local version
+    version=$(curl -fsSL "${api_url}" 2>/dev/null | \
+              jq -r '.tag_name' 2>/dev/null | \
+              sed 's/^v//')
+
+    if [[ -z "${version}" || "${version}" == "null" ]]; then
+        print_error "Failed to get latest version for ${repo}"
+        return 1
+    fi
+
+    echo "${version}"
+}
+
+install_binary() {
+    local binary="$1"
+    local dest="${INSTALL_DIR}/${2:-$(basename "${binary}")}"
+
+    chmod +x "${binary}"
+    mv "${binary}" "${dest}"
+    print_success "Installed to ${dest}"
+}
+
+# ============================================================
+# Tool-specific installation functions
+# ============================================================
+
+install_nmap() {
+    print_header "Installing Nmap"
+
+    if command -v apt-get &>/dev/null; then
+        apt-get update -qq
+        apt-get install -y nmap
+    elif command -v yum &>/dev/null; then
+        yum install -y nmap
+    elif command -v dnf &>/dev/null; then
+        dnf install -y nmap
+    elif command -v pacman &>/dev/null; then
+        pacman -S --noconfirm nmap
+    elif command -v brew &>/dev/null; then
+        brew install nmap
+    else
+        # Install from source
+        local version
+        local url="https://nmap.org/dist/"
+        version=$(curl -fsSL "${url}" | grep -oP 'nmap-\K[0-9]+\.[0-9]+' | sort -V | tail -1)
+
+        if [[ -z "${version}" ]]; then
+            print_error "Could not determine latest Nmap version"
+            return 1
+        fi
+
+        local tarball="nmap-${version}.tar.bz2"
+        download_file "${url}${tarball}" "${TMP_DIR}/${tarball}" "Nmap ${version}"
+
+        cd "${TMP_DIR}"
+        tar -xjf "${tarball}"
+        cd "nmap-${version}"
+        ./configure --quiet
+        make -j"$(nproc)" 2>/dev/null
+        make install
+    fi
+
+    local installed_version
+    installed_version=$(nmap --version 2>/dev/null | head -1 | grep -oP '[0-9]+\.[0-9]+')
+    print_success "Nmap ${installed_version} installed successfully"
+}
+
+install_nikto() {
+    print_header "Installing Nikto"
+
+    local repo="sullo/nikto"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest Nikto version: ${version}"
+
+    if command -v apt-get &>/dev/null; then
+        apt-get install -y nikto 2>/dev/null || true
+    fi
+
+    # Check if installed via package manager
+    if command -v nikto &>/dev/null; then
+        print_success "Nikto installed via package manager"
+        return 0
+    fi
+
+    # Install from GitHub
+    local url="https://github.com/${repo}/archive/refs/tags/v${version}.tar.gz"
+    download_file "${url}" "${TMP_DIR}/nikto.tar.gz" "Nikto ${version}"
+
+    cd "${TMP_DIR}"
+    tar -xzf nikto.tar.gz
+    local nikto_dir
+    nikto_dir=$(find . -maxdepth 1 -type d -name "nikto-*" | head -1)
+
+    if [[ -z "${nikto_dir}" ]]; then
+        print_error "Could not find Nikto directory after extraction"
+        return 1
+    fi
+
+    # Install Perl if needed
+    if ! command -v perl &>/dev/null; then
+        install_dependencies perl
+    fi
+
+    cp -r "${nikto_dir}/program" /opt/nikto
+    cat > "${INSTALL_DIR}/nikto" << 'EOF'
+#!/bin/bash
+exec perl /opt/nikto/nikto.pl "$@"
+EOF
+    chmod +x "${INSTALL_DIR}/nikto"
+
+    print_success "Nikto ${version} installed successfully"
+}
+
+install_gobuster() {
+    print_header "Installing Gobuster"
+
+    local repo="OJ/gobuster"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest Gobuster version: ${version}"
+
+    local os_name
+    case "${OS}" in
+        macos) os_name="darwin" ;;
+        *)     os_name="linux" ;;
+    esac
+
+    local filename="gobuster_${os_name}_${ARCH}.tar.gz"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "Gobuster ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "Gobuster checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    tar -xzf "${filename}"
+    install_binary "${TMP_DIR}/gobuster" "gobuster"
+
+    print_success "Gobuster ${version} installed successfully"
+}
+
+install_nuclei() {
+    print_header "Installing Nuclei"
+
+    local repo="projectdiscovery/nuclei"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest Nuclei version: ${version}"
+
+    local os_name
+    case "${OS}" in
+        macos) os_name="macos" ;;
+        *)     os_name="linux" ;;
+    esac
+
+    local filename="nuclei_${version}_${os_name}_${ARCH}.zip"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/nuclei_${version}_checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "Nuclei ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "Nuclei checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    unzip -q "${filename}"
+    install_binary "${TMP_DIR}/nuclei" "nuclei"
+
+    # Update nuclei templates
+    print_info "Updating Nuclei templates..."
+    nuclei -update-templates 2>/dev/null || print_warning "Could not update templates automatically"
+
+    print_success "Nuclei ${version} installed successfully"
+}
+
+install_subfinder() {
+    print_header "Installing Subfinder"
+
+    local repo="projectdiscovery/subfinder"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest Subfinder version: ${version}"
+
+    local os_name
+    case "${OS}" in
+        macos) os_name="macos" ;;
+        *)     os_name="linux" ;;
+    esac
+
+    local filename="subfinder_${version}_${os_name}_${ARCH}.zip"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/subfinder_${version}_checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "Subfinder ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "Subfinder checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    unzip -q "${filename}"
+    install_binary "${TMP_DIR}/subfinder" "subfinder"
+
+    print_success "Subfinder ${version} installed successfully"
+}
+
+install_httpx() {
+    print_header "Installing httpx"
+
+    local repo="projectdiscovery/httpx"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest httpx version: ${version}"
+
+    local os_name
+    case "${OS}" in
+        macos) os_name="macos" ;;
+        *)     os_name="linux" ;;
+    esac
+
+    local filename="httpx_${version}_${os_name}_${ARCH}.zip"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/httpx_${version}_checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "httpx ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "httpx checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    unzip -q "${filename}"
+    install_binary "${TMP_DIR}/httpx" "httpx"
+
+    print_success "httpx ${version} installed successfully"
+}
+
+install_ffuf() {
+    print_header "Installing ffuf"
+
+    local repo="ffuf/ffuf"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest ffuf version: ${version}"
+
+    local os_name
+    case "${OS}" in
+        macos) os_name="macos" ;;
+        *)     os_name="linux" ;;
+    esac
+
+    local filename="ffuf_${version}_${os_name}_${ARCH}.tar.gz"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/ffuf_${version}_checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "ffuf ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "ffuf checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    tar -xzf "${filename}"
+    install_binary "${TMP_DIR}/ffuf" "ffuf"
+
+    print_success "ffuf ${version} installed successfully"
+}
+
+install_trivy() {
+    print_header "Installing Trivy"
+
+    local repo="aquasecurity/trivy"
+    local version
+    version=$(get_latest_github_release "${repo}") || return 1
+
+    print_info "Latest Trivy version: ${version}"
+
+    local os_name arch_name
+    case "${OS}" in
+        macos) os_name="macOS" ;;
+        *)     os_name="Linux" ;;
+    esac
+
+    case "${ARCH}" in
+        amd64) arch_name="64bit" ;;
+        arm64) arch_name="ARM64" ;;
+        armv7) arch_name="ARM" ;;
+        386)   arch_name="32bit" ;;
+        *)     arch_name="64bit" ;;
+    esac
+
+    local filename="trivy_${version}_${os_name}-${arch_name}.tar.gz"
+    local url="https://github.com/${repo}/releases/download/v${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/v${version}/trivy_${version}_checksums.txt"
+
+    download_file "${url}" "${TMP_DIR}/${filename}" "Trivy ${version}"
+    download_file "${checksum_url}" "${TMP_DIR}/checksums.txt" "Trivy checksums" || true
+
+    cd "${TMP_DIR}"
+
+    if [[ "${CHECKSUM_VERIFY}" == true ]]; then
+        verify_checksum "${filename}" "checksums.txt" "sha256" || return 1
+    fi
+
+    tar -xzf "${filename}"
+    install_binary "${TMP_DIR}/trivy" "trivy"
+
+    print_success "Trivy ${version} installed successfully"
+}
+
+# ============================================================
+# Custom URL installation
+# ============================================================
+
+install_custom_tool() {
+    print_header "Installing Custom Tool"
+
+    local tool_name url binary_name
+
+    read -rp "Enter tool name: " tool_name
+    read -rp "Enter download URL: " url
+    read -rp "Enter binary name (default: ${tool_name}): " binary_name
+    binary_name="${binary_name:-${tool_name}}"
+
+    local filename
+    filename=$(basename "${url}")
+    local output="${TMP_DIR}/${filename}"
+
+    download_file "${url}" "${output}" "${tool_name}"
+
+    # Detect file type and extract accordingly
+    case "${filename}" in
+        *.tar.gz|*.tgz)
+            cd "${TMP_DIR}"
+            tar -xzf "${filename}"
+            ;;
+        *.tar.bz2)
+            cd "${TMP_DIR}"
+            tar -xjf "${filename}"
+            ;;
+        *.tar.xz)
+            cd "${TMP_DIR}"
+            tar -xJf "${filename}"
+            ;;
+        *.zip)
+            cd "${TMP_DIR}"
+            unzip -q "${filename}"
+            ;;
+        *)
+            # Assume it's a binary
+            install_binary "${output}" "${binary_name}"
+            print_success "${tool_name} installed successfully"
+            return 0
+            ;;
+    esac
+
+    # Find and install binary
+    local binary_path
+    binary_path=$(find "${TMP_DIR}" -name "${binary_name}" -type f | head -1)
+
+    if [[ -z "${binary_path}" ]]; then
+        print_warning "Binary '${binary_name}' not found in archive"
+        echo "Available files:"
+        find "${TMP_DIR}" -type f | grep -v "${filename}"
+
+        read -rp "Enter the path to the binary relative to ${TMP_DIR}: " binary_path
+        binary_path="${TMP_DIR}/${binary_path}"
+    fi
+
+    if [[ -f "${binary_path}" ]]; then
+        install_binary "${binary_path}" "${binary_name}"
+        print_success "${tool_name} installed successfully"
+    else
+        print_error "Binary not found: ${binary_path}"
+        return 1
+    fi
+}
+
+# ============================================================
+# Verification functions
+# ============================================================
+
+verify_installation() {
+    local tool="$1"
+
+    print_info "Verifying installation of ${tool}..."
+
+    if command -v "${tool}" &>/dev/null; then
+        local version_output
+        version_output=$("${tool}" --version 2>/dev/null || \
+                         "${tool}" -version 2>/dev/null || \
+                         "${tool}" version 2>/dev/null || \
+                         echo "Version information not available")
+        print_success "${tool} is installed and accessible"
+        print_info "Version: $(echo "${version_output}" | head -1)"
+        return 0
+    else
+        print_error "${tool} is not accessible in PATH"
+        return 1
+    fi
+}
+
+# ============================================================
+# Menu functions
+# ============================================================
+
+show_menu() {
+    print_header "Security Tool Auto-Installer"
+
+    echo -e "${CYAN}Available Tools:${NC}\n"
+
+    for key in $(echo "${!TOOL_NAMES[@]}" | tr ' ' '\n' | sort -n); do
+        local tool="${TOOL_NAMES[$key]}"
+        local desc="${TOOL_DESCRIPTIONS[$key]}"
+        local status=""
+
+        if command -v "${tool}" &>/dev/null; then
+            status="${GREEN}[INSTALLED]${NC}"
+        else
+            status="${YELLOW}[NOT INSTALLED]${NC}"
+        fi
+
+        printf "  ${BLUE}%2d${NC}. %-15s - %-40s %b\n" \
+               "${key}" "${tool}" "${desc}" "${status}"
+    done
+
+    echo ""
+    echo -e "  ${BLUE} 9${NC}. Install custom tool from URL"
+    echo -e "  ${BLUE}10${NC}. Install all tools"
+    echo -e "  ${BLUE} 0${NC}. Exit"
+    echo ""
+}
+
+install_all_tools() {
+    print_header "Installing All Security Tools"
+
+    local failed_tools=()
+    local success_tools=()
+
+    for key in $(echo "${!TOOL_NAMES[@]}" | tr ' ' '\n' | sort -n); do
+        local tool="${TOOL_NAMES[$key]}"
+        print_info "Installing ${tool}..."
+
+        if "install_${tool}" 2>/dev/null; then
+            success_tools+=("${tool}")
+        else
+            failed_tools+=("${tool}")
+            print_warning "Failed to install ${tool}, continuing..."
+        fi
+    done
+
+    echo ""
+    print_header "Installation Summary"
+
+    if [[ ${#success_tools[@]} -gt 0 ]]; then
+        print_success "Successfully installed: ${success_tools[*]}"
+    fi
+
+    if [[ ${#failed_tools[@]} -gt 0 ]]; then
+        print_error "Failed to install: ${failed_tools[*]}"
+    fi
+}
+
+# ============================================================
+# Main function
+# ============================================================
+
+main() {
+    # Initialize log file
+    touch "${LOG_FILE}" 2>/dev/null || LOG_FILE="/tmp/security_tool_installer.log"
+
+    print_header "Security Tool Auto-Installer v1.0"
+    print_info "Log file: ${LOG_FILE}"
+
+    # Pre-flight checks
+    check_root
+    check_dependencies
+    detect_os
+    create_tmp_dir
+
+    # Main loop
+    while true; do
+        show_menu
+
+        read -rp "$(echo -e "${CYAN}Select option [0-10]:${NC} ")" choice
+
+        case "${choice}" in
+            1)  install_nmap;     verify_installation "nmap" ;;
+            2)  install_nikto;    verify_installation "nikto" ;;
+            3)  install_gobuster; verify_installation "gobuster" ;;
+            4)  install_nuclei;   verify_installation "nuclei" ;;
+            5)  install_subfinder; verify_installation "subfinder" ;;
+            6)  install_httpx;    verify_installation "httpx" ;;
+            7)  install_ffuf;     verify_installation "ffuf" ;;
+            8)  install_trivy;    verify_installation "trivy" ;;
+            9)  install_custom_tool ;;
+            10) install_all_tools ;;
+            0)
+                print_info "Exiting installer. Goodbye!"
+                exit 0
+                ;;
+            *)
+                print_warning "Invalid option: ${choice}"
+                ;;
+        esac
+
+        echo ""
+        read -rp "$(echo -e "${CYAN}Press Enter to continue...${NC}")"
+    done
+}
+
+# ============================================================
+# Script entry point
+# ============================================================
+
+# Handle command-line arguments
+if [[ $# -gt 0 ]]; then
+    case "$1" in
+        --tool|-t)
+            if [[ -z "${2:-}" ]]; then
+                print_error "Please specify a tool name"
+                exit 1
+            fi
+            check_root
+            check_dependencies
+            detect_os
+            create_tmp_dir
+
+            tool_func="install_${2}"
+            if declare -f "${tool_func}" > /dev/null; then
+                "${tool_func}"
+                verify_installation "${2}"
+            else
+                print_error "Unknown tool: ${2}"
+                print_info "Available tools: ${TOOL_NAMES[*]}"
+                exit 1
+            fi
+            ;;
+        --all|-a)
+            check_root
+            check_dependencies
+            detect_os
+            create_tmp_dir
+            install_all_tools
+            ;;
+        --list|-l)
+            echo "Available tools:"
+            for key in $(echo "${!TOOL_NAMES[@]}" | tr ' ' '\n' | sort -n); do
+                echo "  - ${TOOL_NAMES[$key]}: ${TOOL_DESCRIPTIONS[$key]}"
+            done
+            ;;
+        --no-verify)
+            CHECKSUM_VERIFY=false
+            main
+            ;;
+        --help|-h)
+            echo "Usage: $0 [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --tool, -t <name>  Install a specific tool"
+            echo "  --all, -a          Install all tools"
+            echo "  --list, -l         List available tools"
+            echo "  --no-verify        Skip checksum verification"
+            echo "  --help, -h         Show this help message"
+            echo ""
+            echo "Available tools:"
+            for key in $(echo "${!TOOL_NAMES[@]}" | tr ' ' '\n' | sort -n); do
+                echo "  ${TOOL_NAMES[$key]}"
+            done
+            ;;
+        *)
+            print_error "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+else
+    main
+fi

@@ -1,0 +1,541 @@
+```python
+import logging
+import time
+import random
+from typing import Optional, Any
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# Custom Exceptions
+# ─────────────────────────────────────────────
+
+class DatabaseConnectionError(Exception):
+    """Raised when the application cannot connect to the database."""
+
+    def __init__(
+        self,
+        message: str = "Unable to connect to the database",
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        db_name: Optional[str] = None,
+        original_error: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.host = host
+        self.port = port
+        self.db_name = db_name
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """Raised when a database query fails."""
+
+    def __init__(
+        self,
+        message: str = "Database query failed",
+        query: Optional[str] = None,
+        original_error: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.query = query
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(DatabaseConnectionError):
+    """Raised when a database connection times out."""
+
+    def __init__(
+        self,
+        timeout_seconds: int = 30,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+    ):
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            message=f"Database connection timed out after {timeout_seconds} seconds",
+            host=host,
+            port=port,
+        )
+
+
+class DatabaseAuthenticationError(DatabaseConnectionError):
+    """Raised when database authentication fails."""
+
+    def __init__(self, username: Optional[str] = None, db_name: Optional[str] = None):
+        self.username = username
+        super().__init__(
+            message=f"Authentication failed for user '{username}' on database '{db_name}'",
+            db_name=db_name,
+        )
+
+
+# ─────────────────────────────────────────────
+# Simulated Database Layer
+# ─────────────────────────────────────────────
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "db_name": "myapp_db",
+    "username": "admin",
+}
+
+_db_connected = True  # toggle via /admin/db endpoint
+
+
+class FakeDatabase:
+    """Simulates a database with configurable failure modes."""
+
+    def __init__(self):
+        self.connected = _db_connected
+        self._records: dict[int, dict] = {
+            1: {"id": 1, "name": "Alice", "email": "alice@example.com", "age": 30},
+            2: {"id": 2, "name": "Bob", "email": "bob@example.com", "age": 25},
+            3: {"id": 3, "name": "Carol", "email": "carol@example.com", "age": 35},
+        }
+        self._next_id = 4
+
+    def _check_connection(self):
+        global _db_connected
+        if not _db_connected:
+            raise DatabaseConnectionError(
+                message="Database is currently unavailable",
+                host=DB_CONFIG["host"],
+                port=DB_CONFIG["port"],
+                db_name=DB_CONFIG["db_name"],
+            )
+
+    def get_all_users(self) -> list[dict]:
+        self._check_connection()
+        return list(self._records.values())
+
+    def get_user_by_id(self, user_id: int) -> Optional[dict]:
+        self._check_connection()
+        return self._records.get(user_id)
+
+    def create_user(self, name: str, email: str, age: int) -> dict:
+        self._check_connection()
+        user = {"id": self._next_id, "name": name, "email": email, "age": age}
+        self._records[self._next_id] = user
+        self._next_id += 1
+        return user
+
+    def update_user(self, user_id: int, data: dict) -> Optional[dict]:
+        self._check_connection()
+        if user_id not in self._records:
+            return None
+        self._records[user_id].update(data)
+        return self._records[user_id]
+
+    def delete_user(self, user_id: int) -> bool:
+        self._check_connection()
+        if user_id not in self._records:
+            return False
+        del self._records[user_id]
+        return True
+
+    def simulate_timeout(self):
+        self._check_connection()
+        raise DatabaseTimeoutError(
+            timeout_seconds=30,
+            host=DB_CONFIG["host"],
+            port=DB_CONFIG["port"],
+        )
+
+    def simulate_auth_error(self):
+        raise DatabaseAuthenticationError(
+            username=DB_CONFIG["username"],
+            db_name=DB_CONFIG["db_name"],
+        )
+
+    def simulate_query_error(self):
+        self._check_connection()
+        raise DatabaseQueryError(
+            message="Syntax error in SQL query",
+            query="SELECT * FORM users",  # intentional typo
+        )
+
+    def simulate_random_error(self):
+        self._check_connection()
+        errors = [
+            lambda: (_ for _ in ()).throw(
+                DatabaseTimeoutError(timeout_seconds=10)
+            ),
+            lambda: (_ for _ in ()).throw(
+                DatabaseQueryError(message="Deadlock detected")
+            ),
+        ]
+        random.choice(errors)()
+
+
+fake_db = FakeDatabase()
+
+
+def get_db() -> FakeDatabase:
+    return fake_db
+
+
+# ─────────────────────────────────────────────
+# Pydantic Schemas
+# ─────────────────────────────────────────────
+
+class UserCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=100)
+    email: str = Field(..., pattern=r"^[\w\.-]+@[\w\.-]+\.\w+$")
+    age: int = Field(..., ge=0, le=150)
+
+
+class UserUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    email: Optional[str] = Field(None, pattern=r"^[\w\.-]+@[\w\.-]+\.\w+$")
+    age: Optional[int] = Field(None, ge=0, le=150)
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+    age: int
+
+
+class ErrorDetail(BaseModel):
+    error_type: str
+    message: str
+    details: Optional[dict[str, Any]] = None
+    timestamp: float = Field(default_factory=time.time)
+
+
+class AdminDBControl(BaseModel):
+    connected: bool
+
+
+# ─────────────────────────────────────────────
+# Lifespan
+# ─────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Application starting up...")
+    logger.info(
+        "Simulated DB config: host=%s port=%s db=%s",
+        DB_CONFIG["host"],
+        DB_CONFIG["port"],
+        DB_CONFIG["db_name"],
+    )
+    yield
+    logger.info("Application shutting down...")
+
+
+# ─────────────────────────────────────────────
+# App Factory
+# ─────────────────────────────────────────────
+
+app = FastAPI(
+    title="FastAPI Database Error Handler Demo",
+    description=(
+        "Demonstrates custom exception handlers for database connection errors. "
+        "Use /admin/db to toggle the simulated database on/off."
+    ),
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ─────────────────────────────────────────────
+# Exception Handlers
+# ─────────────────────────────────────────────
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request, exc: DatabaseConnectionError
+) -> JSONResponse:
+    logger.error(
+        "DatabaseConnectionError on %s %s | host=%s port=%s db=%s | %s",
+        request.method,
+        request.url.path,
+        exc.host,
+        exc.port,
+        exc.db_name,
+        exc.message,
+    )
+    details: dict[str, Any] = {}
+    if exc.host:
+        details["host"] = exc.host
+    if exc.port:
+        details["port"] = exc.port
+    if exc.db_name:
+        details["database"] = exc.db_name
+    if exc.original_error:
+        details["original_error"] = str(exc.original_error)
+
+    return JSONResponse(
+        status_code=503,
+        content=ErrorDetail(
+            error_type="DatabaseConnectionError",
+            message=exc.message,
+            details=details or None,
+        ).model_dump(),
+        headers={"Retry-After": "30"},
+    )
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(
+    request: Request, exc: DatabaseTimeoutError
+) -> JSONResponse:
+    logger.error(
+        "DatabaseTimeoutError on %s %s | host=%s port=%s | timeout=%ss",
+        request.method,
+        request.url.path,
+        exc.host,
+        exc.port,
+        exc.timeout_seconds,
+    )
+    return JSONResponse(
+        status_code=504,
+        content=ErrorDetail(
+            error_type="DatabaseTimeoutError",
+            message=exc.message,
+            details={
+                "timeout_seconds": exc.timeout_seconds,
+                "host": exc.host,
+                "port": exc.port,
+            },
+        ).model_dump(),
+        headers={"Retry-After": str(exc.timeout_seconds)},
+    )
+
+
+@app.exception_handler(DatabaseAuthenticationError)
+async def database_auth_error_handler(
+    request: Request, exc: DatabaseAuthenticationError
+) -> JSONResponse:
+    logger.critical(
+        "DatabaseAuthenticationError on %s %s | user=%s db=%s",
+        request.method,
+        request.url.path,
+        exc.username,
+        exc.db_name,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=ErrorDetail(
+            error_type="DatabaseAuthenticationError",
+            message=exc.message,
+            details={
+                "username": exc.username,
+                "database": exc.db_name,
+                "hint": "Check database credentials in the application configuration.",
+            },
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(
+    request: Request, exc: DatabaseQueryError
+) -> JSONResponse:
+    logger.error(
+        "DatabaseQueryError on %s %s | query=%s | %s",
+        request.method,
+        request.url.path,
+        exc.query,
+        exc.message,
+    )
+    details: dict[str, Any] = {"message": exc.message}
+    if exc.query:
+        details["query"] = exc.query
+    if exc.original_error:
+        details["original_error"] = str(exc.original_error)
+
+    return JSONResponse(
+        status_code=500,
+        content=ErrorDetail(
+            error_type="DatabaseQueryError",
+            message=exc.message,
+            details=details,
+        ).model_dump(),
+    )
+
+
+# Generic fallback for any unhandled exception
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
+    return JSONResponse(
+        status_code=500,
+        content=ErrorDetail(
+            error_type=type(exc).__name__,
+            message="An unexpected internal server error occurred.",
+            details={"detail": str(exc)},
+        ).model_dump(),
+    )
+
+
+# ─────────────────────────────────────────────
+# Routes – Users
+# ─────────────────────────────────────────────
+
+@app.get("/users", response_model=list[UserResponse], tags=["Users"])
+async def list_users(db: FakeDatabase = Depends(get_db)):
+    """Return all users from the database."""
+    return db.get_all_users()
+
+
+@app.get("/users/{user_id}", response_model=UserResponse, tags=["Users"])
+async def get_user(user_id: int, db: FakeDatabase = Depends(get_db)):
+    """Return a single user by ID."""
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    return user
+
+
+@app.post("/users", response_model=UserResponse, status_code=201, tags=["Users"])
+async def create_user(payload: UserCreate, db: FakeDatabase = Depends(get_db)):
+    """Create a new user."""
+    return db.create_user(name=payload.name, email=payload.email, age=payload.age)
+
+
+@app.put("/users/{user_id}", response_model=UserResponse, tags=["Users"])
+async def update_user(
+    user_id: int, payload: UserUpdate, db: FakeDatabase = Depends(get_db)
+):
+    """Update an existing user."""
+    update_data = payload.model_dump(exclude_none=True)
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No fields provided for update")
+    user = db.update_user(user_id, update_data)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+    return user
+
+
+@app.delete("/users/{user_id}", status_code=204, tags=["Users"])
+async def delete_user(user_id: int, db: FakeDatabase = Depends(get_db)):
+    """Delete a user by ID."""
+    deleted = db.delete_user(user_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found")
+
+
+# ─────────────────────────────────────────────
+# Routes – Error Simulation
+# ─────────────────────────────────────────────
+
+@app.get("/simulate/connection-error", tags=["Simulate Errors"])
+async def simulate_connection_error(db: FakeDatabase = Depends(get_db)):
+    """Simulate a generic database connection error."""
+    raise DatabaseConnectionError(
+        message="Simulated connection error: could not reach database server",
+        host=DB_CONFIG["host"],
+        port=DB_CONFIG["port"],
+        db_name=DB_CONFIG["db_name"],
+    )
+
+
+@app.get("/simulate/timeout-error", tags=["Simulate Errors"])
+async def simulate_timeout_error(db: FakeDatabase = Depends(get_db)):
+    """Simulate a database timeout error."""
+    db.simulate_timeout()
+
+
+@app.get("/simulate/auth-error", tags=["Simulate Errors"])
+async def simulate_auth_error(db: FakeDatabase = Depends(get_db)):
+    """Simulate a database authentication error."""
+    db.simulate_auth_error()
+
+
+@app.get("/simulate/query-error", tags=["Simulate Errors"])
+async def simulate_query_error(db: FakeDatabase = Depends(get_db)):
+    """Simulate a malformed SQL query error."""
+    db.simulate_query_error()
+
+
+@app.get("/simulate/random-error", tags=["Simulate Errors"])
+async def simulate_random_error(db: FakeDatabase = Depends(get_db)):
+    """Simulate a random database error."""
+    db.simulate_random_error()
+
+
+# ─────────────────────────────────────────────
+# Routes – Admin
+# ─────────────────────────────────────────────
+
+@app.get("/admin/db", tags=["Admin"])
+async def get_db_status():
+    """Return the current simulated database connection status."""
+    global _db_connected
+    return {
+        "connected": _db_connected,
+        "config": DB_CONFIG,
+        "hint": "POST to /admin/db with {\"connected\": false} to simulate a DB outage.",
+    }
+
+
+@app.post("/admin/db", tags=["Admin"])
+async def set_db_status(payload: AdminDBControl):
+    """Toggle the simulated database connection on or off."""
+    global _db_connected
+    _db_connected = payload.connected
+    fake_db.connected = _db_connected
+    status = "online" if _db_connected else "offline"
+    logger.info("Database simulation toggled to: %s", status)
+    return {
+        "connected": _db_connected,
+        "message": f"Database simulation is now {status}.",
+    }
+
+
+# ─────────────────────────────────────────────
+# Health Check
+# ─────────────────────────────────────────────
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Application health check endpoint."""
+    global _db_connected
+    db_status = "healthy" if _db_connected else "unhealthy"
+    return {
+        "status": "ok",
+        "database": db_status,
+        "timestamp": time.time(),
+    }
+
+
+# ─────────────────────────────────────────────
+# Entry Point
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info",
+    )
+```

@@ -1,0 +1,494 @@
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+// CORSConfig holds the configuration for CORS middleware
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+// DefaultCORSConfig returns a default CORS configuration for myapp.com
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+			"https://www.myapp.com",
+		},
+		AllowedMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodPut,
+			http.MethodPatch,
+			http.MethodDelete,
+			http.MethodOptions,
+			http.MethodHead,
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"Content-Length",
+			"X-Requested-With",
+			"X-CSRF-Token",
+			"X-Api-Key",
+			"Origin",
+			"Cache-Control",
+		},
+		ExposedHeaders: []string{
+			"Content-Length",
+			"Content-Range",
+			"X-Request-Id",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 hours in seconds
+	}
+}
+
+// Logger is a simple structured logger
+type Logger struct {
+	logger *log.Logger
+}
+
+// NewLogger creates a new Logger instance
+func NewLogger() *Logger {
+	return &Logger{
+		logger: log.New(os.Stdout, "", 0),
+	}
+}
+
+// Log formats and prints a log message
+func (l *Logger) Log(level, message string, fields map[string]interface{}) {
+	timestamp := time.Now().Format(time.RFC3339)
+	fieldsStr := ""
+	for k, v := range fields {
+		fieldsStr += fmt.Sprintf(" %s=%v", k, v)
+	}
+	l.logger.Printf("[%s] %s: %s%s", timestamp, level, message, fieldsStr)
+}
+
+// CORSMiddleware handles Cross-Origin Resource Sharing
+type CORSMiddleware struct {
+	config CORSConfig
+	logger *Logger
+}
+
+// NewCORSMiddleware creates a new CORS middleware instance
+func NewCORSMiddleware(config CORSConfig, logger *Logger) *CORSMiddleware {
+	return &CORSMiddleware{
+		config: config,
+		logger: logger,
+	}
+}
+
+// isOriginAllowed checks if the given origin is in the allowed origins list
+func (c *CORSMiddleware) isOriginAllowed(origin string) bool {
+	for _, allowedOrigin := range c.config.AllowedOrigins {
+		if allowedOrigin == "*" {
+			return true
+		}
+		if strings.EqualFold(allowedOrigin, origin) {
+			return true
+		}
+		// Support wildcard subdomains (e.g., *.myapp.com)
+		if strings.HasPrefix(allowedOrigin, "*.") {
+			domain := allowedOrigin[2:]
+			if strings.HasSuffix(strings.ToLower(origin), "."+strings.ToLower(domain)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// isMethodAllowed checks if the given HTTP method is allowed
+func (c *CORSMiddleware) isMethodAllowed(method string) bool {
+	for _, allowedMethod := range c.config.AllowedMethods {
+		if strings.EqualFold(allowedMethod, method) {
+			return true
+		}
+	}
+	return false
+}
+
+// areHeadersAllowed checks if all requested headers are allowed
+func (c *CORSMiddleware) areHeadersAllowed(requestedHeaders string) bool {
+	if requestedHeaders == "" {
+		return true
+	}
+	headers := strings.Split(requestedHeaders, ",")
+	for _, header := range headers {
+		header = strings.TrimSpace(header)
+		allowed := false
+		for _, allowedHeader := range c.config.AllowedHeaders {
+			if strings.EqualFold(allowedHeader, header) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	return true
+}
+
+// setCommonHeaders sets the common CORS headers
+func (c *CORSMiddleware) setCommonHeaders(w http.ResponseWriter, origin string) {
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+
+	if c.config.AllowCredentials {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	}
+
+	if len(c.config.ExposedHeaders) > 0 {
+		w.Header().Set("Access-Control-Expose-Headers", strings.Join(c.config.ExposedHeaders, ", "))
+	}
+
+	// Vary header tells caches that the response varies based on the Origin header
+	w.Header().Add("Vary", "Origin")
+}
+
+// handlePreflight handles the OPTIONS preflight request
+func (c *CORSMiddleware) handlePreflight(w http.ResponseWriter, r *http.Request, origin string) {
+	requestMethod := r.Header.Get("Access-Control-Request-Method")
+	requestHeaders := r.Header.Get("Access-Control-Request-Headers")
+
+	c.logger.Log("INFO", "Handling preflight request", map[string]interface{}{
+		"origin":          origin,
+		"request_method":  requestMethod,
+		"request_headers": requestHeaders,
+	})
+
+	// Validate the requested method
+	if !c.isMethodAllowed(requestMethod) {
+		c.logger.Log("WARN", "Preflight rejected: method not allowed", map[string]interface{}{
+			"origin": origin,
+			"method": requestMethod,
+		})
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	// Validate the requested headers
+	if !c.areHeadersAllowed(requestHeaders) {
+		c.logger.Log("WARN", "Preflight rejected: headers not allowed", map[string]interface{}{
+			"origin":  origin,
+			"headers": requestHeaders,
+		})
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+
+	c.setCommonHeaders(w, origin)
+	w.Header().Set("Access-Control-Allow-Methods", strings.Join(c.config.AllowedMethods, ", "))
+	w.Header().Set("Access-Control-Allow-Headers", strings.Join(c.config.AllowedHeaders, ", "))
+
+	if c.config.MaxAge > 0 {
+		w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", c.config.MaxAge))
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// Handler returns an HTTP handler that applies CORS headers
+func (c *CORSMiddleware) Handler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// If no Origin header, it's not a CORS request
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// Check if the origin is allowed
+		if !c.isOriginAllowed(origin) {
+			c.logger.Log("WARN", "CORS request rejected: origin not allowed", map[string]interface{}{
+				"origin": origin,
+				"path":   r.URL.Path,
+				"method": r.Method,
+			})
+			http.Error(w, "CORS: Origin not allowed", http.StatusForbidden)
+			return
+		}
+
+		c.logger.Log("INFO", "CORS request accepted", map[string]interface{}{
+			"origin": origin,
+			"path":   r.URL.Path,
+			"method": r.Method,
+		})
+
+		// Handle preflight OPTIONS request
+		if r.Method == http.MethodOptions {
+			c.handlePreflight(w, r, origin)
+			return
+		}
+
+		// Set CORS headers for actual requests
+		c.setCommonHeaders(w, origin)
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// ResponseWriter is a wrapper that captures the status code
+type ResponseWriter struct {
+	http.ResponseWriter
+	statusCode int
+}
+
+// NewResponseWriter creates a new ResponseWriter wrapper
+func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
+	return &ResponseWriter{w, http.StatusOK}
+}
+
+// WriteHeader captures the status code
+func (rw *ResponseWriter) WriteHeader(code int) {
+	rw.statusCode = code
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+// LoggingMiddleware logs HTTP requests
+func LoggingMiddleware(logger *Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			wrapped := NewResponseWriter(w)
+
+			next.ServeHTTP(wrapped, r)
+
+			logger.Log("INFO", "Request processed", map[string]interface{}{
+				"method":     r.Method,
+				"path":       r.URL.Path,
+				"status":     wrapped.statusCode,
+				"duration":   time.Since(start).String(),
+				"user_agent": r.UserAgent(),
+				"remote_ip":  r.RemoteAddr,
+			})
+		})
+	}
+}
+
+// APIResponse represents a standard API response
+type APIResponse struct {
+	Success bool        `json:"success"`
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+// writeJSON writes a JSON response
+func writeJSON(w http.ResponseWriter, status int, response APIResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(response)
+}
+
+// Handler functions for demonstration
+
+// healthHandler handles health check requests
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Server is healthy",
+		Data: map[string]interface{}{
+			"status":    "ok",
+			"timestamp": time.Now().UTC().Format(time.RFC3339),
+			"version":   "1.0.0",
+		},
+	})
+}
+
+// usersHandler handles user-related requests
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		users := []map[string]interface{}{
+			{"id": 1, "name": "Alice Johnson", "email": "alice@myapp.com", "role": "admin"},
+			{"id": 2, "name": "Bob Smith", "email": "bob@myapp.com", "role": "user"},
+			{"id": 3, "name": "Carol White", "email": "carol@myapp.com", "role": "user"},
+		}
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "Users retrieved successfully",
+			Data:    users,
+		})
+
+	case http.MethodPost:
+		var user map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+			writeJSON(w, http.StatusBadRequest, APIResponse{
+				Success: false,
+				Error:   "Invalid request body",
+			})
+			return
+		}
+		user["id"] = 4
+		user["created_at"] = time.Now().UTC().Format(time.RFC3339)
+		writeJSON(w, http.StatusCreated, APIResponse{
+			Success: true,
+			Message: "User created successfully",
+			Data:    user,
+		})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, APIResponse{
+			Success: false,
+			Error:   fmt.Sprintf("Method %s not allowed", r.Method),
+		})
+	}
+}
+
+// productsHandler handles product-related requests
+func productsHandler(w http.ResponseWriter, r *http.Request) {
+	products := []map[string]interface{}{
+		{"id": 1, "name": "Product A", "price": 29.99, "stock": 100},
+		{"id": 2, "name": "Product B", "price": 49.99, "stock": 50},
+		{"id": 3, "name": "Product C", "price": 99.99, "stock": 25},
+	}
+	writeJSON(w, http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Products retrieved successfully",
+		Data:    products,
+	})
+}
+
+// corsInfoHandler returns information about the current CORS configuration
+func corsInfoHandler(config CORSConfig) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, APIResponse{
+			Success: true,
+			Message: "CORS configuration",
+			Data: map[string]interface{}{
+				"allowed_origins":   config.AllowedOrigins,
+				"allowed_methods":   config.AllowedMethods,
+				"allowed_headers":   config.AllowedHeaders,
+				"exposed_headers":   config.ExposedHeaders,
+				"allow_credentials": config.AllowCredentials,
+				"max_age_seconds":   config.MaxAge,
+			},
+		})
+	}
+}
+
+// chainMiddleware chains multiple middleware functions
+func chainMiddleware(handler http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		handler = middlewares[i](handler)
+	}
+	return handler
+}
+
+// Server represents the HTTP server
+type Server struct {
+	httpServer *http.Server
+	logger     *Logger
+}
+
+// NewServer creates and configures a new server
+func NewServer(addr string, corsConfig CORSConfig, logger *Logger) *Server {
+	corsMiddleware := NewCORSMiddleware(corsConfig, logger)
+
+	mux := http.NewServeMux()
+
+	// Register routes
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/api/users", usersHandler)
+	mux.HandleFunc("/api/products", productsHandler)
+	mux.HandleFunc("/api/cors-info", corsInfoHandler(corsConfig))
+
+	// Apply middleware chain: Logging -> CORS -> Routes
+	handler := chainMiddleware(
+		mux,
+		LoggingMiddleware(logger),
+		corsMiddleware.Handler,
+	)
+
+	return &Server{
+		httpServer: &http.Server{
+			Addr:         addr,
+			Handler:      handler,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		},
+		logger: logger,
+	}
+}
+
+// Start starts the HTTP server
+func (s *Server) Start() error {
+	s.logger.Log("INFO", "Starting server", map[string]interface{}{
+		"address": s.httpServer.Addr,
+	})
+	return s.httpServer.ListenAndServe()
+}
+
+func main() {
+	logger := NewLogger()
+
+	// Load CORS configuration
+	corsConfig := DefaultCORSConfig()
+
+	// You can also add development origins conditionally
+	env := os.Getenv("APP_ENV")
+	if env == "development" {
+		corsConfig.AllowedOrigins = append(corsConfig.AllowedOrigins,
+			"http://localhost:3000",
+			"http://localhost:8080",
+			"http://127.0.0.1:3000",
+		)
+		logger.Log("INFO", "Development mode: added localhost origins", map[string]interface{}{
+			"origins": corsConfig.AllowedOrigins,
+		})
+	}
+
+	// Get server address from environment or use default
+	addr := os.Getenv("SERVER_ADDR")
+	if addr == "" {
+		addr = ":8080"
+	}
+
+	logger.Log("INFO", "CORS Configuration loaded", map[string]interface{}{
+		"allowed_origins": corsConfig.AllowedOrigins,
+		"allowed_methods": corsConfig.AllowedMethods,
+		"max_age":         corsConfig.MaxAge,
+	})
+
+	server := NewServer(addr, corsConfig, logger)
+
+	fmt.Printf("\n=== Go CORS Server ===\n")
+	fmt.Printf("Server running at http://localhost%s\n", addr)
+	fmt.Printf("Allowed origins: %s\n", strings.Join(corsConfig.AllowedOrigins, ", "))
+	fmt.Printf("\nAvailable endpoints:\n")
+	fmt.Printf("  GET  /health          - Health check\n")
+	fmt.Printf("  GET  /api/users       - List users\n")
+	fmt.Printf("  POST /api/users       - Create user\n")
+	fmt.Printf("  GET  /api/products    - List products\n")
+	fmt.Printf("  GET  /api/cors-info   - CORS configuration info\n")
+	fmt.Printf("\nTest CORS with:\n")
+	fmt.Printf("  curl -H 'Origin: https://myapp.com' http://localhost%s/health\n", addr)
+	fmt.Printf("  curl -X OPTIONS -H 'Origin: https://myapp.com' -H 'Access-Control-Request-Method: POST' http://localhost%s/api/users\n\n", addr)
+
+	if err := server.Start(); err != nil && err != http.ErrServerClosed {
+		logger.Log("ERROR", "Server failed to start", map[string]interface{}{
+			"error": err.Error(),
+		})
+		os.Exit(1)
+	}
+}
+```

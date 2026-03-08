@@ -1,0 +1,314 @@
+
+```ruby
+require 'openssl'
+require 'base64'
+require 'json'
+
+module RSAPSSSigner
+  DEFAULT_SALT_LENGTH = 32
+  DEFAULT_HASH_ALGORITHM = 'SHA256'
+  DEFAULT_KEY_SIZE = 2048
+
+  def self.generate_key_pair(key_size = DEFAULT_KEY_SIZE)
+    private_key = OpenSSL::PKey::RSA.generate(key_size)
+    public_key = private_key.public_key
+
+    {
+      private_key: private_key,
+      public_key: public_key,
+      private_key_pem: private_key.to_pem,
+      public_key_pem: public_key.to_pem
+    }
+  end
+
+  def self.sign_payload(payload, private_key, options = {})
+    salt_length = options[:salt_length] || DEFAULT_SALT_LENGTH
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+
+    private_key = load_private_key(private_key) if private_key.is_a?(String)
+
+    serialized_payload = serialize_payload(payload)
+
+    digest = OpenSSL::Digest.new(hash_algorithm)
+
+    signature = private_key.sign_pss(
+      digest,
+      serialized_payload,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    encoded_signature = Base64.strict_encode64(signature)
+    encoded_payload = Base64.strict_encode64(serialized_payload)
+
+    {
+      payload: encoded_payload,
+      signature: encoded_signature,
+      algorithm: "RSA-PSS-#{hash_algorithm}",
+      salt_length: salt_length,
+      timestamp: Time.now.utc.iso8601
+    }
+  end
+
+  def self.verify_signature(signed_data, public_key, options = {})
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+
+    public_key = load_public_key(public_key) if public_key.is_a?(String)
+
+    encoded_payload = signed_data[:payload] || signed_data['payload']
+    encoded_signature = signed_data[:signature] || signed_data['signature']
+    salt_length = signed_data[:salt_length] || signed_data['salt_length'] || DEFAULT_SALT_LENGTH
+
+    raise ArgumentError, 'Missing payload in signed data' unless encoded_payload
+    raise ArgumentError, 'Missing signature in signed data' unless encoded_signature
+
+    serialized_payload = Base64.strict_decode64(encoded_payload)
+    signature = Base64.strict_decode64(encoded_signature)
+
+    digest = OpenSSL::Digest.new(hash_algorithm)
+
+    verified = public_key.verify_pss(
+      digest,
+      signature,
+      serialized_payload,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    if verified
+      {
+        valid: true,
+        payload: deserialize_payload(serialized_payload),
+        message: 'Signature verified successfully'
+      }
+    else
+      {
+        valid: false,
+        payload: nil,
+        message: 'Signature verification failed'
+      }
+    end
+  rescue OpenSSL::PKey::PKeyError => e
+    {
+      valid: false,
+      payload: nil,
+      message: "Verification error: #{e.message}"
+    }
+  rescue ArgumentError => e
+    {
+      valid: false,
+      payload: nil,
+      message: "Invalid data: #{e.message}"
+    }
+  end
+
+  def self.sign_and_encode_jwt_like(payload, private_key, options = {})
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+    salt_length = options[:salt_length] || DEFAULT_SALT_LENGTH
+
+    private_key = load_private_key(private_key) if private_key.is_a?(String)
+
+    header = {
+      alg: "PS#{hash_algorithm.gsub('SHA', '')}",
+      typ: 'JWT-PSS'
+    }
+
+    encoded_header = Base64.urlsafe_encode64(JSON.generate(header), padding: false)
+    encoded_payload = Base64.urlsafe_encode64(JSON.generate(payload), padding: false)
+
+    signing_input = "#{encoded_header}.#{encoded_payload}"
+
+    digest = OpenSSL::Digest.new(hash_algorithm)
+    signature = private_key.sign_pss(
+      digest,
+      signing_input,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    encoded_signature = Base64.urlsafe_encode64(signature, padding: false)
+
+    "#{signing_input}.#{encoded_signature}"
+  end
+
+  def self.verify_jwt_like(token, public_key, options = {})
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+    salt_length = options[:salt_length] || DEFAULT_SALT_LENGTH
+
+    public_key = load_public_key(public_key) if public_key.is_a?(String)
+
+    parts = token.split('.')
+    raise ArgumentError, 'Invalid token format' unless parts.length == 3
+
+    encoded_header, encoded_payload, encoded_signature = parts
+    signing_input = "#{encoded_header}.#{encoded_payload}"
+
+    signature = Base64.urlsafe_decode64(encoded_signature)
+    digest = OpenSSL::Digest.new(hash_algorithm)
+
+    verified = public_key.verify_pss(
+      digest,
+      signature,
+      signing_input,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    if verified
+      header = JSON.parse(Base64.urlsafe_decode64(encoded_header))
+      payload = JSON.parse(Base64.urlsafe_decode64(encoded_payload))
+
+      {
+        valid: true,
+        header: header,
+        payload: payload,
+        message: 'Token verified successfully'
+      }
+    else
+      { valid: false, message: 'Token verification failed' }
+    end
+  rescue OpenSSL::PKey::PKeyError => e
+    { valid: false, message: "Verification error: #{e.message}" }
+  rescue JSON::ParserError => e
+    { valid: false, message: "JSON parsing error: #{e.message}" }
+  end
+
+  private
+
+  def self.serialize_payload(payload)
+    case payload
+    when String
+      payload
+    when Hash, Array
+      JSON.generate(payload)
+    else
+      payload.to_s
+    end
+  end
+
+  def self.deserialize_payload(serialized_payload)
+    JSON.parse(serialized_payload)
+  rescue JSON::ParserError
+    serialized_payload
+  end
+
+  def self.load_private_key(pem_string)
+    OpenSSL::PKey::RSA.new(pem_string)
+  rescue OpenSSL::PKey::RSAError => e
+    raise ArgumentError, "Invalid private key: #{e.message}"
+  end
+
+  def self.load_public_key(pem_string)
+    OpenSSL::PKey::RSA.new(pem_string)
+  rescue OpenSSL::PKey::RSAError => e
+    raise ArgumentError, "Invalid public key: #{e.message}"
+  end
+end
+
+if __FILE__ == $PROGRAM_NAME
+  puts "=== RSA-PSS Signature Demo ==="
+  puts
+
+  puts "Generating RSA key pair (2048 bits)..."
+  keys = RSAPSSSigner.generate_key_pair(2048)
+  puts "Key pair generated successfully!"
+  puts
+
+  payload = {
+    user_id: 12345,
+    username: "john_doe",
+    email: "john@example.com",
+    roles: ["admin", "user"],
+    issued_at: Time.now.utc.iso8601
+  }
+
+  puts "Original Payload:"
+  puts JSON.pretty_generate(payload)
+  puts
+
+  puts "Signing payload with RSA-PSS..."
+  signed_data = RSAPSSSigner.sign_payload(payload, keys[:private_key])
+  puts "Signed Data:"
+  puts "  Algorithm: #{signed_data[:algorithm]}"
+  puts "  Salt Length: #{signed_data[:salt_length]}"
+  puts "  Timestamp: #{signed_data[:timestamp]}"
+  puts "  Signature (first 50 chars): #{signed_data[:signature][0..49]}..."
+  puts
+
+  puts "Verifying signature..."
+  result = RSAPSSSigner.verify_signature(signed_data, keys[:public_key])
+  puts "Verification Result:"
+  puts "  Valid: #{result[:valid]}"
+  puts "  Message: #{result[:message]}"
+  puts "  Recovered Payload: #{JSON.pretty_generate(result[:payload])}" if result[:valid]
+  puts
+
+  puts "Testing with tampered data..."
+  tampered_data = signed_data.dup
+  tampered_payload = Base64.strict_decode64(signed_data[:payload])
+  tampered_json = JSON.parse(tampered_payload)
+  tampered_json['user_id'] = 99999
+  tampered_data[:payload] = Base64.strict_encode64(JSON.generate(tampered_json))
+
+  tampered_result = RSAPSSSigner.verify_signature(tampered_data, keys[:public_key])
+  puts "Tampered Data Verification:"
+  puts "  Valid: #{tampered_result[:valid]}"
+  puts "  Message: #{tampered_result[:message]}"
+  puts
+
+  puts "=== JWT-like Token Demo ==="
+  jwt_payload = {
+    sub: "user_12345",
+    iss: "my-application",
+    aud: "api-service",
+    exp: (Time.now + 3600).to_i,
+    iat: Time.now.to_i,
+    data: { role: "admin" }
+  }
+
+  puts "Creating JWT-like token..."
+  token = RSAPSSSigner.sign_and_encode_jwt_like(jwt_payload, keys[:private_key])
+  puts "Token (first 100 chars): #{token[0..99]}..."
+  puts
+
+  puts "Verifying JWT-like token..."
+  jwt_result = RSAPSSSigner.verify_jwt_like(token, keys[:public_key])
+  puts "JWT Verification Result:"
+  puts "  Valid: #{jwt_result[:valid]}"
+  puts "  Message: #{jwt_result[:message]}"
+  if jwt_result[:valid]
+    puts "  Header: #{JSON.pretty_generate(jwt_result[:header])}"
+    puts "  Payload: #{JSON.pretty_generate(jwt_result[:payload])}"
+  end
+  puts
+
+  puts "=== PEM Key Export Demo ==="
+  puts "Private Key (first 50 chars): #{keys[:private_key_pem][0..49]}..."
+  puts "Public Key (first 50 chars): #{keys[:public_key_pem][0..49]}..."
+  puts
+
+  puts "Testing with PEM strings..."
+  signed_with_pem = RSAPSSSigner.sign_payload(
+    { message: "Hello, World!" },
+    keys[:private_key_pem]
+  )
+  pem_result = RSAPSSSigner.verify_signature(signed_with_pem, keys[:public_key_pem])
+  puts "PEM String Verification: #{pem_result[:valid] ? 'SUCCESS' : 'FAILED'}"
+  puts
+
+  puts "=== Different Hash Algorithms Demo ==="
+  ['SHA256', 'SHA384', 'SHA512'].each do |algorithm|
+    signed = RSAPSSSigner.sign_payload(
+      { test: "data" },
+      keys[:private_key],
+      hash_algorithm: algorithm
+    )
+    verified = RSAPSSSigner.verify_signature(
+      signed,
+      keys[:public_key],
+      hash_algorithm: algorithm
+    )
+    puts "#{algorithm}: #{verified[:valid] ? 'VERIFIED' : 'FAILED'}"
+  end
+end
+```

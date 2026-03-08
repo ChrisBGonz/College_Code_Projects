@@ -1,0 +1,176 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  ARTIFACT_NAME: build-artifact
+  BUILD_DIR: dist
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Build project
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Create artifact archive
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          zip -r ../${{ env.ARTIFACT_NAME }}.zip .
+          cd ..
+          echo "Artifact size: $(du -sh ${{ env.ARTIFACT_NAME }}.zip | cut -f1)"
+
+      - name: Upload artifact locally
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.zip
+          retention-days: 7
+
+      - name: Set artifact metadata
+        id: metadata
+        run: |
+          echo "timestamp=$(date -u +'%Y%m%d_%H%M%S')" >> $GITHUB_OUTPUT
+          echo "sha_short=$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
+          echo "artifact_filename=${{ env.ARTIFACT_NAME }}_$(date -u +'%Y%m%d_%H%M%S')_$(echo ${{ github.sha }} | cut -c1-8).zip" >> $GITHUB_OUTPUT
+
+      - name: Rename artifact with metadata
+        run: |
+          mv ${{ env.ARTIFACT_NAME }}.zip ${{ steps.metadata.outputs.artifact_filename }}
+
+      # ─────────────────────────────────────────────
+      # Option A: Upload to AWS S3
+      # ─────────────────────────────────────────────
+      - name: Configure AWS credentials
+        if: ${{ vars.STORAGE_PROVIDER == 'aws' || vars.STORAGE_PROVIDER == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Upload artifact to AWS S3
+        if: ${{ vars.STORAGE_PROVIDER == 'aws' || vars.STORAGE_PROVIDER == '' }}
+        run: |
+          aws s3 cp \
+            ${{ steps.metadata.outputs.artifact_filename }} \
+            s3://${{ vars.AWS_S3_BUCKET }}/artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }} \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build-number=${{ github.run_number }}" \
+            --storage-class STANDARD_IA
+
+          echo "✅ Artifact uploaded to S3:"
+          echo "   s3://${{ vars.AWS_S3_BUCKET }}/artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }}"
+
+      # ─────────────────────────────────────────────
+      # Option B: Upload to Google Cloud Storage
+      # ─────────────────────────────────────────────
+      - name: Authenticate to Google Cloud
+        if: ${{ vars.STORAGE_PROVIDER == 'gcs' }}
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Setup Google Cloud SDK
+        if: ${{ vars.STORAGE_PROVIDER == 'gcs' }}
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload artifact to Google Cloud Storage
+        if: ${{ vars.STORAGE_PROVIDER == 'gcs' }}
+        run: |
+          gsutil cp \
+            ${{ steps.metadata.outputs.artifact_filename }} \
+            gs://${{ vars.GCS_BUCKET_NAME }}/artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }}
+
+          gsutil setmeta \
+            -h "x-goog-meta-commit:${{ github.sha }}" \
+            -h "x-goog-meta-branch:${{ github.ref_name }}" \
+            -h "x-goog-meta-build-number:${{ github.run_number }}" \
+            gs://${{ vars.GCS_BUCKET_NAME }}/artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }}
+
+          echo "✅ Artifact uploaded to GCS:"
+          echo "   gs://${{ vars.GCS_BUCKET_NAME }}/artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }}"
+
+      # ─────────────────────────────────────────────
+      # Option C: Upload to Azure Blob Storage
+      # ─────────────────────────────────────────────
+      - name: Upload artifact to Azure Blob Storage
+        if: ${{ vars.STORAGE_PROVIDER == 'azure' }}
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            az storage blob upload \
+              --account-name ${{ vars.AZURE_STORAGE_ACCOUNT }} \
+              --container-name ${{ vars.AZURE_CONTAINER_NAME }} \
+              --name artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }} \
+              --file ${{ steps.metadata.outputs.artifact_filename }} \
+              --metadata commit=${{ github.sha }} branch=${{ github.ref_name }} buildNumber=${{ github.run_number }} \
+              --auth-mode login
+
+            echo "✅ Artifact uploaded to Azure Blob Storage:"
+            echo "   Container: ${{ vars.AZURE_CONTAINER_NAME }}"
+            echo "   Blob: artifacts/${{ github.ref_name }}/${{ steps.metadata.outputs.artifact_filename }}"
+        env:
+          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+
+      - name: Print build summary
+        run: |
+          echo "## 🚀 Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Field | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Build Number** | \`${{ github.run_number }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Timestamp** | \`${{ steps.metadata.outputs.timestamp }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Artifact** | \`${{ steps.metadata.outputs.artifact_filename }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Storage Provider** | \`${{ vars.STORAGE_PROVIDER || 'aws' }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  notify:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+
+    steps:
+      - name: Send failure notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Build failed** for commit \`${{ github.sha }}\` on branch \`${{ github.ref_name }}\`.\n\nPlease check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.`
+            })
+        continue-on-error: true
+```

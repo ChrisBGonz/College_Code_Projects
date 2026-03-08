@@ -1,0 +1,328 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Script to automate updating all dependencies in a Java Maven project to their latest versions.
+Uses Claude AI to analyze and update the pom.xml file.
+"""
+
+import os
+import sys
+import subprocess
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from anthropic import Anthropic
+
+client = Anthropic()
+conversation_history = []
+
+def read_pom_file(pom_path: str) -> str:
+    """Read the content of pom.xml file."""
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def write_pom_file(pom_path: str, content: str) -> None:
+    """Write updated content to pom.xml file."""
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+def run_maven_command(command: list, project_dir: str) -> tuple[int, str, str]:
+    """Run a Maven command and return exit code, stdout, and stderr."""
+    try:
+        result = subprocess.run(
+            command,
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "Command timed out after 300 seconds"
+    except FileNotFoundError:
+        return -1, "", "Maven (mvn) not found. Please ensure Maven is installed and in PATH"
+
+def get_dependency_updates(project_dir: str) -> str:
+    """Run Maven versions plugin to check for dependency updates."""
+    print("Checking for available dependency updates...")
+    exit_code, stdout, stderr = run_maven_command(
+        ["mvn", "versions:display-dependency-updates", "-q"],
+        project_dir
+    )
+    
+    if exit_code != 0 and "versions:display-dependency-updates" not in stderr:
+        # Try without -q flag for more info
+        exit_code, stdout, stderr = run_maven_command(
+            ["mvn", "versions:display-dependency-updates"],
+            project_dir
+        )
+    
+    return stdout + stderr
+
+def get_plugin_updates(project_dir: str) -> str:
+    """Run Maven versions plugin to check for plugin updates."""
+    print("Checking for available plugin updates...")
+    exit_code, stdout, stderr = run_maven_command(
+        ["mvn", "versions:display-plugin-updates"],
+        project_dir
+    )
+    return stdout + stderr
+
+def validate_pom(project_dir: str) -> tuple[bool, str]:
+    """Validate the pom.xml by running mvn validate."""
+    print("Validating updated pom.xml...")
+    exit_code, stdout, stderr = run_maven_command(
+        ["mvn", "validate"],
+        project_dir
+    )
+    success = exit_code == 0
+    return success, stdout + stderr
+
+def chat_with_claude(user_message: str) -> str:
+    """Send a message to Claude and get a response using multi-turn conversation."""
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="""You are an expert Java Maven dependency management assistant. 
+        Your role is to help update Maven project dependencies to their latest stable versions.
+        When analyzing pom.xml files:
+        1. Identify all dependencies and their current versions
+        2. Suggest updates to the latest stable versions (avoid SNAPSHOT, RC, alpha, beta versions unless specifically requested)
+        3. Be careful about major version updates that might introduce breaking changes
+        4. Provide the complete updated pom.xml when requested
+        5. Explain any important considerations for the updates
+        When providing updated pom.xml content, wrap it in <pom_content> tags.""",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def extract_pom_content(response: str) -> str | None:
+    """Extract pom.xml content from Claude's response."""
+    if "<pom_content>" in response and "</pom_content>" in response:
+        start = response.find("<pom_content>") + len("<pom_content>")
+        end = response.find("</pom_content>")
+        return response[start:end].strip()
+    return None
+
+def backup_pom(pom_path: str) -> str:
+    """Create a backup of the original pom.xml."""
+    backup_path = pom_path + ".backup"
+    with open(pom_path, 'r') as f:
+        content = f.read()
+    with open(backup_path, 'w') as f:
+        f.write(content)
+    print(f"Backup created at: {backup_path}")
+    return backup_path
+
+def main():
+    """Main function to orchestrate the dependency update process."""
+    # Get project directory
+    if len(sys.argv) > 1:
+        project_dir = sys.argv[1]
+    else:
+        project_dir = input("Enter the path to your Maven project directory (or press Enter for current directory): ").strip()
+        if not project_dir:
+            project_dir = "."
+    
+    project_dir = os.path.abspath(project_dir)
+    pom_path = os.path.join(project_dir, "pom.xml")
+    
+    # Check if pom.xml exists
+    if not os.path.exists(pom_path):
+        print(f"Error: pom.xml not found at {pom_path}")
+        sys.exit(1)
+    
+    print(f"\n{'='*60}")
+    print("Maven Dependency Update Automation Script")
+    print(f"{'='*60}")
+    print(f"Project directory: {project_dir}")
+    print(f"POM file: {pom_path}")
+    
+    # Read current pom.xml
+    print("\nReading current pom.xml...")
+    pom_content = read_pom_file(pom_path)
+    
+    # Create backup
+    backup_path = backup_pom(pom_path)
+    
+    # Get available updates from Maven
+    dependency_updates = get_dependency_updates(project_dir)
+    plugin_updates = get_plugin_updates(project_dir)
+    
+    # Start conversation with Claude
+    print("\nAnalyzing dependencies with Claude AI...")
+    
+    initial_message = f"""I have a Maven project that needs dependency updates. Here is the current pom.xml:
+
+```xml
+{pom_content}
+```
+
+Available dependency updates from Maven versions plugin:
+```
+{dependency_updates}
+```
+
+Available plugin updates:
+```
+{plugin_updates}
+```
+
+Please analyze the current dependencies and the available updates. 
+1. What are the key updates available?
+2. Are there any updates that might cause breaking changes?
+3. What is your recommendation for updating these dependencies?"""
+    
+    print("\nSending pom.xml to Claude for analysis...")
+    analysis_response = chat_with_claude(initial_message)
+    print("\nClaude's Analysis:")
+    print("-" * 40)
+    print(analysis_response)
+    print("-" * 40)
+    
+    # Ask user if they want to proceed
+    print("\nOptions:")
+    print("1. Update all dependencies to latest stable versions")
+    print("2. Update only patch/minor versions (safer)")
+    print("3. Custom update (specify which dependencies)")
+    print("4. Exit without updating")
+    
+    choice = input("\nEnter your choice (1-4): ").strip()
+    
+    if choice == "4":
+        print("Exiting without updates.")
+        return
+    
+    # Prepare update request based on choice
+    if choice == "1":
+        update_request = """Please provide the complete updated pom.xml with ALL dependencies updated to their latest stable versions.
+        Include the full pom.xml content wrapped in <pom_content> tags.
+        Avoid SNAPSHOT, RC, alpha, and beta versions."""
+    elif choice == "2":
+        update_request = """Please provide the complete updated pom.xml with only PATCH and MINOR version updates (no major version changes).
+        This is the safer approach to avoid breaking changes.
+        Include the full pom.xml content wrapped in <pom_content> tags."""
+    elif choice == "3":
+        custom_deps = input("Enter the dependencies you want to update (e.g., 'spring-boot, junit, log4j'): ").strip()
+        update_request = f"""Please provide the complete updated pom.xml updating only these specific dependencies: {custom_deps}
+        Update them to their latest stable versions.
+        Include the full pom.xml content wrapped in <pom_content> tags."""
+    else:
+        print("Invalid choice. Exiting.")
+        return
+    
+    # Get updated pom.xml from Claude
+    print("\nGenerating updated pom.xml...")
+    update_response = chat_with_claude(update_request)
+    
+    # Extract pom content
+    updated_pom = extract_pom_content(update_response)
+    
+    if not updated_pom:
+        print("Could not extract updated pom.xml from Claude's response.")
+        print("Claude's response:")
+        print(update_response)
+        
+        # Ask Claude to provide it again
+        retry_response = chat_with_claude("Please provide the complete updated pom.xml content wrapped in <pom_content> tags.")
+        updated_pom = extract_pom_content(retry_response)
+        
+        if not updated_pom:
+            print("Failed to get updated pom.xml. Restoring backup.")
+            return
+    
+    # Write updated pom.xml
+    print("\nWriting updated pom.xml...")
+    write_pom_file(pom_path, updated_pom)
+    
+    # Validate the updated pom.xml
+    is_valid, validation_output = validate_pom(project_dir)
+    
+    if is_valid:
+        print("\n✓ Updated pom.xml is valid!")
+        
+        # Ask Claude for a summary
+        summary_request = f"""The pom.xml has been successfully updated and validated. 
+        Please provide a summary of:
+        1. What dependencies were updated and to which versions
+        2. Any important notes about the updates
+        3. Recommended next steps (e.g., running tests, checking for compatibility issues)"""
+        
+        summary_response = chat_with_claude(summary_request)
+        print("\nUpdate Summary:")
+        print("-" * 40)
+        print(summary_response)
+        print("-" * 40)
+        
+        print(f"\n✓ Successfully updated dependencies in {pom_path}")
+        print(f"  Original backup saved at: {backup_path}")
+        
+    else:
+        print("\n✗ Updated pom.xml validation failed!")
+        print("Validation output:")
+        print(validation_output)
+        
+        # Ask Claude to fix the issues
+        fix_request = f"""The updated pom.xml failed validation with this error:
+        
+{validation_output}
+
+Please fix the pom.xml and provide the corrected version wrapped in <pom_content> tags."""
+        
+        print("\nAsking Claude to fix the issues...")
+        fix_response = chat_with_claude(fix_request)
+        fixed_pom = extract_pom_content(fix_response)
+        
+        if fixed_pom:
+            print("Writing fixed pom.xml...")
+            write_pom_file(pom_path, fixed_pom)
+            
+            is_valid_fixed, validation_output_fixed = validate_pom(project_dir)
+            
+            if is_valid_fixed:
+                print("\n✓ Fixed pom.xml is valid!")
+                print(f"✓ Successfully updated dependencies in {pom_path}")
+            else:
+                print("\n✗ Could not fix the pom.xml automatically.")
+                print("Restoring original backup...")
+                backup_content = read_pom_file(backup_path)
+                write_pom_file(pom_path, backup_content)
+                print(f"Original pom.xml restored from backup: {backup_path}")
+        else:
+            print("Could not get a fix from Claude. Restoring original backup...")
+            backup_content = read_pom_file(backup_path)
+            write_pom_file(pom_path, backup_content)
+            print(f"Original pom.xml restored from backup: {backup_path}")
+    
+    # Interactive follow-up
+    print("\n" + "="*60)
+    print("You can continue asking questions about the updates.")
+    print("Type 'exit' to quit.")
+    print("="*60)
+    
+    while True:
+        user_input = input("\nYour question: ").strip()
+        if user_input.lower() in ['exit', 'quit', 'q']:
+            break
+        if user_input:
+            response = chat_with_claude(user_input)
+            print("\nClaude's response:")
+            print("-" * 40)
+            print(response)
+            print("-" * 40)
+
+if __name__ == "__main__":
+    main()
+```
