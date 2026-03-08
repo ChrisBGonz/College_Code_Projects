@@ -1,0 +1,253 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using Microsoft.Data.SqlClient;
+using Anthropic.SDK;
+using Anthropic.SDK.Messaging;
+
+class DynamicSQLSorter
+{
+    private readonly string _connectionString;
+    private readonly AnthropicClient _anthropicClient;
+
+    public DynamicSQLSorter(string connectionString, string anthropicApiKey)
+    {
+        _connectionString = connectionString;
+        _anthropicClient = new AnthropicClient(anthropicApiKey);
+    }
+
+    public async Task<DataTable> ExecuteDynamicSortQuery(string tableName, string columnName, string sortOrder = "ASC")
+    {
+        // Use Claude to validate and generate safe SQL
+        var validatedQuery = await ValidateAndGenerateSQL(tableName, columnName, sortOrder);
+        
+        if (string.IsNullOrEmpty(validatedQuery))
+        {
+            throw new InvalidOperationException("Failed to generate a valid SQL query");
+        }
+
+        return await ExecuteQuery(validatedQuery);
+    }
+
+    private async Task<string> ValidateAndGenerateSQL(string tableName, string columnName, string sortOrder)
+    {
+        var messages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = new List<ContentBase>
+                {
+                    new TextContent
+                    {
+                        Text = $@"Generate a safe SQL SELECT query to sort a table with the following parameters:
+- Table name: {tableName}
+- Column to sort by: {columnName}
+- Sort order: {sortOrder}
+
+Requirements:
+1. Validate that the column name and table name contain only alphanumeric characters and underscores
+2. The sort order should be either ASC or DESC
+3. Return ONLY the SQL query without any explanation or markdown
+4. If the parameters are invalid or potentially dangerous, return 'INVALID'
+5. Use proper SQL syntax for SQL Server
+
+Example output format:
+SELECT * FROM TableName ORDER BY ColumnName ASC"
+                    }
+                }
+            }
+        };
+
+        var request = new MessageParameters
+        {
+            Messages = messages,
+            Model = AnthropicModels.Claude3Haiku,
+            MaxTokens = 500,
+            Temperature = 0
+        };
+
+        var response = await _anthropicClient.Messages.GetClaudeMessageAsync(request);
+        
+        var generatedSQL = response.Content[0].ToString()?.Trim();
+        
+        if (string.IsNullOrEmpty(generatedSQL) || generatedSQL == "INVALID")
+        {
+            return string.Empty;
+        }
+
+        return generatedSQL;
+    }
+
+    private async Task<DataTable> ExecuteQuery(string query)
+    {
+        var dataTable = new DataTable();
+        
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+            
+            using (var command = new SqlCommand(query, connection))
+            {
+                using (var adapter = new SqlDataAdapter(command))
+                {
+                    adapter.Fill(dataTable);
+                }
+            }
+        }
+        
+        return dataTable;
+    }
+
+    public async Task<string> GetSortingRecommendation(string tableName, string[] availableColumns)
+    {
+        var messages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = new List<ContentBase>
+                {
+                    new TextContent
+                    {
+                        Text = $@"Given a database table named '{tableName}' with the following columns: {string.Join(", ", availableColumns)}
+
+Recommend the best column(s) to sort by for optimal performance and user experience. 
+Consider common patterns like:
+- ID columns for default ordering
+- Date/time columns for chronological sorting
+- Name columns for alphabetical sorting
+
+Provide a brief recommendation in 2-3 sentences."
+                    }
+                }
+            }
+        };
+
+        var request = new MessageParameters
+        {
+            Messages = messages,
+            Model = AnthropicModels.Claude3Haiku,
+            MaxTokens = 300,
+            Temperature = 0.3m
+        };
+
+        var response = await _anthropicClient.Messages.GetClaudeMessageAsync(request);
+        return response.Content[0].ToString() ?? "Unable to generate recommendation";
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        // Example usage - in production, use proper configuration management
+        var connectionString = "Server=localhost;Database=TestDB;Trusted_Connection=True;";
+        var anthropicApiKey = Environment.GetEnvironmentVariable("ANTHROPIC_API_KEY") ?? "your-api-key-here";
+
+        var sorter = new DynamicSQLSorter(connectionString, anthropicApiKey);
+
+        Console.WriteLine("Dynamic SQL Sorting with Claude AI Validation");
+        Console.WriteLine("==============================================\n");
+
+        // Demonstrate the SQL generation capability
+        Console.WriteLine("Demonstrating SQL generation for different scenarios:\n");
+
+        var testCases = new[]
+        {
+            new { Table = "Employees", Column = "LastName", Order = "ASC" },
+            new { Table = "Orders", Column = "OrderDate", Order = "DESC" },
+            new { Table = "Products", Column = "Price", Order = "ASC" },
+            new { Table = "Users", Column = "'; DROP TABLE Users; --", Order = "ASC" } // SQL injection attempt
+        };
+
+        var anthropicClient = new AnthropicClient(anthropicApiKey);
+
+        foreach (var testCase in testCases)
+        {
+            Console.WriteLine($"Table: {testCase.Table}, Column: {testCase.Column}, Order: {testCase.Order}");
+            
+            var messages = new List<Message>
+            {
+                new Message
+                {
+                    Role = RoleType.User,
+                    Content = new List<ContentBase>
+                    {
+                        new TextContent
+                        {
+                            Text = $@"Generate a safe SQL SELECT query to sort a table with the following parameters:
+- Table name: {testCase.Table}
+- Column to sort by: {testCase.Column}
+- Sort order: {testCase.Order}
+
+Requirements:
+1. Validate that the column name and table name contain only alphanumeric characters and underscores
+2. The sort order should be either ASC or DESC
+3. Return ONLY the SQL query without any explanation or markdown
+4. If the parameters are invalid or potentially dangerous, return 'INVALID'
+5. Use proper SQL syntax for SQL Server"
+                        }
+                    }
+                }
+            };
+
+            var request = new MessageParameters
+            {
+                Messages = messages,
+                Model = AnthropicModels.Claude3Haiku,
+                MaxTokens = 200,
+                Temperature = 0
+            };
+
+            var response = await anthropicClient.Messages.GetClaudeMessageAsync(request);
+            var result = response.Content[0].ToString()?.Trim();
+            
+            Console.WriteLine($"Generated SQL: {result}");
+            Console.WriteLine();
+        }
+
+        // Demonstrate sorting recommendation
+        Console.WriteLine("\nGetting sorting recommendations:");
+        Console.WriteLine("================================\n");
+
+        var recommendationMessages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = new List<ContentBase>
+                {
+                    new TextContent
+                    {
+                        Text = @"Given a database table named 'Employees' with the following columns: EmployeeID, FirstName, LastName, Department, HireDate, Salary, Email
+
+Recommend the best column(s) to sort by for optimal performance and user experience. 
+Consider common patterns like:
+- ID columns for default ordering
+- Date/time columns for chronological sorting
+- Name columns for alphabetical sorting
+
+Provide a brief recommendation in 2-3 sentences."
+                    }
+                }
+            }
+        };
+
+        var recommendationRequest = new MessageParameters
+        {
+            Messages = recommendationMessages,
+            Model = AnthropicModels.Claude3Haiku,
+            MaxTokens = 300,
+            Temperature = 0.3m
+        };
+
+        var recommendationResponse = await anthropicClient.Messages.GetClaudeMessageAsync(recommendationRequest);
+        Console.WriteLine($"Recommendation for Employees table:\n{recommendationResponse.Content[0]}");
+
+        Console.WriteLine("\nNote: To execute actual database queries, configure a valid SQL Server connection string.");
+    }
+}
+```

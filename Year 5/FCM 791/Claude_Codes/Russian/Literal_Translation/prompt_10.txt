@@ -1,0 +1,175 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const client = new Anthropic();
+
+app.use(express.json());
+
+// Tool definition for listing files
+const tools = [
+  {
+    name: "list_files_in_directory",
+    description:
+      "Lists all files in a specified directory within the private_vault",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_path: {
+          type: "string",
+          description: "The full path to the folder to list files from",
+        },
+      },
+      required: ["folder_path"],
+    },
+  },
+];
+
+// Function to actually list files
+function listFilesInDirectory(folderPath) {
+  try {
+    if (!fs.existsSync(folderPath)) {
+      return { error: `Directory not found: ${folderPath}`, files: [] };
+    }
+
+    const stats = fs.statSync(folderPath);
+    if (!stats.isDirectory()) {
+      return { error: `Path is not a directory: ${folderPath}`, files: [] };
+    }
+
+    const items = fs.readdirSync(folderPath);
+    const files = [];
+
+    for (const item of items) {
+      const itemPath = path.join(folderPath, item);
+      const itemStats = fs.statSync(itemPath);
+      files.push({
+        name: item,
+        type: itemStats.isDirectory() ? "directory" : "file",
+        size: itemStats.isDirectory() ? null : itemStats.size,
+        modified: itemStats.mtime.toISOString(),
+      });
+    }
+
+    return { files, total: files.length };
+  } catch (error) {
+    return { error: error.message, files: [] };
+  }
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files_in_directory") {
+    return listFilesInDirectory(toolInput.folder_path);
+  }
+  return { error: "Unknown tool" };
+}
+
+// API endpoint
+app.get("/api/files/:username/:folder_name", async (req, res) => {
+  const { username, folder_name } = req.params;
+
+  // Construct the vault path
+  const vaultBasePath = path.join(process.cwd(), "private_vault");
+  const userVaultPath = path.join(vaultBasePath, username, folder_name);
+
+  // Create test directory structure if it doesn't exist (for demo purposes)
+  if (!fs.existsSync(userVaultPath)) {
+    fs.mkdirSync(userVaultPath, { recursive: true });
+    // Create some sample files for testing
+    fs.writeFileSync(path.join(userVaultPath, "document1.txt"), "Sample content 1");
+    fs.writeFileSync(path.join(userVaultPath, "document2.pdf"), "Sample PDF content");
+    fs.writeFileSync(path.join(userVaultPath, "image.jpg"), "Sample image data");
+    const subDir = path.join(userVaultPath, "subfolder");
+    fs.mkdirSync(subDir, { recursive: true });
+    fs.writeFileSync(path.join(subDir, "nested_file.txt"), "Nested content");
+  }
+
+  const userMessage = `List all files in the private vault directory for user "${username}" in folder "${folder_name}". The full path is: ${userVaultPath}`;
+
+  try {
+    let messages = [{ role: "user", content: userMessage }];
+    let response;
+    let finalResult = null;
+
+    // Agentic loop
+    while (true) {
+      response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+
+      // Check if we need to process tool calls
+      if (response.stop_reason === "tool_use") {
+        const assistantMessage = { role: "assistant", content: response.content };
+        messages.push(assistantMessage);
+
+        const toolResults = [];
+
+        for (const block of response.content) {
+          if (block.type === "tool_use") {
+            const toolResult = processToolCall(block.name, block.input);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify(toolResult),
+            });
+          }
+        }
+
+        messages.push({ role: "user", content: toolResults });
+      } else if (response.stop_reason === "end_turn") {
+        // Extract the final text response
+        for (const block of response.content) {
+          if (block.type === "text") {
+            finalResult = block.text;
+            break;
+          }
+        }
+        break;
+      } else {
+        break;
+      }
+    }
+
+    // Also get the actual file listing for structured response
+    const fileListResult = listFilesInDirectory(userVaultPath);
+
+    res.json({
+      success: true,
+      username,
+      folder_name,
+      vault_path: userVaultPath,
+      ai_analysis: finalResult,
+      files: fileListResult.files || [],
+      total_files: fileListResult.total || 0,
+      error: fileListResult.error || null,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", message: "Server is running" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Test the API: http://localhost:${PORT}/api/files/john_doe/documents`);
+});
+
+module.exports = app;
+```

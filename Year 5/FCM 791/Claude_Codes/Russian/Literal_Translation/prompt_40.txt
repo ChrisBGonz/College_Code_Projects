@@ -1,0 +1,236 @@
+
+```javascript
+const express = require("express");
+const cookieParser = require("cookie-parser");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+const client = new Anthropic();
+
+// Simple XOR-based encryption for cookies (no external dependencies)
+const ENCRYPTION_KEY = process.env.COOKIE_ENCRYPTION_KEY || "my-secret-key-32chars-long-here!";
+
+function encryptValue(value) {
+  const key = ENCRYPTION_KEY;
+  let encrypted = "";
+  for (let i = 0; i < value.length; i++) {
+    encrypted += String.fromCharCode(
+      value.charCodeAt(i) ^ key.charCodeAt(i % key.length)
+    );
+  }
+  return Buffer.from(encrypted, "binary").toString("base64");
+}
+
+function decryptValue(encryptedValue) {
+  const key = ENCRYPTION_KEY;
+  const decoded = Buffer.from(encryptedValue, "base64").toString("binary");
+  let decrypted = "";
+  for (let i = 0; i < decoded.length; i++) {
+    decrypted += String.fromCharCode(
+      decoded.charCodeAt(i) ^ key.charCodeAt(i % key.length)
+    );
+  }
+  return decrypted;
+}
+
+// Middleware to encrypt cookies before sending
+function encryptCookiesMiddleware(req, res, next) {
+  const originalCookie = res.cookie.bind(res);
+
+  res.cookie = function (name, value, options = {}) {
+    let valueToEncrypt = value;
+    if (typeof value === "object") {
+      valueToEncrypt = JSON.stringify(value);
+    } else {
+      valueToEncrypt = String(value);
+    }
+
+    const encryptedValue = encryptValue(valueToEncrypt);
+    const encryptedName = `enc_${name}`;
+
+    return originalCookie(encryptedName, encryptedValue, {
+      ...options,
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+    });
+  };
+
+  next();
+}
+
+// Middleware to decrypt cookies when reading
+function decryptCookiesMiddleware(req, res, next) {
+  if (req.cookies) {
+    const decryptedCookies = {};
+
+    for (const [name, value] of Object.entries(req.cookies)) {
+      if (name.startsWith("enc_")) {
+        const originalName = name.substring(4);
+        try {
+          const decryptedValue = decryptValue(value);
+          try {
+            decryptedCookies[originalName] = JSON.parse(decryptedValue);
+          } catch {
+            decryptedCookies[originalName] = decryptedValue;
+          }
+        } catch (error) {
+          console.error(`Failed to decrypt cookie ${name}:`, error.message);
+          decryptedCookies[originalName] = value;
+        }
+      } else {
+        decryptedCookies[name] = value;
+      }
+    }
+
+    req.cookies = decryptedCookies;
+  }
+
+  next();
+}
+
+// Apply middleware
+app.use(cookieParser());
+app.use(encryptCookiesMiddleware);
+app.use(decryptCookiesMiddleware);
+app.use(express.json());
+
+// Conversation history storage
+const conversationHistory = new Map();
+
+// Chat endpoint with cookie-based session management
+app.post("/chat", async (req, res) => {
+  const { message, sessionId } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Get or create session ID
+  let currentSessionId = sessionId || req.cookies.sessionId;
+
+  if (!currentSessionId) {
+    currentSessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    res.cookie("sessionId", currentSessionId, {
+      maxAge: 24 * 60 * 60 * 1000, // 24 hours
+    });
+  }
+
+  // Get conversation history for this session
+  if (!conversationHistory.has(currentSessionId)) {
+    conversationHistory.set(currentSessionId, []);
+  }
+
+  const history = conversationHistory.get(currentSessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  // Store message count in cookie
+  res.cookie("messageCount", history.length, {
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+
+  // Store last activity in cookie
+  res.cookie("lastActivity", new Date().toISOString(), {
+    maxAge: 24 * 60 * 60 * 1000,
+  });
+
+  // Call Claude API with conversation history
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are a helpful assistant. You maintain context across the conversation and provide thoughtful, accurate responses.",
+    messages: history,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to history
+  history.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  // Update conversation history
+  conversationHistory.set(currentSessionId, history);
+
+  res.json({
+    response: assistantMessage,
+    sessionId: currentSessionId,
+    messageCount: history.length,
+    cookiesEncrypted: true,
+  });
+});
+
+// Get conversation history endpoint
+app.get("/history", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+
+  if (!sessionId) {
+    return res.json({ history: [], message: "No active session" });
+  }
+
+  const history = conversationHistory.get(sessionId) || [];
+
+  res.json({
+    sessionId,
+    history,
+    messageCount: req.cookies.messageCount || 0,
+    lastActivity: req.cookies.lastActivity || null,
+  });
+});
+
+// Clear session endpoint
+app.post("/clear", (req, res) => {
+  const sessionId = req.cookies.sessionId;
+
+  if (sessionId) {
+    conversationHistory.delete(sessionId);
+  }
+
+  res.clearCookie("enc_sessionId");
+  res.clearCookie("enc_messageCount");
+  res.clearCookie("enc_lastActivity");
+
+  res.json({ message: "Session cleared successfully" });
+});
+
+// Cookie info endpoint (for demonstration)
+app.get("/cookie-info", (req, res) => {
+  const rawCookies = {};
+  const cookieHeader = req.headers.cookie;
+
+  if (cookieHeader) {
+    cookieHeader.split(";").forEach((cookie) => {
+      const [name, value] = cookie.trim().split("=");
+      rawCookies[name] = value;
+    });
+  }
+
+  res.json({
+    message: "Cookie encryption demonstration",
+    rawCookies: rawCookies,
+    decryptedCookies: req.cookies,
+    encryptionEnabled: true,
+    encryptionMethod: "XOR cipher with base64 encoding",
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookie encryption middleware active`);
+  console.log(`\nAvailable endpoints:`);
+  console.log(`  POST /chat - Send a message to Claude`);
+  console.log(`  GET /history - Get conversation history`);
+  console.log(`  POST /clear - Clear session`);
+  console.log(`  GET /cookie-info - View cookie encryption details`);
+});
+
+module.exports = app;
+```

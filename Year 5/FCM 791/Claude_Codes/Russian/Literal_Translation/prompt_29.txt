@@ -1,0 +1,337 @@
+
+```python
+import anthropic
+import subprocess
+import os
+import sys
+from pathlib import Path
+
+
+def run_command(command: str, cwd: str = None) -> tuple[int, str, str]:
+    """Run a shell command and return exit code, stdout, stderr."""
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        cwd=cwd
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def get_pom_content(project_path: str) -> str:
+    """Read the pom.xml file content."""
+    pom_path = Path(project_path) / "pom.xml"
+    if not pom_path.exists():
+        raise FileNotFoundError(f"pom.xml not found in {project_path}")
+    
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def save_pom_content(project_path: str, content: str) -> None:
+    """Save the updated pom.xml file."""
+    pom_path = Path(project_path) / "pom.xml"
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
+def get_outdated_dependencies(project_path: str) -> str:
+    """Run Maven versions plugin to get outdated dependencies."""
+    print("Checking for outdated dependencies...")
+    
+    exit_code, stdout, stderr = run_command(
+        "mvn versions:display-dependency-updates -q",
+        cwd=project_path
+    )
+    
+    if exit_code != 0 and "BUILD FAILURE" in stderr:
+        # Try without -q flag for more info
+        exit_code, stdout, stderr = run_command(
+            "mvn versions:display-dependency-updates",
+            cwd=project_path
+        )
+    
+    return stdout + stderr
+
+
+def update_dependencies_with_claude(project_path: str) -> None:
+    """Use Claude to analyze and update Maven dependencies."""
+    client = anthropic.Anthropic()
+    
+    # Get current pom.xml content
+    print("Reading pom.xml...")
+    pom_content = get_pom_content(project_path)
+    
+    # Get outdated dependencies info
+    outdated_info = get_outdated_dependencies(project_path)
+    
+    print("\nAnalyzing dependencies with Claude AI...")
+    print("=" * 60)
+    
+    # Prepare the prompt for Claude
+    prompt = f"""You are a Maven dependency update expert. I need you to analyze a Maven project's pom.xml and update all dependencies to their latest stable versions.
+
+Here is the current pom.xml content:
+```xml
+{pom_content}
+```
+
+Here is the output from Maven versions plugin showing available updates:
+```
+{outdated_info}
+```
+
+Please analyze the pom.xml and provide:
+1. A list of all dependencies that need to be updated with their current and new versions
+2. The complete updated pom.xml with all dependencies updated to their latest stable versions
+3. Any important notes about breaking changes or compatibility issues
+
+Format your response as follows:
+- First, list the updates in a clear format
+- Then provide the complete updated pom.xml between ```xml and ``` tags
+- Finally, add any important notes
+
+Important guidelines:
+- Only update to stable releases (no SNAPSHOT, alpha, beta, RC versions unless the current version is already non-stable)
+- Maintain compatibility between related dependencies (e.g., Spring Boot components should use the same version)
+- Be conservative with major version updates that might introduce breaking changes
+- Keep the same XML formatting and structure as the original"""
+
+    # Use streaming to get Claude's response
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "=" * 60)
+    
+    # Extract the updated pom.xml from Claude's response
+    updated_pom = extract_pom_from_response(full_response)
+    
+    if updated_pom:
+        print("\nSaving updated pom.xml...")
+        
+        # Create backup of original pom.xml
+        backup_path = Path(project_path) / "pom.xml.backup"
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(pom_content)
+        print(f"Original pom.xml backed up to: {backup_path}")
+        
+        # Save the updated pom.xml
+        save_pom_content(project_path, updated_pom)
+        print("Updated pom.xml saved successfully!")
+        
+        # Verify the updated pom.xml is valid
+        print("\nVerifying updated pom.xml...")
+        exit_code, stdout, stderr = run_command(
+            "mvn validate",
+            cwd=project_path
+        )
+        
+        if exit_code == 0:
+            print("✓ Updated pom.xml is valid!")
+            
+            # Try to compile the project
+            print("\nAttempting to compile the project...")
+            exit_code, stdout, stderr = run_command(
+                "mvn compile -q",
+                cwd=project_path
+            )
+            
+            if exit_code == 0:
+                print("✓ Project compiles successfully with updated dependencies!")
+            else:
+                print("⚠ Project compilation failed. You may need to resolve compatibility issues.")
+                print("Compilation errors:")
+                print(stderr[:2000] if len(stderr) > 2000 else stderr)
+                print("\nThe backup of the original pom.xml is available at: pom.xml.backup")
+        else:
+            print("✗ Updated pom.xml validation failed!")
+            print("Restoring original pom.xml...")
+            save_pom_content(project_path, pom_content)
+            print("Original pom.xml restored.")
+    else:
+        print("\n⚠ Could not extract updated pom.xml from Claude's response.")
+        print("Please review the suggestions above and update manually.")
+
+
+def extract_pom_from_response(response: str) -> str:
+    """Extract the pom.xml content from Claude's response."""
+    # Look for XML content between ```xml and ``` tags
+    import re
+    
+    # Try to find XML block
+    xml_pattern = r'```xml\s*([\s\S]*?)\s*```'
+    matches = re.findall(xml_pattern, response)
+    
+    if matches:
+        # Return the last XML block (which should be the complete updated pom.xml)
+        for match in reversed(matches):
+            if '<project' in match and '</project>' in match:
+                return match.strip()
+    
+    # Try to find XML without code blocks
+    if '<project' in response and '</project>' in response:
+        start = response.find('<project')
+        end = response.rfind('</project>') + len('</project>')
+        if start != -1 and end != -1:
+            return response[start:end].strip()
+    
+    return None
+
+
+def create_sample_pom(project_path: str) -> None:
+    """Create a sample pom.xml for testing."""
+    sample_pom = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>sample-project</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Sample Maven Project</name>
+    <description>A sample Maven project for dependency update testing</description>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring.version>5.3.20</spring.version>
+        <jackson.version>2.13.3</jackson.version>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Framework -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-core</artifactId>
+            <version>${spring.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context</artifactId>
+            <version>${spring.version}</version>
+        </dependency>
+        
+        <!-- Jackson -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+        
+        <!-- Apache Commons -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.12.0</version>
+        </dependency>
+        
+        <!-- Logging -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.36</version>
+        </dependency>
+        <dependency>
+            <groupId>ch.qos.logback</groupId>
+            <artifactId>logback-classic</artifactId>
+            <version>1.2.11</version>
+        </dependency>
+        
+        <!-- Testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>4.6.1</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.10.1</version>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>versions-maven-plugin</artifactId>
+                <version>2.11.0</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>"""
+    
+    pom_path = Path(project_path) / "pom.xml"
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(sample_pom)
+    print(f"Sample pom.xml created at: {pom_path}")
+
+
+def main():
+    """Main function to run the dependency update script."""
+    print("Maven Dependency Updater with Claude AI")
+    print("=" * 60)
+    
+    # Get project path from command line or use current directory
+    if len(sys.argv) > 1:
+        project_path = sys.argv[1]
+    else:
+        project_path = os.getcwd()
+    
+    project_path = str(Path(project_path).resolve())
+    print(f"Project path: {project_path}")
+    
+    # Check if pom.xml exists, if not create a sample one
+    pom_path = Path(project_path) / "pom.xml"
+    if not pom_path.exists():
+        print("\nNo pom.xml found. Creating a sample pom.xml for demonstration...")
+        create_sample_pom(project_path)
+    
+    # Check if Maven is installed
+    exit_code, stdout, stderr = run_command("mvn --version")
+    if exit_code != 0:
+        print("Error: Maven is not installed or not in PATH")
+        print("Please install Maven and try again")
+        sys.exit(1)
+    
+    print(f"Maven version: {stdout.split(chr(10))[0]}")
+    
+    # Run the dependency update process
+    try:
+        update_dependencies_with_claude(project_path)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
+```

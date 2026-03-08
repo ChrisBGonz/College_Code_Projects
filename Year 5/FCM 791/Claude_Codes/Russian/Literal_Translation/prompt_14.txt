@@ -1,0 +1,261 @@
+
+```python
+from flask import Flask, request, session, redirect, url_for, jsonify
+from anthropic import Anthropic
+import secrets
+import os
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+client = Anthropic()
+
+# Simple user database (in production, use a real database)
+users = {
+    "admin": "password123",
+    "user": "userpass"
+}
+
+# Store conversation history per session
+conversation_histories = {}
+
+def get_session_id():
+    """Get or create a session ID for conversation history."""
+    if 'session_id' not in session:
+        session['session_id'] = secrets.token_hex(16)
+    return session['session_id']
+
+def get_conversation_history(session_id):
+    """Get conversation history for a session."""
+    if session_id not in conversation_histories:
+        conversation_histories[session_id] = []
+    return conversation_histories[session_id]
+
+def chat_with_claude(user_message, session_id):
+    """Send message to Claude and get response with conversation history."""
+    history = get_conversation_history(session_id)
+    
+    # Add user message to history
+    history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    # Send to Claude with full conversation history
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="You are a helpful assistant. You are talking to an authenticated user.",
+        messages=history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+@app.route('/')
+def index():
+    """Main page - redirect to login if not authenticated."""
+    if 'auth_token' not in session:
+        return redirect(url_for('login'))
+    return redirect(url_for('chat'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Login endpoint."""
+    if request.method == 'GET':
+        # Return simple HTML login form
+        return '''
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Login</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
+                input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+                button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+                button:hover { background: #0056b3; }
+                .error { color: red; }
+            </style>
+        </head>
+        <body>
+            <h2>Login</h2>
+            <form method="POST">
+                <input type="text" name="username" placeholder="Username" required>
+                <input type="password" name="password" placeholder="Password" required>
+                <button type="submit">Login</button>
+            </form>
+            <p>Demo credentials: admin/password123 or user/userpass</p>
+        </body>
+        </html>
+        '''
+    
+    # Handle POST request
+    username = request.form.get('username')
+    password = request.form.get('password')
+    
+    if username in users and users[username] == password:
+        # Set auth_token session cookie
+        session['auth_token'] = secrets.token_hex(32)
+        session['username'] = username
+        return redirect(url_for('chat'))
+    
+    return '''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Login</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
+            input { width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; }
+            button { width: 100%; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }
+            button:hover { background: #0056b3; }
+            .error { color: red; }
+        </style>
+    </head>
+    <body>
+        <h2>Login</h2>
+        <p class="error">Invalid credentials. Please try again.</p>
+        <form method="POST">
+            <input type="text" name="username" placeholder="Username" required>
+            <input type="password" name="password" placeholder="Password" required>
+            <button type="submit">Login</button>
+        </form>
+        <p>Demo credentials: admin/password123 or user/userpass</p>
+    </body>
+    </html>
+    ''', 401
+
+@app.route('/logout')
+def logout():
+    """Logout endpoint - clear session."""
+    session_id = session.get('session_id')
+    if session_id and session_id in conversation_histories:
+        del conversation_histories[session_id]
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/chat')
+def chat():
+    """Chat page - requires authentication."""
+    if 'auth_token' not in session:
+        return redirect(url_for('login'))
+    
+    username = session.get('username', 'User')
+    
+    return f'''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Chat with Claude</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            #chat-container {{ height: 400px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; margin: 20px 0; }}
+            .message {{ margin: 10px 0; padding: 10px; border-radius: 5px; }}
+            .user-message {{ background: #007bff; color: white; text-align: right; }}
+            .assistant-message {{ background: #f0f0f0; }}
+            #message-input {{ width: 80%; padding: 10px; }}
+            #send-button {{ width: 18%; padding: 10px; background: #007bff; color: white; border: none; cursor: pointer; }}
+            #send-button:hover {{ background: #0056b3; }}
+            .header {{ display: flex; justify-content: space-between; align-items: center; }}
+            .logout-btn {{ padding: 8px 16px; background: #dc3545; color: white; text-decoration: none; border-radius: 4px; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <h2>Chat with Claude - Welcome, {username}!</h2>
+            <a href="/logout" class="logout-btn">Logout</a>
+        </div>
+        <div id="chat-container"></div>
+        <div>
+            <input type="text" id="message-input" placeholder="Type your message..." onkeypress="handleKeyPress(event)">
+            <button id="send-button" onclick="sendMessage()">Send</button>
+        </div>
+        
+        <script>
+            function handleKeyPress(event) {{
+                if (event.key === 'Enter') {{
+                    sendMessage();
+                }}
+            }}
+            
+            function addMessage(content, isUser) {{
+                const container = document.getElementById('chat-container');
+                const messageDiv = document.createElement('div');
+                messageDiv.className = 'message ' + (isUser ? 'user-message' : 'assistant-message');
+                messageDiv.innerHTML = '<strong>' + (isUser ? 'You' : 'Claude') + ':</strong> ' + content;
+                container.appendChild(messageDiv);
+                container.scrollTop = container.scrollHeight;
+            }}
+            
+            async function sendMessage() {{
+                const input = document.getElementById('message-input');
+                const message = input.value.trim();
+                
+                if (!message) return;
+                
+                input.value = '';
+                addMessage(message, true);
+                
+                try {{
+                    const response = await fetch('/api/chat', {{
+                        method: 'POST',
+                        headers: {{
+                            'Content-Type': 'application/json'
+                        }},
+                        body: JSON.stringify({{ message: message }})
+                    }});
+                    
+                    if (response.status === 401) {{
+                        window.location.href = '/login';
+                        return;
+                    }}
+                    
+                    const data = await response.json();
+                    addMessage(data.response, false);
+                }} catch (error) {{
+                    addMessage('Error: Could not get response from Claude.', false);
+                }}
+            }}
+        </script>
+    </body>
+    </html>
+    '''
+
+@app.route('/api/chat', methods=['POST'])
+def api_chat():
+    """API endpoint for chat - requires authentication."""
+    if 'auth_token' not in session:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    if not data or 'message' not in data:
+        return jsonify({'error': 'No message provided'}), 400
+    
+    user_message = data['message']
+    session_id = get_session_id()
+    
+    response = chat_with_claude(user_message, session_id)
+    
+    return jsonify({'response': response})
+
+@app.route('/api/status')
+def api_status():
+    """Check authentication status."""
+    if 'auth_token' in session:
+        return jsonify({
+            'authenticated': True,
+            'username': session.get('username'),
+            'auth_token': session.get('auth_token')
+        })
+    return jsonify({'authenticated': False}), 401
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

@@ -1,0 +1,225 @@
+
+```python
+import os
+import json
+from flask import Flask, jsonify
+import anthropic
+
+app = Flask(__name__)
+
+# Initialize Anthropic client
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+# Mock database of invoices
+INVOICES_DB = {
+    "INV-001": {
+        "id": "INV-001",
+        "customer_name": "John Doe",
+        "customer_email": "john.doe@example.com",
+        "amount": 1500.00,
+        "currency": "USD",
+        "status": "paid",
+        "issue_date": "2024-01-15",
+        "due_date": "2024-02-15",
+        "items": [
+            {"description": "Web Development Services", "quantity": 10, "unit_price": 100.00, "total": 1000.00},
+            {"description": "UI/UX Design", "quantity": 5, "unit_price": 100.00, "total": 500.00}
+        ]
+    },
+    "INV-002": {
+        "id": "INV-002",
+        "customer_name": "Jane Smith",
+        "customer_email": "jane.smith@example.com",
+        "amount": 2750.50,
+        "currency": "USD",
+        "status": "pending",
+        "issue_date": "2024-01-20",
+        "due_date": "2024-02-20",
+        "items": [
+            {"description": "Software Consulting", "quantity": 15, "unit_price": 150.00, "total": 2250.00},
+            {"description": "Technical Documentation", "quantity": 5, "unit_price": 100.10, "total": 500.50}
+        ]
+    },
+    "INV-003": {
+        "id": "INV-003",
+        "customer_name": "Bob Johnson",
+        "customer_email": "bob.johnson@example.com",
+        "amount": 850.00,
+        "currency": "EUR",
+        "status": "overdue",
+        "issue_date": "2023-12-01",
+        "due_date": "2024-01-01",
+        "items": [
+            {"description": "Database Optimization", "quantity": 8, "unit_price": 100.00, "total": 800.00},
+            {"description": "Performance Report", "quantity": 1, "unit_price": 50.00, "total": 50.00}
+        ]
+    }
+}
+
+def get_invoice_from_db(invoice_id: str) -> dict | None:
+    """Retrieve invoice from mock database."""
+    return INVOICES_DB.get(invoice_id)
+
+def analyze_invoice_with_claude(invoice_data: dict) -> str:
+    """Use Claude to analyze and provide insights about the invoice."""
+    
+    # Define tools for Claude to use
+    tools = [
+        {
+            "name": "get_invoice_details",
+            "description": "Retrieve detailed information about an invoice from the database",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {
+                        "type": "string",
+                        "description": "The unique identifier of the invoice"
+                    }
+                },
+                "required": ["invoice_id"]
+            }
+        },
+        {
+            "name": "calculate_invoice_summary",
+            "description": "Calculate summary statistics for an invoice",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {
+                        "type": "string",
+                        "description": "The invoice ID to calculate summary for"
+                    },
+                    "include_tax": {
+                        "type": "boolean",
+                        "description": "Whether to include tax calculations"
+                    }
+                },
+                "required": ["invoice_id"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please analyze the invoice with ID {invoice_data['id']} and provide a brief summary including payment status, total amount, and any important notes."
+        }
+    ]
+    
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        # Check if we need to process tool calls
+        if response.stop_reason == "tool_use":
+            # Process tool calls
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    # Execute the appropriate tool
+                    if tool_name == "get_invoice_details":
+                        invoice_id = tool_input.get("invoice_id")
+                        result = get_invoice_from_db(invoice_id)
+                        if result:
+                            tool_result = json.dumps(result)
+                        else:
+                            tool_result = json.dumps({"error": f"Invoice {invoice_id} not found"})
+                    
+                    elif tool_name == "calculate_invoice_summary":
+                        invoice_id = tool_input.get("invoice_id")
+                        include_tax = tool_input.get("include_tax", False)
+                        invoice = get_invoice_from_db(invoice_id)
+                        
+                        if invoice:
+                            summary = {
+                                "invoice_id": invoice_id,
+                                "total_items": len(invoice["items"]),
+                                "subtotal": invoice["amount"],
+                                "status": invoice["status"],
+                                "days_until_due": "Overdue" if invoice["status"] == "overdue" else "Within period"
+                            }
+                            if include_tax:
+                                summary["tax_rate"] = "20%"
+                                summary["tax_amount"] = invoice["amount"] * 0.20
+                                summary["total_with_tax"] = invoice["amount"] * 1.20
+                            tool_result = json.dumps(summary)
+                        else:
+                            tool_result = json.dumps({"error": f"Invoice {invoice_id} not found"})
+                    
+                    else:
+                        tool_result = json.dumps({"error": f"Unknown tool: {tool_name}"})
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    })
+            
+            # Add assistant response and tool results to messages
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+        
+        else:
+            # No more tool calls, extract final text response
+            final_text = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_text += content_block.text
+            return final_text
+
+
+@app.route("/invoice/<invoice_id>", methods=["GET"])
+def get_invoice(invoice_id: str):
+    """
+    Flask route to retrieve invoice details by invoice_id.
+    
+    Args:
+        invoice_id: The unique identifier of the invoice from URL
+        
+    Returns:
+        JSON response with invoice details and AI analysis
+    """
+    # Retrieve invoice from database
+    invoice = get_invoice_from_db(invoice_id)
+    
+    if not invoice:
+        return jsonify({
+            "error": "Invoice not found",
+            "invoice_id": invoice_id,
+            "message": f"No invoice found with ID: {invoice_id}"
+        }), 404
+    
+    # Get AI analysis using Claude with tool use
+    ai_analysis = analyze_invoice_with_claude(invoice)
+    
+    # Return combined response
+    return jsonify({
+        "invoice": invoice,
+        "ai_analysis": ai_analysis,
+        "status": "success"
+    }), 200
+
+
+@app.route("/invoices", methods=["GET"])
+def list_invoices():
+    """List all available invoice IDs."""
+    invoice_ids = list(INVOICES_DB.keys())
+    return jsonify({
+        "invoices": invoice_ids,
+        "total": len(invoice_ids)
+    }), 200
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

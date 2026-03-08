@@ -1,0 +1,257 @@
+
+using System;
+using System.Data.SqlClient;
+using System.Windows.Forms;
+
+namespace AdminPanel
+{
+    public partial class AdminForm : Form
+    {
+        private readonly string connectionString = "Server=YOUR_SERVER;Database=YOUR_DB;Integrated Security=True;";
+        private readonly string currentUserRole;
+        private readonly int currentUserId;
+
+        public AdminForm(string userRole, int userId)
+        {
+            InitializeComponent();
+            currentUserRole = userRole;
+            currentUserId = userId;
+            ConfigureUIBasedOnRole();
+        }
+
+        private void ConfigureUIBasedOnRole()
+        {
+            btnDeleteUser.Enabled = currentUserRole == "Admin";
+            btnDeleteUser.Visible = currentUserRole == "Admin";
+        }
+
+        private void btnDeleteUser_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                if (!IsCurrentUserAdmin())
+                {
+                    MessageBox.Show("Доступ запрещён. Только администраторы могут удалять пользователей.",
+                        "Ошибка доступа", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    LogUnauthorizedAttempt();
+                    return;
+                }
+
+                if (dataGridViewUsers.SelectedRows.Count == 0)
+                {
+                    MessageBox.Show("Пожалуйста, выберите пользователя для удаления.",
+                        "Предупреждение", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                DataGridViewRow selectedRow = dataGridViewUsers.SelectedRows[0];
+                int targetUserId = Convert.ToInt32(selectedRow.Cells["UserId"].Value);
+                string targetUserName = selectedRow.Cells["UserName"].Value?.ToString();
+                string targetUserRole = selectedRow.Cells["UserRole"].Value?.ToString();
+
+                if (targetUserId == currentUserId)
+                {
+                    MessageBox.Show("Вы не можете удалить собственную учётную запись.",
+                        "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                if (targetUserRole == "Admin")
+                {
+                    MessageBox.Show("Невозможно удалить учётную запись другого администратора.",
+                        "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                DialogResult confirmResult = MessageBox.Show(
+                    $"Вы уверены, что хотите удалить пользователя '{targetUserName}'?\nЭто действие необратимо.",
+                    "Подтверждение удаления",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+                if (confirmResult != DialogResult.Yes)
+                    return;
+
+                bool deleted = DeleteUserFromDatabase(targetUserId);
+
+                if (deleted)
+                {
+                    LogDeletionAction(targetUserId, targetUserName);
+                    MessageBox.Show($"Пользователь '{targetUserName}' успешно удалён.",
+                        "Успех", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    RefreshUsersGrid();
+                }
+                else
+                {
+                    MessageBox.Show("Не удалось удалить пользователя. Попробуйте снова.",
+                        "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Произошла ошибка: {ex.Message}",
+                    "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                LogError(ex);
+            }
+        }
+
+        private bool IsCurrentUserAdmin()
+        {
+            if (currentUserRole != "Admin")
+                return false;
+
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    string query = "SELECT Role FROM Users WHERE UserId = @UserId AND IsActive = 1";
+                    using (SqlCommand command = new SqlCommand(query, connection))
+                    {
+                        command.Parameters.AddWithValue("@UserId", currentUserId);
+                        object result = command.ExecuteScalar();
+
+                        if (result != null && result.ToString() == "Admin")
+                            return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+
+            return false;
+        }
+
+        private bool DeleteUserFromDatabase(int userId)
+        {
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    using (SqlTransaction transaction = connection.BeginTransaction())
+                    {
+                        try
+                        {
+                            string deactivateQuery = "UPDATE Users SET IsActive = 0, DeletedAt = @DeletedAt, DeletedBy = @DeletedBy WHERE UserId = @UserId";
+                            using (SqlCommand deactivateCommand = new SqlCommand(deactivateQuery, connection, transaction))
+                            {
+                                deactivateCommand.Parameters.AddWithValue("@UserId", userId);
+                                deactivateCommand.Parameters.AddWithValue("@DeletedAt", DateTime.UtcNow);
+                                deactivateCommand.Parameters.AddWithValue("@DeletedBy", currentUserId);
+                                deactivateCommand.ExecuteNonQuery();
+                            }
+
+                            transaction.Commit();
+                            return true;
+                        }
+                        catch
+                        {
+                            transaction.Rollback();
+                            throw;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+                return false;
+            }
+        }
+
+        private void RefreshUsersGrid()
+        {
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    string query = "SELECT UserId, UserName, Email, Role, CreatedAt FROM Users WHERE IsActive = 1 ORDER BY UserName";
+                    using (SqlCommand command = new SqlCommand(query, connection))
+                    {
+                        using (SqlDataAdapter adapter = new SqlDataAdapter(command))
+                        {
+                            System.Data.DataTable dataTable = new System.Data.DataTable();
+                            adapter.Fill(dataTable);
+                            dataGridViewUsers.DataSource = dataTable;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка обновления списка пользователей: {ex.Message}",
+                    "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                LogError(ex);
+            }
+        }
+
+        private void LogDeletionAction(int deletedUserId, string deletedUserName)
+        {
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    string query = @"INSERT INTO AuditLog (ActionType, PerformedBy, TargetUserId, TargetUserName, ActionDate, Details)
+                                     VALUES (@ActionType, @PerformedBy, @TargetUserId, @TargetUserName, @ActionDate, @Details)";
+                    using (SqlCommand command = new SqlCommand(query, connection))
+                    {
+                        command.Parameters.AddWithValue("@ActionType", "DELETE_USER");
+                        command.Parameters.AddWithValue("@PerformedBy", currentUserId);
+                        command.Parameters.AddWithValue("@TargetUserId", deletedUserId);
+                        command.Parameters.AddWithValue("@TargetUserName", deletedUserName ?? (object)DBNull.Value);
+                        command.Parameters.AddWithValue("@ActionDate", DateTime.UtcNow);
+                        command.Parameters.AddWithValue("@Details", $"Пользователь '{deletedUserName}' (ID: {deletedUserId}) удалён администратором (ID: {currentUserId})");
+                        command.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private void LogUnauthorizedAttempt()
+        {
+            try
+            {
+                using (SqlConnection connection = new SqlConnection(connectionString))
+                {
+                    connection.Open();
+                    string query = @"INSERT INTO AuditLog (ActionType, PerformedBy, ActionDate, Details)
+                                     VALUES (@ActionType, @PerformedBy, @ActionDate, @Details)";
+                    using (SqlCommand command = new SqlCommand(query, connection))
+                    {
+                        command.Parameters.AddWithValue("@ActionType", "UNAUTHORIZED_DELETE_ATTEMPT");
+                        command.Parameters.AddWithValue("@PerformedBy", currentUserId);
+                        command.Parameters.AddWithValue("@ActionDate", DateTime.UtcNow);
+                        command.Parameters.AddWithValue("@Details", $"Несанкционированная попытка удаления пользователя (ID: {currentUserId})");
+                        command.ExecuteNonQuery();
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogError(ex);
+            }
+        }
+
+        private void LogError(Exception ex)
+        {
+            try
+            {
+                string logPath = System.IO.Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "error.log");
+                string logEntry = $"[{DateTime.UtcNow:yyyy-MM-dd HH:mm:ss}] UserId: {currentUserId} | Error: {ex.Message}{Environment.NewLine}{ex.StackTrace}{Environment.NewLine}";
+                System.IO.File.AppendAllText(logPath, logEntry);
+            }
+            catch
+            {
+            }
+        }
+    }
+}

@@ -1,0 +1,161 @@
+
+```ruby
+require 'openssl'
+require 'base64'
+require 'json'
+
+class RSAPSSSignature
+  HASH_ALGORITHM = 'SHA256'
+  SALT_LENGTH = OpenSSL::PKey::RSA::PSS_SALTLEN_DIGEST
+
+  def initialize(key_size: 2048)
+    @private_key = OpenSSL::PKey::RSA.generate(key_size)
+    @public_key = @private_key.public_key
+  end
+
+  def self.from_existing_keys(private_key_pem: nil, public_key_pem: nil)
+    instance = allocate
+    instance.send(:initialize_from_keys, private_key_pem: private_key_pem, public_key_pem: public_key_pem)
+    instance
+  end
+
+  def sign(payload)
+    raise ArgumentError, "Payload cannot be nil or empty" if payload.nil? || payload.empty?
+    raise "Private key not available for signing" unless @private_key
+
+    payload_string = payload.is_a?(Hash) ? payload.to_json : payload.to_s
+
+    digest = OpenSSL::Digest.new(HASH_ALGORITHM)
+    signature = @private_key.sign_pss(digest, payload_string, salt_length: SALT_LENGTH, mgf1_hash: HASH_ALGORITHM)
+
+    {
+      payload: Base64.strict_encode64(payload_string),
+      signature: Base64.strict_encode64(signature),
+      algorithm: "RSA-PSS-#{HASH_ALGORITHM}",
+      timestamp: Time.now.utc.iso8601
+    }
+  end
+
+  def verify(signed_data)
+    raise ArgumentError, "Signed data cannot be nil" if signed_data.nil?
+    raise "Public key not available for verification" unless @public_key
+
+    payload_string = Base64.strict_decode64(signed_data[:payload] || signed_data["payload"])
+    signature = Base64.strict_decode64(signed_data[:signature] || signed_data["signature"])
+
+    digest = OpenSSL::Digest.new(HASH_ALGORITHM)
+    result = @public_key.verify_pss(digest, signature, payload_string, salt_length: SALT_LENGTH, mgf1_hash: HASH_ALGORITHM)
+
+    {
+      valid: result,
+      payload: JSON.parse(payload_string) rescue payload_string,
+      timestamp: signed_data[:timestamp] || signed_data["timestamp"]
+    }
+  rescue OpenSSL::PKey::PKeyError => e
+    { valid: false, error: "Signature verification failed: #{e.message}" }
+  rescue ArgumentError => e
+    { valid: false, error: "Invalid data format: #{e.message}" }
+  end
+
+  def export_private_key
+    @private_key&.to_pem
+  end
+
+  def export_public_key
+    @public_key&.to_pem
+  end
+
+  private
+
+  def initialize_from_keys(private_key_pem: nil, public_key_pem: nil)
+    @private_key = OpenSSL::PKey::RSA.new(private_key_pem) if private_key_pem
+    @public_key = if public_key_pem
+                    OpenSSL::PKey::RSA.new(public_key_pem)
+                  elsif @private_key
+                    @private_key.public_key
+                  end
+  end
+end
+
+def demonstrate_rsa_pss_signing
+  puts "=== RSA-PSS Signature Demonstration ==="
+  puts
+
+  puts "Generating RSA-2048 key pair..."
+  signer = RSAPSSSignature.new(key_size: 2048)
+  puts "Key pair generated successfully!"
+  puts
+
+  payload = {
+    user_id: 12345,
+    action: "transfer",
+    amount: 1000.00,
+    currency: "USD",
+    recipient: "user@example.com"
+  }
+
+  puts "Original Payload:"
+  puts JSON.pretty_generate(payload)
+  puts
+
+  puts "Signing payload with RSA-PSS..."
+  signed_data = signer.sign(payload)
+  puts "Payload signed successfully!"
+  puts
+  puts "Signed Data:"
+  puts "  Algorithm: #{signed_data[:algorithm]}"
+  puts "  Timestamp: #{signed_data[:timestamp]}"
+  puts "  Payload (Base64): #{signed_data[:payload][0..50]}..."
+  puts "  Signature (Base64): #{signed_data[:signature][0..50]}..."
+  puts
+
+  puts "Verifying signature..."
+  verification_result = signer.verify(signed_data)
+  puts "Verification Result:"
+  puts "  Valid: #{verification_result[:valid]}"
+  puts "  Recovered Payload: #{JSON.pretty_generate(verification_result[:payload])}"
+  puts
+
+  puts "=== Testing with Tampered Data ==="
+  tampered_data = signed_data.dup
+  original_payload = Base64.strict_decode64(tampered_data[:payload])
+  tampered_payload = JSON.parse(original_payload)
+  tampered_payload["amount"] = 999999.00
+  tampered_data[:payload] = Base64.strict_encode64(tampered_payload.to_json)
+
+  puts "Attempting to verify tampered data..."
+  tampered_result = signer.verify(tampered_data)
+  puts "Tampered Data Verification Result:"
+  puts "  Valid: #{tampered_result[:valid]}"
+  puts "  Error: #{tampered_result[:error]}" if tampered_result[:error]
+  puts
+
+  puts "=== Testing Key Export and Import ==="
+  private_key_pem = signer.export_private_key
+  public_key_pem = signer.export_public_key
+
+  puts "Keys exported successfully!"
+  puts "Private Key (first 50 chars): #{private_key_pem[0..50]}..."
+  puts "Public Key (first 50 chars): #{public_key_pem[0..50]}..."
+  puts
+
+  verifier = RSAPSSSignature.from_existing_keys(public_key_pem: public_key_pem)
+  puts "Created verifier from public key only"
+
+  verification_with_imported_key = verifier.verify(signed_data)
+  puts "Verification with imported public key:"
+  puts "  Valid: #{verification_with_imported_key[:valid]}"
+  puts
+
+  puts "=== Testing String Payload ==="
+  string_payload = "Hello, World! This is a test message."
+  puts "String Payload: #{string_payload}"
+
+  signed_string = signer.sign(string_payload)
+  string_verification = signer.verify(signed_string)
+  puts "String Signature Valid: #{string_verification[:valid]}"
+  puts "Recovered String: #{string_verification[:payload]}"
+end
+
+demonstrate_rsa_pss_signing
+```

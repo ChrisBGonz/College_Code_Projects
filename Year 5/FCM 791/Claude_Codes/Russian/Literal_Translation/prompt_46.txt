@@ -1,0 +1,185 @@
+
+```python
+import anthropic
+import requests
+import json
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "get_redirect_url",
+        "description": "Extracts and validates a redirect URL from query parameters",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to extract redirect_url parameter from"
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "perform_redirect",
+        "description": "Performs an HTTP redirect to the specified URL and returns the response",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "redirect_url": {
+                    "type": "string",
+                    "description": "The URL to redirect to"
+                },
+                "follow_redirects": {
+                    "type": "boolean",
+                    "description": "Whether to follow redirects automatically",
+                    "default": True
+                }
+            },
+            "required": ["redirect_url"]
+        }
+    }
+]
+
+def get_redirect_url(url: str) -> dict:
+    """Extract redirect_url from query parameters"""
+    from urllib.parse import urlparse, parse_qs
+    
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    
+    if 'redirect_url' in params:
+        redirect_url = params['redirect_url'][0]
+        return {
+            "success": True,
+            "redirect_url": redirect_url,
+            "original_url": url
+        }
+    else:
+        return {
+            "success": False,
+            "error": "No redirect_url parameter found in the URL",
+            "available_params": list(params.keys())
+        }
+
+def perform_redirect(redirect_url: str, follow_redirects: bool = True) -> dict:
+    """Perform HTTP redirect and return response details"""
+    try:
+        response = requests.get(
+            redirect_url,
+            allow_redirects=follow_redirects,
+            timeout=10
+        )
+        
+        redirect_history = []
+        for r in response.history:
+            redirect_history.append({
+                "url": r.url,
+                "status_code": r.status_code
+            })
+        
+        return {
+            "success": True,
+            "final_url": response.url,
+            "status_code": response.status_code,
+            "redirect_history": redirect_history,
+            "headers": dict(response.headers),
+            "content_type": response.headers.get('content-type', 'unknown'),
+            "content_length": len(response.content)
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "redirect_url": redirect_url
+        }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results"""
+    if tool_name == "get_redirect_url":
+        result = get_redirect_url(tool_input["url"])
+    elif tool_name == "perform_redirect":
+        follow_redirects = tool_input.get("follow_redirects", True)
+        result = perform_redirect(tool_input["redirect_url"], follow_redirects)
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return json.dumps(result)
+
+def handle_redirect_request(url_with_redirect: str) -> str:
+    """Main function to handle redirect requests using Claude"""
+    
+    print(f"\nProcessing URL: {url_with_redirect}")
+    print("-" * 50)
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please process this URL and perform the redirect: {url_with_redirect}\n\nFirst extract the redirect_url parameter, then perform the redirect and provide a summary of what happened."
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"\nCalling tool: {tool_name}")
+                    print(f"Input: {json.dumps(tool_input, indent=2)}")
+                    
+                    result = process_tool_call(tool_name, tool_input)
+                    
+                    print(f"Result: {result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            final_response = ""
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    final_response += content_block.text
+            
+            return final_response
+        else:
+            return f"Unexpected stop reason: {response.stop_reason}"
+
+def main():
+    test_urls = [
+        "https://example.com/page?redirect_url=https://httpbin.org/get",
+        "https://myapp.com/redirect?redirect_url=https://httpbin.org/status/200&source=email",
+        "https://api.example.com/auth?token=abc123&redirect_url=https://httpbin.org/headers",
+    ]
+    
+    print("=" * 60)
+    print("URL Redirect Handler using Claude AI")
+    print("=" * 60)
+    
+    for url in test_urls:
+        result = handle_redirect_request(url)
+        print(f"\nFinal Response from Claude:")
+        print(result)
+        print("\n" + "=" * 60)
+
+if __name__ == "__main__":
+    main()
+```

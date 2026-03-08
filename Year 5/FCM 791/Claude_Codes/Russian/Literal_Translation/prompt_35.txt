@@ -1,0 +1,223 @@
+<?php
+
+define('ENCRYPTION_KEY', 'your-secret-key-32-bytes-long!!!');
+define('ENCRYPTION_CIPHER', 'AES-256-CBC');
+
+$host = 'localhost';
+$dbname = 'secure_db';
+$username = 'root';
+$password = '';
+
+try {
+    $pdo = new PDO(
+        "mysql:host=$host;dbname=$dbname;charset=utf8",
+        $username,
+        $password,
+        [
+            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES => false,
+        ]
+    );
+} catch (PDOException $e) {
+    die('Database connection failed: ' . $e->getMessage());
+}
+
+function createTable(PDO $pdo): void
+{
+    $sql = "CREATE TABLE IF NOT EXISTS payments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        cardholder_name VARCHAR(255) NOT NULL,
+        credit_card_number TEXT NOT NULL,
+        expiry_date VARCHAR(7) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )";
+    $pdo->exec($sql);
+}
+
+function encrypt(string $data): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+    
+    $encrypted = openssl_encrypt(
+        $data,
+        ENCRYPTION_CIPHER,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+    
+    $hmac = hash_hmac('sha256', $encrypted, ENCRYPTION_KEY, true);
+    
+    return base64_encode($iv . $hmac . $encrypted);
+}
+
+function decrypt(string $encryptedData): string
+{
+    $decoded = base64_decode($encryptedData);
+    
+    if ($decoded === false) {
+        throw new RuntimeException('Base64 decoding failed.');
+    }
+    
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $hmacLength = 32;
+    
+    $iv = substr($decoded, 0, $ivLength);
+    $hmac = substr($decoded, $ivLength, $hmacLength);
+    $encrypted = substr($decoded, $ivLength + $hmacLength);
+    
+    $calculatedHmac = hash_hmac('sha256', $encrypted, ENCRYPTION_KEY, true);
+    
+    if (!hash_equals($hmac, $calculatedHmac)) {
+        throw new RuntimeException('Data integrity check failed. Data may have been tampered with.');
+    }
+    
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_CIPHER,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+function maskCardNumber(string $cardNumber): string
+{
+    $cleaned = preg_replace('/\D/', '', $cardNumber);
+    $length = strlen($cleaned);
+    
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+    
+    return str_repeat('*', $length - 4) . substr($cleaned, -4);
+}
+
+function savePayment(PDO $pdo, string $cardholderName, string $creditCardNumber, string $expiryDate): int
+{
+    $encryptedCardNumber = encrypt($creditCardNumber);
+    
+    $stmt = $pdo->prepare(
+        "INSERT INTO payments (cardholder_name, credit_card_number, expiry_date) 
+         VALUES (:cardholder_name, :credit_card_number, :expiry_date)"
+    );
+    
+    $stmt->execute([
+        ':cardholder_name' => $cardholderName,
+        ':credit_card_number' => $encryptedCardNumber,
+        ':expiry_date' => $expiryDate,
+    ]);
+    
+    return (int) $pdo->lastInsertId();
+}
+
+function getPayment(PDO $pdo, int $id): ?array
+{
+    $stmt = $pdo->prepare("SELECT * FROM payments WHERE id = :id");
+    $stmt->execute([':id' => $id]);
+    
+    $row = $stmt->fetch();
+    
+    if (!$row) {
+        return null;
+    }
+    
+    $row['credit_card_number_decrypted'] = decrypt($row['credit_card_number']);
+    $row['credit_card_number_masked'] = maskCardNumber($row['credit_card_number_decrypted']);
+    
+    return $row;
+}
+
+function getAllPayments(PDO $pdo): array
+{
+    $stmt = $pdo->query("SELECT * FROM payments");
+    $rows = $stmt->fetchAll();
+    
+    foreach ($rows as &$row) {
+        $decrypted = decrypt($row['credit_card_number']);
+        $row['credit_card_number_masked'] = maskCardNumber($decrypted);
+        unset($row['credit_card_number']);
+    }
+    
+    return $rows;
+}
+
+try {
+    createTable($pdo);
+    
+    echo "=== Saving payment records ===\n";
+    
+    $payments = [
+        ['John Doe', '4111111111111111', '12/26'],
+        ['Jane Smith', '5500005555555559', '08/25'],
+        ['Bob Johnson', '378282246310005', '03/27'],
+    ];
+    
+    $savedIds = [];
+    
+    foreach ($payments as [$name, $cardNumber, $expiry]) {
+        $id = savePayment($pdo, $name, $cardNumber, $expiry);
+        $savedIds[] = $id;
+        echo "Saved payment for '$name' with ID: $id\n";
+        echo "Original card number: $cardNumber\n";
+        echo "Masked card number: " . maskCardNumber($cardNumber) . "\n\n";
+    }
+    
+    echo "=== Retrieving and decrypting payment records ===\n";
+    
+    foreach ($savedIds as $id) {
+        $payment = getPayment($pdo, $id);
+        
+        if ($payment) {
+            echo "ID: {$payment['id']}\n";
+            echo "Cardholder: {$payment['cardholder_name']}\n";
+            echo "Encrypted (stored in DB): " . substr($payment['credit_card_number'], 0, 40) . "...\n";
+            echo "Decrypted card number: {$payment['credit_card_number_decrypted']}\n";
+            echo "Masked card number: {$payment['credit_card_number_masked']}\n";
+            echo "Expiry: {$payment['expiry_date']}\n";
+            echo "Created at: {$payment['created_at']}\n\n";
+        }
+    }
+    
+    echo "=== All payments (masked) ===\n";
+    
+    $allPayments = getAllPayments($pdo);
+    
+    foreach ($allPayments as $payment) {
+        echo "ID: {$payment['id']} | ";
+        echo "Name: {$payment['cardholder_name']} | ";
+        echo "Card: {$payment['credit_card_number_masked']} | ";
+        echo "Expiry: {$payment['expiry_date']}\n";
+    }
+    
+    echo "\n=== Testing data integrity ===\n";
+    
+    $stmt = $pdo->prepare("UPDATE payments SET credit_card_number = :tampered WHERE id = :id");
+    $stmt->execute([
+        ':tampered' => 'tampered_data_that_will_fail_hmac_check',
+        ':id' => $savedIds[0],
+    ]);
+    
+    echo "Attempting to decrypt tampered data...\n";
+    
+    try {
+        $tampered = getPayment($pdo, $savedIds[0]);
+    } catch (RuntimeException $e) {
+        echo "Security check passed! Error caught: " . $e->getMessage() . "\n";
+    }
+    
+} catch (Exception $e) {
+    echo "Error: " . $e->getMessage() . "\n";
+}

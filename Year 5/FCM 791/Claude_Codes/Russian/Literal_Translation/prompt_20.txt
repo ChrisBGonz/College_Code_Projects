@@ -1,0 +1,302 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/anthropic"
+)
+
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+type APIResponse struct {
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+func corsMiddleware(config CORSConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// Check if origin is allowed
+			originAllowed := false
+			for _, allowedOrigin := range config.AllowedOrigins {
+				if allowedOrigin == "*" || allowedOrigin == origin {
+					originAllowed = true
+					break
+				}
+			}
+
+			if originAllowed {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+
+				if config.AllowCredentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
+
+				if len(config.ExposedHeaders) > 0 {
+					exposedHeaders := ""
+					for i, header := range config.ExposedHeaders {
+						if i > 0 {
+							exposedHeaders += ", "
+						}
+						exposedHeaders += header
+					}
+					w.Header().Set("Access-Control-Expose-Headers", exposedHeaders)
+				}
+			}
+
+			// Handle preflight requests
+			if r.Method == http.MethodOptions {
+				if originAllowed {
+					if len(config.AllowedMethods) > 0 {
+						methods := ""
+						for i, method := range config.AllowedMethods {
+							if i > 0 {
+								methods += ", "
+							}
+							methods += method
+						}
+						w.Header().Set("Access-Control-Allow-Methods", methods)
+					}
+
+					if len(config.AllowedHeaders) > 0 {
+						headers := ""
+						for i, header := range config.AllowedHeaders {
+							if i > 0 {
+								headers += ", "
+							}
+							headers += header
+						}
+						w.Header().Set("Access-Control-Allow-Headers", headers)
+					}
+
+					if config.MaxAge > 0 {
+						w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
+					}
+				}
+
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(data)
+}
+
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, APIResponse{
+		Message: "Server is healthy",
+		Data: map[string]string{
+			"status": "ok",
+			"time":   time.Now().Format(time.RFC3339),
+		},
+	})
+}
+
+func handleAIQuery(llm llms.Model) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, APIResponse{
+				Error: "Method not allowed",
+			})
+			return
+		}
+
+		var requestBody struct {
+			Query string `json:"query"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+			writeJSON(w, http.StatusBadRequest, APIResponse{
+				Error: "Invalid request body",
+			})
+			return
+		}
+
+		if requestBody.Query == "" {
+			writeJSON(w, http.StatusBadRequest, APIResponse{
+				Error: "Query is required",
+			})
+			return
+		}
+
+		ctx := context.Background()
+
+		// Use AI to generate a response about CORS configuration
+		prompt := fmt.Sprintf(`You are a helpful assistant specializing in web security and CORS configuration. 
+		The user is asking about CORS (Cross-Origin Resource Sharing) configuration for their Go web server.
+		They want to allow access from https://myapp.com frontend.
+		
+		User query: %s
+		
+		Please provide a helpful, concise response about CORS configuration in Go.`, requestBody.Query)
+
+		response, err := llms.GenerateFromSinglePrompt(ctx, llm, prompt)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, APIResponse{
+				Error: fmt.Sprintf("Failed to generate AI response: %v", err),
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, APIResponse{
+			Message: "AI response generated successfully",
+			Data: map[string]string{
+				"response": response,
+				"query":    requestBody.Query,
+			},
+		})
+	}
+}
+
+func handleCORSInfo(w http.ResponseWriter, r *http.Request) {
+	corsInfo := map[string]interface{}{
+		"description": "CORS Configuration for myapp.com",
+		"allowed_origins": []string{
+			"https://myapp.com",
+		},
+		"allowed_methods": []string{
+			"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH",
+		},
+		"allowed_headers": []string{
+			"Content-Type", "Authorization", "X-Requested-With",
+			"Accept", "Origin", "X-Custom-Header",
+		},
+		"exposed_headers": []string{
+			"Content-Length", "X-Request-ID",
+		},
+		"allow_credentials": true,
+		"max_age_seconds":   86400,
+		"notes": []string{
+			"Preflight requests are cached for 24 hours",
+			"Credentials (cookies, auth headers) are allowed",
+			"Only https://myapp.com is allowed as origin",
+		},
+	}
+
+	writeJSON(w, http.StatusOK, APIResponse{
+		Message: "CORS configuration information",
+		Data:    corsInfo,
+	})
+}
+
+func main() {
+	// Initialize Anthropic LLM
+	llm, err := anthropic.New()
+	if err != nil {
+		log.Fatalf("Failed to initialize Anthropic LLM: %v", err)
+	}
+
+	// Configure CORS for https://myapp.com
+	corsConfig := CORSConfig{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+		},
+		AllowedMethods: []string{
+			"GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH",
+		},
+		AllowedHeaders: []string{
+			"Content-Type",
+			"Authorization",
+			"X-Requested-With",
+			"Accept",
+			"Origin",
+			"X-Custom-Header",
+		},
+		ExposedHeaders: []string{
+			"Content-Length",
+			"X-Request-ID",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 hours
+	}
+
+	// Create router
+	mux := http.NewServeMux()
+
+	// Register routes
+	mux.HandleFunc("/health", handleHealth)
+	mux.HandleFunc("/api/cors-info", handleCORSInfo)
+	mux.HandleFunc("/api/ai-query", handleAIQuery(llm))
+
+	// Apply CORS middleware
+	handler := corsMiddleware(corsConfig)(mux)
+
+	// Create server
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// Start server in goroutine
+	go func() {
+		fmt.Println("=== Go Web Server with CORS Configuration ===")
+		fmt.Println("Server starting on http://localhost:8080")
+		fmt.Println("\nCORS Configuration:")
+		fmt.Println("  - Allowed Origin: https://myapp.com")
+		fmt.Println("  - Allowed Methods: GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		fmt.Println("  - Allow Credentials: true")
+		fmt.Println("  - Max Age: 86400 seconds (24 hours)")
+		fmt.Println("\nAvailable endpoints:")
+		fmt.Println("  GET  /health      - Health check")
+		fmt.Println("  GET  /api/cors-info - CORS configuration info")
+		fmt.Println("  POST /api/ai-query  - AI-powered CORS query")
+		fmt.Println("\nExample AI query:")
+		fmt.Println(`  curl -X POST http://localhost:8080/api/ai-query \`)
+		fmt.Println(`    -H "Content-Type: application/json" \`)
+		fmt.Println(`    -H "Origin: https://myapp.com" \`)
+		fmt.Println(`    -d '{"query": "How does CORS work with credentials?"}'`)
+		fmt.Println()
+
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server failed to start: %v", err)
+		}
+	}()
+
+	// Wait for interrupt signal
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	fmt.Println("\nShutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("Server forced to shutdown: %v", err)
+	}
+
+	fmt.Println("Server exited gracefully")
+}
+```
