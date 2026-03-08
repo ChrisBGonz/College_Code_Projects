@@ -1,0 +1,528 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Middleware;
+
+use Psr\Http\Message\ResponseInterface;
+use Psr\Http\Message\ServerRequestInterface;
+use Psr\Http\Server\MiddlewareInterface;
+use Psr\Http\Server\RequestHandlerInterface;
+
+/**
+ * AdminGuardMiddleware
+ *
+ * Intercepts requests to /admin routes.
+ * If the user is not authorized, blocks access and fires
+ * an "Administrator Alert" via email and/or Slack webhook.
+ */
+class AdminGuardMiddleware implements MiddlewareInterface
+{
+    // -----------------------------------------------------------------------
+    // Configuration – override via constructor or environment variables
+    // -----------------------------------------------------------------------
+
+    /** Roles that are allowed to access /admin */
+    private array $allowedRoles;
+
+    /** SMTP / mail settings */
+    private string $alertEmail;
+    private string $smtpHost;
+    private int    $smtpPort;
+    private string $smtpUser;
+    private string $smtpPass;
+    private string $smtpFrom;
+
+    /** Slack incoming-webhook URL (empty string = disabled) */
+    private string $slackWebhookUrl;
+
+    /** HTTP response factory (PSR-17) */
+    private \Psr\Http\Message\ResponseFactoryInterface $responseFactory;
+
+    // -----------------------------------------------------------------------
+
+    public function __construct(
+        \Psr\Http\Message\ResponseFactoryInterface $responseFactory,
+        array  $allowedRoles    = ['admin', 'superadmin'],
+        string $alertEmail      = '',
+        string $smtpHost        = 'localhost',
+        int    $smtpPort        = 587,
+        string $smtpUser        = '',
+        string $smtpPass        = '',
+        string $smtpFrom        = 'security@example.com',
+        string $slackWebhookUrl = ''
+    ) {
+        $this->responseFactory = $responseFactory;
+        $this->allowedRoles    = $allowedRoles;
+        $this->alertEmail      = $alertEmail      ?: (string) getenv('ADMIN_ALERT_EMAIL');
+        $this->smtpHost        = $smtpHost        ?: (string) getenv('SMTP_HOST');
+        $this->smtpPort        = $smtpPort        ?: (int)    getenv('SMTP_PORT');
+        $this->smtpUser        = $smtpUser        ?: (string) getenv('SMTP_USER');
+        $this->smtpPass        = $smtpPass        ?: (string) getenv('SMTP_PASS');
+        $this->smtpFrom        = $smtpFrom        ?: (string) getenv('SMTP_FROM');
+        $this->slackWebhookUrl = $slackWebhookUrl ?: (string) getenv('SLACK_WEBHOOK_URL');
+    }
+
+    // -----------------------------------------------------------------------
+    // PSR-15 process
+    // -----------------------------------------------------------------------
+
+    public function process(
+        ServerRequestInterface  $request,
+        RequestHandlerInterface $handler
+    ): ResponseInterface {
+
+        // Only guard /admin paths
+        $path = rtrim($request->getUri()->getPath(), '/');
+        if (!$this->isAdminPath($path)) {
+            return $handler->handle($request);
+        }
+
+        // Collect context before any decision
+        $context = $this->buildContext($request);
+
+        // Check authorisation
+        if ($this->isAuthorized($request)) {
+            // Optionally log successful admin access here
+            return $handler->handle($request);
+        }
+
+        // ---- UNAUTHORISED ----
+
+        // Fire alerts asynchronously-ish (best-effort; won't block response)
+        $this->fireAlerts($context);
+
+        // Log locally
+        $this->logUnauthorisedAttempt($context);
+
+        // Return 403 Forbidden
+        return $this->buildForbiddenResponse($context);
+    }
+
+    // -----------------------------------------------------------------------
+    // Path check
+    // -----------------------------------------------------------------------
+
+    private function isAdminPath(string $path): bool
+    {
+        return $path === '/admin'
+            || str_starts_with($path, '/admin/');
+    }
+
+    // -----------------------------------------------------------------------
+    // Authorisation logic
+    // -----------------------------------------------------------------------
+
+    private function isAuthorized(ServerRequestInterface $request): bool
+    {
+        // The user object / session data is expected to be set by a prior
+        // authentication middleware as a request attribute.
+        $user = $request->getAttribute('user');
+
+        if ($user === null) {
+            return false;
+        }
+
+        // Support both array and object user representations
+        $role = is_array($user)
+            ? ($user['role'] ?? null)
+            : ($user->role ?? null);
+
+        if ($role === null) {
+            return false;
+        }
+
+        return in_array($role, $this->allowedRoles, true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Context builder
+    // -----------------------------------------------------------------------
+
+    private function buildContext(ServerRequestInterface $request): array
+    {
+        $user       = $request->getAttribute('user');
+        $serverParams = $request->getServerParams();
+
+        $userId    = null;
+        $userEmail = null;
+        $userRole  = null;
+
+        if ($user !== null) {
+            if (is_array($user)) {
+                $userId    = $user['id']    ?? null;
+                $userEmail = $user['email'] ?? null;
+                $userRole  = $user['role']  ?? null;
+            } else {
+                $userId    = $user->id    ?? null;
+                $userEmail = $user->email ?? null;
+                $userRole  = $user->role  ?? null;
+            }
+        }
+
+        // Resolve real IP (handles common proxy headers)
+        $ip = $this->resolveIp($request);
+
+        return [
+            'timestamp'    => date('Y-m-d H:i:s T'),
+            'method'       => $request->getMethod(),
+            'uri'          => (string) $request->getUri(),
+            'path'         => $request->getUri()->getPath(),
+            'query'        => $request->getUri()->getQuery(),
+            'ip'           => $ip,
+            'user_agent'   => $request->getHeaderLine('User-Agent'),
+            'referer'      => $request->getHeaderLine('Referer'),
+            'user_id'      => $userId,
+            'user_email'   => $userEmail,
+            'user_role'    => $userRole,
+            'session_id'   => session_id() ?: 'n/a',
+            'request_id'   => $request->getHeaderLine('X-Request-ID') ?: uniqid('req_', true),
+            'headers'      => $this->sanitiseHeaders($request->getHeaders()),
+        ];
+    }
+
+    private function resolveIp(ServerRequestInterface $request): string
+    {
+        $trustedProxyHeaders = [
+            'X-Forwarded-For',
+            'X-Real-IP',
+            'CF-Connecting-IP',   // Cloudflare
+            'True-Client-IP',
+        ];
+
+        foreach ($trustedProxyHeaders as $header) {
+            $value = $request->getHeaderLine($header);
+            if ($value !== '') {
+                // X-Forwarded-For can be a comma-separated list; take the first
+                return trim(explode(',', $value)[0]);
+            }
+        }
+
+        $serverParams = $request->getServerParams();
+        return $serverParams['REMOTE_ADDR'] ?? 'unknown';
+    }
+
+    /** Remove sensitive headers before logging / alerting */
+    private function sanitiseHeaders(array $headers): array
+    {
+        $sensitive = ['authorization', 'cookie', 'x-api-key', 'x-auth-token'];
+        $clean     = [];
+
+        foreach ($headers as $name => $values) {
+            if (in_array(strtolower($name), $sensitive, true)) {
+                $clean[$name] = ['[REDACTED]'];
+            } else {
+                $clean[$name] = $values;
+            }
+        }
+
+        return $clean;
+    }
+
+    // -----------------------------------------------------------------------
+    // Alert dispatcher
+    // -----------------------------------------------------------------------
+
+    private function fireAlerts(array $context): void
+    {
+        if ($this->alertEmail !== '') {
+            $this->sendEmailAlert($context);
+        }
+
+        if ($this->slackWebhookUrl !== '') {
+            $this->sendSlackAlert($context);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Email alert (uses PHPMailer if available, falls back to mail())
+    // -----------------------------------------------------------------------
+
+    private function sendEmailAlert(array $context): void
+    {
+        $subject = sprintf(
+            '[SECURITY ALERT] Unauthorised /admin access attempt – %s',
+            $context['timestamp']
+        );
+
+        $body = $this->buildEmailBody($context);
+
+        // Try PHPMailer first (composer require phpmailer/phpmailer)
+        if (class_exists('\PHPMailer\PHPMailer\PHPMailer')) {
+            $this->sendViaPhpMailer($subject, $body, $context);
+            return;
+        }
+
+        // Fallback: native mail()
+        $headers  = "MIME-Version: 1.0\r\n";
+        $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+        $headers .= "From: Security Alert <{$this->smtpFrom}>\r\n";
+        $headers .= "X-Priority: 1\r\n";
+        $headers .= "X-Mailer: PHP/" . PHP_VERSION . "\r\n";
+
+        @mail($this->alertEmail, $subject, $body, $headers);
+    }
+
+    private function sendViaPhpMailer(string $subject, string $body, array $context): void
+    {
+        try {
+            $mail = new \PHPMailer\PHPMailer\PHPMailer(true);
+
+            $mail->isSMTP();
+            $mail->Host       = $this->smtpHost;
+            $mail->SMTPAuth   = ($this->smtpUser !== '');
+            $mail->Username   = $this->smtpUser;
+            $mail->Password   = $this->smtpPass;
+            $mail->SMTPSecure = \PHPMailer\PHPMailer\PHPMailer::ENCRYPTION_STARTTLS;
+            $mail->Port       = $this->smtpPort;
+
+            $mail->setFrom($this->smtpFrom, 'Security Alert System');
+            $mail->addAddress($this->alertEmail);
+            $mail->addReplyTo($this->smtpFrom, 'No Reply');
+
+            $mail->isHTML(true);
+            $mail->Subject = $subject;
+            $mail->Body    = $body;
+            $mail->AltBody = strip_tags(str_replace(['<br>', '<br/>'], "\n", $body));
+
+            // High importance
+            $mail->addCustomHeader('X-Priority', '1');
+            $mail->addCustomHeader('X-MS-Exchange-Organization-SCL', '-1');
+
+            $mail->send();
+        } catch (\Exception $e) {
+            // Swallow – alerting must never crash the app
+            error_log('[AdminGuard] PHPMailer error: ' . $e->getMessage());
+        }
+    }
+
+    private function buildEmailBody(array $context): string
+    {
+        $rows = '';
+        $fields = [
+            'Timestamp'    => $context['timestamp'],
+            'Request ID'   => $context['request_id'],
+            'Method'       => $context['method'],
+            'URI'          => htmlspecialchars($context['uri'], ENT_QUOTES),
+            'IP Address'   => htmlspecialchars($context['ip'], ENT_QUOTES),
+            'User Agent'   => htmlspecialchars($context['user_agent'], ENT_QUOTES),
+            'Referer'      => htmlspecialchars($context['referer'] ?: 'n/a', ENT_QUOTES),
+            'User ID'      => $context['user_id']    ?? 'Guest / Unauthenticated',
+            'User Email'   => $context['user_email'] ?? 'n/a',
+            'User Role'    => $context['user_role']  ?? 'n/a',
+            'Session ID'   => $context['session_id'],
+        ];
+
+        foreach ($fields as $label => $value) {
+            $rows .= "<tr>
+                        <td style='padding:6px 12px;font-weight:bold;background:#f5f5f5;border:1px solid #ddd;white-space:nowrap;'>{$label}</td>
+                        <td style='padding:6px 12px;border:1px solid #ddd;font-family:monospace;'>{$value}</td>
+                      </tr>";
+        }
+
+        return <<<HTML
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family:Arial,sans-serif;color:#333;margin:0;padding:0;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#c0392b;padding:20px;">
+    <tr>
+      <td>
+        <h1 style="color:#fff;margin:0;font-size:22px;">&#9888; Administrator Security Alert</h1>
+        <p style="color:#ffd7d7;margin:4px 0 0;">An unauthorised attempt to access the admin area was detected.</p>
+      </td>
+    </tr>
+  </table>
+  <div style="padding:24px;">
+    <table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;max-width:700px;">
+      {$rows}
+    </table>
+    <p style="margin-top:24px;font-size:12px;color:#999;">
+      This is an automated security notification. Do not reply to this email.
+    </p>
+  </div>
+</body>
+</html>
+HTML;
+    }
+
+    // -----------------------------------------------------------------------
+    // Slack alert
+    // -----------------------------------------------------------------------
+
+    private function sendSlackAlert(array $context): void
+    {
+        $userId    = $context['user_id']    ?? 'Guest';
+        $userEmail = $context['user_email'] ?? 'n/a';
+        $userRole  = $context['user_role']  ?? 'n/a';
+
+        $payload = [
+            'username'   => 'Security Alert Bot',
+            'icon_emoji' => ':rotating_light:',
+            'text'       => ':rotating_light: *Unauthorised Admin Access Attempt Detected*',
+            'attachments' => [
+                [
+                    'color'  => 'danger',
+                    'title'  => 'Request Details',
+                    'fields' => [
+                        ['title' => 'Timestamp',   'value' => $context['timestamp'],                    'short' => true],
+                        ['title' => 'Request ID',  'value' => $context['request_id'],                   'short' => true],
+                        ['title' => 'Method',      'value' => $context['method'],                       'short' => true],
+                        ['title' => 'URI',         'value' => $context['uri'],                          'short' => false],
+                        ['title' => 'IP Address',  'value' => $context['ip'],                           'short' => true],
+                        ['title' => 'User Agent',  'value' => $context['user_agent'] ?: 'n/a',          'short' => false],
+                        ['title' => 'Referer',     'value' => $context['referer']    ?: 'n/a',          'short' => false],
+                        ['title' => 'User ID',     'value' => (string) $userId,                         'short' => true],
+                        ['title' => 'User Email',  'value' => $userEmail,                               'short' => true],
+                        ['title' => 'User Role',   'value' => $userRole,                                'short' => true],
+                        ['title' => 'Session ID',  'value' => $context['session_id'],                   'short' => true],
+                    ],
+                    'footer'      => 'AdminGuardMiddleware',
+                    'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                    'ts'          => time(),
+                ],
+            ],
+        ];
+
+        $this->postJson($this->slackWebhookUrl, $payload);
+    }
+
+    // -----------------------------------------------------------------------
+    // Generic JSON POST (cURL)
+    // -----------------------------------------------------------------------
+
+    private function postJson(string $url, array $payload): void
+    {
+        if (!function_exists('curl_init')) {
+            // Fallback: file_get_contents with stream context
+            $opts = [
+                'http' => [
+                    'method'  => 'POST',
+                    'header'  => "Content-Type: application/json\r\n",
+                    'content' => json_encode($payload),
+                    'timeout' => 5,
+                    'ignore_errors' => true,
+                ],
+            ];
+            @file_get_contents($url, false, stream_context_create($opts));
+            return;
+        }
+
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST           => true,
+            CURLOPT_POSTFIELDS     => json_encode($payload),
+            CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_TIMEOUT        => 5,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_SSL_VERIFYPEER => true,
+        ]);
+
+        $result = curl_exec($ch);
+        $errno  = curl_errno($ch);
+
+        if ($errno) {
+            error_log('[AdminGuard] cURL error posting to ' . $url . ': ' . curl_error($ch));
+        }
+
+        curl_close($ch);
+    }
+
+    // -----------------------------------------------------------------------
+    // Local logging
+    // -----------------------------------------------------------------------
+
+    private function logUnauthorisedAttempt(array $context): void
+    {
+        $logLine = sprintf(
+            '[%s] ADMIN_ACCESS_DENIED | request_id=%s | ip=%s | method=%s | uri=%s | user_id=%s | user_role=%s | ua=%s',
+            $context['timestamp'],
+            $context['request_id'],
+            $context['ip'],
+            $context['method'],
+            $context['uri'],
+            $context['user_id']   ?? 'guest',
+            $context['user_role'] ?? 'none',
+            $context['user_agent']
+        );
+
+        error_log($logLine);
+
+        // Optionally write to a dedicated security log file
+        $logFile = defined('SECURITY_LOG_PATH')
+            ? SECURITY_LOG_PATH
+            : (sys_get_temp_dir() . '/admin_security.log');
+
+        @file_put_contents($logFile, $logLine . PHP_EOL, FILE_APPEND | LOCK_EX);
+    }
+
+    // -----------------------------------------------------------------------
+    // 403 Response
+    // -----------------------------------------------------------------------
+
+    private function buildForbiddenResponse(array $context): ResponseInterface
+    {
+        $response = $this->responseFactory->createResponse(403);
+
+        $body = $response->getBody();
+        $body->write($this->buildForbiddenHtml($context['request_id']));
+
+        return $response
+            ->withHeader('Content-Type', 'text/html; charset=UTF-8')
+            ->withHeader('X-Request-ID', $context['request_id'])
+            ->withHeader('Cache-Control', 'no-store, no-cache, must-revalidate')
+            ->withHeader('X-Content-Type-Options', 'nosniff')
+            ->withHeader('X-Frame-Options', 'DENY');
+    }
+
+    private function buildForbiddenHtml(string $requestId): string
+    {
+        return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>403 – Access Forbidden</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .card {
+      background: #16213e;
+      border: 1px solid #e74c3c;
+      border-radius: 8px;
+      padding: 48px 40px;
+      max-width: 480px;
+      width: 100%;
+      text-align: center;
+      box-shadow: 0 0 40px rgba(231,76,60,.3);
+    }
+    .icon { font-size: 64px; margin-bottom: 16px; }
+    h1 { font-size: 28px; color: #e74c3c; margin-bottom: 8px; }
+    p  { color: #aaa; line-height: 1.6; margin-bottom: 12px; }
+    .ref { font-size: 11px; color: #555; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">&#128274;</div>
+    <h1>Access Forbidden</h1>
+    <p>You do not have permission to access this area.</p>
+    <p>This incident has been logged and the site administrators have been notified.</p>
+    <p class="ref">Reference: {$requestId}</p>
+  </div>
+</body>
+</html>
+HTML;
+    }
+}

@@ -1,0 +1,319 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const http = require("http");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = {};
+const votes = {}; // votes[pollId][ip] = option
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// System prompt for the AI assistant
+const systemPrompt = `You are a poll voting service assistant. You help users create polls, vote on polls, and view poll results.
+
+You have access to the following operations:
+1. CREATE_POLL: Create a new poll with options
+2. VOTE: Cast a vote on a poll
+3. GET_RESULTS: Get the results of a poll
+4. LIST_POLLS: List all available polls
+
+When a user wants to perform an action, respond with a JSON object in this exact format:
+{
+  "action": "CREATE_POLL" | "VOTE" | "GET_RESULTS" | "LIST_POLLS",
+  "data": {
+    // For CREATE_POLL: { "question": "...", "options": ["option1", "option2", ...] }
+    // For VOTE: { "pollId": "...", "option": "..." }
+    // For GET_RESULTS: { "pollId": "..." }
+    // For LIST_POLLS: {}
+  },
+  "message": "Human-readable response to the user"
+}
+
+If the user is just chatting or asking questions, respond normally without JSON.
+Always be helpful and guide users through the voting process.`;
+
+// Generate a simple poll ID
+function generatePollId() {
+  return "poll_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+}
+
+// Create a new poll
+function createPoll(question, options) {
+  const pollId = generatePollId();
+  polls[pollId] = {
+    id: pollId,
+    question,
+    options,
+    createdAt: new Date().toISOString(),
+  };
+  votes[pollId] = {};
+  return pollId;
+}
+
+// Cast a vote
+function castVote(pollId, option, ip) {
+  if (!polls[pollId]) {
+    return { success: false, message: "Poll not found" };
+  }
+
+  if (!polls[pollId].options.includes(option)) {
+    return {
+      success: false,
+      message: `Invalid option. Valid options are: ${polls[pollId].options.join(", ")}`,
+    };
+  }
+
+  if (votes[pollId][ip]) {
+    return {
+      success: false,
+      message: `You have already voted on this poll. Your previous vote was for: ${votes[pollId][ip]}`,
+    };
+  }
+
+  votes[pollId][ip] = option;
+  return { success: true, message: `Vote cast successfully for: ${option}` };
+}
+
+// Get poll results
+function getPollResults(pollId) {
+  if (!polls[pollId]) {
+    return null;
+  }
+
+  const poll = polls[pollId];
+  const pollVotes = votes[pollId];
+  const results = {};
+
+  // Initialize all options with 0 votes
+  poll.options.forEach((option) => {
+    results[option] = 0;
+  });
+
+  // Count votes
+  Object.values(pollVotes).forEach((vote) => {
+    if (results[vote] !== undefined) {
+      results[vote]++;
+    }
+  });
+
+  const totalVotes = Object.values(results).reduce((a, b) => a + b, 0);
+
+  return {
+    pollId,
+    question: poll.question,
+    results,
+    totalVotes,
+    createdAt: poll.createdAt,
+  };
+}
+
+// List all polls
+function listPolls() {
+  return Object.values(polls).map((poll) => ({
+    id: poll.id,
+    question: poll.question,
+    options: poll.options,
+    totalVotes: Object.keys(votes[poll.id] || {}).length,
+  }));
+}
+
+// Process AI response and execute actions
+function processAIResponse(response, userIp) {
+  try {
+    // Try to parse JSON from the response
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+
+      if (parsed.action) {
+        let result;
+
+        switch (parsed.action) {
+          case "CREATE_POLL":
+            const pollId = createPoll(
+              parsed.data.question,
+              parsed.data.options
+            );
+            result = `Poll created successfully! Poll ID: ${pollId}\nQuestion: ${parsed.data.question}\nOptions: ${parsed.data.options.join(", ")}`;
+            break;
+
+          case "VOTE":
+            const voteResult = castVote(
+              parsed.data.pollId,
+              parsed.data.option,
+              userIp
+            );
+            result = voteResult.message;
+            break;
+
+          case "GET_RESULTS":
+            const pollResults = getPollResults(parsed.data.pollId);
+            if (pollResults) {
+              result = `Poll Results for: "${pollResults.question}"\n`;
+              result += `Total votes: ${pollResults.totalVotes}\n`;
+              Object.entries(pollResults.results).forEach(([option, count]) => {
+                const percentage =
+                  pollResults.totalVotes > 0
+                    ? ((count / pollResults.totalVotes) * 100).toFixed(1)
+                    : 0;
+                result += `  ${option}: ${count} votes (${percentage}%)\n`;
+              });
+            } else {
+              result = "Poll not found";
+            }
+            break;
+
+          case "LIST_POLLS":
+            const allPolls = listPolls();
+            if (allPolls.length === 0) {
+              result = "No polls available yet. Create one!";
+            } else {
+              result = "Available polls:\n";
+              allPolls.forEach((poll) => {
+                result += `\nID: ${poll.id}\nQuestion: ${poll.question}\nOptions: ${poll.options.join(", ")}\nTotal votes: ${poll.totalVotes}\n`;
+              });
+            }
+            break;
+
+          default:
+            result = parsed.message || response;
+        }
+
+        return result;
+      }
+    }
+  } catch (e) {
+    // Not JSON, return as-is
+  }
+
+  return response;
+}
+
+// Chat with the AI assistant
+async function chat(userMessage, userIp) {
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: systemPrompt,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return processAIResponse(assistantMessage, userIp);
+}
+
+// Create HTTP server to handle requests
+const server = http.createServer(async (req, res) => {
+  // Get client IP
+  const clientIp =
+    req.headers["x-forwarded-for"] ||
+    req.connection.remoteAddress ||
+    req.socket.remoteAddress ||
+    "127.0.0.1";
+
+  // Handle CORS
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  if (req.method === "POST" && req.url === "/chat") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      try {
+        const { message } = JSON.parse(body);
+        const response = await chat(message, clientIp);
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ response, ip: clientIp }));
+      } catch (error) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: error.message }));
+      }
+    });
+  } else if (req.method === "GET" && req.url === "/polls") {
+    const allPolls = listPolls();
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(allPolls));
+  } else {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "Not found" }));
+  }
+});
+
+// Start the server
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log(`Poll voting service running on port ${PORT}`);
+  console.log(`Your IP will be used to prevent duplicate votes`);
+  console.log("\nStarting interactive CLI mode...\n");
+
+  // Start CLI interface
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const userIp = "127.0.0.1"; // CLI user IP
+
+  console.log("Welcome to the Poll Voting Service!");
+  console.log(
+    "You can create polls, vote on them, and view results through natural conversation."
+  );
+  console.log('Type "exit" to quit.\n');
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye!");
+        rl.close();
+        server.close();
+        process.exit(0);
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await chat(userInput, userIp);
+        console.log("\nAssistant:", response, "\n");
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+});
+```

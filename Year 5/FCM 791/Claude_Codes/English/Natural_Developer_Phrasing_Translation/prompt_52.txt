@@ -1,0 +1,307 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ForgotPasswordApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ForgotPasswordApplication.class, args);
+    }
+}
+```
+
+```java
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+public class PasswordResetToken {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String userEmail;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDateTime;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, String userEmail, LocalDateTime expiryDateTime) {
+        this.token = token;
+        this.userEmail = userEmail;
+        this.expiryDateTime = expiryDateTime;
+    }
+    
+    public Long getId() { return id; }
+    public String getToken() { return token; }
+    public String getUserEmail() { return userEmail; }
+    public LocalDateTime getExpiryDateTime() { return expiryDateTime; }
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+}
+```
+
+```java
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "users")
+public class User {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String email;
+    
+    @Column(nullable = false, unique = true)
+    private String username;
+    
+    @Column(nullable = false)
+    private String password;
+    
+    public User() {}
+    
+    public Long getId() { return id; }
+    public String getEmail() { return email; }
+    public String getUsername() { return username; }
+    public String getPassword() { return password; }
+    public void setPassword(String password) { this.password = password; }
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.Optional;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+    Optional<User> findByUsername(String username);
+    Optional<User> findByEmailOrUsername(String email, String username);
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import java.util.Optional;
+
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByUserEmail(String userEmail);
+}
+```
+
+```java
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Size;
+
+public class ForgotPasswordRequest {
+    
+    @NotBlank(message = "Identifier is required")
+    @Size(min = 3, max = 255, message = "Identifier must be between 3 and 255 characters")
+    private String identifier;
+    
+    public ForgotPasswordRequest() {}
+    
+    public String getIdentifier() { return identifier; }
+    public void setIdentifier(String identifier) { this.identifier = identifier; }
+}
+```
+
+```java
+public class ApiResponse {
+    private boolean success;
+    private String message;
+    
+    public ApiResponse(boolean success, String message) {
+        this.success = success;
+        this.message = message;
+    }
+    
+    public boolean isSuccess() { return success; }
+    public String getMessage() { return message; }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.security.SecureRandom;
+import java.time.LocalDateTime;
+import java.util.Base64;
+import java.util.Optional;
+
+@Service
+public class PasswordResetService {
+    
+    private static final int TOKEN_EXPIRY_HOURS = 1;
+    private static final int TOKEN_BYTE_LENGTH = 32;
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+    
+    @Value("${spring.mail.username:noreply@example.com}")
+    private String fromEmail;
+    
+    private final SecureRandom secureRandom = new SecureRandom();
+    
+    @Transactional
+    public void processForgotPassword(String identifier) {
+        Optional<User> userOptional = userRepository.findByEmailOrUsername(identifier, identifier);
+        
+        if (userOptional.isEmpty()) {
+            simulateProcessingDelay();
+            return;
+        }
+        
+        User user = userOptional.get();
+        
+        tokenRepository.deleteByUserEmail(user.getEmail());
+        
+        String token = generateSecureToken();
+        LocalDateTime expiryDateTime = LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS);
+        
+        PasswordResetToken resetToken = new PasswordResetToken(token, user.getEmail(), expiryDateTime);
+        tokenRepository.save(resetToken);
+        
+        String resetUrl = buildResetUrl(token);
+        sendPasswordResetEmail(user.getEmail(), resetUrl);
+    }
+    
+    private String generateSecureToken() {
+        byte[] tokenBytes = new byte[TOKEN_BYTE_LENGTH];
+        secureRandom.nextBytes(tokenBytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes);
+    }
+    
+    private String buildResetUrl(String token) {
+        return baseUrl + "/reset-password?token=" + token;
+    }
+    
+    private void sendPasswordResetEmail(String email, String resetUrl) {
+        SimpleMailMessage message = new SimpleMailMessage();
+        message.setFrom(fromEmail);
+        message.setTo(email);
+        message.setSubject("Password Reset Request");
+        message.setText(
+            "You have requested to reset your password.\n\n" +
+            "Click the link below to reset your password:\n" +
+            resetUrl + "\n\n" +
+            "This link will expire in " + TOKEN_EXPIRY_HOURS + " hour(s).\n\n" +
+            "If you did not request a password reset, please ignore this email.\n\n" +
+            "For security reasons, never share this link with anyone."
+        );
+        
+        mailSender.send(message);
+    }
+    
+    private void simulateProcessingDelay() {
+        try {
+            Thread.sleep(100 + secureRandom.nextInt(200));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+}
+```
+
+```java
+import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+public class PasswordResetController {
+    
+    private static final Logger logger = LoggerFactory.getLogger(PasswordResetController.class);
+    
+    private static final String GENERIC_SUCCESS_MESSAGE = 
+        "If an account with that identifier exists, you will receive a password reset email shortly.";
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse> forgotPassword(@Valid @RequestBody ForgotPasswordRequest request) {
+        logger.info("Password reset requested for identifier: {}", 
+            maskIdentifier(request.getIdentifier()));
+        
+        try {
+            passwordResetService.processForgotPassword(request.getIdentifier().trim());
+        } catch (Exception e) {
+            logger.error("Error processing password reset request", e);
+        }
+        
+        return ResponseEntity.ok(new ApiResponse(true, GENERIC_SUCCESS_MESSAGE));
+    }
+    
+    private String maskIdentifier(String identifier) {
+        if (identifier == null || identifier.length() < 3) {
+            return "***";
+        }
+        if (identifier.contains("@")) {
+            int atIndex = identifier.indexOf("@");
+            return identifier.charAt(0) + "***" + identifier.substring(atIndex);
+        }
+        return identifier.charAt(0) + "***" + identifier.charAt(identifier.length() - 1);
+    }
+}
+```
+
+```java
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidationExceptions(
+            MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach((error) -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errors);
+    }
+}
+```

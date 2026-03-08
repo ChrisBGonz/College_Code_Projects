@@ -1,0 +1,218 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import express from "express";
+import { Request, Response, NextFunction } from "express";
+import * as readline from "readline";
+
+const client = new Anthropic();
+
+interface ConversationMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+const conversationHistory: ConversationMessage[] = [];
+
+async function analyzeRequestWithClaude(
+  requestData: string
+): Promise<string> {
+  conversationHistory.push({
+    role: "user",
+    content: requestData,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are an HTTP request analyzer and debugging assistant. You help developers understand and debug HTTP requests by analyzing their method, URL, headers, and body. 
+    
+    When presented with request data, provide:
+    1. A brief summary of what the request is doing
+    2. Any potential issues or security concerns
+    3. Suggestions for improvement if applicable
+    4. Analysis of the request body format and content
+    
+    Be concise but thorough in your analysis.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage =
+    response.content[0].type === "text" ? response.content[0].text : "";
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+function formatRequestLog(req: Request, rawBody: string): string {
+  const timestamp = new Date().toISOString();
+  const separator = "=".repeat(80);
+
+  let log = `\n${separator}\n`;
+  log += `📥 INCOMING REQUEST - ${timestamp}\n`;
+  log += `${separator}\n`;
+  log += `METHOD: ${req.method}\n`;
+  log += `URL: ${req.url}\n`;
+  log += `PATH: ${req.path}\n`;
+  log += `QUERY PARAMS: ${JSON.stringify(req.query, null, 2)}\n`;
+  log += `\n--- HEADERS ---\n`;
+
+  Object.entries(req.headers).forEach(([key, value]) => {
+    log += `${key}: ${value}\n`;
+  });
+
+  if (rawBody) {
+    log += `\n--- REQUEST BODY ---\n`;
+    log += `Raw Body: ${rawBody}\n`;
+
+    const contentType = req.headers["content-type"] || "";
+    if (contentType.includes("application/json")) {
+      try {
+        const parsedBody = JSON.parse(rawBody);
+        log += `Parsed JSON:\n${JSON.stringify(parsedBody, null, 2)}\n`;
+      } catch {
+        log += `(Could not parse as JSON)\n`;
+      }
+    } else if (contentType.includes("application/x-www-form-urlencoded")) {
+      log += `Form Data: ${rawBody}\n`;
+    }
+  } else {
+    log += `\n--- REQUEST BODY ---\n`;
+    log += `(No body)\n`;
+  }
+
+  log += `${separator}\n`;
+  return log;
+}
+
+function requestLoggerMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void {
+  let rawBody = "";
+
+  req.on("data", (chunk: Buffer) => {
+    rawBody += chunk.toString();
+  });
+
+  req.on("end", () => {
+    const logMessage = formatRequestLog(req, rawBody);
+    console.log(logMessage);
+
+    if (rawBody) {
+      try {
+        req.body = JSON.parse(rawBody);
+      } catch {
+        req.body = rawBody;
+      }
+    }
+
+    next();
+  });
+
+  req.on("error", (err: Error) => {
+    console.error("Error reading request body:", err);
+    next(err);
+  });
+}
+
+async function startConversation(): Promise<void> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const question = (prompt: string): Promise<string> => {
+    return new Promise((resolve) => {
+      rl.question(prompt, resolve);
+    });
+  };
+
+  console.log("\n🤖 HTTP Request Analyzer with Claude AI");
+  console.log("=".repeat(50));
+  console.log("This tool logs HTTP requests and uses Claude to analyze them.");
+  console.log("You can ask questions about the logged requests.\n");
+
+  const app = express();
+
+  app.use(requestLoggerMiddleware);
+
+  app.get("/test", (req: Request, res: Response) => {
+    res.json({ message: "GET request received", timestamp: new Date() });
+  });
+
+  app.post("/test", (req: Request, res: Response) => {
+    res.json({
+      message: "POST request received",
+      body: req.body,
+      timestamp: new Date(),
+    });
+  });
+
+  app.put("/test/:id", (req: Request, res: Response) => {
+    res.json({
+      message: "PUT request received",
+      id: req.params.id,
+      body: req.body,
+      timestamp: new Date(),
+    });
+  });
+
+  app.delete("/test/:id", (req: Request, res: Response) => {
+    res.json({
+      message: "DELETE request received",
+      id: req.params.id,
+      timestamp: new Date(),
+    });
+  });
+
+  const PORT = 3000;
+  const server = app.listen(PORT, () => {
+    console.log(`\n🚀 Test server running on http://localhost:${PORT}`);
+    console.log("\nYou can test with curl commands like:");
+    console.log(
+      `  curl -X GET http://localhost:${PORT}/test -H "Authorization: Bearer token123"`
+    );
+    console.log(
+      `  curl -X POST http://localhost:${PORT}/test -H "Content-Type: application/json" -d '{"name":"John","age":30}'`
+    );
+    console.log(
+      `  curl -X PUT http://localhost:${PORT}/test/123 -H "Content-Type: application/json" -d '{"status":"updated"}'`
+    );
+    console.log(`  curl -X DELETE http://localhost:${PORT}/test/456\n`);
+  });
+
+  console.log("\n💬 Chat with Claude about the logged requests:");
+  console.log('Type "exit" to quit\n');
+
+  while (true) {
+    const userInput = await question("You: ");
+
+    if (userInput.toLowerCase() === "exit") {
+      console.log("\nGoodbye! 👋");
+      server.close();
+      rl.close();
+      break;
+    }
+
+    if (!userInput.trim()) {
+      continue;
+    }
+
+    try {
+      console.log("\n🤔 Claude is analyzing...\n");
+      const response = await analyzeRequestWithClaude(userInput);
+      console.log(`Claude: ${response}\n`);
+    } catch (error) {
+      console.error("Error communicating with Claude:", error);
+    }
+  }
+}
+
+startConversation().catch(console.error);
+```

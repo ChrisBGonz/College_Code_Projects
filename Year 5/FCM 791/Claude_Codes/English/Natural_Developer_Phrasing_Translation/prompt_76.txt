@@ -1,0 +1,323 @@
+
+```python
+#!/usr/bin/env python3
+"""
+CI/CD Pipeline Automation Script using Claude AI
+Pulls Docker images from registry and deploys to production environment
+"""
+
+import anthropic
+import subprocess
+import sys
+import json
+from datetime import datetime
+
+
+def run_command(command: str) -> tuple[int, str, str]:
+    """Execute a shell command and return exit code, stdout, stderr"""
+    process = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True
+    )
+    return process.returncode, process.stdout, process.stderr
+
+
+def get_docker_info() -> dict:
+    """Gather current Docker environment information"""
+    info = {}
+    
+    # Get Docker version
+    code, stdout, _ = run_command("docker --version")
+    info["docker_version"] = stdout.strip() if code == 0 else "Docker not available"
+    
+    # Get running containers
+    code, stdout, _ = run_command("docker ps --format '{{.Names}}: {{.Image}} ({{.Status}})'")
+    info["running_containers"] = stdout.strip() if code == 0 else "No containers running"
+    
+    # Get available images
+    code, stdout, _ = run_command("docker images --format '{{.Repository}}:{{.Tag}} ({{.Size}})'")
+    info["available_images"] = stdout.strip() if code == 0 else "No images available"
+    
+    return info
+
+
+def execute_deployment_step(step: str, command: str) -> dict:
+    """Execute a deployment step and return results"""
+    print(f"\n{'='*60}")
+    print(f"Executing: {step}")
+    print(f"Command: {command}")
+    print('='*60)
+    
+    code, stdout, stderr = run_command(command)
+    
+    result = {
+        "step": step,
+        "command": command,
+        "exit_code": code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "success": code == 0
+    }
+    
+    if stdout:
+        print(f"Output: {stdout}")
+    if stderr and code != 0:
+        print(f"Error: {stderr}")
+    
+    return result
+
+
+def deploy_with_claude(image_name: str, registry: str = "docker.io", 
+                       container_name: str = None, port_mapping: str = None,
+                       environment_vars: dict = None):
+    """
+    Main deployment function using Claude AI with streaming
+    
+    Args:
+        image_name: Docker image name (e.g., 'nginx:latest' or 'myapp:v1.0')
+        registry: Docker registry URL (default: docker.io)
+        container_name: Name for the deployed container
+        port_mapping: Port mapping (e.g., '8080:80')
+        environment_vars: Dictionary of environment variables
+    """
+    
+    client = anthropic.Anthropic()
+    
+    # Prepare deployment context
+    docker_info = get_docker_info()
+    deployment_context = {
+        "image": image_name,
+        "registry": registry,
+        "container_name": container_name or f"prod-{image_name.split(':')[0].split('/')[-1]}",
+        "port_mapping": port_mapping,
+        "environment_vars": environment_vars or {},
+        "timestamp": datetime.now().isoformat(),
+        "docker_info": docker_info
+    }
+    
+    print(f"\n{'='*60}")
+    print("CI/CD PIPELINE DEPLOYMENT")
+    print(f"{'='*60}")
+    print(f"Image: {image_name}")
+    print(f"Registry: {registry}")
+    print(f"Container Name: {deployment_context['container_name']}")
+    print(f"Timestamp: {deployment_context['timestamp']}")
+    print(f"{'='*60}\n")
+    
+    # Create the prompt for Claude
+    prompt = f"""You are a CI/CD pipeline automation assistant. I need to deploy a Docker image to production.
+
+Current Environment:
+- Docker Version: {docker_info['docker_version']}
+- Running Containers: {docker_info['running_containers']}
+- Available Images: {docker_info['available_images']}
+
+Deployment Request:
+- Image to deploy: {image_name}
+- Registry: {registry}
+- Container name: {deployment_context['container_name']}
+- Port mapping: {port_mapping or 'Not specified'}
+- Environment variables: {json.dumps(environment_vars or {}, indent=2)}
+
+Please provide a step-by-step deployment plan with the exact Docker commands to:
+1. Pull the image from the registry
+2. Stop and remove any existing container with the same name (if exists)
+3. Deploy the new container with appropriate settings
+4. Verify the deployment was successful
+5. Provide rollback commands in case of failure
+
+Format your response as a structured deployment plan with clear steps and commands.
+For each step, provide:
+- Step name
+- Command to execute
+- Expected outcome
+- What to check for success
+
+Also include:
+- Pre-deployment checks
+- Post-deployment verification steps
+- Monitoring recommendations"""
+
+    print("Consulting Claude AI for deployment strategy...")
+    print("-" * 60)
+    
+    # Use streaming to get Claude's response
+    deployment_plan = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            deployment_plan += text
+    
+    print("\n" + "-" * 60)
+    print("\nExecuting deployment based on Claude's recommendations...")
+    
+    # Execute the actual deployment steps
+    deployment_results = []
+    
+    # Step 1: Pull the image
+    full_image = f"{registry}/{image_name}" if registry != "docker.io" else image_name
+    result = execute_deployment_step(
+        "Pull Docker Image",
+        f"docker pull {full_image}"
+    )
+    deployment_results.append(result)
+    
+    if not result["success"]:
+        print(f"\n❌ Failed to pull image: {full_image}")
+        print("Deployment aborted.")
+        return False
+    
+    # Step 2: Stop existing container if running
+    container_name = deployment_context['container_name']
+    result = execute_deployment_step(
+        "Stop Existing Container",
+        f"docker stop {container_name} 2>/dev/null || true"
+    )
+    deployment_results.append(result)
+    
+    # Step 3: Remove existing container
+    result = execute_deployment_step(
+        "Remove Existing Container",
+        f"docker rm {container_name} 2>/dev/null || true"
+    )
+    deployment_results.append(result)
+    
+    # Step 4: Build run command
+    run_command_str = f"docker run -d --name {container_name}"
+    
+    if port_mapping:
+        run_command_str += f" -p {port_mapping}"
+    
+    if environment_vars:
+        for key, value in environment_vars.items():
+            run_command_str += f" -e {key}={value}"
+    
+    # Add restart policy for production
+    run_command_str += " --restart unless-stopped"
+    run_command_str += f" {full_image}"
+    
+    result = execute_deployment_step(
+        "Deploy New Container",
+        run_command_str
+    )
+    deployment_results.append(result)
+    
+    if not result["success"]:
+        print(f"\n❌ Failed to deploy container")
+        print("Attempting rollback...")
+        return False
+    
+    # Step 5: Verify deployment
+    result = execute_deployment_step(
+        "Verify Deployment",
+        f"docker ps --filter name={container_name} --format 'Container: {{{{.Names}}}} | Status: {{{{.Status}}}} | Image: {{{{.Image}}}}'"
+    )
+    deployment_results.append(result)
+    
+    # Step 6: Check container logs
+    result = execute_deployment_step(
+        "Check Container Logs",
+        f"docker logs {container_name} --tail 20"
+    )
+    deployment_results.append(result)
+    
+    # Generate deployment summary
+    print(f"\n{'='*60}")
+    print("DEPLOYMENT SUMMARY")
+    print(f"{'='*60}")
+    
+    successful_steps = sum(1 for r in deployment_results if r["success"])
+    total_steps = len(deployment_results)
+    
+    print(f"Steps completed: {successful_steps}/{total_steps}")
+    print(f"Image deployed: {full_image}")
+    print(f"Container name: {container_name}")
+    
+    if port_mapping:
+        print(f"Port mapping: {port_mapping}")
+    
+    # Ask Claude for deployment assessment
+    assessment_prompt = f"""Based on the deployment results below, provide a brief assessment of the deployment status and any recommendations:
+
+Deployment Results:
+{json.dumps(deployment_results, indent=2)}
+
+Please provide:
+1. Overall deployment status (Success/Partial/Failed)
+2. Any issues detected
+3. Immediate recommendations
+4. Monitoring suggestions"""
+
+    print("\n" + "-" * 60)
+    print("Claude's Deployment Assessment:")
+    print("-" * 60)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[
+            {
+                "role": "user",
+                "content": assessment_prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n" + "="*60)
+    
+    all_successful = all(r["success"] for r in deployment_results)
+    
+    if all_successful:
+        print("\n✅ Deployment completed successfully!")
+    else:
+        print("\n⚠️  Deployment completed with some issues. Please review the logs above.")
+    
+    return all_successful
+
+
+def main():
+    """Main entry point for the CI/CD pipeline script"""
+    
+    # Example deployment configuration
+    # In a real CI/CD pipeline, these would come from environment variables or pipeline parameters
+    
+    print("Starting CI/CD Pipeline Automation with Claude AI")
+    print("="*60)
+    
+    # Example 1: Deploy nginx
+    success = deploy_with_claude(
+        image_name="nginx:latest",
+        registry="docker.io",
+        container_name="prod-nginx",
+        port_mapping="8080:80",
+        environment_vars={
+            "NGINX_HOST": "production.example.com",
+            "NGINX_PORT": "80"
+        }
+    )
+    
+    if success:
+        print("\n🚀 Pipeline execution completed successfully!")
+        sys.exit(0)
+    else:
+        print("\n💥 Pipeline execution failed!")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+```

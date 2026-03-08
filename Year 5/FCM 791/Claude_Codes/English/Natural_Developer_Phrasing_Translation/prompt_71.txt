@@ -1,0 +1,464 @@
+
+```python
+import pickle
+import os
+import time
+from dataclasses import dataclass, field
+from typing import Any
+from pathlib import Path
+
+
+@dataclass
+class Player:
+    name: str
+    health: int = 100
+    max_health: int = 100
+    level: int = 1
+    experience: int = 0
+    position: tuple = (0, 0)
+    inventory: list = field(default_factory=list)
+    equipped: dict = field(default_factory=dict)
+    skills: dict = field(default_factory=dict)
+    gold: int = 0
+
+    def gain_experience(self, amount: int):
+        self.experience += amount
+        while self.experience >= self.level * 100:
+            self.experience -= self.level * 100
+            self.level += 1
+            self.max_health += 10
+            self.health = min(self.health + 10, self.max_health)
+            print(f"{self.name} leveled up to level {self.level}!")
+
+    def take_damage(self, amount: int):
+        self.health = max(0, self.health - amount)
+
+    def heal(self, amount: int):
+        self.health = min(self.max_health, self.health + amount)
+
+    def add_item(self, item: str):
+        self.inventory.append(item)
+
+    def remove_item(self, item: str) -> bool:
+        if item in self.inventory:
+            self.inventory.remove(item)
+            return True
+        return False
+
+    def is_alive(self) -> bool:
+        return self.health > 0
+
+
+@dataclass
+class WorldState:
+    current_map: str = "starting_village"
+    discovered_maps: list = field(default_factory=list)
+    completed_quests: list = field(default_factory=list)
+    active_quests: list = field(default_factory=list)
+    npc_states: dict = field(default_factory=dict)
+    world_flags: dict = field(default_factory=dict)
+    enemy_states: dict = field(default_factory=dict)
+
+    def discover_map(self, map_name: str):
+        if map_name not in self.discovered_maps:
+            self.discovered_maps.append(map_name)
+
+    def complete_quest(self, quest_id: str):
+        if quest_id in self.active_quests:
+            self.active_quests.remove(quest_id)
+        if quest_id not in self.completed_quests:
+            self.completed_quests.append(quest_id)
+
+    def start_quest(self, quest_id: str):
+        if quest_id not in self.active_quests and quest_id not in self.completed_quests:
+            self.active_quests.append(quest_id)
+
+    def set_flag(self, flag: str, value: Any = True):
+        self.world_flags[flag] = value
+
+    def get_flag(self, flag: str, default: Any = False) -> Any:
+        return self.world_flags.get(flag, default)
+
+
+@dataclass
+class GameSettings:
+    difficulty: str = "normal"
+    sound_volume: float = 1.0
+    music_volume: float = 0.8
+    fullscreen: bool = False
+    resolution: tuple = (1920, 1080)
+    keybindings: dict = field(default_factory=dict)
+    language: str = "en"
+
+    def __post_init__(self):
+        if not self.keybindings:
+            self.keybindings = {
+                "move_up": "W",
+                "move_down": "S",
+                "move_left": "A",
+                "move_right": "D",
+                "attack": "SPACE",
+                "interact": "E",
+                "inventory": "I",
+                "map": "M",
+                "pause": "ESC",
+            }
+
+
+@dataclass
+class GameStatistics:
+    play_time_seconds: float = 0.0
+    enemies_defeated: int = 0
+    quests_completed: int = 0
+    deaths: int = 0
+    items_collected: int = 0
+    distance_traveled: float = 0.0
+    gold_earned: int = 0
+    gold_spent: int = 0
+    save_count: int = 0
+    session_start_time: float = field(default_factory=time.time)
+
+    def update_play_time(self):
+        current_time = time.time()
+        self.play_time_seconds += current_time - self.session_start_time
+        self.session_start_time = current_time
+
+    def get_formatted_play_time(self) -> str:
+        total_seconds = int(self.play_time_seconds)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+class GameState:
+    VERSION = "1.0.0"
+
+    def __init__(self, player_name: str = "Hero"):
+        self.version: str = self.VERSION
+        self.player: Player = Player(name=player_name)
+        self.world: WorldState = WorldState()
+        self.settings: GameSettings = GameSettings()
+        self.statistics: GameStatistics = GameStatistics()
+        self.save_slot: int = 1
+        self.save_timestamp: float = 0.0
+        self.game_time: float = 0.0
+        self.custom_data: dict = {}
+
+        self.world.discover_map("starting_village")
+
+    def get_save_info(self) -> dict:
+        return {
+            "version": self.version,
+            "player_name": self.player.name,
+            "player_level": self.player.level,
+            "current_map": self.world.current_map,
+            "play_time": self.statistics.get_formatted_play_time(),
+            "save_timestamp": self.save_timestamp,
+            "save_slot": self.save_slot,
+        }
+
+    def __repr__(self) -> str:
+        return (
+            f"GameState(player={self.player.name}, "
+            f"level={self.player.level}, "
+            f"map={self.world.current_map}, "
+            f"version={self.version})"
+        )
+
+
+class SaveManager:
+    DEFAULT_SAVE_DIR = "saves"
+    SAVE_FILE_EXTENSION = ".sav"
+    BACKUP_EXTENSION = ".bak"
+    MAX_BACKUP_COUNT = 3
+
+    def __init__(self, save_directory: str = None):
+        self.save_directory = Path(save_directory or self.DEFAULT_SAVE_DIR)
+        self.save_directory.mkdir(parents=True, exist_ok=True)
+
+    def _get_save_path(self, slot: int) -> Path:
+        return self.save_directory / f"save_slot_{slot}{self.SAVE_FILE_EXTENSION}"
+
+    def _get_backup_path(self, slot: int, backup_index: int) -> Path:
+        return self.save_directory / f"save_slot_{slot}_backup_{backup_index}{self.BACKUP_EXTENSION}"
+
+    def _create_backup(self, slot: int):
+        save_path = self._get_save_path(slot)
+        if not save_path.exists():
+            return
+
+        for i in range(self.MAX_BACKUP_COUNT - 1, 0, -1):
+            older_backup = self._get_backup_path(slot, i)
+            newer_backup = self._get_backup_path(slot, i - 1)
+            if newer_backup.exists():
+                if older_backup.exists():
+                    older_backup.unlink()
+                newer_backup.rename(older_backup)
+
+        first_backup = self._get_backup_path(slot, 0)
+        if first_backup.exists():
+            first_backup.unlink()
+
+        import shutil
+        shutil.copy2(save_path, first_backup)
+
+    def save_game_state(self, game_state: GameState, slot: int = 1) -> bool:
+        try:
+            game_state.statistics.update_play_time()
+            game_state.save_slot = slot
+            game_state.save_timestamp = time.time()
+            game_state.statistics.save_count += 1
+
+            self._create_backup(slot)
+
+            save_path = self._get_save_path(slot)
+            temp_path = save_path.with_suffix(".tmp")
+
+            with open(temp_path, "wb") as f:
+                pickle.dump(game_state, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+            temp_path.replace(save_path)
+
+            print(f"Game saved successfully to slot {slot}.")
+            print(f"  Player: {game_state.player.name} (Level {game_state.player.level})")
+            print(f"  Location: {game_state.world.current_map}")
+            print(f"  Play Time: {game_state.statistics.get_formatted_play_time()}")
+            print(f"  Save file: {save_path}")
+            return True
+
+        except (OSError, pickle.PicklingError) as e:
+            print(f"Error saving game state to slot {slot}: {e}")
+            temp_path = self._get_save_path(slot).with_suffix(".tmp")
+            if temp_path.exists():
+                temp_path.unlink()
+            return False
+
+    def load_game_state(self, slot: int = 1) -> GameState | None:
+        save_path = self._get_save_path(slot)
+
+        if not save_path.exists():
+            print(f"No save file found in slot {slot}.")
+            return None
+
+        try:
+            with open(save_path, "rb") as f:
+                game_state = pickle.load(f)
+
+            if not isinstance(game_state, GameState):
+                raise ValueError("Loaded object is not a valid GameState instance.")
+
+            game_state.statistics.session_start_time = time.time()
+
+            print(f"Game loaded successfully from slot {slot}.")
+            print(f"  Player: {game_state.player.name} (Level {game_state.player.level})")
+            print(f"  Location: {game_state.world.current_map}")
+            print(f"  Play Time: {game_state.statistics.get_formatted_play_time()}")
+            print(f"  Save file: {save_path}")
+            return game_state
+
+        except (OSError, pickle.UnpicklingError, ValueError, AttributeError) as e:
+            print(f"Error loading game state from slot {slot}: {e}")
+            print("Attempting to load from backup...")
+            return self._load_from_backup(slot)
+
+    def _load_from_backup(self, slot: int) -> GameState | None:
+        for i in range(self.MAX_BACKUP_COUNT):
+            backup_path = self._get_backup_path(slot, i)
+            if backup_path.exists():
+                try:
+                    with open(backup_path, "rb") as f:
+                        game_state = pickle.load(f)
+                    if isinstance(game_state, GameState):
+                        game_state.statistics.session_start_time = time.time()
+                        print(f"Successfully loaded from backup {i} for slot {slot}.")
+                        return game_state
+                except (OSError, pickle.UnpicklingError, ValueError, AttributeError) as e:
+                    print(f"Backup {i} also failed: {e}")
+                    continue
+
+        print(f"All backups for slot {slot} failed. No game state could be loaded.")
+        return None
+
+    def delete_save(self, slot: int) -> bool:
+        save_path = self._get_save_path(slot)
+        deleted = False
+
+        if save_path.exists():
+            save_path.unlink()
+            deleted = True
+
+        for i in range(self.MAX_BACKUP_COUNT):
+            backup_path = self._get_backup_path(slot, i)
+            if backup_path.exists():
+                backup_path.unlink()
+                deleted = True
+
+        if deleted:
+            print(f"Save slot {slot} deleted successfully.")
+        else:
+            print(f"No save data found for slot {slot}.")
+
+        return deleted
+
+    def list_saves(self) -> list[dict]:
+        saves = []
+        for save_file in sorted(self.save_directory.glob(f"*{self.SAVE_FILE_EXTENSION}")):
+            try:
+                with open(save_file, "rb") as f:
+                    game_state = pickle.load(f)
+                if isinstance(game_state, GameState):
+                    saves.append(game_state.get_save_info())
+            except (OSError, pickle.UnpicklingError, AttributeError):
+                saves.append({"file": str(save_file), "error": "Corrupted save file"})
+        return saves
+
+    def save_exists(self, slot: int) -> bool:
+        return self._get_save_path(slot).exists()
+
+
+def save_game_state(game_state: GameState, slot: int = 1, save_directory: str = None) -> bool:
+    manager = SaveManager(save_directory)
+    return manager.save_game_state(game_state, slot)
+
+
+def load_game_state(slot: int = 1, save_directory: str = None) -> GameState | None:
+    manager = SaveManager(save_directory)
+    return manager.load_game_state(slot)
+
+
+def demo():
+    print("=" * 60)
+    print("Game State Persistence Demo")
+    print("=" * 60)
+
+    print("\n--- Creating New Game State ---")
+    game = GameState(player_name="Aria")
+    game.player.level = 5
+    game.player.health = 85
+    game.player.gold = 250
+    game.player.inventory = ["Iron Sword", "Health Potion", "Magic Shield", "Ancient Map"]
+    game.player.equipped = {"weapon": "Iron Sword", "armor": "Leather Armor"}
+    game.player.skills = {"fireball": 3, "heal": 2, "stealth": 1}
+    game.player.position = (42, 17)
+    game.player.experience = 350
+
+    game.world.current_map = "dark_forest"
+    game.world.discover_map("dark_forest")
+    game.world.discover_map("mountain_pass")
+    game.world.start_quest("quest_001_find_artifact")
+    game.world.start_quest("quest_002_rescue_villager")
+    game.world.complete_quest("quest_000_tutorial")
+    game.world.set_flag("boss_defeated", True)
+    game.world.set_flag("secret_door_opened", True)
+    game.world.npc_states = {
+        "blacksmith_john": {"relationship": "friendly", "shop_unlocked": True},
+        "elder_mira": {"quest_given": True, "dialogue_stage": 3},
+    }
+
+    game.statistics.enemies_defeated = 47
+    game.statistics.deaths = 2
+    game.statistics.items_collected = 23
+    game.statistics.gold_earned = 500
+    game.statistics.gold_spent = 250
+
+    game.settings.difficulty = "hard"
+    game.settings.music_volume = 0.6
+
+    print(f"Created: {game}")
+    print(f"Player inventory: {game.player.inventory}")
+    print(f"Discovered maps: {game.world.discovered_maps}")
+    print(f"Active quests: {game.world.active_quests}")
+    print(f"Completed quests: {game.world.completed_quests}")
+
+    print("\n--- Saving Game State ---")
+    manager = SaveManager("demo_saves")
+    success = manager.save_game_state(game, slot=1)
+    print(f"Save successful: {success}")
+
+    print("\n--- Saving to Another Slot ---")
+    game.player.position = (100, 200)
+    game.world.current_map = "mountain_pass"
+    success2 = manager.save_game_state(game, slot=2)
+    print(f"Save to slot 2 successful: {success2}")
+
+    print("\n--- Listing All Saves ---")
+    saves = manager.list_saves()
+    for save_info in saves:
+        print(f"  Slot {save_info.get('save_slot', '?')}: "
+              f"{save_info.get('player_name', 'Unknown')} "
+              f"(Level {save_info.get('player_level', '?')}) - "
+              f"{save_info.get('current_map', 'Unknown')} - "
+              f"Play time: {save_info.get('play_time', '00:00:00')}")
+
+    print("\n--- Loading Game State from Slot 1 ---")
+    loaded_game = manager.load_game_state(slot=1)
+
+    if loaded_game:
+        print(f"\nLoaded: {loaded_game}")
+        print(f"Player name: {loaded_game.player.name}")
+        print(f"Player level: {loaded_game.player.level}")
+        print(f"Player health: {loaded_game.player.health}/{loaded_game.player.max_health}")
+        print(f"Player gold: {loaded_game.player.gold}")
+        print(f"Player position: {loaded_game.player.position}")
+        print(f"Player inventory: {loaded_game.player.inventory}")
+        print(f"Player skills: {loaded_game.player.skills}")
+        print(f"Current map: {loaded_game.world.current_map}")
+        print(f"Discovered maps: {loaded_game.world.discovered_maps}")
+        print(f"Active quests: {loaded_game.world.active_quests}")
+        print(f"Completed quests: {loaded_game.world.completed_quests}")
+        print(f"World flags: {loaded_game.world.world_flags}")
+        print(f"NPC states: {loaded_game.world.npc_states}")
+        print(f"Enemies defeated: {loaded_game.statistics.enemies_defeated}")
+        print(f"Deaths: {loaded_game.statistics.deaths}")
+        print(f"Difficulty: {loaded_game.settings.difficulty}")
+        print(f"Music volume: {loaded_game.settings.music_volume}")
+        print(f"Save count: {loaded_game.statistics.save_count}")
+
+        print("\n--- Verifying Data Integrity ---")
+        assert loaded_game.player.name == "Aria", "Player name mismatch!"
+        assert loaded_game.player.level == 5, "Player level mismatch!"
+        assert loaded_game.player.gold == 250, "Player gold mismatch!"
+        assert "Iron Sword" in loaded_game.player.inventory, "Inventory item missing!"
+        assert loaded_game.world.current_map == "dark_forest", "Map mismatch!"
+        assert "quest_001_find_artifact" in loaded_game.world.active_quests, "Quest missing!"
+        assert loaded_game.world.get_flag("boss_defeated") == True, "World flag missing!"
+        assert loaded_game.statistics.enemies_defeated == 47, "Statistics mismatch!"
+        print("All data integrity checks passed!")
+
+    print("\n--- Testing Convenience Functions ---")
+    new_game = GameState("Bob")
+    new_game.player.level = 10
+    new_game.player.gold = 1000
+
+    save_result = save_game_state(new_game, slot=3, save_directory="demo_saves")
+    print(f"Convenience save result: {save_result}")
+
+    loaded_via_convenience = load_game_state(slot=3, save_directory="demo_saves")
+    if loaded_via_convenience:
+        print(f"Convenience load result: {loaded_via_convenience}")
+        assert loaded_via_convenience.player.name == "Bob"
+        assert loaded_via_convenience.player.level == 10
+        print("Convenience function test passed!")
+
+    print("\n--- Testing Non-existent Slot ---")
+    missing = manager.load_game_state(slot=99)
+    print(f"Loading non-existent slot returned: {missing}")
+
+    print("\n--- Cleaning Up Demo Saves ---")
+    for slot in [1, 2, 3]:
+        manager.delete_save(slot)
+
+    import shutil
+    if Path("demo_saves").exists():
+        shutil.rmtree("demo_saves")
+        print("Demo save directory removed.")
+
+    print("\n" + "=" * 60)
+    print("Demo completed successfully!")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    demo()
+```

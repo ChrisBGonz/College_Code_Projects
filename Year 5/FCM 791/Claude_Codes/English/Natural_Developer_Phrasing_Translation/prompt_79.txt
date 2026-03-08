@@ -1,0 +1,258 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Script that reads a manifest file containing expected file hashes,
+computes hashes for the corresponding local project files, and validates
+they match—reporting any missing files or hash mismatches.
+"""
+
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def compute_file_hash(file_path: str, algorithm: str = "sha256") -> str | None:
+    """Compute the hash of a file using the specified algorithm."""
+    try:
+        hash_func = hashlib.new(algorithm)
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"Error computing hash for {file_path}: {e}")
+        return None
+
+
+def read_manifest(manifest_path: str) -> dict:
+    """Read and parse the manifest file."""
+    try:
+        with open(manifest_path, "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Error: Manifest file not found: {manifest_path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in manifest file: {e}")
+        sys.exit(1)
+
+
+def validate_files(manifest: dict, base_dir: str = ".") -> dict:
+    """Validate files against the manifest and return results."""
+    results = {
+        "valid": [],
+        "missing": [],
+        "mismatches": [],
+        "errors": []
+    }
+    
+    algorithm = manifest.get("algorithm", "sha256")
+    files = manifest.get("files", {})
+    
+    for file_path, expected_hash in files.items():
+        full_path = os.path.join(base_dir, file_path)
+        computed_hash = compute_file_hash(full_path, algorithm)
+        
+        if computed_hash is None:
+            results["missing"].append(file_path)
+        elif computed_hash.lower() == expected_hash.lower():
+            results["valid"].append(file_path)
+        else:
+            results["mismatches"].append({
+                "file": file_path,
+                "expected": expected_hash,
+                "computed": computed_hash
+            })
+    
+    return results
+
+
+def analyze_with_claude(manifest: dict, validation_results: dict) -> None:
+    """Use Claude to analyze the validation results and provide insights."""
+    client = anthropic.Anthropic()
+    
+    # Prepare the analysis request
+    analysis_data = {
+        "manifest_info": {
+            "algorithm": manifest.get("algorithm", "sha256"),
+            "total_files": len(manifest.get("files", {})),
+            "description": manifest.get("description", "No description provided")
+        },
+        "validation_results": {
+            "valid_count": len(validation_results["valid"]),
+            "missing_count": len(validation_results["missing"]),
+            "mismatch_count": len(validation_results["mismatches"]),
+            "valid_files": validation_results["valid"],
+            "missing_files": validation_results["missing"],
+            "mismatched_files": validation_results["mismatches"]
+        }
+    }
+    
+    prompt = f"""Analyze the following file validation results and provide a comprehensive report:
+
+Validation Data:
+{json.dumps(analysis_data, indent=2)}
+
+Please provide:
+1. A summary of the validation status
+2. Severity assessment of any issues found
+3. Specific details about missing files and hash mismatches
+4. Recommendations for resolving any issues
+5. Overall integrity assessment of the project files
+
+Format your response clearly with sections and bullet points where appropriate."""
+
+    print("\n" + "="*60)
+    print("CLAUDE AI ANALYSIS")
+    print("="*60)
+    
+    # Use streaming for the response
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n" + "="*60)
+
+
+def print_validation_report(validation_results: dict) -> None:
+    """Print a formatted validation report."""
+    print("\n" + "="*60)
+    print("FILE VALIDATION REPORT")
+    print("="*60)
+    
+    total = (len(validation_results["valid"]) + 
+             len(validation_results["missing"]) + 
+             len(validation_results["mismatches"]))
+    
+    print(f"\nTotal files checked: {total}")
+    print(f"✓ Valid: {len(validation_results['valid'])}")
+    print(f"✗ Missing: {len(validation_results['missing'])}")
+    print(f"⚠ Mismatches: {len(validation_results['mismatches'])}")
+    
+    if validation_results["valid"]:
+        print("\n--- VALID FILES ---")
+        for file_path in validation_results["valid"]:
+            print(f"  ✓ {file_path}")
+    
+    if validation_results["missing"]:
+        print("\n--- MISSING FILES ---")
+        for file_path in validation_results["missing"]:
+            print(f"  ✗ {file_path}")
+    
+    if validation_results["mismatches"]:
+        print("\n--- HASH MISMATCHES ---")
+        for mismatch in validation_results["mismatches"]:
+            print(f"  ⚠ {mismatch['file']}")
+            print(f"    Expected: {mismatch['expected']}")
+            print(f"    Computed: {mismatch['computed']}")
+    
+    print("="*60)
+
+
+def create_sample_manifest(output_path: str = "manifest.json") -> None:
+    """Create a sample manifest file for demonstration."""
+    # Create some sample files
+    sample_files = {
+        "sample_script.py": "print('Hello, World!')\n",
+        "config.json": '{"version": "1.0", "debug": false}\n',
+        "README.md": "# Sample Project\n\nThis is a sample project.\n"
+    }
+    
+    # Write sample files
+    for filename, content in sample_files.items():
+        with open(filename, "w") as f:
+            f.write(content)
+    
+    # Compute hashes
+    manifest = {
+        "description": "Sample project manifest",
+        "algorithm": "sha256",
+        "files": {}
+    }
+    
+    for filename in sample_files:
+        hash_value = compute_file_hash(filename)
+        if hash_value:
+            manifest["files"][filename] = hash_value
+    
+    # Add a non-existent file to demonstrate missing file detection
+    manifest["files"]["missing_file.txt"] = "abc123def456"
+    
+    # Modify one file to demonstrate mismatch detection
+    with open("config.json", "w") as f:
+        f.write('{"version": "2.0", "debug": true}\n')
+    
+    # Save manifest
+    with open(output_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    print(f"Sample manifest created: {output_path}")
+    print("Note: 'config.json' has been modified and 'missing_file.txt' doesn't exist")
+    print("This demonstrates hash mismatch and missing file detection.\n")
+
+
+def main():
+    """Main function to run the file validation script."""
+    # Check if we should create a demo
+    if len(sys.argv) > 1 and sys.argv[1] == "--demo":
+        print("Creating demo files and manifest...")
+        create_sample_manifest()
+        manifest_path = "manifest.json"
+        base_dir = "."
+    elif len(sys.argv) >= 2:
+        manifest_path = sys.argv[1]
+        base_dir = sys.argv[2] if len(sys.argv) >= 3 else "."
+    else:
+        # Default to looking for manifest.json in current directory
+        manifest_path = "manifest.json"
+        base_dir = "."
+        
+        if not os.path.exists(manifest_path):
+            print("Usage: python solution.py [manifest_path] [base_directory]")
+            print("       python solution.py --demo  (creates demo files)")
+            print("\nNo manifest.json found. Creating demo...")
+            create_sample_manifest()
+    
+    print(f"Reading manifest: {manifest_path}")
+    print(f"Base directory: {os.path.abspath(base_dir)}")
+    
+    # Read manifest
+    manifest = read_manifest(manifest_path)
+    
+    # Validate files
+    print("\nValidating files...")
+    validation_results = validate_files(manifest, base_dir)
+    
+    # Print basic report
+    print_validation_report(validation_results)
+    
+    # Analyze with Claude
+    print("\nAnalyzing results with Claude AI...")
+    analyze_with_claude(manifest, validation_results)
+    
+    # Return exit code based on validation results
+    if validation_results["missing"] or validation_results["mismatches"]:
+        sys.exit(1)
+    else:
+        print("\n✓ All files validated successfully!")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+```

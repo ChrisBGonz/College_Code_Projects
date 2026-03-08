@@ -1,0 +1,390 @@
+
+```csharp
+using System;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging;
+
+namespace AuthDemo.Services
+{
+    public class AuthenticationService
+    {
+        private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly IConfiguration _configuration;
+        private readonly ILogger<AuthenticationService> _logger;
+
+        // Default persistent cookie lifetime (30 days)
+        private const int DefaultPersistentCookieDays = 30;
+
+        // Session cookie lifetime (browser session only)
+        private const int SessionCookieMinutes = 60;
+
+        public AuthenticationService(
+            IHttpContextAccessor httpContextAccessor,
+            IConfiguration configuration,
+            ILogger<AuthenticationService> logger)
+        {
+            _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+            _configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <summary>
+        /// Signs in the user and optionally issues a persistent "Remember Me" cookie.
+        /// </summary>
+        /// <param name="userId">The unique identifier of the authenticated user.</param>
+        /// <param name="username">The username of the authenticated user.</param>
+        /// <param name="email">The email address of the authenticated user.</param>
+        /// <param name="roles">Optional array of roles assigned to the user.</param>
+        /// <param name="rememberMe">Whether to issue a persistent cookie (Remember Me).</param>
+        /// <param name="persistentDays">
+        /// Number of days the persistent cookie should remain valid.
+        /// Defaults to <see cref="DefaultPersistentCookieDays"/> if not specified.
+        /// </param>
+        /// <returns>A task representing the asynchronous sign-in operation.</returns>
+        public async Task SignInAsync(
+            string userId,
+            string username,
+            string email,
+            string[]? roles = null,
+            bool rememberMe = false,
+            int? persistentDays = null)
+        {
+            if (string.IsNullOrWhiteSpace(userId))
+                throw new ArgumentException("User ID cannot be null or empty.", nameof(userId));
+
+            if (string.IsNullOrWhiteSpace(username))
+                throw new ArgumentException("Username cannot be null or empty.", nameof(username));
+
+            var httpContext = _httpContextAccessor.HttpContext
+                ?? throw new InvalidOperationException("HttpContext is not available.");
+
+            // Build the claims identity
+            var claims = BuildClaims(userId, username, email, roles, rememberMe);
+            var claimsIdentity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
+            var claimsPrincipal = new ClaimsPrincipal(claimsIdentity);
+
+            // Configure authentication properties
+            var authProperties = BuildAuthenticationProperties(rememberMe, persistentDays);
+
+            try
+            {
+                await httpContext.SignInAsync(
+                    CookieAuthenticationDefaults.AuthenticationScheme,
+                    claimsPrincipal,
+                    authProperties);
+
+                _logger.LogInformation(
+                    "User {UserId} ({Username}) signed in successfully. RememberMe: {RememberMe}",
+                    userId, username, rememberMe);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to sign in user {UserId} ({Username}).", userId, username);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Signs out the current user and clears the authentication cookie.
+        /// </summary>
+        public async Task SignOutAsync()
+        {
+            var httpContext = _httpContextAccessor.HttpContext
+                ?? throw new InvalidOperationException("HttpContext is not available.");
+
+            var userId = httpContext.User?.FindFirstValue(ClaimTypes.NameIdentifier);
+
+            try
+            {
+                await httpContext.SignOutAsync(CookieAuthenticationDefaults.AuthenticationScheme);
+
+                _logger.LogInformation("User {UserId} signed out successfully.", userId ?? "Unknown");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to sign out user {UserId}.", userId ?? "Unknown");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Refreshes the authentication cookie, extending its expiration.
+        /// Useful for sliding expiration scenarios.
+        /// </summary>
+        /// <param name="rememberMe">Whether the user opted into persistent login.</param>
+        /// <param name="persistentDays">Number of days to extend the cookie.</param>
+        public async Task RefreshCookieAsync(bool rememberMe = false, int? persistentDays = null)
+        {
+            var httpContext = _httpContextAccessor.HttpContext
+                ?? throw new InvalidOperationException("HttpContext is not available.");
+
+            if (httpContext.User?.Identity?.IsAuthenticated != true)
+            {
+                _logger.LogWarning("Attempted to refresh cookie for unauthenticated user.");
+                return;
+            }
+
+            var authProperties = BuildAuthenticationProperties(rememberMe, persistentDays);
+
+            await httpContext.SignInAsync(
+                CookieAuthenticationDefaults.AuthenticationScheme,
+                httpContext.User,
+                authProperties);
+
+            _logger.LogInformation(
+                "Authentication cookie refreshed for user {UserId}.",
+                httpContext.User.FindFirstValue(ClaimTypes.NameIdentifier));
+        }
+
+        /// <summary>
+        /// Builds the list of claims for the authenticated user.
+        /// </summary>
+        private static System.Collections.Generic.List<Claim> BuildClaims(
+            string userId,
+            string username,
+            string email,
+            string[]? roles,
+            bool rememberMe)
+        {
+            var claims = new System.Collections.Generic.List<Claim>
+            {
+                new Claim(ClaimTypes.NameIdentifier, userId),
+                new Claim(ClaimTypes.Name, username),
+                new Claim(ClaimTypes.Email, email ?? string.Empty),
+                // Store RememberMe preference as a claim for future reference
+                new Claim("RememberMe", rememberMe.ToString()),
+                // Include a unique session identifier to support token revocation
+                new Claim("SessionId", GenerateSessionId()),
+                // Record the login timestamp
+                new Claim("LoginTime", DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString())
+            };
+
+            // Add role claims if provided
+            if (roles != null)
+            {
+                foreach (var role in roles)
+                {
+                    if (!string.IsNullOrWhiteSpace(role))
+                        claims.Add(new Claim(ClaimTypes.Role, role));
+                }
+            }
+
+            return claims;
+        }
+
+        /// <summary>
+        /// Builds the <see cref="AuthenticationProperties"/> with appropriate cookie settings.
+        /// </summary>
+        private AuthenticationProperties BuildAuthenticationProperties(bool rememberMe, int? persistentDays)
+        {
+            var properties = new AuthenticationProperties
+            {
+                // IsPersistent = true causes the cookie to survive browser restarts
+                IsPersistent = rememberMe,
+
+                // Allow the cookie to be refreshed (sliding expiration)
+                AllowRefresh = true,
+
+                // Redirect paths for authentication events
+                RedirectUri = _configuration["Auth:LoginPath"] ?? "/login"
+            };
+
+            if (rememberMe)
+            {
+                // Persistent cookie: set explicit expiration
+                var days = persistentDays
+                    ?? _configuration.GetValue<int?>("Auth:PersistentCookieDays")
+                    ?? DefaultPersistentCookieDays;
+
+                // Clamp to a reasonable maximum (e.g., 90 days) to limit exposure
+                days = Math.Min(days, 90);
+                days = Math.Max(days, 1);
+
+                properties.ExpiresUtc = DateTimeOffset.UtcNow.AddDays(days);
+
+                _logger.LogDebug(
+                    "Issuing persistent auth cookie expiring in {Days} days (at {ExpiresUtc}).",
+                    days, properties.ExpiresUtc);
+            }
+            else
+            {
+                // Session cookie: expires when the browser is closed.
+                // We still set a server-side absolute expiration as a safety net.
+                properties.ExpiresUtc = DateTimeOffset.UtcNow.AddMinutes(SessionCookieMinutes);
+
+                _logger.LogDebug(
+                    "Issuing session auth cookie with server-side expiry of {Minutes} minutes.",
+                    SessionCookieMinutes);
+            }
+
+            return properties;
+        }
+
+        /// <summary>
+        /// Generates a cryptographically random session identifier.
+        /// </summary>
+        private static string GenerateSessionId()
+        {
+            var bytes = new byte[32];
+            using var rng = RandomNumberGenerator.Create();
+            rng.GetBytes(bytes);
+            return Convert.ToBase64String(bytes);
+        }
+    }
+}
+```
+
+```csharp
+// Program.cs / Startup.cs — Cookie authentication configuration
+// Add this to your DI/middleware setup to enforce secure cookie flags.
+
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddScoped<AuthDemo.Services.AuthenticationService>();
+
+builder.Services
+    .AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
+    .AddCookie(CookieAuthenticationDefaults.AuthenticationScheme, options =>
+    {
+        // ── Cookie name ──────────────────────────────────────────────────────
+        options.Cookie.Name = "__Host-AuthToken"; // __Host- prefix enforces Secure + Path=/
+
+        // ── Security flags ───────────────────────────────────────────────────
+
+        // HttpOnly: prevents JavaScript access to the cookie (mitigates XSS theft)
+        options.Cookie.HttpOnly = true;
+
+        // Secure: cookie is only sent over HTTPS
+        options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+
+        // SameSite=Strict: cookie is not sent on cross-site requests (mitigates CSRF)
+        // Use Lax if you need the cookie sent on top-level navigations from external sites.
+        options.Cookie.SameSite = SameSiteMode.Strict;
+
+        // Ensure the cookie is essential (not subject to consent requirements for auth)
+        options.Cookie.IsEssential = true;
+
+        // ── Expiration ───────────────────────────────────────────────────────
+
+        // Sliding expiration: resets the cookie lifetime on each authenticated request
+        options.SlidingExpiration = true;
+
+        // Default expiration for session cookies (overridden by AuthenticationProperties
+        // when IsPersistent = true / RememberMe is set)
+        options.ExpireTimeSpan = TimeSpan.FromMinutes(60);
+
+        // ── Paths ────────────────────────────────────────────────────────────
+        options.LoginPath = "/login";
+        options.LogoutPath = "/logout";
+        options.AccessDeniedPath = "/access-denied";
+
+        // ── Tick interval ────────────────────────────────────────────────────
+        // How often the cookie is reissued (sliding window refresh interval)
+        options.Cookie.Path = "/";
+    });
+
+builder.Services.AddAuthorization();
+
+var app = builder.Build();
+
+app.UseHttpsRedirection();
+app.UseAuthentication();
+app.UseAuthorization();
+
+app.MapControllers();
+
+app.Run();
+```
+
+```csharp
+// Example controller showing how to call SignInAsync with RememberMe support.
+
+using System.Threading.Tasks;
+using AuthDemo.Services;
+using Microsoft.AspNetCore.Mvc;
+
+namespace AuthDemo.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    public class AccountController : ControllerBase
+    {
+        private readonly AuthenticationService _authService;
+
+        public AccountController(AuthenticationService authService)
+        {
+            _authService = authService;
+        }
+
+        [HttpPost("login")]
+        public async Task<IActionResult> Login([FromBody] LoginRequest request)
+        {
+            if (!ModelState.IsValid)
+                return BadRequest(ModelState);
+
+            // TODO: Replace with your real user lookup and password verification logic.
+            var user = await ValidateCredentialsAsync(request.Username, request.Password);
+            if (user == null)
+                return Unauthorized(new { message = "Invalid username or password." });
+
+            await _authService.SignInAsync(
+                userId: user.Id,
+                username: user.Username,
+                email: user.Email,
+                roles: user.Roles,
+                rememberMe: request.RememberMe,
+                persistentDays: request.RememberMe ? 30 : null);
+
+            return Ok(new { message = "Login successful." });
+        }
+
+        [HttpPost("logout")]
+        public async Task<IActionResult> Logout()
+        {
+            await _authService.SignOutAsync();
+            return Ok(new { message = "Logged out successfully." });
+        }
+
+        // Stub — replace with real DB lookup + password hash verification
+        private static Task<UserDto?> ValidateCredentialsAsync(string username, string password)
+        {
+            if (username == "demo" && password == "P@ssw0rd!")
+            {
+                return Task.FromResult<UserDto?>(new UserDto
+                {
+                    Id = "usr_001",
+                    Username = "demo",
+                    Email = "demo@example.com",
+                    Roles = new[] { "User" }
+                });
+            }
+
+            return Task.FromResult<UserDto?>(null);
+        }
+    }
+
+    public record LoginRequest(string Username, string Password, bool RememberMe);
+
+    public class UserDto
+    {
+        public string Id { get; set; } = string.Empty;
+        public string Username { get; set; } = string.Empty;
+        public string Email { get; set; } = string.Empty;
+        public string[] Roles { get; set; } = Array.Empty<string>();
+    }
+}
+```

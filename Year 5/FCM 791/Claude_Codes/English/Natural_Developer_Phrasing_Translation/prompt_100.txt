@@ -1,0 +1,284 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+
+// Circuit Breaker States
+const CircuitState = {
+  CLOSED: "CLOSED", // Normal operation
+  OPEN: "OPEN", // Halting calls due to failures
+  HALF_OPEN: "HALF_OPEN", // Testing if backend recovered
+};
+
+// Circuit Breaker Implementation
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 60000; // 60 seconds
+    this.monitoringPeriod = options.monitoringPeriod || 10000; // 10 seconds
+
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+
+    console.log("Circuit Breaker initialized in CLOSED state");
+  }
+
+  async execute(fn) {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() < this.nextAttemptTime) {
+        const waitTime = Math.ceil((this.nextAttemptTime - Date.now()) / 1000);
+        throw new Error(
+          `Circuit breaker is OPEN. Next attempt in ${waitTime} seconds.`
+        );
+      }
+      // Transition to HALF_OPEN to test recovery
+      this.transitionTo(CircuitState.HALF_OPEN);
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount++;
+      console.log(
+        `HALF_OPEN: Success ${this.successCount}/${this.successThreshold}`
+      );
+
+      if (this.successCount >= this.successThreshold) {
+        this.reset();
+        this.transitionTo(CircuitState.CLOSED);
+      }
+    } else {
+      this.failureCount = 0;
+    }
+  }
+
+  onFailure() {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    console.log(
+      `Failure recorded: ${this.failureCount}/${this.failureThreshold}`
+    );
+
+    if (
+      this.state === CircuitState.HALF_OPEN ||
+      this.failureCount >= this.failureThreshold
+    ) {
+      this.transitionTo(CircuitState.OPEN);
+    }
+  }
+
+  transitionTo(newState) {
+    const oldState = this.state;
+    this.state = newState;
+
+    if (newState === CircuitState.OPEN) {
+      this.nextAttemptTime = Date.now() + this.timeout;
+      console.log(
+        `Circuit breaker transitioned: ${oldState} -> OPEN. Will retry at ${new Date(this.nextAttemptTime).toISOString()}`
+      );
+    } else if (newState === CircuitState.HALF_OPEN) {
+      this.successCount = 0;
+      console.log(
+        `Circuit breaker transitioned: ${oldState} -> HALF_OPEN. Testing recovery...`
+      );
+    } else if (newState === CircuitState.CLOSED) {
+      console.log(
+        `Circuit breaker transitioned: ${oldState} -> CLOSED. Normal operation resumed.`
+      );
+    }
+  }
+
+  reset() {
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.nextAttemptTime = null;
+  }
+
+  getStatus() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime
+        ? new Date(this.lastFailureTime).toISOString()
+        : null,
+      nextAttemptTime: this.nextAttemptTime
+        ? new Date(this.nextAttemptTime).toISOString()
+        : null,
+    };
+  }
+}
+
+// Anthropic API Client with Circuit Breaker
+class ResilientAnthropicClient {
+  constructor() {
+    this.client = new Anthropic();
+    this.circuitBreaker = new CircuitBreaker({
+      failureThreshold: 3,
+      successThreshold: 2,
+      timeout: 30000, // 30 seconds for demo
+      monitoringPeriod: 5000,
+    });
+
+    this.requestCount = 0;
+    this.successCount = 0;
+    this.failureCount = 0;
+  }
+
+  async makeRequest(prompt, simulateFailure = false) {
+    this.requestCount++;
+    const requestId = this.requestCount;
+
+    console.log(`\n--- Request #${requestId} ---`);
+    console.log(`Circuit Breaker Status: ${JSON.stringify(this.circuitBreaker.getStatus(), null, 2)}`);
+
+    try {
+      const result = await this.circuitBreaker.execute(async () => {
+        if (simulateFailure) {
+          throw new Error("Simulated backend failure");
+        }
+
+        // Make actual API call with streaming
+        const stream = await this.client.messages.stream({
+          model: "claude-opus-4-5",
+          max_tokens: 150,
+          messages: [
+            {
+              role: "user",
+              content: prompt,
+            },
+          ],
+        });
+
+        let fullResponse = "";
+        process.stdout.write(`Response #${requestId}: `);
+
+        for await (const chunk of stream) {
+          if (
+            chunk.type === "content_block_delta" &&
+            chunk.delta.type === "text_delta"
+          ) {
+            process.stdout.write(chunk.delta.text);
+            fullResponse += chunk.delta.text;
+          }
+        }
+        console.log("\n");
+
+        return fullResponse;
+      });
+
+      this.successCount++;
+      console.log(`Request #${requestId} succeeded`);
+      return result;
+    } catch (error) {
+      this.failureCount++;
+      console.log(`Request #${requestId} failed: ${error.message}`);
+      throw error;
+    }
+  }
+
+  getStats() {
+    return {
+      totalRequests: this.requestCount,
+      successCount: this.successCount,
+      failureCount: this.failureCount,
+      circuitBreakerStatus: this.circuitBreaker.getStatus(),
+    };
+  }
+}
+
+// Demo function to showcase circuit breaker behavior
+async function demonstrateCircuitBreaker() {
+  console.log("=== Circuit Breaker Demo ===\n");
+
+  const client = new ResilientAnthropicClient();
+
+  // Phase 1: Normal operation (CLOSED state)
+  console.log("Phase 1: Normal operation");
+  console.log("=".repeat(50));
+
+  try {
+    await client.makeRequest("Say 'Hello World' in exactly 3 words.");
+    await client.makeRequest("What is 2+2? Answer in one word.");
+  } catch (error) {
+    console.log(`Error in Phase 1: ${error.message}`);
+  }
+
+  // Phase 2: Simulate failures to trigger circuit breaker
+  console.log("\nPhase 2: Simulating failures to trigger circuit breaker");
+  console.log("=".repeat(50));
+
+  for (let i = 0; i < 4; i++) {
+    try {
+      await client.makeRequest(`Failure test ${i + 1}`, true); // Simulate failure
+    } catch (error) {
+      console.log(`Expected failure: ${error.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  // Phase 3: Circuit is OPEN - requests should be rejected immediately
+  console.log("\nPhase 3: Circuit is OPEN - requests rejected");
+  console.log("=".repeat(50));
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      await client.makeRequest("This should be rejected by circuit breaker");
+    } catch (error) {
+      console.log(`Rejected by circuit breaker: ${error.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  // Phase 4: Wait for circuit to allow HALF_OPEN probe
+  console.log("\nPhase 4: Waiting for circuit to enter HALF_OPEN state...");
+  console.log("=".repeat(50));
+  console.log("(In production, this would wait 30 seconds)");
+  console.log("Simulating time passage by manually setting nextAttemptTime...\n");
+
+  // For demo purposes, manually reset the timer
+  client.circuitBreaker.nextAttemptTime = Date.now() - 1;
+
+  // Phase 5: HALF_OPEN - test recovery with real requests
+  console.log("Phase 5: HALF_OPEN - testing recovery");
+  console.log("=".repeat(50));
+
+  try {
+    await client.makeRequest("Recovery test 1: Say 'I am recovered'");
+    await client.makeRequest("Recovery test 2: Count to 3");
+  } catch (error) {
+    console.log(`Error in recovery phase: ${error.message}`);
+  }
+
+  // Phase 6: Circuit should be CLOSED again
+  console.log("\nPhase 6: Circuit should be CLOSED - normal operation");
+  console.log("=".repeat(50));
+
+  try {
+    await client.makeRequest("Final test: What is the capital of France?");
+  } catch (error) {
+    console.log(`Error in final phase: ${error.message}`);
+  }
+
+  // Print final statistics
+  console.log("\n=== Final Statistics ===");
+  console.log(JSON.stringify(client.getStats(), null, 2));
+}
+
+// Run the demonstration
+demonstrateCircuitBreaker().catch(console.error);
+```

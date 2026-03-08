@@ -1,0 +1,169 @@
+
+```python
+import anthropic
+import httpx
+from flask import Flask, Response, jsonify, request
+
+app = Flask(__name__)
+client = anthropic.Anthropic()
+
+
+def fetch_url_content(url: str) -> tuple[str | None, int | None, str | None]:
+    """
+    Fetch content from a URL using httpx.
+    Returns (content, status_code, error_message)
+    """
+    try:
+        with httpx.Client(follow_redirects=True, timeout=30.0) as http_client:
+            response = http_client.get(url)
+            
+            if response.status_code == 404:
+                return None, 404, f"Page not found (404): {url}"
+            
+            response.raise_for_status()
+            return response.text, response.status_code, None
+            
+    except httpx.HTTPStatusError as e:
+        return None, e.response.status_code, f"HTTP error {e.response.status_code}: {str(e)}"
+    except httpx.RequestError as e:
+        return None, None, f"Request error: {str(e)}"
+    except Exception as e:
+        return None, None, f"Unexpected error: {str(e)}"
+
+
+def analyze_content_with_claude(url: str, content: str) -> str:
+    """
+    Use Claude to analyze and summarize the fetched content using streaming.
+    Returns the analysis as a string.
+    """
+    prompt = f"""I fetched the content from this URL: {url}
+
+Here is the page content:
+{content[:5000]}  
+
+Please provide a brief summary of what this page contains and its main purpose."""
+
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            full_response += text
+    
+    return full_response
+
+
+@app.route('/fetch', methods=['GET', 'POST'])
+def fetch_url():
+    """
+    Endpoint that accepts a URL, fetches its content, and returns the response.
+    
+    GET: Pass URL as query parameter: /fetch?url=https://example.com
+    POST: Pass URL in JSON body: {"url": "https://example.com"}
+    """
+    if request.method == 'GET':
+        url = request.args.get('url')
+    else:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+        url = data.get('url')
+    
+    if not url:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    content, status_code, error = fetch_url_content(url)
+    
+    if error:
+        if status_code == 404:
+            return jsonify({
+                "error": "Not Found",
+                "message": error,
+                "url": url,
+                "status_code": 404
+            }), 404
+        else:
+            return jsonify({
+                "error": "Request Failed",
+                "message": error,
+                "url": url,
+                "status_code": status_code
+            }), 502
+    
+    analysis = analyze_content_with_claude(url, content)
+    
+    return jsonify({
+        "url": url,
+        "status_code": status_code,
+        "content_length": len(content),
+        "content_preview": content[:500] if content else "",
+        "analysis": analysis
+    })
+
+
+@app.route('/fetch/raw', methods=['GET', 'POST'])
+def fetch_url_raw():
+    """
+    Endpoint that returns the raw HTML content of the fetched URL.
+    
+    GET: Pass URL as query parameter: /fetch/raw?url=https://example.com
+    POST: Pass URL in JSON body: {"url": "https://example.com"}
+    """
+    if request.method == 'GET':
+        url = request.args.get('url')
+    else:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+        url = data.get('url')
+    
+    if not url:
+        return jsonify({"error": "URL parameter is required"}), 400
+    
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    content, status_code, error = fetch_url_content(url)
+    
+    if error:
+        if status_code == 404:
+            return Response(
+                f"<html><body><h1>404 Not Found</h1><p>{error}</p></body></html>",
+                status=404,
+                mimetype='text/html'
+            )
+        else:
+            return Response(
+                f"<html><body><h1>Error</h1><p>{error}</p></body></html>",
+                status=502,
+                mimetype='text/html'
+            )
+    
+    return Response(content, status=200, mimetype='text/html')
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Simple health check endpoint."""
+    return jsonify({"status": "healthy", "service": "URL Fetcher with Claude Analysis"})
+
+
+if __name__ == '__main__':
+    print("Starting Flask URL Fetcher with Claude Analysis...")
+    print("Endpoints:")
+    print("  GET/POST /fetch?url=<url> - Fetch URL and get Claude analysis")
+    print("  GET/POST /fetch/raw?url=<url> - Fetch URL and return raw HTML")
+    print("  GET /health - Health check")
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

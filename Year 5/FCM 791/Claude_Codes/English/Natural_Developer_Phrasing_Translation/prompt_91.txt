@@ -1,0 +1,197 @@
+
+```python
+import requests
+import logging
+from typing import Optional, Dict, Any
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+PAYMENTS_API_BASE_URL = "https://api.payments.example.com"
+REQUEST_TIMEOUT = 2  # seconds
+
+
+def call_payments_api(
+    endpoint: str,
+    method: str = "POST",
+    payload: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, str]] = None,
+) -> bool:
+    """
+    Call the external payments API with a 2-second timeout.
+
+    Fails open (returns True) if:
+    - The request times out
+    - The API is unresponsive
+    - A connection error occurs
+    - Any unexpected exception occurs
+
+    Returns:
+        True if the payment check passes or if the API is unavailable (fail open).
+        False if the API explicitly rejects the request.
+    """
+    url = f"{PAYMENTS_API_BASE_URL}/{endpoint.lstrip('/')}"
+    default_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if headers:
+        default_headers.update(headers)
+
+    try:
+        response = requests.request(
+            method=method.upper(),
+            url=url,
+            json=payload or {},
+            headers=default_headers,
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        if response.status_code == 200:
+            data = response.json()
+            approved = data.get("approved", True)
+            logger.info("Payments API responded with approved=%s", approved)
+            return bool(approved)
+
+        if response.status_code in (400, 402, 403):
+            logger.warning(
+                "Payments API explicitly rejected request: status=%s body=%s",
+                response.status_code,
+                response.text,
+            )
+            return False
+
+        logger.warning(
+            "Payments API returned unexpected status %s — failing open",
+            response.status_code,
+        )
+        return True
+
+    except requests.exceptions.Timeout:
+        logger.warning(
+            "Payments API timed out after %ss — failing open", REQUEST_TIMEOUT
+        )
+        return True
+
+    except requests.exceptions.ConnectionError as exc:
+        logger.warning("Payments API connection error: %s — failing open", exc)
+        return True
+
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Payments API request error: %s — failing open", exc)
+        return True
+
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Unexpected error calling payments API: %s — failing open", exc
+        )
+        return True
+
+
+def verify_payment(
+    user_id: str,
+    amount: float,
+    currency: str = "USD",
+    payment_method_token: Optional[str] = None,
+) -> bool:
+    """
+    High-level helper to verify a payment for a user.
+
+    Args:
+        user_id: The identifier of the user making the payment.
+        amount: The payment amount.
+        currency: The currency code (default: USD).
+        payment_method_token: Optional tokenised payment method.
+
+    Returns:
+        True if the payment is approved or the API is unavailable (fail open).
+        False if the payment is explicitly declined.
+    """
+    payload = {
+        "user_id": user_id,
+        "amount": amount,
+        "currency": currency,
+    }
+    if payment_method_token:
+        payload["payment_method_token"] = payment_method_token
+
+    logger.info(
+        "Verifying payment for user=%s amount=%.2f %s", user_id, amount, currency
+    )
+    result = call_payments_api(endpoint="/v1/payments/verify", payload=payload)
+    logger.info("Payment verification result for user=%s: %s", user_id, result)
+    return result
+
+
+def charge_payment(
+    user_id: str,
+    amount: float,
+    currency: str = "USD",
+    payment_method_token: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+) -> bool:
+    """
+    High-level helper to charge a payment for a user.
+
+    Args:
+        user_id: The identifier of the user being charged.
+        amount: The charge amount.
+        currency: The currency code (default: USD).
+        payment_method_token: Optional tokenised payment method.
+        idempotency_key: Optional key to prevent duplicate charges.
+
+    Returns:
+        True if the charge succeeds or the API is unavailable (fail open).
+        False if the charge is explicitly declined.
+    """
+    payload: Dict[str, Any] = {
+        "user_id": user_id,
+        "amount": amount,
+        "currency": currency,
+    }
+    if payment_method_token:
+        payload["payment_method_token"] = payment_method_token
+
+    extra_headers: Dict[str, str] = {}
+    if idempotency_key:
+        extra_headers["Idempotency-Key"] = idempotency_key
+
+    logger.info(
+        "Charging user=%s amount=%.2f %s", user_id, amount, currency
+    )
+    result = call_payments_api(
+        endpoint="/v1/payments/charge",
+        payload=payload,
+        headers=extra_headers if extra_headers else None,
+    )
+    logger.info("Charge result for user=%s: %s", user_id, result)
+    return result
+
+
+if __name__ == "__main__":
+    # Example usage
+    user_can_proceed = verify_payment(
+        user_id="user_123",
+        amount=49.99,
+        currency="USD",
+        payment_method_token="tok_abc123",
+    )
+
+    if user_can_proceed:
+        print("User is allowed to continue with their purchase.")
+    else:
+        print("Payment was declined. Please update your payment method.")
+
+    charge_result = charge_payment(
+        user_id="user_123",
+        amount=49.99,
+        currency="USD",
+        payment_method_token="tok_abc123",
+        idempotency_key="order_456_charge",
+    )
+
+    if charge_result:
+        print("Charge succeeded (or API was unavailable — order will be fulfilled).")
+    else:
+        print("Charge explicitly failed.")
+```

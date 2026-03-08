@@ -1,0 +1,538 @@
+
+```python
+import http.server
+import http.cookies
+import urllib.parse
+import json
+from datetime import datetime, timedelta
+import hashlib
+import os
+
+# In-memory user store for demonstration
+users_db = {}
+trials_db = {}
+
+class SignupHandler(http.server.BaseHTTPRequestHandler):
+    
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        
+        if path == '/signup':
+            self.handle_signup_page()
+        elif path == '/trial/activate':
+            self.handle_trial_activation_page()
+        elif path == '/already-used-trial':
+            self.handle_already_used_trial_page()
+        elif path == '/success':
+            self.handle_success_page()
+        elif path == '/dashboard':
+            self.handle_dashboard_page()
+        else:
+            self.send_error(404, "Page not found")
+    
+    def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        
+        if path == '/signup':
+            self.handle_signup_post()
+        elif path == '/trial/activate':
+            self.handle_trial_activation_post()
+        else:
+            self.send_error(404, "Endpoint not found")
+    
+    def get_cookies(self):
+        cookie_header = self.headers.get('Cookie', '')
+        cookies = http.cookies.SimpleCookie()
+        cookies.load(cookie_header)
+        return cookies
+    
+    def get_cookie_value(self, name):
+        cookies = self.get_cookies()
+        if name in cookies:
+            return cookies[name].value
+        return None
+    
+    def has_used_trial(self):
+        value = self.get_cookie_value('has_used_trial')
+        if value is None:
+            return False
+        return value.lower() == 'true'
+    
+    def set_trial_cookie(self, response_headers):
+        cookie = http.cookies.SimpleCookie()
+        cookie['has_used_trial'] = 'true'
+        cookie['has_used_trial']['path'] = '/'
+        
+        # Set cookie to expire in 1 year
+        expires = datetime.utcnow() + timedelta(days=365)
+        cookie['has_used_trial']['expires'] = expires.strftime('%a, %d %b %Y %H:%M:%S GMT')
+        
+        # Security flags
+        cookie['has_used_trial']['httponly'] = True
+        cookie['has_used_trial']['samesite'] = 'Strict'
+        
+        return cookie.output(header='Set-Cookie')
+    
+    def parse_post_data(self):
+        content_length = int(self.headers.get('Content-Length', 0))
+        if content_length == 0:
+            return {}
+        
+        post_data = self.rfile.read(content_length).decode('utf-8')
+        content_type = self.headers.get('Content-Type', '')
+        
+        if 'application/json' in content_type:
+            try:
+                return json.loads(post_data)
+            except json.JSONDecodeError:
+                return {}
+        elif 'application/x-www-form-urlencoded' in content_type:
+            return dict(urllib.parse.parse_qsl(post_data))
+        
+        return {}
+    
+    def send_html_response(self, status_code, html_content, extra_headers=None):
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', len(html_content.encode('utf-8')))
+        
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
+        
+        self.end_headers()
+        self.wfile.write(html_content.encode('utf-8'))
+    
+    def send_json_response(self, status_code, data, extra_headers=None):
+        json_content = json.dumps(data)
+        self.send_response(status_code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(json_content.encode('utf-8')))
+        
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
+        
+        self.end_headers()
+        self.wfile.write(json_content.encode('utf-8'))
+    
+    def redirect(self, location, status_code=302, extra_headers=None):
+        self.send_response(status_code)
+        self.send_header('Location', location)
+        
+        if extra_headers:
+            for header_name, header_value in extra_headers.items():
+                self.send_header(header_name, header_value)
+        
+        self.end_headers()
+    
+    def handle_signup_page(self):
+        if self.has_used_trial():
+            self.redirect('/already-used-trial')
+            return
+        
+        html = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Sign Up - Free Trial</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }
+                .form-group { margin-bottom: 15px; }
+                label { display: block; margin-bottom: 5px; font-weight: bold; }
+                input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+                button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; width: 100%; font-size: 16px; }
+                button:hover { background-color: #0056b3; }
+                .trial-badge { background-color: #28a745; color: white; padding: 5px 10px; border-radius: 4px; font-size: 12px; }
+                h1 { color: #333; }
+                .error { color: red; margin-top: 10px; }
+            </style>
+        </head>
+        <body>
+            <h1>Start Your Free Trial <span class="trial-badge">FREE</span></h1>
+            <p>Create your account and get 30 days free access to all features.</p>
+            
+            <form id="signupForm" method="POST" action="/signup">
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email" required placeholder="you@example.com">
+                </div>
+                <div class="form-group">
+                    <label for="username">Username</label>
+                    <input type="text" id="username" name="username" required placeholder="Choose a username">
+                </div>
+                <div class="form-group">
+                    <label for="password">Password</label>
+                    <input type="password" id="password" name="password" required placeholder="Create a strong password">
+                </div>
+                <div class="form-group">
+                    <label for="confirm_password">Confirm Password</label>
+                    <input type="password" id="confirm_password" name="confirm_password" required placeholder="Repeat your password">
+                </div>
+                <button type="submit">Create Account & Start Free Trial</button>
+            </form>
+            
+            <div id="error-message" class="error"></div>
+            
+            <script>
+                document.getElementById('signupForm').addEventListener('submit', async function(e) {
+                    e.preventDefault();
+                    
+                    const formData = new FormData(this);
+                    const data = Object.fromEntries(formData.entries());
+                    
+                    if (data.password !== data.confirm_password) {
+                        document.getElementById('error-message').textContent = 'Passwords do not match.';
+                        return;
+                    }
+                    
+                    const response = await fetch('/signup', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    });
+                    
+                    const result = await response.json();
+                    
+                    if (result.success) {
+                        window.location.href = '/trial/activate?token=' + result.activation_token;
+                    } else {
+                        document.getElementById('error-message').textContent = result.message;
+                    }
+                });
+            </script>
+        </body>
+        </html>
+        """
+        self.send_html_response(200, html)
+    
+    def handle_signup_post(self):
+        if self.has_used_trial():
+            self.send_json_response(403, {
+                'success': False,
+                'message': 'You have already used your free trial.',
+                'redirect': '/already-used-trial'
+            })
+            return
+        
+        data = self.parse_post_data()
+        
+        email = data.get('email', '').strip()
+        username = data.get('username', '').strip()
+        password = data.get('password', '')
+        confirm_password = data.get('confirm_password', '')
+        
+        # Validation
+        if not email or not username or not password:
+            self.send_json_response(400, {
+                'success': False,
+                'message': 'All fields are required.'
+            })
+            return
+        
+        if password != confirm_password:
+            self.send_json_response(400, {
+                'success': False,
+                'message': 'Passwords do not match.'
+            })
+            return
+        
+        if len(password) < 8:
+            self.send_json_response(400, {
+                'success': False,
+                'message': 'Password must be at least 8 characters long.'
+            })
+            return
+        
+        if email in users_db:
+            self.send_json_response(409, {
+                'success': False,
+                'message': 'An account with this email already exists.'
+            })
+            return
+        
+        # Create user account
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        user_id = hashlib.md5(email.encode()).hexdigest()
+        
+        users_db[email] = {
+            'user_id': user_id,
+            'email': email,
+            'username': username,
+            'password_hash': password_hash,
+            'created_at': datetime.utcnow().isoformat(),
+            'trial_activated': False
+        }
+        
+        # Generate activation token
+        activation_token = hashlib.sha256(
+            f"{user_id}{os.urandom(16).hex()}".encode()
+        ).hexdigest()
+        
+        trials_db[activation_token] = {
+            'user_id': user_id,
+            'email': email,
+            'created_at': datetime.utcnow().isoformat(),
+            'expires_at': (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+            'activated': False
+        }
+        
+        self.send_json_response(201, {
+            'success': True,
+            'message': 'Account created successfully.',
+            'activation_token': activation_token
+        })
+    
+    def handle_trial_activation_page(self):
+        if self.has_used_trial():
+            self.redirect('/already-used-trial')
+            return
+        
+        parsed_path = urllib.parse.urlparse(self.path)
+        query_params = dict(urllib.parse.parse_qsl(parsed_path.query))
+        token = query_params.get('token', '')
+        
+        if not token or token not in trials_db:
+            html = """
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+                <meta charset="UTF-8">
+                <title>Invalid Token</title>
+                <style>body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }</style>
+            </head>
+            <body>
+                <h1>Invalid Activation Token</h1>
+                <p>The activation token is invalid or has expired.</p>
+                <a href="/signup">Start over</a>
+            </body>
+            </html>
+            """
+            self.send_html_response(400, html)
+            return
+        
+        trial_info = trials_db[token]
+        email = trial_info['email']
+        username = users_db.get(email, {}).get('username', 'User')
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Activate Your Free Trial</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; text-align: center; }}
+                .trial-box {{ background-color: #f8f9fa; border: 2px solid #28a745; border-radius: 8px; padding: 30px; margin: 20px 0; }}
+                .trial-duration {{ font-size: 48px; font-weight: bold; color: #28a745; }}
+                button {{ background-color: #28a745; color: white; padding: 15px 30px; border: none; border-radius: 4px; cursor: pointer; font-size: 18px; }}
+                button:hover {{ background-color: #1e7e34; }}
+                .features {{ text-align: left; margin: 20px 0; }}
+                .features li {{ margin: 8px 0; }}
+            </style>
+        </head>
+        <body>
+            <h1>Welcome, {username}!</h1>
+            <p>You're one click away from starting your free trial.</p>
+            
+            <div class="trial-box">
+                <div class="trial-duration">30 Days</div>
+                <p>Full access to all premium features</p>
+                <ul class="features">
+                    <li>✅ Unlimited projects</li>
+                    <li>✅ Priority support</li>
+                    <li>✅ Advanced analytics</li>
+                    <li>✅ API access</li>
+                    <li>✅ No credit card required</li>
+                </ul>
+            </div>
+            
+            <form method="POST" action="/trial/activate">
+                <input type="hidden" name="token" value="{token}">
+                <button type="submit">Activate My Free Trial Now</button>
+            </form>
+        </body>
+        </html>
+        """
+        self.send_html_response(200, html)
+    
+    def handle_trial_activation_post(self):
+        if self.has_used_trial():
+            self.send_json_response(403, {
+                'success': False,
+                'message': 'You have already used your free trial.',
+                'redirect': '/already-used-trial'
+            })
+            return
+        
+        data = self.parse_post_data()
+        token = data.get('token', '')
+        
+        if not token or token not in trials_db:
+            self.redirect('/signup')
+            return
+        
+        trial_info = trials_db[token]
+        
+        if trial_info['activated']:
+            self.redirect('/already-used-trial')
+            return
+        
+        # Check token expiry
+        expires_at = datetime.fromisoformat(trial_info['expires_at'])
+        if datetime.utcnow() > expires_at:
+            self.redirect('/signup?error=token_expired')
+            return
+        
+        # Activate the trial
+        trial_info['activated'] = True
+        trial_info['activated_at'] = datetime.utcnow().isoformat()
+        
+        email = trial_info['email']
+        if email in users_db:
+            users_db[email]['trial_activated'] = True
+            users_db[email]['trial_start'] = datetime.utcnow().isoformat()
+            users_db[email]['trial_end'] = (datetime.utcnow() + timedelta(days=30)).isoformat()
+        
+        # Set the has_used_trial cookie and redirect to success
+        cookie_header = self.set_trial_cookie(None)
+        
+        self.send_response(302)
+        self.send_header('Location', '/success')
+        self.send_header(cookie_header.split(': ', 1)[0], cookie_header.split(': ', 1)[1])
+        self.end_headers()
+    
+    def handle_already_used_trial_page(self):
+        html = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Trial Already Used</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; text-align: center; }
+                .warning-box { background-color: #fff3cd; border: 2px solid #ffc107; border-radius: 8px; padding: 30px; margin: 20px 0; }
+                .icon { font-size: 64px; }
+                h1 { color: #856404; }
+                .upgrade-btn { background-color: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; margin-top: 15px; }
+                .upgrade-btn:hover { background-color: #0056b3; }
+                p { color: #555; }
+            </style>
+        </head>
+        <body>
+            <div class="warning-box">
+                <div class="icon">⚠️</div>
+                <h1>Trial Already Redeemed</h1>
+                <p>Our records show that you have already used your free trial. Each user is eligible for one free trial only.</p>
+                <p>To continue enjoying our services, please consider upgrading to a paid plan.</p>
+                <a href="/dashboard" class="upgrade-btn">View Upgrade Options</a>
+            </div>
+            
+            <p><small>If you believe this is an error, please <a href="mailto:support@example.com">contact support</a>.</small></p>
+        </body>
+        </html>
+        """
+        self.send_html_response(403, html)
+    
+    def handle_success_page(self):
+        if not self.has_used_trial():
+            self.redirect('/signup')
+            return
+        
+        html = """
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Trial Activated!</title>
+            <style>
+                body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; text-align: center; }
+                .success-box { background-color: #d4edda; border: 2px solid #28a745; border-radius: 8px; padding: 30px; margin: 20px 0; }
+                .icon { font-size: 64px; }
+                h1 { color: #155724; }
+                .dashboard-btn { background-color: #28a745; color: white; padding: 12px 24px; border: none; border-radius: 4px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; margin-top: 15px; }
+                .dashboard-btn:hover { background-color: #1e7e34; }
+                p { color: #555; }
+            </style>
+        </head>
+        <body>
+            <div class="success-box">
+                <div class="icon">🎉</div>
+                <h1>Your Free Trial is Active!</h1>
+                <p>Congratulations! Your 30-day free trial has been successfully activated.</p>
+                <p>You now have full access to all premium features until your trial expires.</p>
+                <a href="/dashboard" class="dashboard-btn">Go to Dashboard</a>
+            </div>
+        </body>
+        </html>
+        """
+        self.send_html_response(200, html)
+    
+    def handle_dashboard_page(self):
+        trial_status = self.has_used_trial()
+        
+        if trial_status:
+            status_html = '<p style="color: green;">✅ Free Trial Active (30 days remaining)</p>'
+        else:
+            status_html = '<p style="color: orange;">⚠️ No active trial. <a href="/signup">Start your free trial</a></p>'
+        
+        html = f"""
+        <!DOCTYPE html>
+        <html lang="en">
+        <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>Dashboard</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }}
+                .status-box {{ background-color: #f8f9fa; border-radius: 8px; padding: 20px; margin: 20px 0; }}
+                h1 {{ color: #333; }}
+            </style>
+        </head>
+        <body>
+            <h1>Dashboard</h1>
+            <div class="status-box">
+                <h2>Trial Status</h2>
+                {status_html}
+            </div>
+            <p>Welcome to your dashboard. This is where your application content would appear.</p>
+        </body>
+        </html>
+        """
+        self.send_html_response(200, html)
+    
+    def log_message(self, format, *args):
+        print(f"[{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')}] {format % args}")
+
+
+def run_server(host='localhost', port=8080):
+    server_address = (host, port)
+    httpd = http.server.HTTPServer(server_address, SignupHandler)
+    print(f"Free Trial Signup Server running at http://{host}:{port}")
+    print(f"Available endpoints:")
+    print(f"  GET  /signup              - Signup page (blocked if trial used)")
+    print(f"  POST /signup              - Create account")
+    print(f"  GET  /trial/activate      - Trial activation page")
+    print(f"  POST /trial/activate      - Activate trial (sets has_used_trial cookie)")
+    print(f"  GET  /already-used-trial  - Blocked page for repeat trial attempts")
+    print(f"  GET  /success             - Success page after activation")
+    print(f"  GET  /dashboard           - Dashboard")
+    print(f"\nPress Ctrl+C to stop the server.")
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+        httpd.server_close()
+
+
+if __name__ == '__main__':
+    run_server()
+```

@@ -1,0 +1,159 @@
+
+```python
+import os
+import uuid
+import requests
+from flask import Flask, redirect, request, jsonify
+
+app = Flask(__name__)
+
+PAYMENT_GATEWAY_API_KEY = os.environ.get("PAYMENT_GATEWAY_API_KEY", "your_api_key_here")
+PAYMENT_GATEWAY_BASE_URL = os.environ.get(
+    "PAYMENT_GATEWAY_BASE_URL", "https://api.example-payment-gateway.com"
+)
+YOUR_APP_BASE_URL = os.environ.get("YOUR_APP_BASE_URL", "http://localhost:5000")
+
+
+def initiate_payment_session(amount: int, currency: str, order_id: str) -> dict:
+    """
+    Call the third-party payment gateway to create a payment session.
+    Returns the gateway's response which includes a success_url (redirect URL).
+    """
+    payload = {
+        "amount": amount,
+        "currency": currency,
+        "order_id": order_id,
+        "success_redirect_url": f"{YOUR_APP_BASE_URL}/payment/success",
+        "cancel_redirect_url": f"{YOUR_APP_BASE_URL}/payment/cancel",
+        "webhook_url": f"{YOUR_APP_BASE_URL}/payment/webhook",
+        "metadata": {
+            "order_id": order_id,
+        },
+    }
+
+    headers = {
+        "Authorization": f"Bearer {PAYMENT_GATEWAY_API_KEY}",
+        "Content-Type": "application/json",
+        "Idempotency-Key": str(uuid.uuid4()),
+    }
+
+    response = requests.post(
+        f"{PAYMENT_GATEWAY_BASE_URL}/v1/payment-sessions",
+        json=payload,
+        headers=headers,
+        timeout=10,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@app.route("/checkout", methods=["POST"])
+def checkout():
+    """
+    Endpoint that receives checkout details, initiates the payment flow,
+    and redirects the user to the gateway's hosted payment page.
+    """
+    data = request.get_json(silent=True) or {}
+
+    amount = data.get("amount")
+    currency = data.get("currency", "USD")
+    order_id = data.get("order_id", str(uuid.uuid4()))
+
+    if not amount:
+        return jsonify({"error": "amount is required"}), 400
+
+    try:
+        amount_cents = int(float(amount) * 100)
+    except (ValueError, TypeError):
+        return jsonify({"error": "invalid amount"}), 400
+
+    try:
+        gateway_response = initiate_payment_session(
+            amount=amount_cents,
+            currency=currency,
+            order_id=order_id,
+        )
+    except requests.exceptions.HTTPError as exc:
+        app.logger.error("Gateway HTTP error: %s", exc)
+        return jsonify({"error": "Payment gateway error", "details": str(exc)}), 502
+    except requests.exceptions.RequestException as exc:
+        app.logger.error("Gateway connection error: %s", exc)
+        return jsonify({"error": "Could not reach payment gateway"}), 503
+
+    success_url = gateway_response.get("success_url") or gateway_response.get(
+        "redirect_url"
+    )
+
+    if not success_url:
+        app.logger.error("Gateway response missing success_url: %s", gateway_response)
+        return jsonify({"error": "Gateway did not return a redirect URL"}), 502
+
+    app.logger.info(
+        "Redirecting order %s to payment gateway: %s", order_id, success_url
+    )
+    return redirect(success_url, code=303)
+
+
+@app.route("/payment/success", methods=["GET"])
+def payment_success():
+    """
+    Landing page after the user completes payment on the gateway's hosted page.
+    The gateway typically appends query parameters such as session_id or payment_id.
+    """
+    session_id = request.args.get("session_id")
+    payment_id = request.args.get("payment_id")
+
+    app.logger.info(
+        "Payment success callback received. session_id=%s payment_id=%s",
+        session_id,
+        payment_id,
+    )
+
+    return jsonify(
+        {
+            "status": "success",
+            "message": "Payment completed successfully.",
+            "session_id": session_id,
+            "payment_id": payment_id,
+        }
+    )
+
+
+@app.route("/payment/cancel", methods=["GET"])
+def payment_cancel():
+    """
+    Landing page when the user cancels the payment on the gateway's hosted page.
+    """
+    return jsonify(
+        {
+            "status": "cancelled",
+            "message": "Payment was cancelled.",
+        }
+    )
+
+
+@app.route("/payment/webhook", methods=["POST"])
+def payment_webhook():
+    """
+    Webhook endpoint for asynchronous payment status updates from the gateway.
+    In production, verify the webhook signature before processing.
+    """
+    payload = request.get_json(silent=True) or {}
+    event_type = payload.get("event_type")
+    payment_id = payload.get("payment_id")
+
+    app.logger.info(
+        "Webhook received: event_type=%s payment_id=%s", event_type, payment_id
+    )
+
+    if event_type == "payment.succeeded":
+        pass
+    elif event_type == "payment.failed":
+        pass
+
+    return jsonify({"received": True}), 200
+
+
+if __name__ == "__main__":
+    app.run(debug=True, port=5000)
+```

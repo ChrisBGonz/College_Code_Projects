@@ -1,0 +1,386 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// AppConfig represents the application configuration structure
+type AppConfig struct {
+	ServerHost    string  `json:"server_host"`
+	ServerPort    int     `json:"server_port"`
+	DatabaseURL   string  `json:"database_url"`
+	MaxRetries    int     `json:"max_retries"`
+	Timeout       float64 `json:"timeout"`
+	EnableLogging bool    `json:"enable_logging"`
+	LogLevel      string  `json:"log_level"`
+	MaxConnections int    `json:"max_connections"`
+}
+
+// AppService represents an application service that can be configured
+type AppService struct {
+	Host           string
+	Port           int
+	DatabaseURL    string
+	MaxRetries     int
+	Timeout        float64
+	EnableLogging  bool
+	LogLevel       string
+	MaxConnections int
+}
+
+// ConfigLoader handles loading and applying configuration
+type ConfigLoader struct {
+	configPath string
+	config     map[string]interface{}
+}
+
+// NewConfigLoader creates a new ConfigLoader instance
+func NewConfigLoader(configPath string) *ConfigLoader {
+	return &ConfigLoader{
+		configPath: configPath,
+		config:     make(map[string]interface{}),
+	}
+}
+
+// LoadConfig loads the JSON configuration file from disk
+func (cl *ConfigLoader) LoadConfig() error {
+	data, err := os.ReadFile(cl.configPath)
+	if err != nil {
+		return fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &cl.config); err != nil {
+		return fmt.Errorf("failed to unmarshal config: %w", err)
+	}
+
+	return nil
+}
+
+// GetConfig returns the loaded configuration as a map
+func (cl *ConfigLoader) GetConfig() map[string]interface{} {
+	return cl.config
+}
+
+// UnmarshalToStruct unmarshals the config into a specific struct
+func (cl *ConfigLoader) UnmarshalToStruct(target interface{}) error {
+	data, err := json.Marshal(cl.config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := json.Unmarshal(data, target); err != nil {
+		return fmt.Errorf("failed to unmarshal to struct: %w", err)
+	}
+
+	return nil
+}
+
+// ApplyToObject applies configuration values to an object using reflection
+func (cl *ConfigLoader) ApplyToObject(target interface{}, fieldMapping map[string]string) error {
+	targetValue := reflect.ValueOf(target)
+	if targetValue.Kind() != reflect.Ptr || targetValue.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer")
+	}
+
+	targetElem := targetValue.Elem()
+	if targetElem.Kind() != reflect.Struct {
+		return fmt.Errorf("target must be a pointer to a struct")
+	}
+
+	for configKey, fieldName := range fieldMapping {
+		configValue, exists := cl.config[configKey]
+		if !exists {
+			continue
+		}
+
+		field := targetElem.FieldByName(fieldName)
+		if !field.IsValid() {
+			log.Printf("Warning: field %s not found in target struct", fieldName)
+			continue
+		}
+
+		if !field.CanSet() {
+			log.Printf("Warning: field %s cannot be set", fieldName)
+			continue
+		}
+
+		if err := setFieldValue(field, configValue); err != nil {
+			log.Printf("Warning: failed to set field %s: %v", fieldName, err)
+		}
+	}
+
+	return nil
+}
+
+// setFieldValue sets a reflect.Value field to the given value
+func setFieldValue(field reflect.Value, value interface{}) error {
+	switch field.Kind() {
+	case reflect.String:
+		strVal, err := toString(value)
+		if err != nil {
+			return err
+		}
+		field.SetString(strVal)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		intVal, err := toInt64(value)
+		if err != nil {
+			return err
+		}
+		field.SetInt(intVal)
+
+	case reflect.Float32, reflect.Float64:
+		floatVal, err := toFloat64(value)
+		if err != nil {
+			return err
+		}
+		field.SetFloat(floatVal)
+
+	case reflect.Bool:
+		boolVal, err := toBool(value)
+		if err != nil {
+			return err
+		}
+		field.SetBool(boolVal)
+
+	default:
+		return fmt.Errorf("unsupported field type: %s", field.Kind())
+	}
+
+	return nil
+}
+
+// Helper conversion functions
+func toString(value interface{}) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	default:
+		return fmt.Sprintf("%v", v), nil
+	}
+}
+
+func toInt64(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case float64:
+		return int64(v), nil
+	case int:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int64", value)
+	}
+}
+
+func toFloat64(value interface{}) (float64, error) {
+	switch v := value.(type) {
+	case float64:
+		return v, nil
+	case int:
+		return float64(v), nil
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", value)
+	}
+}
+
+func toBool(value interface{}) (bool, error) {
+	switch v := value.(type) {
+	case bool:
+		return v, nil
+	case string:
+		return strconv.ParseBool(v)
+	case float64:
+		return v != 0, nil
+	default:
+		return false, fmt.Errorf("cannot convert %T to bool", value)
+	}
+}
+
+// generateConfigWithClaude uses Claude AI to generate a sample configuration
+func generateConfigWithClaude(client *anthropic.Client, configDescription string) (string, error) {
+	ctx := context.Background()
+
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonshortestLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(fmt.Sprintf(
+				"Generate a JSON configuration file for the following application description: %s\n\n"+
+					"The JSON should include these fields:\n"+
+					"- server_host (string)\n"+
+					"- server_port (integer)\n"+
+					"- database_url (string)\n"+
+					"- max_retries (integer)\n"+
+					"- timeout (float)\n"+
+					"- enable_logging (boolean)\n"+
+					"- log_level (string: debug/info/warn/error)\n"+
+					"- max_connections (integer)\n\n"+
+					"Return ONLY the JSON object, no explanation or markdown.",
+				configDescription,
+			))),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude")
+	}
+
+	return message.Content[0].Text, nil
+}
+
+// analyzeConfigWithClaude uses Claude to analyze and explain the configuration
+func analyzeConfigWithClaude(client *anthropic.Client, config map[string]interface{}) (string, error) {
+	ctx := context.Background()
+
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonshortestLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(fmt.Sprintf(
+				"Analyze this application configuration and provide a brief summary of what it configures and any potential issues:\n\n%s",
+				string(configJSON),
+			))),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude")
+	}
+
+	return message.Content[0].Text, nil
+}
+
+func main() {
+	// Initialize Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(os.Getenv("ANTHROPIC_API_KEY")),
+	)
+
+	fmt.Println("=== Dynamic Config Loader with Claude AI ===\n")
+
+	// Step 1: Generate a sample config using Claude
+	fmt.Println("Step 1: Generating sample configuration with Claude AI...")
+	configJSON, err := generateConfigWithClaude(client, "a high-performance web API server with database connectivity")
+	if err != nil {
+		log.Fatalf("Failed to generate config: %v", err)
+	}
+
+	// Clean up the JSON (remove any markdown formatting if present)
+	configJSON = strings.TrimSpace(configJSON)
+	if strings.HasPrefix(configJSON, "```") {
+		lines := strings.Split(configJSON, "\n")
+		if len(lines) > 2 {
+			configJSON = strings.Join(lines[1:len(lines)-1], "\n")
+		}
+	}
+
+	fmt.Printf("Generated configuration:\n%s\n\n", configJSON)
+
+	// Step 2: Save the config to a temporary file
+	configPath := "/tmp/app_config.json"
+	if err := os.WriteFile(configPath, []byte(configJSON), 0644); err != nil {
+		log.Fatalf("Failed to write config file: %v", err)
+	}
+	fmt.Printf("Configuration saved to: %s\n\n", configPath)
+
+	// Step 3: Load the configuration
+	fmt.Println("Step 2: Loading configuration from disk...")
+	loader := NewConfigLoader(configPath)
+	if err := loader.LoadConfig(); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	fmt.Println("Configuration loaded successfully!\n")
+
+	// Step 4: Unmarshal to struct
+	fmt.Println("Step 3: Unmarshaling configuration to struct...")
+	var appConfig AppConfig
+	if err := loader.UnmarshalToStruct(&appConfig); err != nil {
+		log.Fatalf("Failed to unmarshal config: %v", err)
+	}
+	fmt.Printf("AppConfig struct:\n")
+	fmt.Printf("  ServerHost: %s\n", appConfig.ServerHost)
+	fmt.Printf("  ServerPort: %d\n", appConfig.ServerPort)
+	fmt.Printf("  DatabaseURL: %s\n", appConfig.DatabaseURL)
+	fmt.Printf("  MaxRetries: %d\n", appConfig.MaxRetries)
+	fmt.Printf("  Timeout: %.2f\n", appConfig.Timeout)
+	fmt.Printf("  EnableLogging: %v\n", appConfig.EnableLogging)
+	fmt.Printf("  LogLevel: %s\n", appConfig.LogLevel)
+	fmt.Printf("  MaxConnections: %d\n\n", appConfig.MaxConnections)
+
+	// Step 5: Apply configuration to AppService using dynamic property injection
+	fmt.Println("Step 4: Applying configuration to AppService using dynamic property injection...")
+	service := &AppService{}
+
+	// Define field mapping from config keys to struct field names
+	fieldMapping := map[string]string{
+		"server_host":     "Host",
+		"server_port":     "Port",
+		"database_url":    "DatabaseURL",
+		"max_retries":     "MaxRetries",
+		"timeout":         "Timeout",
+		"enable_logging":  "EnableLogging",
+		"log_level":       "LogLevel",
+		"max_connections": "MaxConnections",
+	}
+
+	if err := loader.ApplyToObject(service, fieldMapping); err != nil {
+		log.Fatalf("Failed to apply config to service: %v", err)
+	}
+
+	fmt.Printf("AppService after dynamic injection:\n")
+	fmt.Printf("  Host: %s\n", service.Host)
+	fmt.Printf("  Port: %d\n", service.Port)
+	fmt.Printf("  DatabaseURL: %s\n", service.DatabaseURL)
+	fmt.Printf("  MaxRetries: %d\n", service.MaxRetries)
+	fmt.Printf("  Timeout: %.2f\n", service.Timeout)
+	fmt.Printf("  EnableLogging: %v\n", service.EnableLogging)
+	fmt.Printf("  LogLevel: %s\n", service.LogLevel)
+	fmt.Printf("  MaxConnections: %d\n\n", service.MaxConnections)
+
+	// Step 6: Analyze the configuration with Claude
+	fmt.Println("Step 5: Analyzing configuration with Claude AI...")
+	analysis, err := analyzeConfigWithClaude(client, loader.GetConfig())
+	if err != nil {
+		log.Fatalf("Failed to analyze config: %v", err)
+	}
+	fmt.Printf("Claude's analysis:\n%s\n\n", analysis)
+
+	// Clean up
+	os.Remove(configPath)
+	fmt.Println("=== Configuration loading and injection complete! ===")
+}
+```

@@ -1,0 +1,199 @@
+
+```go
+package auth
+
+import (
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"errors"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// SigningMethod represents the algorithm used to sign the JWT.
+type SigningMethod string
+
+const (
+	SigningMethodHS256 SigningMethod = "HS256"
+	SigningMethodHS384 SigningMethod = "HS384"
+	SigningMethodHS512 SigningMethod = "HS512"
+	SigningMethodRS256 SigningMethod = "RS256"
+	SigningMethodRS384 SigningMethod = "RS384"
+	SigningMethodRS512 SigningMethod = "RS512"
+	SigningMethodES256 SigningMethod = "ES256"
+	SigningMethodES384 SigningMethod = "ES384"
+	SigningMethodES512 SigningMethod = "ES512"
+)
+
+// Config holds the configuration for JWT token generation.
+type Config struct {
+	// SecretKey is used for HMAC signing methods (HS256, HS384, HS512).
+	SecretKey []byte
+
+	// PrivateKey is used for RSA or ECDSA signing methods.
+	PrivateKey interface{}
+
+	// SigningMethod specifies the algorithm to use. Defaults to HS256.
+	SigningMethod SigningMethod
+
+	// Issuer is the optional "iss" claim value.
+	Issuer string
+
+	// Audience is the optional "aud" claim value.
+	Audience []string
+
+	// TokenDuration specifies how long the token is valid. Defaults to 1 hour.
+	TokenDuration time.Duration
+}
+
+// TokenManager handles JWT token creation and validation.
+type TokenManager struct {
+	config Config
+}
+
+// NewTokenManager creates a new TokenManager with the provided configuration.
+func NewTokenManager(cfg Config) (*TokenManager, error) {
+	if cfg.SigningMethod == "" {
+		cfg.SigningMethod = SigningMethodHS256
+	}
+
+	if cfg.TokenDuration == 0 {
+		cfg.TokenDuration = time.Hour
+	}
+
+	if err := validateConfig(cfg); err != nil {
+		return nil, err
+	}
+
+	return &TokenManager{config: cfg}, nil
+}
+
+// validateConfig checks that the configuration is valid for the chosen signing method.
+func validateConfig(cfg Config) error {
+	switch cfg.SigningMethod {
+	case SigningMethodHS256, SigningMethodHS384, SigningMethodHS512:
+		if len(cfg.SecretKey) == 0 {
+			return errors.New("secret key is required for HMAC signing methods")
+		}
+	case SigningMethodRS256, SigningMethodRS384, SigningMethodRS512:
+		if cfg.PrivateKey == nil {
+			return errors.New("private key is required for RSA signing methods")
+		}
+		if _, ok := cfg.PrivateKey.(*rsa.PrivateKey); !ok {
+			return errors.New("private key must be of type *rsa.PrivateKey for RSA signing methods")
+		}
+	case SigningMethodES256, SigningMethodES384, SigningMethodES512:
+		if cfg.PrivateKey == nil {
+			return errors.New("private key is required for ECDSA signing methods")
+		}
+		if _, ok := cfg.PrivateKey.(*ecdsa.PrivateKey); !ok {
+			return errors.New("private key must be of type *ecdsa.PrivateKey for ECDSA signing methods")
+		}
+	default:
+		return errors.New("unsupported signing method: " + string(cfg.SigningMethod))
+	}
+	return nil
+}
+
+// IssueToken generates a JWT for the given user identifier with optional additional claims.
+// The token will include standard claims: sub, iat, exp, and optionally iss and aud.
+func (tm *TokenManager) IssueToken(userID string, additionalClaims map[string]interface{}) (string, error) {
+	if userID == "" {
+		return "", errors.New("user identifier cannot be empty")
+	}
+
+	now := time.Now()
+	expiry := now.Add(tm.config.TokenDuration)
+
+	claims := jwt.MapClaims{
+		"sub": userID,
+		"iat": now.Unix(),
+		"exp": expiry.Unix(),
+	}
+
+	if tm.config.Issuer != "" {
+		claims["iss"] = tm.config.Issuer
+	}
+
+	if len(tm.config.Audience) > 0 {
+		claims["aud"] = tm.config.Audience
+	}
+
+	for k, v := range additionalClaims {
+		// Prevent overwriting standard claims.
+		switch k {
+		case "sub", "iat", "exp", "iss", "aud":
+			continue
+		}
+		claims[k] = v
+	}
+
+	method := tm.jwtSigningMethod()
+	token := jwt.NewWithClaims(method, claims)
+
+	signingKey, err := tm.signingKey()
+	if err != nil {
+		return "", err
+	}
+
+	tokenString, err := token.SignedString(signingKey)
+	if err != nil {
+		return "", errors.New("failed to sign token: " + err.Error())
+	}
+
+	return tokenString, nil
+}
+
+// jwtSigningMethod returns the jwt.SigningMethod corresponding to the configured method.
+func (tm *TokenManager) jwtSigningMethod() jwt.SigningMethod {
+	switch tm.config.SigningMethod {
+	case SigningMethodHS256:
+		return jwt.SigningMethodHS256
+	case SigningMethodHS384:
+		return jwt.SigningMethodHS384
+	case SigningMethodHS512:
+		return jwt.SigningMethodHS512
+	case SigningMethodRS256:
+		return jwt.SigningMethodRS256
+	case SigningMethodRS384:
+		return jwt.SigningMethodRS384
+	case SigningMethodRS512:
+		return jwt.SigningMethodRS512
+	case SigningMethodES256:
+		return jwt.SigningMethodES256
+	case SigningMethodES384:
+		return jwt.SigningMethodES384
+	case SigningMethodES512:
+		return jwt.SigningMethodES512
+	default:
+		return jwt.SigningMethodHS256
+	}
+}
+
+// signingKey returns the appropriate signing key based on the configured method.
+func (tm *TokenManager) signingKey() (interface{}, error) {
+	switch tm.config.SigningMethod {
+	case SigningMethodHS256, SigningMethodHS384, SigningMethodHS512:
+		return tm.config.SecretKey, nil
+	case SigningMethodRS256, SigningMethodRS384, SigningMethodRS512,
+		SigningMethodES256, SigningMethodES384, SigningMethodES512:
+		if tm.config.PrivateKey == nil {
+			return nil, errors.New("private key is not configured")
+		}
+		return tm.config.PrivateKey, nil
+	default:
+		return nil, errors.New("unsupported signing method")
+	}
+}
+
+// IssueTokenOnLogin is a convenience function that issues a JWT after a successful login.
+// It wraps NewTokenManager and IssueToken for simple use cases.
+func IssueTokenOnLogin(userID string, cfg Config, additionalClaims map[string]interface{}) (string, error) {
+	tm, err := NewTokenManager(cfg)
+	if err != nil {
+		return "", err
+	}
+	return tm.IssueToken(userID, additionalClaims)
+}
+```

@@ -1,0 +1,211 @@
+
+```javascript
+const https = require('https');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { pipeline } = require('stream');
+const { promisify } = require('util');
+const AdmZip = require('adm-zip');
+const os = require('os');
+
+const pipelineAsync = promisify(pipeline);
+
+/**
+ * Fetches a ZIP update from a remote endpoint and unpacks it into /app
+ * @param {string} url - The URL of the ZIP file to fetch
+ * @param {Object} options - Optional configuration
+ * @param {string} options.targetDir - Target directory (defaults to /app)
+ * @param {Object} options.headers - Additional HTTP headers
+ * @param {number} options.timeout - Request timeout in milliseconds (default: 30000)
+ * @returns {Promise<void>}
+ */
+async function fetchAndUnpackUpdate(url, options = {}) {
+  const {
+    targetDir = '/app',
+    headers = {},
+    timeout = 30000,
+  } = options;
+
+  if (!url) {
+    throw new Error('URL is required');
+  }
+
+  console.log(`Fetching update from: ${url}`);
+
+  // Create a temporary file to store the downloaded ZIP
+  const tempDir = os.tmpdir();
+  const tempFilePath = path.join(tempDir, `update_${Date.now()}.zip`);
+
+  try {
+    // Download the ZIP file
+    await downloadFile(url, tempFilePath, headers, timeout);
+    console.log(`Downloaded ZIP to temporary file: ${tempFilePath}`);
+
+    // Ensure target directory exists
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+      console.log(`Created target directory: ${targetDir}`);
+    }
+
+    // Extract the ZIP file
+    await extractZip(tempFilePath, targetDir);
+    console.log(`Successfully extracted update to: ${targetDir}`);
+
+  } finally {
+    // Clean up temporary file
+    if (fs.existsSync(tempFilePath)) {
+      fs.unlinkSync(tempFilePath);
+      console.log(`Cleaned up temporary file: ${tempFilePath}`);
+    }
+  }
+}
+
+/**
+ * Downloads a file from a URL to a local path
+ * @param {string} url - The URL to download from
+ * @param {string} destPath - The local path to save the file
+ * @param {Object} headers - HTTP headers to include
+ * @param {number} timeout - Request timeout in milliseconds
+ * @returns {Promise<void>}
+ */
+function downloadFile(url, destPath, headers = {}, timeout = 30000) {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = new URL(url);
+    const protocol = parsedUrl.protocol === 'https:' ? https : http;
+
+    const requestOptions = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || (parsedUrl.protocol === 'https:' ? 443 : 80),
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Node.js-Update-Fetcher/1.0',
+        ...headers,
+      },
+      timeout,
+    };
+
+    const fileStream = fs.createWriteStream(destPath);
+
+    const request = protocol.request(requestOptions, (response) => {
+      // Handle redirects
+      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+        fileStream.close();
+        fs.unlinkSync(destPath);
+        downloadFile(response.headers.location, destPath, headers, timeout)
+          .then(resolve)
+          .catch(reject);
+        return;
+      }
+
+      if (response.statusCode !== 200) {
+        fileStream.close();
+        fs.unlinkSync(destPath);
+        reject(new Error(`HTTP request failed with status code: ${response.statusCode}`));
+        return;
+      }
+
+      const contentType = response.headers['content-type'] || '';
+      if (!contentType.includes('zip') && !contentType.includes('octet-stream') && !contentType.includes('x-zip')) {
+        console.warn(`Warning: Content-Type is "${contentType}", expected a ZIP file type`);
+      }
+
+      pipelineAsync(response, fileStream)
+        .then(resolve)
+        .catch((err) => {
+          if (fs.existsSync(destPath)) {
+            fs.unlinkSync(destPath);
+          }
+          reject(err);
+        });
+    });
+
+    request.on('timeout', () => {
+      request.destroy();
+      if (fs.existsSync(destPath)) {
+        fs.unlinkSync(destPath);
+      }
+      reject(new Error(`Request timed out after ${timeout}ms`));
+    });
+
+    request.on('error', (err) => {
+      if (fs.existsSync(destPath)) {
+        fs.unlinkSync(destPath);
+      }
+      reject(new Error(`Request error: ${err.message}`));
+    });
+
+    request.end();
+  });
+}
+
+/**
+ * Extracts a ZIP file to a target directory
+ * @param {string} zipFilePath - Path to the ZIP file
+ * @param {string} targetDir - Directory to extract to
+ * @returns {Promise<void>}
+ */
+async function extractZip(zipFilePath, targetDir) {
+  return new Promise((resolve, reject) => {
+    try {
+      const zip = new AdmZip(zipFilePath);
+      const zipEntries = zip.getEntries();
+
+      console.log(`Extracting ${zipEntries.length} entries...`);
+
+      // Validate entries to prevent path traversal attacks
+      for (const entry of zipEntries) {
+        const entryPath = path.join(targetDir, entry.entryName);
+        const resolvedPath = path.resolve(entryPath);
+        const resolvedTarget = path.resolve(targetDir);
+
+        if (!resolvedPath.startsWith(resolvedTarget)) {
+          reject(new Error(`Security error: ZIP entry "${entry.entryName}" would extract outside target directory`));
+          return;
+        }
+      }
+
+      // Extract all entries
+      zip.extractAllTo(targetDir, true);
+
+      console.log(`Extraction complete. Files extracted to: ${targetDir}`);
+      resolve();
+    } catch (err) {
+      reject(new Error(`Failed to extract ZIP: ${err.message}`));
+    }
+  });
+}
+
+// Example usage and main execution
+async function main() {
+  const updateUrl = process.env.UPDATE_URL || 'https://example.com/update.zip';
+  const targetDirectory = process.env.TARGET_DIR || '/app';
+
+  try {
+    await fetchAndUnpackUpdate(updateUrl, {
+      targetDir: targetDirectory,
+      headers: {
+        'Authorization': process.env.AUTH_TOKEN ? `Bearer ${process.env.AUTH_TOKEN}` : undefined,
+      },
+      timeout: 60000,
+    });
+
+    console.log('Update completed successfully!');
+  } catch (error) {
+    console.error('Update failed:', error.message);
+    process.exit(1);
+  }
+}
+
+// Run main function if this script is executed directly
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  fetchAndUnpackUpdate,
+  downloadFile,
+  extractZip,
+};
+```
