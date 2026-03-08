@@ -1,0 +1,190 @@
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+import logging
+
+logging.basicConfig(level=logging.ERROR)
+logger = logging.getLogger(__name__)
+
+
+class DatabaseConnectionError(Exception):
+    def __init__(self, message: str = "Database connection failed", original_error: Exception = None):
+        self.message = message
+        self.original_error = original_error
+        super().__init__(self.message)
+
+
+app = FastAPI(
+    title="FastAPI Custom Exception Handler Demo",
+    description="Demonstrates custom exception handling for database connection errors",
+    version="1.0.0",
+)
+
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(request: Request, exc: DatabaseConnectionError) -> JSONResponse:
+    logger.error(
+        "DatabaseConnectionError on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc.message,
+        exc_info=exc.original_error,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "type": "DatabaseConnectionError",
+                "code": "DB_CONNECTION_FAILED",
+                "message": exc.message,
+                "detail": str(exc.original_error) if exc.original_error else None,
+                "path": str(request.url.path),
+                "method": request.method,
+            }
+        },
+        headers={"Retry-After": "30"},
+    )
+
+
+@app.exception_handler(OperationalError)
+async def sqlalchemy_operational_error_handler(request: Request, exc: OperationalError) -> JSONResponse:
+    logger.error(
+        "SQLAlchemy OperationalError on %s %s",
+        request.method,
+        request.url.path,
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "type": "OperationalError",
+                "code": "DB_OPERATIONAL_ERROR",
+                "message": "A database operational error occurred. Please try again later.",
+                "detail": str(exc.orig) if exc.orig else str(exc),
+                "path": str(request.url.path),
+                "method": request.method,
+            }
+        },
+        headers={"Retry-After": "30"},
+    )
+
+
+def get_db_connection():
+    """Simulate getting a database connection."""
+    engine = create_engine("postgresql://invalid_user:invalid_pass@localhost:9999/nonexistent_db")
+    return engine
+
+
+def simulate_db_query():
+    """Simulate a database query that might fail."""
+    try:
+        engine = get_db_connection()
+        with engine.connect() as connection:
+            result = connection.execute(text("SELECT 1"))
+            return result.fetchone()
+    except OperationalError as e:
+        raise DatabaseConnectionError(
+            message="Could not connect to the database. Please check your connection settings.",
+            original_error=e,
+        ) from e
+
+
+@app.get("/")
+async def root():
+    return {
+        "message": "FastAPI Custom Exception Handler Demo",
+        "endpoints": {
+            "/db/connect": "Triggers DatabaseConnectionError",
+            "/db/operational": "Triggers SQLAlchemy OperationalError directly",
+            "/db/success": "Simulates a successful DB response",
+            "/health": "Health check endpoint",
+        },
+    }
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy", "service": "fastapi-exception-demo"}
+
+
+@app.get("/db/connect")
+async def trigger_database_connection_error():
+    """
+    Endpoint that triggers a DatabaseConnectionError.
+    The custom exception handler will catch this and return a 503 response.
+    """
+    simulate_db_query()
+    return {"message": "This should not be reached"}
+
+
+@app.get("/db/operational")
+async def trigger_operational_error():
+    """
+    Endpoint that triggers an SQLAlchemy OperationalError directly.
+    The custom exception handler will catch this and return a 503 response.
+    """
+    try:
+        engine = create_engine("postgresql://bad_user:bad_pass@localhost:9999/bad_db")
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except OperationalError:
+        raise
+
+    return {"message": "This should not be reached"}
+
+
+@app.get("/db/custom")
+async def trigger_custom_error_with_message():
+    """
+    Endpoint that raises a DatabaseConnectionError with a custom message.
+    """
+    raise DatabaseConnectionError(
+        message="Primary database cluster is unreachable. Failover in progress.",
+        original_error=Exception("Connection timeout after 30s"),
+    )
+
+
+@app.get("/db/success")
+async def simulate_success():
+    """
+    Endpoint that simulates a successful database operation.
+    No exception is raised here.
+    """
+    return {
+        "status": "success",
+        "data": {
+            "id": 1,
+            "name": "Sample Record",
+            "value": 42,
+        },
+        "message": "Database query executed successfully",
+    }
+
+
+@app.get("/items/{item_id}")
+async def get_item(item_id: int):
+    """
+    Endpoint that simulates fetching an item from the database.
+    Raises DatabaseConnectionError if item_id is 0 (simulating DB failure).
+    """
+    if item_id == 0:
+        raise DatabaseConnectionError(
+            message=f"Failed to fetch item {item_id}: Database connection lost",
+            original_error=Exception("Connection reset by peer"),
+        )
+
+    return {
+        "item_id": item_id,
+        "name": f"Item {item_id}",
+        "description": "A sample item fetched from the database",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
+```

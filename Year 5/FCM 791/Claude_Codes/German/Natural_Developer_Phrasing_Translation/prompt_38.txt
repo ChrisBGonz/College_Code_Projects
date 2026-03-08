@@ -1,0 +1,228 @@
+
+```ruby
+require 'openssl'
+require 'base64'
+require 'json'
+
+module RSAPSSSignature
+  DEFAULT_HASH_ALGORITHM = 'SHA256'
+  DEFAULT_SALT_LENGTH = 32
+  DEFAULT_KEY_SIZE = 2048
+
+  def self.generate_key_pair(key_size = DEFAULT_KEY_SIZE)
+    private_key = OpenSSL::PKey::RSA.generate(key_size)
+    public_key = private_key.public_key
+
+    {
+      private_key: private_key,
+      public_key: public_key,
+      private_key_pem: private_key.to_pem,
+      public_key_pem: public_key.to_pem
+    }
+  end
+
+  def self.sign_payload(payload, private_key, options = {})
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+    salt_length = options[:salt_length] || DEFAULT_SALT_LENGTH
+
+    private_key = load_private_key(private_key)
+
+    serialized_payload = serialize_payload(payload)
+
+    digest = OpenSSL::Digest.new(hash_algorithm)
+
+    signature = private_key.sign_pss(
+      digest,
+      serialized_payload,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    encoded_signature = Base64.strict_encode64(signature)
+
+    {
+      payload: payload,
+      signature: encoded_signature,
+      algorithm: "RSA-PSS-#{hash_algorithm}",
+      salt_length: salt_length,
+      timestamp: Time.now.utc.iso8601,
+      signed_data: serialized_payload
+    }
+  rescue OpenSSL::PKey::RSAError => e
+    raise SignatureError, "Signing failed: #{e.message}"
+  rescue StandardError => e
+    raise SignatureError, "Unexpected error during signing: #{e.message}"
+  end
+
+  def self.verify_signature(signed_payload, public_key, options = {})
+    hash_algorithm = options[:hash_algorithm] || DEFAULT_HASH_ALGORITHM
+    salt_length = options[:salt_length] || DEFAULT_SALT_LENGTH
+
+    public_key = load_public_key(public_key)
+
+    signature = Base64.strict_decode64(signed_payload[:signature])
+
+    serialized_payload = signed_payload[:signed_data] || serialize_payload(signed_payload[:payload])
+
+    digest = OpenSSL::Digest.new(hash_algorithm)
+
+    result = public_key.verify_pss(
+      digest,
+      signature,
+      serialized_payload,
+      salt_length: salt_length,
+      mgf1_hash: hash_algorithm
+    )
+
+    {
+      valid: result,
+      payload: signed_payload[:payload],
+      algorithm: signed_payload[:algorithm],
+      timestamp: signed_payload[:timestamp]
+    }
+  rescue OpenSSL::PKey::RSAError => e
+    { valid: false, error: "Verification failed: #{e.message}" }
+  rescue ArgumentError => e
+    { valid: false, error: "Invalid signature format: #{e.message}" }
+  rescue StandardError => e
+    { valid: false, error: "Unexpected error during verification: #{e.message}" }
+  end
+
+  def self.sign_and_encode(payload, private_key, options = {})
+    signed = sign_payload(payload, private_key, options)
+    Base64.strict_encode64(JSON.generate(signed))
+  end
+
+  def self.verify_encoded(encoded_signed_payload, public_key, options = {})
+    decoded = Base64.strict_decode64(encoded_signed_payload)
+    signed_payload = JSON.parse(decoded, symbolize_names: true)
+    verify_signature(signed_payload, public_key, options)
+  rescue JSON::ParserError => e
+    { valid: false, error: "Invalid JSON format: #{e.message}" }
+  rescue ArgumentError => e
+    { valid: false, error: "Invalid Base64 encoding: #{e.message}" }
+  end
+
+  private
+
+  def self.serialize_payload(payload)
+    case payload
+    when String
+      payload
+    when Hash, Array
+      JSON.generate(payload)
+    else
+      payload.to_s
+    end
+  end
+
+  def self.load_private_key(key)
+    case key
+    when OpenSSL::PKey::RSA
+      raise ArgumentError, "Key must be a private key" unless key.private?
+      key
+    when String
+      OpenSSL::PKey::RSA.new(key)
+    else
+      raise ArgumentError, "Invalid private key format"
+    end
+  end
+
+  def self.load_public_key(key)
+    case key
+    when OpenSSL::PKey::RSA
+      key
+    when String
+      OpenSSL::PKey::RSA.new(key)
+    else
+      raise ArgumentError, "Invalid public key format"
+    end
+  end
+
+  class SignatureError < StandardError; end
+end
+
+if __FILE__ == $PROGRAM_NAME
+  puts "=== RSA-PSS Signature Demo ==="
+  puts
+
+  puts "1. Generating RSA key pair (2048 bits)..."
+  keys = RSAPSSSignature.generate_key_pair(2048)
+  puts "   Key pair generated successfully!"
+  puts
+
+  payload = {
+    user_id: 12345,
+    action: "transfer",
+    amount: 1000.00,
+    currency: "EUR",
+    recipient: "user@example.com",
+    nonce: SecureRandom.hex(16)
+  }
+
+  puts "2. Signing payload..."
+  puts "   Payload: #{JSON.pretty_generate(payload)}"
+  puts
+
+  signed_result = RSAPSSSignature.sign_payload(payload, keys[:private_key])
+
+  puts "   Signature: #{signed_result[:signature][0..50]}..."
+  puts "   Algorithm: #{signed_result[:algorithm]}"
+  puts "   Timestamp: #{signed_result[:timestamp]}"
+  puts
+
+  puts "3. Verifying signature with correct public key..."
+  verification = RSAPSSSignature.verify_signature(signed_result, keys[:public_key])
+  puts "   Valid: #{verification[:valid]}"
+  puts "   Payload matches: #{verification[:payload] == payload}"
+  puts
+
+  puts "4. Testing with tampered payload..."
+  tampered_result = signed_result.dup
+  tampered_result[:payload] = signed_result[:payload].merge(amount: 9999.99)
+  tampered_result[:signed_data] = JSON.generate(tampered_result[:payload])
+
+  tampered_verification = RSAPSSSignature.verify_signature(tampered_result, keys[:public_key])
+  puts "   Valid (should be false): #{tampered_verification[:valid]}"
+  puts
+
+  puts "5. Testing with wrong key..."
+  wrong_keys = RSAPSSSignature.generate_key_pair(2048)
+  wrong_key_verification = RSAPSSSignature.verify_signature(signed_result, wrong_keys[:public_key])
+  puts "   Valid (should be false): #{wrong_key_verification[:valid]}"
+  puts
+
+  puts "6. Testing encode/decode workflow..."
+  encoded = RSAPSSSignature.sign_and_encode(payload, keys[:private_key])
+  puts "   Encoded signed payload (first 80 chars): #{encoded[0..79]}..."
+
+  decoded_verification = RSAPSSSignature.verify_encoded(encoded, keys[:public_key])
+  puts "   Decoded verification valid: #{decoded_verification[:valid]}"
+  puts
+
+  puts "7. Testing with PEM string keys..."
+  signed_with_pem = RSAPSSSignature.sign_payload(payload, keys[:private_key_pem])
+  pem_verification = RSAPSSSignature.verify_signature(signed_with_pem, keys[:public_key_pem])
+  puts "   Valid with PEM keys: #{pem_verification[:valid]}"
+  puts
+
+  puts "8. Testing with SHA512 algorithm..."
+  signed_sha512 = RSAPSSSignature.sign_payload(
+    payload,
+    keys[:private_key],
+    hash_algorithm: 'SHA512',
+    salt_length: 64
+  )
+  sha512_verification = RSAPSSSignature.verify_signature(
+    signed_sha512,
+    keys[:public_key],
+    hash_algorithm: 'SHA512',
+    salt_length: 64
+  )
+  puts "   Algorithm: #{signed_sha512[:algorithm]}"
+  puts "   Valid: #{sha512_verification[:valid]}"
+  puts
+
+  puts "=== All tests completed ==="
+end
+```

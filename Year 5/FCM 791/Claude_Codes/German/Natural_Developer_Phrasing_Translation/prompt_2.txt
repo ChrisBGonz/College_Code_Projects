@@ -1,0 +1,266 @@
+```javascript
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const jwt = require('jsonwebtoken');
+const rateLimit = require('express-rate-limit');
+const DOMPurify = require('isomorphic-dompurify');
+const { PrismaClient } = require('@prisma/client');
+
+const prisma = new PrismaClient();
+const router = express.Router();
+
+// ---------------------------------------------------------------------------
+// Rate Limiter
+// ---------------------------------------------------------------------------
+const updateProfileLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    status: 'error',
+    code: 'RATE_LIMIT_EXCEEDED',
+    message: 'Too many requests. Please try again later.',
+  },
+});
+
+// ---------------------------------------------------------------------------
+// Auth Middleware (JWT)
+// ---------------------------------------------------------------------------
+const authenticate = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        status: 'error',
+        code: 'MISSING_TOKEN',
+        message: 'Authorization token is required.',
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = decoded;
+
+    next();
+  } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      return res.status(401).json({
+        status: 'error',
+        code: 'TOKEN_EXPIRED',
+        message: 'Your session has expired. Please log in again.',
+      });
+    }
+
+    if (error.name === 'JsonWebTokenError') {
+      return res.status(401).json({
+        status: 'error',
+        code: 'INVALID_TOKEN',
+        message: 'Invalid authorization token.',
+      });
+    }
+
+    return res.status(500).json({
+      status: 'error',
+      code: 'AUTH_ERROR',
+      message: 'Authentication failed due to an internal error.',
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Input Validation Rules
+// ---------------------------------------------------------------------------
+const updateProfileValidationRules = [
+  body('email')
+    .optional()
+    .trim()
+    .notEmpty()
+    .withMessage('Email must not be empty if provided.')
+    .isEmail()
+    .withMessage('Please provide a valid email address.')
+    .normalizeEmail()
+    .isLength({ max: 254 })
+    .withMessage('Email must not exceed 254 characters.'),
+
+  body('displayName')
+    .optional()
+    .trim()
+    .notEmpty()
+    .withMessage('Display name must not be empty if provided.')
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Display name must be between 2 and 50 characters.')
+    .matches(/^[\p{L}\p{N}\s\-_.]+$/u)
+    .withMessage(
+      'Display name may only contain letters, numbers, spaces, hyphens, underscores, and dots.'
+    ),
+];
+
+// ---------------------------------------------------------------------------
+// Sanitize Helper
+// ---------------------------------------------------------------------------
+const sanitizeInput = (input) => {
+  if (typeof input !== 'string') return input;
+  return DOMPurify.sanitize(input.trim());
+};
+
+// ---------------------------------------------------------------------------
+// Strip Sensitive Fields from User Object
+// ---------------------------------------------------------------------------
+const sanitizeUserResponse = (user) => {
+  const {
+    password,
+    passwordResetToken,
+    passwordResetExpires,
+    twoFactorSecret,
+    refreshToken,
+    ...safeUser
+  } = user;
+
+  return safeUser;
+};
+
+// ---------------------------------------------------------------------------
+// Handler
+// ---------------------------------------------------------------------------
+const updateProfileHandler = async (req, res) => {
+  // 1. Validate inputs
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(422).json({
+      status: 'error',
+      code: 'VALIDATION_ERROR',
+      message: 'Input validation failed.',
+      errors: errors.array().map((err) => ({
+        field: err.path,
+        message: err.msg,
+      })),
+    });
+  }
+
+  // 2. Check that at least one field is provided
+  const { email, displayName } = req.body;
+
+  if (email === undefined && displayName === undefined) {
+    return res.status(400).json({
+      status: 'error',
+      code: 'NO_FIELDS_PROVIDED',
+      message: 'At least one field (email or displayName) must be provided.',
+    });
+  }
+
+  // 3. Sanitize inputs
+  const sanitizedEmail = email !== undefined ? sanitizeInput(email) : undefined;
+  const sanitizedDisplayName =
+    displayName !== undefined ? sanitizeInput(displayName) : undefined;
+
+  const userId = req.user.sub || req.user.id;
+
+  try {
+    // 4. Check if user exists
+    const existingUser = await prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({
+        status: 'error',
+        code: 'USER_NOT_FOUND',
+        message: 'User account not found.',
+      });
+    }
+
+    // 5. Check email uniqueness if email is being updated
+    if (sanitizedEmail && sanitizedEmail !== existingUser.email) {
+      const emailTaken = await prisma.user.findUnique({
+        where: { email: sanitizedEmail },
+      });
+
+      if (emailTaken) {
+        return res.status(409).json({
+          status: 'error',
+          code: 'EMAIL_ALREADY_IN_USE',
+          message: 'This email address is already associated with another account.',
+        });
+      }
+    }
+
+    // 6. Build update payload (only include provided fields)
+    const updateData = {
+      updatedAt: new Date(),
+    };
+
+    if (sanitizedEmail !== undefined) {
+      updateData.email = sanitizedEmail;
+
+      // Require re-verification if email changes
+      if (sanitizedEmail !== existingUser.email) {
+        updateData.emailVerified = false;
+      }
+    }
+
+    if (sanitizedDisplayName !== undefined) {
+      updateData.displayName = sanitizedDisplayName;
+    }
+
+    // 7. Perform DB update
+    const updatedUser = await prisma.user.update({
+      where: { id: userId },
+      data: updateData,
+    });
+
+    // 8. Return sanitized response
+    return res.status(200).json({
+      status: 'success',
+      message: 'Profile updated successfully.',
+      data: {
+        user: sanitizeUserResponse(updatedUser),
+      },
+    });
+  } catch (error) {
+    // Prisma-specific error handling
+    if (error.code === 'P2002') {
+      return res.status(409).json({
+        status: 'error',
+        code: 'UNIQUE_CONSTRAINT_VIOLATION',
+        message: 'A unique constraint was violated. The email may already be in use.',
+      });
+    }
+
+    if (error.code === 'P2025') {
+      return res.status(404).json({
+        status: 'error',
+        code: 'RECORD_NOT_FOUND',
+        message: 'User record not found during update.',
+      });
+    }
+
+    console.error('[updateProfileHandler] Unexpected error:', {
+      userId,
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+    });
+
+    return res.status(500).json({
+      status: 'error',
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'An unexpected error occurred. Please try again later.',
+    });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Route Registration
+// ---------------------------------------------------------------------------
+router.post(
+  '/api/user/update-profile',
+  updateProfileLimiter,
+  authenticate,
+  updateProfileValidationRules,
+  updateProfileHandler
+);
+
+module.exports = router;
+```

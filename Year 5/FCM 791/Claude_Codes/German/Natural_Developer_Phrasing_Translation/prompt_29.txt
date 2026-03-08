@@ -1,0 +1,275 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Maven Dependency Updater using Claude AI
+Automatically updates all dependencies in a Java/Maven project to their latest versions.
+"""
+
+import anthropic
+import subprocess
+import sys
+import os
+import re
+from pathlib import Path
+
+
+def run_command(command: str, cwd: str = None) -> tuple[int, str, str]:
+    """Run a shell command and return exit code, stdout, stderr."""
+    result = subprocess.run(
+        command,
+        shell=True,
+        capture_output=True,
+        text=True,
+        cwd=cwd
+    )
+    return result.returncode, result.stdout, result.stderr
+
+
+def get_maven_dependency_updates(project_path: str) -> str:
+    """Run Maven versions plugin to get available updates."""
+    print("Checking for available dependency updates...")
+    
+    # Run versions:display-dependency-updates
+    exit_code, stdout, stderr = run_command(
+        "mvn versions:display-dependency-updates -q",
+        cwd=project_path
+    )
+    
+    dep_updates = stdout if exit_code == 0 else f"Error: {stderr}"
+    
+    # Run versions:display-plugin-updates
+    exit_code, stdout, stderr = run_command(
+        "mvn versions:display-plugin-updates -q",
+        cwd=project_path
+    )
+    
+    plugin_updates = stdout if exit_code == 0 else f"Error: {stderr}"
+    
+    return f"Dependency Updates:\n{dep_updates}\n\nPlugin Updates:\n{plugin_updates}"
+
+
+def read_pom_file(project_path: str) -> str:
+    """Read the pom.xml file content."""
+    pom_path = Path(project_path) / "pom.xml"
+    if not pom_path.exists():
+        raise FileNotFoundError(f"pom.xml not found in {project_path}")
+    
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def write_pom_file(project_path: str, content: str):
+    """Write updated content to pom.xml."""
+    pom_path = Path(project_path) / "pom.xml"
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+
+def backup_pom_file(project_path: str):
+    """Create a backup of the original pom.xml."""
+    pom_path = Path(project_path) / "pom.xml"
+    backup_path = Path(project_path) / "pom.xml.backup"
+    
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    with open(backup_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    print(f"Backup created: {backup_path}")
+
+
+def update_dependencies_with_claude(project_path: str):
+    """Use Claude to analyze and update Maven dependencies."""
+    client = anthropic.Anthropic()
+    
+    # Read current pom.xml
+    print("Reading pom.xml...")
+    pom_content = read_pom_file(project_path)
+    
+    # Get available updates from Maven
+    print("Running Maven versions plugin...")
+    updates_info = get_maven_dependency_updates(project_path)
+    
+    # Create backup
+    backup_pom_file(project_path)
+    
+    print("\nAnalyzing dependencies with Claude AI...")
+    print("=" * 60)
+    
+    # Prepare the prompt for Claude
+    prompt = f"""You are a Maven dependency management expert. I need you to update a Maven project's pom.xml to use the latest available versions of all dependencies and plugins.
+
+Here is the current pom.xml content:
+```xml
+{pom_content}
+```
+
+Here is the output from Maven versions plugin showing available updates:
+```
+{updates_info}
+```
+
+Please analyze the pom.xml and the available updates, then provide the complete updated pom.xml with all dependencies and plugins updated to their latest stable versions.
+
+Important guidelines:
+1. Update ALL dependencies to their latest stable versions (not SNAPSHOT or RC versions unless already using them)
+2. Update ALL plugin versions to their latest stable versions
+3. Maintain the exact same XML structure and formatting
+4. Keep all existing configuration, properties, and settings intact
+5. If a dependency version is managed through a property (like ${{spring.version}}), update the property value
+6. Ensure compatibility between related dependencies (e.g., Spring Boot components should use the same version)
+7. Do not remove any dependencies or plugins
+8. Provide the complete updated pom.xml, not just the changes
+
+Please provide ONLY the complete updated pom.xml content, starting with <?xml and ending with </project>. No explanations or markdown formatting."""
+
+    # Use streaming to get the response
+    updated_pom = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            updated_pom += text
+    
+    print("\n" + "=" * 60)
+    
+    # Extract XML content if wrapped in markdown
+    if "```xml" in updated_pom:
+        match = re.search(r'```xml\n(.*?)```', updated_pom, re.DOTALL)
+        if match:
+            updated_pom = match.group(1).strip()
+    elif "```" in updated_pom:
+        match = re.search(r'```\n(.*?)```', updated_pom, re.DOTALL)
+        if match:
+            updated_pom = match.group(1).strip()
+    
+    # Validate that we got valid XML
+    if not updated_pom.strip().startswith("<?xml") and not updated_pom.strip().startswith("<project"):
+        print("\nWarning: Response doesn't appear to be valid XML. Checking for XML content...")
+        # Try to find XML content
+        xml_match = re.search(r'(<\?xml.*?</project>)', updated_pom, re.DOTALL)
+        if xml_match:
+            updated_pom = xml_match.group(1)
+        else:
+            print("Error: Could not extract valid XML from response. Original pom.xml preserved.")
+            return
+    
+    # Write updated pom.xml
+    print("\nWriting updated pom.xml...")
+    write_pom_file(project_path, updated_pom)
+    print("pom.xml updated successfully!")
+    
+    # Verify the update by running Maven
+    print("\nVerifying updated pom.xml with Maven...")
+    exit_code, stdout, stderr = run_command(
+        "mvn validate -q",
+        cwd=project_path
+    )
+    
+    if exit_code == 0:
+        print("✓ Maven validation successful!")
+        
+        # Show summary of changes
+        print("\nGenerating update summary...")
+        show_update_summary(project_path)
+    else:
+        print(f"✗ Maven validation failed: {stderr}")
+        print("Restoring backup...")
+        backup_path = Path(project_path) / "pom.xml.backup"
+        if backup_path.exists():
+            with open(backup_path, 'r') as f:
+                original_content = f.read()
+            write_pom_file(project_path, original_content)
+            print("Original pom.xml restored from backup.")
+
+
+def show_update_summary(project_path: str):
+    """Show a summary of what was updated."""
+    backup_path = Path(project_path) / "pom.xml.backup"
+    pom_path = Path(project_path) / "pom.xml"
+    
+    if not backup_path.exists():
+        return
+    
+    with open(backup_path, 'r') as f:
+        original = f.read()
+    
+    with open(pom_path, 'r') as f:
+        updated = f.read()
+    
+    # Simple diff to show version changes
+    original_versions = re.findall(r'<version>(.*?)</version>', original)
+    updated_versions = re.findall(r'<version>(.*?)</version>', updated)
+    
+    changes = []
+    for orig, upd in zip(original_versions, updated_versions):
+        if orig != upd:
+            changes.append(f"  {orig} → {upd}")
+    
+    if changes:
+        print("\nVersion changes detected:")
+        for change in changes:
+            print(change)
+    else:
+        print("\nNo version changes detected (already up to date or changes in structure).")
+
+
+def main():
+    """Main function to run the dependency updater."""
+    # Get project path from command line or use current directory
+    if len(sys.argv) > 1:
+        project_path = sys.argv[1]
+    else:
+        project_path = os.getcwd()
+    
+    # Validate project path
+    if not os.path.exists(project_path):
+        print(f"Error: Project path '{project_path}' does not exist.")
+        sys.exit(1)
+    
+    pom_path = Path(project_path) / "pom.xml"
+    if not pom_path.exists():
+        print(f"Error: No pom.xml found in '{project_path}'.")
+        print("Please provide a valid Maven project directory.")
+        sys.exit(1)
+    
+    print(f"Maven Dependency Updater")
+    print(f"Project: {project_path}")
+    print("=" * 60)
+    
+    # Check if Maven is available
+    exit_code, stdout, stderr = run_command("mvn --version")
+    if exit_code != 0:
+        print("Error: Maven is not installed or not in PATH.")
+        print("Please install Maven and try again.")
+        sys.exit(1)
+    
+    print(f"Maven version: {stdout.split(chr(10))[0]}")
+    print("=" * 60)
+    
+    try:
+        update_dependencies_with_claude(project_path)
+        print("\n✓ Dependency update process completed!")
+        print(f"  Backup saved as: {Path(project_path) / 'pom.xml.backup'}")
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user.")
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
+```

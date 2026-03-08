@@ -1,0 +1,536 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * Secure Credit Card Number Encryption/Decryption
+ * Using AES-256-GCM with OpenSSL
+ *
+ * Requirements:
+ * - PHP 7.1+ (GCM support)
+ * - OpenSSL extension
+ * - PDO extension with MySQL driver
+ *
+ * Environment variables required:
+ * - DB_HOST, DB_NAME, DB_USER, DB_PASS
+ * - ENCRYPTION_KEY (32 bytes, base64-encoded)
+ *
+ * Generate a key with:
+ * php -r "echo base64_encode(random_bytes(32));"
+ */
+
+// ---------------------------------------------------------------------------
+// Configuration & Bootstrap
+// ---------------------------------------------------------------------------
+
+const CIPHER_ALGO      = 'aes-256-gcm';
+const IV_LENGTH        = 12;   // 96-bit nonce recommended for GCM
+const TAG_LENGTH       = 16;   // 128-bit authentication tag
+const KEY_BYTE_LENGTH  = 32;   // 256-bit key
+
+/**
+ * Load environment variables from a .env file (simple parser).
+ * In production, prefer a proper secrets manager or server-level env injection.
+ */
+function loadEnv(string $path): void
+{
+    if (!is_file($path) || !is_readable($path)) {
+        return;
+    }
+
+    $lines = file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    foreach ($lines as $line) {
+        $line = trim($line);
+        if ($line === '' || str_starts_with($line, '#')) {
+            continue;
+        }
+        if (!str_contains($line, '=')) {
+            continue;
+        }
+        [$name, $value] = explode('=', $line, 2);
+        $name  = trim($name);
+        $value = trim($value, " \t\n\r\0\x0B\"'");
+        if ($name !== '' && !array_key_exists($name, $_ENV)) {
+            putenv("{$name}={$value}");
+            $_ENV[$name]    = $value;
+            $_SERVER[$name] = $value;
+        }
+    }
+}
+
+/**
+ * Retrieve a required environment variable or throw.
+ */
+function requireEnv(string $name): string
+{
+    $value = getenv($name);
+    if ($value === false || $value === '') {
+        throw new RuntimeException(
+            "Required environment variable '{$name}' is not set or empty."
+        );
+    }
+    return $value;
+}
+
+// ---------------------------------------------------------------------------
+// Key Management
+// ---------------------------------------------------------------------------
+
+/**
+ * Retrieve and validate the encryption key from the environment.
+ * The key must be stored as a base64-encoded 32-byte value.
+ *
+ * @return string Raw binary key (32 bytes)
+ * @throws RuntimeException
+ */
+function getEncryptionKey(): string
+{
+    $encoded = requireEnv('ENCRYPTION_KEY');
+    $key     = base64_decode($encoded, true);
+
+    if ($key === false) {
+        throw new RuntimeException('ENCRYPTION_KEY is not valid base64.');
+    }
+
+    if (strlen($key) !== KEY_BYTE_LENGTH) {
+        throw new RuntimeException(
+            sprintf(
+                'ENCRYPTION_KEY must decode to exactly %d bytes; got %d.',
+                KEY_BYTE_LENGTH,
+                strlen($key)
+            )
+        );
+    }
+
+    return $key;
+}
+
+// ---------------------------------------------------------------------------
+// Encryption / Decryption
+// ---------------------------------------------------------------------------
+
+/**
+ * Encrypt a plaintext string using AES-256-GCM.
+ *
+ * @param  string $plaintext  The sensitive value to encrypt.
+ * @param  string $key        Raw binary encryption key (32 bytes).
+ * @return array{
+ *     ciphertext: string,
+ *     iv:         string,
+ *     tag:        string
+ * }  All values are base64-encoded for safe DB storage.
+ *
+ * @throws RuntimeException on encryption failure.
+ */
+function encryptValue(string $plaintext, string $key): array
+{
+    // Generate a cryptographically secure random nonce (IV)
+    $iv = random_bytes(IV_LENGTH);
+
+    $tag        = '';
+    $ciphertext = openssl_encrypt(
+        $plaintext,
+        CIPHER_ALGO,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv,
+        $tag,
+        '',          // additional authenticated data (AAD) – empty here
+        TAG_LENGTH
+    );
+
+    if ($ciphertext === false) {
+        throw new RuntimeException(
+            'Encryption failed: ' . openssl_error_string()
+        );
+    }
+
+    return [
+        'ciphertext' => base64_encode($ciphertext),
+        'iv'         => base64_encode($iv),
+        'tag'        => base64_encode($tag),
+    ];
+}
+
+/**
+ * Decrypt a ciphertext encrypted with encryptValue().
+ *
+ * @param  string $ciphertextB64  Base64-encoded ciphertext.
+ * @param  string $ivB64          Base64-encoded IV/nonce.
+ * @param  string $tagB64         Base64-encoded authentication tag.
+ * @param  string $key            Raw binary encryption key (32 bytes).
+ * @return string                 Decrypted plaintext.
+ * @throws RuntimeException on decryption or authentication failure.
+ */
+function decryptValue(
+    string $ciphertextB64,
+    string $ivB64,
+    string $tagB64,
+    string $key
+): string {
+    $ciphertext = base64_decode($ciphertextB64, true);
+    $iv         = base64_decode($ivB64, true);
+    $tag        = base64_decode($tagB64, true);
+
+    if ($ciphertext === false || $iv === false || $tag === false) {
+        throw new RuntimeException('Invalid base64 data supplied for decryption.');
+    }
+
+    if (strlen($iv) !== IV_LENGTH) {
+        throw new RuntimeException('IV length mismatch.');
+    }
+
+    if (strlen($tag) !== TAG_LENGTH) {
+        throw new RuntimeException('Authentication tag length mismatch.');
+    }
+
+    $plaintext = openssl_decrypt(
+        $ciphertext,
+        CIPHER_ALGO,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv,
+        $tag
+    );
+
+    if ($plaintext === false) {
+        // This covers both decryption errors AND authentication tag failures.
+        throw new RuntimeException(
+            'Decryption failed (possible tampering or wrong key): '
+            . openssl_error_string()
+        );
+    }
+
+    return $plaintext;
+}
+
+// ---------------------------------------------------------------------------
+// Database Layer
+// ---------------------------------------------------------------------------
+
+/**
+ * Create a hardened PDO connection.
+ */
+function createPdo(): PDO
+{
+    $host   = requireEnv('DB_HOST');
+    $dbName = requireEnv('DB_NAME');
+    $user   = requireEnv('DB_USER');
+    $pass   = requireEnv('DB_PASS');
+    $port   = getenv('DB_PORT') ?: '3306';
+    $charset = 'utf8mb4';
+
+    $dsn = "mysql:host={$host};port={$port};dbname={$dbName};charset={$charset}";
+
+    $options = [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+        PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT => true,
+    ];
+
+    return new PDO($dsn, $user, $pass, $options);
+}
+
+/**
+ * Ensure the required table exists (idempotent).
+ */
+function ensureSchema(PDO $pdo): void
+{
+    $pdo->exec(
+        <<<'SQL'
+        CREATE TABLE IF NOT EXISTS payment_methods (
+            id              BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            cardholder_name VARCHAR(255)    NOT NULL,
+            -- Encrypted credit card number components
+            cc_ciphertext   TEXT            NOT NULL COMMENT 'AES-256-GCM ciphertext (base64)',
+            cc_iv           CHAR(24)        NOT NULL COMMENT 'GCM nonce/IV (base64, 16 chars = 12 raw bytes)',
+            cc_tag          CHAR(24)        NOT NULL COMMENT 'GCM auth tag (base64, 24 chars = 16 raw bytes)',
+            -- Optional: store last 4 digits in plaintext for display purposes
+            cc_last4        CHAR(4)         NOT NULL,
+            created_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP
+                                            ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_cc_last4 (cc_last4)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        SQL
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Repository
+// ---------------------------------------------------------------------------
+
+final class PaymentMethodRepository
+{
+    public function __construct(
+        private readonly PDO    $pdo,
+        private readonly string $encryptionKey
+    ) {}
+
+    /**
+     * Persist a new payment method with an encrypted credit card number.
+     *
+     * @param  string $cardholderName
+     * @param  string $creditCardNumber  Raw PAN (Primary Account Number).
+     * @return int                       Newly inserted row ID.
+     * @throws RuntimeException
+     */
+    public function create(string $cardholderName, string $creditCardNumber): int
+    {
+        $this->validateCardNumber($creditCardNumber);
+
+        $encrypted = encryptValue($creditCardNumber, $this->encryptionKey);
+        $last4     = substr($creditCardNumber, -4);
+
+        $stmt = $this->pdo->prepare(
+            <<<'SQL'
+            INSERT INTO payment_methods
+                (cardholder_name, cc_ciphertext, cc_iv, cc_tag, cc_last4)
+            VALUES
+                (:cardholder_name, :cc_ciphertext, :cc_iv, :cc_tag, :cc_last4)
+            SQL
+        );
+
+        $stmt->execute([
+            ':cardholder_name' => $cardholderName,
+            ':cc_ciphertext'   => $encrypted['ciphertext'],
+            ':cc_iv'           => $encrypted['iv'],
+            ':cc_tag'          => $encrypted['tag'],
+            ':cc_last4'        => $last4,
+        ]);
+
+        return (int) $this->pdo->lastInsertId();
+    }
+
+    /**
+     * Retrieve a payment method and decrypt the credit card number.
+     *
+     * @param  int $id
+     * @return array{
+     *     id:              int,
+     *     cardholder_name: string,
+     *     credit_card_number: string,
+     *     cc_last4:        string,
+     *     created_at:      string
+     * }
+     * @throws RuntimeException
+     */
+    public function findById(int $id): array
+    {
+        $stmt = $this->pdo->prepare(
+            <<<'SQL'
+            SELECT id, cardholder_name, cc_ciphertext, cc_iv, cc_tag, cc_last4, created_at
+            FROM   payment_methods
+            WHERE  id = :id
+            LIMIT  1
+            SQL
+        );
+        $stmt->execute([':id' => $id]);
+        $row = $stmt->fetch();
+
+        if ($row === false) {
+            throw new RuntimeException("Payment method with ID {$id} not found.");
+        }
+
+        $plainCcNumber = decryptValue(
+            $row['cc_ciphertext'],
+            $row['cc_iv'],
+            $row['cc_tag'],
+            $this->encryptionKey
+        );
+
+        return [
+            'id'                 => (int) $row['id'],
+            'cardholder_name'    => $row['cardholder_name'],
+            'credit_card_number' => $plainCcNumber,
+            'cc_last4'           => $row['cc_last4'],
+            'created_at'         => $row['created_at'],
+        ];
+    }
+
+    /**
+     * Update the credit card number for an existing record.
+     *
+     * @param  int    $id
+     * @param  string $newCreditCardNumber
+     * @throws RuntimeException
+     */
+    public function updateCardNumber(int $id, string $newCreditCardNumber): void
+    {
+        $this->validateCardNumber($newCreditCardNumber);
+
+        // Each update generates a fresh IV – never reuse IV+key pairs.
+        $encrypted = encryptValue($newCreditCardNumber, $this->encryptionKey);
+        $last4     = substr($newCreditCardNumber, -4);
+
+        $stmt = $this->pdo->prepare(
+            <<<'SQL'
+            UPDATE payment_methods
+            SET    cc_ciphertext = :cc_ciphertext,
+                   cc_iv        = :cc_iv,
+                   cc_tag       = :cc_tag,
+                   cc_last4     = :cc_last4
+            WHERE  id = :id
+            SQL
+        );
+
+        $stmt->execute([
+            ':cc_ciphertext' => $encrypted['ciphertext'],
+            ':cc_iv'         => $encrypted['iv'],
+            ':cc_tag'        => $encrypted['tag'],
+            ':cc_last4'      => $last4,
+            ':id'            => $id,
+        ]);
+
+        if ($stmt->rowCount() === 0) {
+            throw new RuntimeException("Payment method with ID {$id} not found for update.");
+        }
+    }
+
+    /**
+     * Delete a payment method record.
+     */
+    public function delete(int $id): void
+    {
+        $stmt = $this->pdo->prepare(
+            'DELETE FROM payment_methods WHERE id = :id'
+        );
+        $stmt->execute([':id' => $id]);
+    }
+
+    /**
+     * Basic Luhn algorithm check + length validation.
+     * Does NOT replace PCI-DSS compliant validation.
+     *
+     * @throws InvalidArgumentException
+     */
+    private function validateCardNumber(string $number): void
+    {
+        $digits = preg_replace('/\D/', '', $number);
+
+        if ($digits === null || strlen($digits) < 13 || strlen($digits) > 19) {
+            throw new InvalidArgumentException(
+                'Credit card number must be between 13 and 19 digits.'
+            );
+        }
+
+        // Luhn check
+        $sum     = 0;
+        $flip    = false;
+        $length  = strlen($digits);
+
+        for ($i = $length - 1; $i >= 0; $i--) {
+            $digit = (int) $digits[$i];
+            if ($flip) {
+                $digit *= 2;
+                if ($digit > 9) {
+                    $digit -= 9;
+                }
+            }
+            $sum  += $digit;
+            $flip  = !$flip;
+        }
+
+        if ($sum % 10 !== 0) {
+            throw new InvalidArgumentException(
+                'Credit card number failed Luhn validation.'
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Demo / Integration Test
+// ---------------------------------------------------------------------------
+
+function runDemo(): void
+{
+    echo "=== AES-256-GCM Credit Card Encryption Demo ===" . PHP_EOL . PHP_EOL;
+
+    // 1. Load environment
+    loadEnv(__DIR__ . '/.env');
+
+    // 2. Retrieve encryption key (fails fast if misconfigured)
+    $key = getEncryptionKey();
+    echo "[OK] Encryption key loaded (" . strlen($key) . " bytes)." . PHP_EOL;
+
+    // 3. Verify OpenSSL supports the chosen cipher
+    if (!in_array(CIPHER_ALGO, openssl_get_cipher_methods(), true)) {
+        throw new RuntimeException(CIPHER_ALGO . ' is not supported by this OpenSSL build.');
+    }
+    echo "[OK] Cipher " . CIPHER_ALGO . " is available." . PHP_EOL . PHP_EOL;
+
+    // 4. Database connection & schema
+    $pdo = createPdo();
+    ensureSchema($pdo);
+    echo "[OK] Database connected and schema verified." . PHP_EOL . PHP_EOL;
+
+    $repo = new PaymentMethodRepository($pdo, $key);
+
+    // 5. Insert a payment method
+    $testCard   = '4532015112830366'; // Valid Luhn test number
+    $testHolder = 'Jane Doe';
+
+    echo "Inserting payment method for '{$testHolder}' with card ending in "
+        . substr($testCard, -4) . " ..." . PHP_EOL;
+
+    $id = $repo->create($testHolder, $testCard);
+    echo "[OK] Inserted with ID: {$id}" . PHP_EOL . PHP_EOL;
+
+    // 6. Retrieve and decrypt
+    echo "Retrieving and decrypting record ID {$id} ..." . PHP_EOL;
+    $record = $repo->findById($id);
+
+    echo "[OK] Cardholder : " . $record['cardholder_name']    . PHP_EOL;
+    echo "[OK] Last 4     : " . $record['cc_last4']           . PHP_EOL;
+    echo "[OK] Decrypted  : " . $record['credit_card_number'] . PHP_EOL;
+    echo "[OK] Created at : " . $record['created_at']         . PHP_EOL . PHP_EOL;
+
+    // 7. Verify round-trip integrity
+    if ($record['credit_card_number'] !== $testCard) {
+        throw new RuntimeException('Round-trip mismatch! Decrypted value does not match original.');
+    }
+    echo "[OK] Round-trip integrity verified." . PHP_EOL . PHP_EOL;
+
+    // 8. Update card number (new IV generated automatically)
+    $newCard = '5425233430109903'; // Another valid Luhn test number
+    echo "Updating card number to one ending in " . substr($newCard, -4) . " ..." . PHP_EOL;
+    $repo->updateCardNumber($id, $newCard);
+
+    $updated = $repo->findById($id);
+    if ($updated['credit_card_number'] !== $newCard) {
+        throw new RuntimeException('Update round-trip mismatch!');
+    }
+    echo "[OK] Update verified. New last4: " . $updated['cc_last4'] . PHP_EOL . PHP_EOL;
+
+    // 9. Demonstrate raw DB row (ciphertext is opaque)
+    $rawStmt = $pdo->prepare('SELECT * FROM payment_methods WHERE id = :id');
+    $rawStmt->execute([':id' => $id]);
+    $raw = $rawStmt->fetch();
+
+    echo "--- Raw database row (what an attacker sees) ---" . PHP_EOL;
+    echo "cc_ciphertext : " . $raw['cc_ciphertext'] . PHP_EOL;
+    echo "cc_iv         : " . $raw['cc_iv']         . PHP_EOL;
+    echo "cc_tag        : " . $raw['cc_tag']         . PHP_EOL;
+    echo "cc_last4      : " . $raw['cc_last4']       . PHP_EOL . PHP_EOL;
+
+    // 10. Cleanup
+    $repo->delete($id);
+    echo "[OK] Test record deleted." . PHP_EOL . PHP_EOL;
+
+    echo "=== Demo completed successfully ===" . PHP_EOL;
+}
+
+// ---------------------------------------------------------------------------
+// Entry Point
+// ---------------------------------------------------------------------------
+
+try {
+    runDemo();
+} catch (Throwable $e) {
+    // Never expose internal details in production; log them server-side.
+    fwrite(STDERR, '[ERROR] ' . $e->getMessage() . PHP_EOL);
+    fwrite(STDERR, $e->getTraceAsString() . PHP_EOL);
+    exit(1);
+}

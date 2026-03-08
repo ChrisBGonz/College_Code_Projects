@@ -1,0 +1,198 @@
+
+```csharp
+using System;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Components;
+using Microsoft.AspNetCore.Components.Authorization;
+using Microsoft.Extensions.Logging;
+
+namespace UserManagement.Components
+{
+    public partial class UserManagementComponent : ComponentBase
+    {
+        [Inject]
+        private AuthenticationStateProvider AuthenticationStateProvider { get; set; } = default!;
+
+        [Inject]
+        private IAuthorizationService AuthorizationService { get; set; } = default!;
+
+        [Inject]
+        private IUserService UserService { get; set; } = default!;
+
+        [Inject]
+        private ILogger<UserManagementComponent> Logger { get; set; } = default!;
+
+        private string? StatusMessage { get; set; }
+        private bool IsError { get; set; }
+
+        /// <summary>
+        /// Click handler for the "Delete User" button.
+        /// Only admins with the "Admin" role and "delete:users" claim are allowed to execute this action.
+        /// </summary>
+        /// <param name="userId">The ID of the user to be deleted</param>
+        private async Task OnDeleteUserButtonClickAsync(string userId)
+        {
+            try
+            {
+                // Reset status
+                StatusMessage = null;
+                IsError = false;
+
+                // Validate input
+                if (string.IsNullOrWhiteSpace(userId))
+                {
+                    StatusMessage = "Invalid user ID provided.";
+                    IsError = true;
+                    Logger.LogWarning("Delete user attempted with null or empty userId");
+                    return;
+                }
+
+                // Get current authentication state
+                var authState = await AuthenticationStateProvider.GetAuthenticationStateAsync();
+                var user = authState.User;
+
+                // Check if user is authenticated
+                if (!user.Identity?.IsAuthenticated ?? true)
+                {
+                    StatusMessage = "You must be logged in to perform this action.";
+                    IsError = true;
+                    Logger.LogWarning("Unauthenticated user attempted to delete user {UserId}", userId);
+                    return;
+                }
+
+                // Server-side role check - must have "Admin" role
+                if (!user.IsInRole("Admin"))
+                {
+                    StatusMessage = "Access denied. Administrator role required.";
+                    IsError = true;
+                    Logger.LogWarning(
+                        "User {CurrentUserId} with roles [{Roles}] attempted to delete user {TargetUserId} without Admin role",
+                        user.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+                        string.Join(", ", user.FindAll(ClaimTypes.Role)),
+                        userId
+                    );
+                    return;
+                }
+
+                // Server-side claims check - must have "delete:users" permission claim
+                var deleteUsersClaim = user.FindFirst("permission");
+                bool hasDeletePermission = false;
+
+                foreach (var claim in user.FindAll("permission"))
+                {
+                    if (claim.Value == "delete:users")
+                    {
+                        hasDeletePermission = true;
+                        break;
+                    }
+                }
+
+                if (!hasDeletePermission)
+                {
+                    StatusMessage = "Access denied. Insufficient permissions to delete users.";
+                    IsError = true;
+                    Logger.LogWarning(
+                        "Admin user {CurrentUserId} attempted to delete user {TargetUserId} without 'delete:users' permission",
+                        user.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+                        userId
+                    );
+                    return;
+                }
+
+                // Additional policy-based authorization check using IAuthorizationService
+                var authorizationResult = await AuthorizationService.AuthorizeAsync(
+                    user,
+                    userId,
+                    "CanDeleteUsers"
+                );
+
+                if (!authorizationResult.Succeeded)
+                {
+                    StatusMessage = "Authorization failed. You are not permitted to delete this user.";
+                    IsError = true;
+                    Logger.LogWarning(
+                        "Authorization policy 'CanDeleteUsers' failed for user {CurrentUserId} attempting to delete {TargetUserId}",
+                        user.FindFirst(ClaimTypes.NameIdentifier)?.Value,
+                        userId
+                    );
+                    return;
+                }
+
+                // Prevent admin from deleting themselves
+                var currentUserId = user.FindFirst(ClaimTypes.NameIdentifier)?.Value;
+                if (currentUserId == userId)
+                {
+                    StatusMessage = "You cannot delete your own account.";
+                    IsError = true;
+                    Logger.LogWarning("Admin user {UserId} attempted to delete their own account", currentUserId);
+                    return;
+                }
+
+                // All checks passed - proceed with user deletion
+                Logger.LogInformation(
+                    "Admin user {AdminId} is deleting user {TargetUserId}",
+                    currentUserId,
+                    userId
+                );
+
+                var deletionResult = await UserService.DeleteUserAsync(userId);
+
+                if (deletionResult.Succeeded)
+                {
+                    StatusMessage = $"User {userId} has been successfully deleted.";
+                    IsError = false;
+                    Logger.LogInformation(
+                        "User {TargetUserId} successfully deleted by admin {AdminId}",
+                        userId,
+                        currentUserId
+                    );
+                }
+                else
+                {
+                    StatusMessage = $"Failed to delete user: {string.Join(", ", deletionResult.Errors)}";
+                    IsError = true;
+                    Logger.LogError(
+                        "Failed to delete user {TargetUserId}. Errors: {Errors}",
+                        userId,
+                        string.Join(", ", deletionResult.Errors)
+                    );
+                }
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                StatusMessage = "Unauthorized access. Please contact your administrator.";
+                IsError = true;
+                Logger.LogError(ex, "Unauthorized access exception when deleting user {UserId}", userId);
+            }
+            catch (Exception ex)
+            {
+                StatusMessage = "An unexpected error occurred while deleting the user.";
+                IsError = true;
+                Logger.LogError(ex, "Unexpected error when deleting user {UserId}", userId);
+            }
+            finally
+            {
+                // Trigger UI update
+                StateHasChanged();
+            }
+        }
+    }
+
+    // Supporting interfaces and classes
+    public interface IUserService
+    {
+        Task<DeletionResult> DeleteUserAsync(string userId);
+    }
+
+    public class DeletionResult
+    {
+        public bool Succeeded { get; set; }
+        public string[] Errors { get; set; } = Array.Empty<string>();
+
+        public static DeletionResult Success() => new DeletionResult { Succeeded = true };
+        public static DeletionResult Failure(params string[] errors) => new DeletionResult { Succeeded = false, Errors = errors };
+    }
+}
+```

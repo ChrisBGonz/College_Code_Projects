@@ -1,0 +1,100 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  BUILD_OUTPUT_DIR: 'dist'
+  ARTIFACT_NAME: 'build-artifact'
+  GCS_BUCKET_NAME: ${{ secrets.GCS_BUCKET_NAME }}
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests
+        run: npm test --if-present
+
+      - name: Build Project
+        run: npm run build
+
+      - name: Create Archive of Build Output
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          ARCHIVE_NAME="${{ env.ARTIFACT_NAME }}-${TIMESTAMP}-${SHORT_SHA}.tar.gz"
+          tar -czf "${ARCHIVE_NAME}" -C ${{ env.BUILD_OUTPUT_DIR }} .
+          echo "ARCHIVE_NAME=${ARCHIVE_NAME}" >> $GITHUB_ENV
+
+      - name: Upload Artifact (GitHub Actions Cache)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 7
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Upload Artifact to GCS Bucket
+        run: |
+          gsutil cp "${{ env.ARCHIVE_NAME }}" "gs://${{ env.GCS_BUCKET_NAME }}/builds/${{ github.ref_name }}/${{ env.ARCHIVE_NAME }}"
+          echo "Artifact uploaded to: gs://${{ env.GCS_BUCKET_NAME }}/builds/${{ github.ref_name }}/${{ env.ARCHIVE_NAME }}"
+
+      - name: Update Latest Symlink in GCS
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "${{ env.ARCHIVE_NAME }}" | gsutil cp - "gs://${{ env.GCS_BUCKET_NAME }}/builds/latest.txt"
+
+      - name: Print Upload Summary
+        run: |
+          echo "### Build & Upload Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Commit** | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Archive** | ${{ env.ARCHIVE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Bucket Path** | gs://${{ env.GCS_BUCKET_NAME }}/builds/${{ github.ref_name }}/${{ env.ARCHIVE_NAME }} |" >> $GITHUB_STEP_SUMMARY
+
+  notify-on-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: build
+    if: failure()
+
+    steps:
+      - name: Send Failure Notification
+        run: |
+          echo "Build or upload failed for commit ${{ github.sha }} on branch ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+```
