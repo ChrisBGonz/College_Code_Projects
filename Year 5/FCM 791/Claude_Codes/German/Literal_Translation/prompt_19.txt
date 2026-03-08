@@ -1,0 +1,523 @@
+
+```python
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import logging
+from datetime import datetime
+from typing import Optional, List
+from pydantic import BaseModel
+import random
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+# Custom Exception Classes
+class DatabaseConnectionError(Exception):
+    """Exception raised when database connection fails."""
+    
+    def __init__(
+        self,
+        message: str = "Database connection failed",
+        db_host: Optional[str] = None,
+        db_port: Optional[int] = None,
+        retry_after: Optional[int] = None
+    ):
+        self.message = message
+        self.db_host = db_host
+        self.db_port = db_port
+        self.retry_after = retry_after
+        self.timestamp = datetime.utcnow().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """Exception raised when a database query fails."""
+    
+    def __init__(
+        self,
+        message: str = "Database query failed",
+        query: Optional[str] = None,
+        error_code: Optional[str] = None
+    ):
+        self.message = message
+        self.query = query
+        self.error_code = error_code
+        self.timestamp = datetime.utcnow().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(Exception):
+    """Exception raised when a database operation times out."""
+    
+    def __init__(
+        self,
+        message: str = "Database operation timed out",
+        timeout_seconds: Optional[int] = None,
+        operation: Optional[str] = None
+    ):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.operation = operation
+        self.timestamp = datetime.utcnow().isoformat()
+        super().__init__(self.message)
+
+
+class DatabaseAuthenticationError(Exception):
+    """Exception raised when database authentication fails."""
+    
+    def __init__(
+        self,
+        message: str = "Database authentication failed",
+        db_user: Optional[str] = None
+    ):
+        self.message = message
+        self.db_user = db_user
+        self.timestamp = datetime.utcnow().isoformat()
+        super().__init__(self.message)
+
+
+# Pydantic Models
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    age: int
+
+
+class User(BaseModel):
+    id: int
+    name: str
+    email: str
+    age: int
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    message: str
+    timestamp: str
+    details: Optional[dict] = None
+
+
+# Simulated Database
+fake_db = {
+    "users": [
+        {"id": 1, "name": "Alice Johnson", "email": "alice@example.com", "age": 30},
+        {"id": 2, "name": "Bob Smith", "email": "bob@example.com", "age": 25},
+        {"id": 3, "name": "Charlie Brown", "email": "charlie@example.com", "age": 35},
+    ],
+    "connection_status": True,
+    "auth_status": True,
+}
+
+
+# Database Simulation Functions
+def simulate_db_connection(force_error: bool = False) -> bool:
+    """Simulate database connection check."""
+    if force_error or not fake_db["connection_status"]:
+        raise DatabaseConnectionError(
+            message="Cannot establish connection to the database server",
+            db_host="localhost",
+            db_port=5432,
+            retry_after=30
+        )
+    return True
+
+
+def simulate_db_auth(force_error: bool = False) -> bool:
+    """Simulate database authentication."""
+    if force_error or not fake_db["auth_status"]:
+        raise DatabaseAuthenticationError(
+            message="Invalid credentials for database access",
+            db_user="app_user"
+        )
+    return True
+
+
+def simulate_db_query(query_type: str, data: Optional[dict] = None, force_timeout: bool = False):
+    """Simulate database query execution."""
+    if force_timeout:
+        raise DatabaseTimeoutError(
+            message="Query execution exceeded maximum allowed time",
+            timeout_seconds=30,
+            operation=query_type
+        )
+    
+    if query_type == "get_all_users":
+        return fake_db["users"]
+    
+    elif query_type == "get_user_by_id":
+        user_id = data.get("id")
+        user = next((u for u in fake_db["users"] if u["id"] == user_id), None)
+        if not user:
+            raise DatabaseQueryError(
+                message=f"No record found with id {user_id}",
+                query=f"SELECT * FROM users WHERE id = {user_id}",
+                error_code="NO_ROWS_FOUND"
+            )
+        return user
+    
+    elif query_type == "create_user":
+        new_id = max(u["id"] for u in fake_db["users"]) + 1
+        new_user = {"id": new_id, **data}
+        fake_db["users"].append(new_user)
+        return new_user
+    
+    elif query_type == "delete_user":
+        user_id = data.get("id")
+        user = next((u for u in fake_db["users"] if u["id"] == user_id), None)
+        if not user:
+            raise DatabaseQueryError(
+                message=f"Cannot delete: No record found with id {user_id}",
+                query=f"DELETE FROM users WHERE id = {user_id}",
+                error_code="NO_ROWS_AFFECTED"
+            )
+        fake_db["users"] = [u for u in fake_db["users"] if u["id"] != user_id]
+        return {"deleted": True, "id": user_id}
+    
+    return None
+
+
+# FastAPI Application
+app = FastAPI(
+    title="Database Error Handler Demo",
+    description="FastAPI application demonstrating custom exception handlers for database errors",
+    version="1.0.0"
+)
+
+# CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# Custom Exception Handlers
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request,
+    exc: DatabaseConnectionError
+) -> JSONResponse:
+    """Handle database connection errors."""
+    logger.error(
+        f"Database connection error: {exc.message} | "
+        f"Host: {exc.db_host}:{exc.db_port} | "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "DATABASE_CONNECTION_ERROR",
+            "message": exc.message,
+            "timestamp": exc.timestamp,
+            "details": {
+                "db_host": exc.db_host,
+                "db_port": exc.db_port,
+                "retry_after_seconds": exc.retry_after,
+                "suggestion": "Please try again later or contact the system administrator"
+            }
+        },
+        headers={"Retry-After": str(exc.retry_after)} if exc.retry_after else {}
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(
+    request: Request,
+    exc: DatabaseQueryError
+) -> JSONResponse:
+    """Handle database query errors."""
+    logger.error(
+        f"Database query error: {exc.message} | "
+        f"Error Code: {exc.error_code} | "
+        f"Path: {request.url.path}"
+    )
+    
+    status_code = 404 if exc.error_code in ["NO_ROWS_FOUND", "NO_ROWS_AFFECTED"] else 400
+    
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": "DATABASE_QUERY_ERROR",
+            "message": exc.message,
+            "timestamp": exc.timestamp,
+            "details": {
+                "error_code": exc.error_code,
+                "failed_query": exc.query if exc.query else "Query details not available"
+            }
+        }
+    )
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(
+    request: Request,
+    exc: DatabaseTimeoutError
+) -> JSONResponse:
+    """Handle database timeout errors."""
+    logger.error(
+        f"Database timeout error: {exc.message} | "
+        f"Operation: {exc.operation} | "
+        f"Timeout: {exc.timeout_seconds}s | "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=504,
+        content={
+            "error": "DATABASE_TIMEOUT_ERROR",
+            "message": exc.message,
+            "timestamp": exc.timestamp,
+            "details": {
+                "operation": exc.operation,
+                "timeout_seconds": exc.timeout_seconds,
+                "suggestion": "The operation took too long. Consider optimizing your query or increasing timeout limits."
+            }
+        }
+    )
+
+
+@app.exception_handler(DatabaseAuthenticationError)
+async def database_auth_error_handler(
+    request: Request,
+    exc: DatabaseAuthenticationError
+) -> JSONResponse:
+    """Handle database authentication errors."""
+    logger.error(
+        f"Database authentication error: {exc.message} | "
+        f"User: {exc.db_user} | "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=401,
+        content={
+            "error": "DATABASE_AUTHENTICATION_ERROR",
+            "message": exc.message,
+            "timestamp": exc.timestamp,
+            "details": {
+                "db_user": exc.db_user,
+                "suggestion": "Please verify database credentials and permissions"
+            }
+        }
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException
+) -> JSONResponse:
+    """Handle general HTTP exceptions."""
+    logger.warning(
+        f"HTTP error {exc.status_code}: {exc.detail} | "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": "HTTP_ERROR",
+            "message": exc.detail,
+            "timestamp": datetime.utcnow().isoformat(),
+            "details": None
+        }
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(
+    request: Request,
+    exc: Exception
+) -> JSONResponse:
+    """Handle unexpected exceptions."""
+    logger.critical(
+        f"Unexpected error: {str(exc)} | "
+        f"Type: {type(exc).__name__} | "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_SERVER_ERROR",
+            "message": "An unexpected error occurred",
+            "timestamp": datetime.utcnow().isoformat(),
+            "details": {
+                "error_type": type(exc).__name__,
+                "suggestion": "Please contact support if this issue persists"
+            }
+        }
+    )
+
+
+# API Routes
+@app.get("/", tags=["Health"])
+async def root():
+    """Root endpoint - API information."""
+    return {
+        "application": "Database Error Handler Demo",
+        "version": "1.0.0",
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat(),
+        "endpoints": {
+            "users": "/users",
+            "health": "/health",
+            "docs": "/docs",
+            "error_simulation": "/simulate/*"
+        }
+    }
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Check application and database health."""
+    try:
+        simulate_db_connection()
+        simulate_db_auth()
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except DatabaseConnectionError as e:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "database": "disconnected",
+                "error": e.message,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+        )
+
+
+@app.get("/users", response_model=List[User], tags=["Users"])
+async def get_all_users():
+    """Retrieve all users from the database."""
+    simulate_db_connection()
+    simulate_db_auth()
+    users = simulate_db_query("get_all_users")
+    return users
+
+
+@app.get("/users/{user_id}", response_model=User, tags=["Users"])
+async def get_user(user_id: int):
+    """Retrieve a specific user by ID."""
+    simulate_db_connection()
+    simulate_db_auth()
+    user = simulate_db_query("get_user_by_id", {"id": user_id})
+    return user
+
+
+@app.post("/users", response_model=User, status_code=201, tags=["Users"])
+async def create_user(user: UserCreate):
+    """Create a new user in the database."""
+    simulate_db_connection()
+    simulate_db_auth()
+    new_user = simulate_db_query("create_user", user.model_dump())
+    logger.info(f"Created new user with id: {new_user['id']}")
+    return new_user
+
+
+@app.delete("/users/{user_id}", tags=["Users"])
+async def delete_user(user_id: int):
+    """Delete a user from the database."""
+    simulate_db_connection()
+    simulate_db_auth()
+    result = simulate_db_query("delete_user", {"id": user_id})
+    logger.info(f"Deleted user with id: {user_id}")
+    return {"message": f"User {user_id} successfully deleted", "result": result}
+
+
+# Error Simulation Endpoints
+@app.get("/simulate/connection-error", tags=["Error Simulation"])
+async def simulate_connection_error():
+    """Simulate a database connection error."""
+    simulate_db_connection(force_error=True)
+    return {"message": "This should not be reached"}
+
+
+@app.get("/simulate/auth-error", tags=["Error Simulation"])
+async def simulate_auth_error():
+    """Simulate a database authentication error."""
+    simulate_db_connection()
+    simulate_db_auth(force_error=True)
+    return {"message": "This should not be reached"}
+
+
+@app.get("/simulate/timeout-error", tags=["Error Simulation"])
+async def simulate_timeout_error():
+    """Simulate a database timeout error."""
+    simulate_db_connection()
+    simulate_db_auth()
+    simulate_db_query("get_all_users", force_timeout=True)
+    return {"message": "This should not be reached"}
+
+
+@app.get("/simulate/query-error", tags=["Error Simulation"])
+async def simulate_query_error():
+    """Simulate a database query error by requesting non-existent user."""
+    simulate_db_connection()
+    simulate_db_auth()
+    simulate_db_query("get_user_by_id", {"id": 99999})
+    return {"message": "This should not be reached"}
+
+
+@app.get("/simulate/random-error", tags=["Error Simulation"])
+async def simulate_random_error():
+    """Simulate a random database error."""
+    error_type = random.choice(["connection", "auth", "timeout", "query"])
+    
+    simulate_db_connection(force_error=(error_type == "connection"))
+    simulate_db_auth(force_error=(error_type == "auth"))
+    simulate_db_query(
+        "get_user_by_id",
+        {"id": 99999} if error_type == "query" else {"id": 1},
+        force_timeout=(error_type == "timeout")
+    )
+    
+    return {"message": "No error occurred this time", "attempted_error": error_type}
+
+
+@app.post("/simulate/toggle-connection", tags=["Error Simulation"])
+async def toggle_db_connection():
+    """Toggle database connection status for testing."""
+    fake_db["connection_status"] = not fake_db["connection_status"]
+    status = "enabled" if fake_db["connection_status"] else "disabled"
+    logger.info(f"Database connection {status}")
+    return {
+        "message": f"Database connection {status}",
+        "connection_status": fake_db["connection_status"]
+    }
+
+
+@app.post("/simulate/toggle-auth", tags=["Error Simulation"])
+async def toggle_db_auth():
+    """Toggle database authentication status for testing."""
+    fake_db["auth_status"] = not fake_db["auth_status"]
+    status = "enabled" if fake_db["auth_status"] else "disabled"
+    logger.info(f"Database authentication {status}")
+    return {
+        "message": f"Database authentication {status}",
+        "auth_status": fake_db["auth_status"]
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+```

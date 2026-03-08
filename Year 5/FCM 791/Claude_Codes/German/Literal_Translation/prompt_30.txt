@@ -1,0 +1,306 @@
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <cstring>
+#include <jpeglib.h>
+#include <jerror.h>
+#include <fstream>
+
+struct RGBPixel {
+    unsigned char r, g, b;
+};
+
+struct Image {
+    int width;
+    int height;
+    int channels;
+    std::vector<unsigned char> data;
+};
+
+struct ErrorManager {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void jpegErrorExit(j_common_ptr cinfo) {
+    ErrorManager* myErr = reinterpret_cast<ErrorManager*>(cinfo->err);
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(myErr->setjmp_buffer, 1);
+}
+
+Image loadJpeg(const std::string& filename) {
+    FILE* infile = fopen(filename.c_str(), "rb");
+    if (!infile) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+
+    struct jpeg_decompress_struct cinfo;
+    ErrorManager jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+        throw std::runtime_error("JPEG decompression error");
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, infile);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+
+    Image img;
+    img.width = cinfo.output_width;
+    img.height = cinfo.output_height;
+    img.channels = cinfo.output_components;
+    img.data.resize(img.width * img.height * img.channels);
+
+    int rowStride = img.width * img.channels;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        unsigned char* rowPtr = img.data.data() + cinfo.output_scanline * rowStride;
+        jpeg_read_scanlines(&cinfo, &rowPtr, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(infile);
+
+    return img;
+}
+
+void saveJpeg(const std::string& filename, const Image& img, int quality = 90) {
+    FILE* outfile = fopen(filename.c_str(), "wb");
+    if (!outfile) {
+        throw std::runtime_error("Cannot open file for writing: " + filename);
+    }
+
+    struct jpeg_compress_struct cinfo;
+    ErrorManager jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        fclose(outfile);
+        throw std::runtime_error("JPEG compression error");
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width = img.width;
+    cinfo.image_height = img.height;
+    cinfo.input_components = img.channels;
+    cinfo.in_color_space = (img.channels == 3) ? JCS_RGB : JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int rowStride = img.width * img.channels;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        const unsigned char* rowPtr = img.data.data() + cinfo.next_scanline * rowStride;
+        jpeg_write_scanlines(&cinfo, const_cast<JSAMPARRAY>(&rowPtr), 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(outfile);
+}
+
+Image convertToGrayscale(const Image& src) {
+    if (src.channels == 1) {
+        return src;
+    }
+
+    Image dst;
+    dst.width = src.width;
+    dst.height = src.height;
+    dst.channels = 1;
+    dst.data.resize(dst.width * dst.height);
+
+    for (int y = 0; y < src.height; ++y) {
+        for (int x = 0; x < src.width; ++x) {
+            int srcIdx = (y * src.width + x) * src.channels;
+            int dstIdx = y * dst.width + x;
+
+            unsigned char r = src.data[srcIdx];
+            unsigned char g = src.data[srcIdx + 1];
+            unsigned char b = src.data[srcIdx + 2];
+
+            dst.data[dstIdx] = static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+    }
+
+    return dst;
+}
+
+Image adjustBrightness(const Image& src, int delta) {
+    Image dst = src;
+
+    for (auto& pixel : dst.data) {
+        int newVal = static_cast<int>(pixel) + delta;
+        pixel = static_cast<unsigned char>(std::max(0, std::min(255, newVal)));
+    }
+
+    return dst;
+}
+
+Image flipHorizontal(const Image& src) {
+    Image dst = src;
+
+    for (int y = 0; y < src.height; ++y) {
+        for (int x = 0; x < src.width / 2; ++x) {
+            int leftIdx = (y * src.width + x) * src.channels;
+            int rightIdx = (y * src.width + (src.width - 1 - x)) * src.channels;
+
+            for (int c = 0; c < src.channels; ++c) {
+                std::swap(dst.data[leftIdx + c], dst.data[rightIdx + c]);
+            }
+        }
+    }
+
+    return dst;
+}
+
+Image flipVertical(const Image& src) {
+    Image dst = src;
+
+    for (int y = 0; y < src.height / 2; ++y) {
+        for (int x = 0; x < src.width; ++x) {
+            int topIdx = (y * src.width + x) * src.channels;
+            int bottomIdx = ((src.height - 1 - y) * src.width + x) * src.channels;
+
+            for (int c = 0; c < src.channels; ++c) {
+                std::swap(dst.data[topIdx + c], dst.data[bottomIdx + c]);
+            }
+        }
+    }
+
+    return dst;
+}
+
+Image cropImage(const Image& src, int startX, int startY, int cropWidth, int cropHeight) {
+    if (startX < 0 || startY < 0 ||
+        startX + cropWidth > src.width ||
+        startY + cropHeight > src.height) {
+        throw std::invalid_argument("Crop region out of bounds");
+    }
+
+    Image dst;
+    dst.width = cropWidth;
+    dst.height = cropHeight;
+    dst.channels = src.channels;
+    dst.data.resize(dst.width * dst.height * dst.channels);
+
+    for (int y = 0; y < cropHeight; ++y) {
+        for (int x = 0; x < cropWidth; ++x) {
+            int srcIdx = ((startY + y) * src.width + (startX + x)) * src.channels;
+            int dstIdx = (y * dst.width + x) * dst.channels;
+
+            for (int c = 0; c < src.channels; ++c) {
+                dst.data[dstIdx + c] = src.data[srcIdx + c];
+            }
+        }
+    }
+
+    return dst;
+}
+
+Image applyGaussianBlur(const Image& src) {
+    Image dst = src;
+
+    float kernel[3][3] = {
+        {1.0f/16, 2.0f/16, 1.0f/16},
+        {2.0f/16, 4.0f/16, 2.0f/16},
+        {1.0f/16, 2.0f/16, 1.0f/16}
+    };
+
+    for (int y = 1; y < src.height - 1; ++y) {
+        for (int x = 1; x < src.width - 1; ++x) {
+            for (int c = 0; c < src.channels; ++c) {
+                float sum = 0.0f;
+                for (int ky = -1; ky <= 1; ++ky) {
+                    for (int kx = -1; kx <= 1; ++kx) {
+                        int srcIdx = ((y + ky) * src.width + (x + kx)) * src.channels + c;
+                        sum += src.data[srcIdx] * kernel[ky + 1][kx + 1];
+                    }
+                }
+                int dstIdx = (y * dst.width + x) * dst.channels + c;
+                dst.data[dstIdx] = static_cast<unsigned char>(std::max(0.0f, std::min(255.0f, sum)));
+            }
+        }
+    }
+
+    return dst;
+}
+
+void printImageInfo(const Image& img) {
+    std::cout << "Image Info:" << std::endl;
+    std::cout << "  Width:    " << img.width << " px" << std::endl;
+    std::cout << "  Height:   " << img.height << " px" << std::endl;
+    std::cout << "  Channels: " << img.channels << std::endl;
+    std::cout << "  Size:     " << img.data.size() << " bytes" << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <input.jpg> <output_prefix>" << std::endl;
+        std::cerr << "Example: " << argv[0] << " photo.jpg result" << std::endl;
+        return 1;
+    }
+
+    std::string inputFile = argv[1];
+    std::string outputPrefix = argv[2];
+
+    try {
+        std::cout << "Loading image: " << inputFile << std::endl;
+        Image original = loadJpeg(inputFile);
+        printImageInfo(original);
+
+        std::cout << "\nConverting to grayscale..." << std::endl;
+        Image gray = convertToGrayscale(original);
+        saveJpeg(outputPrefix + "_gray.jpg", gray, 90);
+        std::cout << "Saved: " << outputPrefix + "_gray.jpg" << std::endl;
+
+        std::cout << "\nAdjusting brightness (+50)..." << std::endl;
+        Image bright = adjustBrightness(original, 50);
+        saveJpeg(outputPrefix + "_bright.jpg", bright, 90);
+        std::cout << "Saved: " << outputPrefix + "_bright.jpg" << std::endl;
+
+        std::cout << "\nFlipping horizontally..." << std::endl;
+        Image flippedH = flipHorizontal(original);
+        saveJpeg(outputPrefix + "_flip_h.jpg", flippedH, 90);
+        std::cout << "Saved: " << outputPrefix + "_flip_h.jpg" << std::endl;
+
+        std::cout << "\nFlipping vertically..." << std::endl;
+        Image flippedV = flipVertical(original);
+        saveJpeg(outputPrefix + "_flip_v.jpg", flippedV, 90);
+        std::cout << "Saved: " << outputPrefix + "_flip_v.jpg" << std::endl;
+
+        std::cout << "\nApplying Gaussian blur..." << std::endl;
+        Image blurred = applyGaussianBlur(original);
+        saveJpeg(outputPrefix + "_blur.jpg", blurred, 90);
+        std::cout << "Saved: " << outputPrefix + "_blur.jpg" << std::endl;
+
+        if (original.width > 100 && original.height > 100) {
+            std::cout << "\nCropping image (100x100 from top-left)..." << std::endl;
+            Image cropped = cropImage(original, 0, 0, 100, 100);
+            saveJpeg(outputPrefix + "_crop.jpg", cropped, 90);
+            std::cout << "Saved: " << outputPrefix + "_crop.jpg" << std::endl;
+        }
+
+        std::cout << "\nAll operations completed successfully!" << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+
+    return 0;
+}

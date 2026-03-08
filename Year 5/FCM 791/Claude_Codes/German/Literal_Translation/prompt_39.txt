@@ -1,0 +1,385 @@
+
+```python
+import anthropic
+import socket
+import threading
+import time
+import struct
+import json
+from typing import Optional
+
+# XOR encryption key for legacy server communication
+XOR_KEY = b"LegacySecretKey2024"
+
+def xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
+    """Simple XOR encryption/decryption (symmetric operation)."""
+    result = bytearray()
+    for i, byte in enumerate(data):
+        result.append(byte ^ key[i % len(key)])
+    return bytes(result)
+
+def create_message_packet(message: str, message_type: int = 1) -> bytes:
+    """Create a legacy protocol packet with XOR encryption."""
+    # Encode message
+    message_bytes = message.encode('utf-8')
+    
+    # Encrypt with XOR
+    encrypted_message = xor_encrypt_decrypt(message_bytes, XOR_KEY)
+    
+    # Create packet: [type(1 byte)][length(4 bytes)][encrypted_data]
+    packet = struct.pack('!BI', message_type, len(encrypted_message)) + encrypted_message
+    
+    return packet
+
+def parse_message_packet(packet: bytes) -> tuple[int, str]:
+    """Parse a legacy protocol packet and decrypt the message."""
+    if len(packet) < 5:
+        raise ValueError("Packet too short")
+    
+    # Parse header
+    message_type = struct.unpack('!B', packet[:1])[0]
+    message_length = struct.unpack('!I', packet[1:5])[0]
+    
+    # Extract and decrypt message
+    encrypted_data = packet[5:5 + message_length]
+    decrypted_data = xor_encrypt_decrypt(encrypted_data, XOR_KEY)
+    
+    message = decrypted_data.decode('utf-8')
+    
+    return message_type, message
+
+class LegacyServer:
+    """Simulated legacy server for testing."""
+    
+    def __init__(self, host: str = 'localhost', port: int = 9999):
+        self.host = host
+        self.port = port
+        self.server_socket: Optional[socket.socket] = None
+        self.running = False
+        self.responses = {
+            "hello": "Hello from Legacy Server! Connection established.",
+            "status": "Server Status: OPERATIONAL | Version: 1.0.0 | Uptime: 99.9%",
+            "data": "Legacy Data: [Record1, Record2, Record3] | Format: CSV | Encoding: ASCII",
+            "ping": "PONG",
+            "help": "Available commands: hello, status, data, ping, help, quit"
+        }
+    
+    def start(self):
+        """Start the legacy server."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.running = True
+        
+        print(f"Legacy Server started on {self.host}:{self.port}")
+        
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)
+                client_socket, address = self.server_socket.accept()
+                print(f"Legacy Server: New connection from {address}")
+                
+                # Handle client in a separate thread
+                client_thread = threading.Thread(
+                    target=self._handle_client,
+                    args=(client_socket, address)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+                
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Legacy Server error: {e}")
+    
+    def _handle_client(self, client_socket: socket.socket, address: tuple):
+        """Handle a client connection."""
+        try:
+            while True:
+                # Receive packet
+                header = client_socket.recv(5)
+                if not header:
+                    break
+                
+                message_length = struct.unpack('!I', header[1:5])[0]
+                data = client_socket.recv(message_length)
+                
+                if not data:
+                    break
+                
+                # Parse message
+                packet = header + data
+                message_type, message = parse_message_packet(packet)
+                
+                print(f"Legacy Server received: '{message}' from {address}")
+                
+                # Generate response
+                response_text = self.responses.get(
+                    message.lower().strip(),
+                    f"Unknown command: '{message}'. Type 'help' for available commands."
+                )
+                
+                # Send encrypted response
+                response_packet = create_message_packet(response_text, message_type=2)
+                client_socket.send(response_packet)
+                
+                if message.lower().strip() == "quit":
+                    break
+                    
+        except Exception as e:
+            print(f"Legacy Server client handler error: {e}")
+        finally:
+            client_socket.close()
+            print(f"Legacy Server: Connection closed from {address}")
+    
+    def stop(self):
+        """Stop the legacy server."""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+class LegacySocketClient:
+    """Client for communicating with the legacy server."""
+    
+    def __init__(self, host: str = 'localhost', port: int = 9999):
+        self.host = host
+        self.port = port
+        self.socket: Optional[socket.socket] = None
+    
+    def connect(self) -> bool:
+        """Connect to the legacy server."""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.connect((self.host, self.port))
+            self.socket.settimeout(10.0)
+            print(f"Connected to legacy server at {self.host}:{self.port}")
+            return True
+        except Exception as e:
+            print(f"Failed to connect to legacy server: {e}")
+            return False
+    
+    def send_message(self, message: str) -> Optional[str]:
+        """Send an encrypted message and receive the response."""
+        if not self.socket:
+            return None
+        
+        try:
+            # Create and send encrypted packet
+            packet = create_message_packet(message)
+            self.socket.send(packet)
+            
+            # Receive response header
+            header = self.socket.recv(5)
+            if not header:
+                return None
+            
+            message_length = struct.unpack('!I', header[1:5])[0]
+            data = self.socket.recv(message_length)
+            
+            # Parse response
+            response_packet = header + data
+            _, response = parse_message_packet(response_packet)
+            
+            return response
+            
+        except Exception as e:
+            print(f"Communication error: {e}")
+            return None
+    
+    def disconnect(self):
+        """Disconnect from the legacy server."""
+        if self.socket:
+            try:
+                self.send_message("quit")
+            except:
+                pass
+            self.socket.close()
+            self.socket = None
+            print("Disconnected from legacy server")
+
+def use_claude_to_interact_with_legacy_server():
+    """Use Claude with tool use to interact with the legacy server."""
+    
+    # Define tools for Claude to use
+    tools = [
+        {
+            "name": "connect_to_legacy_server",
+            "description": "Connect to the legacy server using a custom socket with XOR encryption",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "host": {
+                        "type": "string",
+                        "description": "The hostname or IP address of the legacy server"
+                    },
+                    "port": {
+                        "type": "integer",
+                        "description": "The port number of the legacy server"
+                    }
+                },
+                "required": ["host", "port"]
+            }
+        },
+        {
+            "name": "send_legacy_message",
+            "description": "Send an encrypted message to the legacy server and receive the response",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message to send to the legacy server"
+                    }
+                },
+                "required": ["message"]
+            }
+        },
+        {
+            "name": "disconnect_from_legacy_server",
+            "description": "Disconnect from the legacy server",
+            "input_schema": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    ]
+    
+    # Initialize client
+    client_instance = LegacySocketClient()
+    
+    # Initialize Anthropic client
+    anthropic_client = anthropic.Anthropic()
+    
+    # Initial message to Claude
+    messages = [
+        {
+            "role": "user",
+            "content": """You are tasked with communicating with a legacy server that uses XOR encryption for security. 
+            Please:
+            1. Connect to the legacy server at localhost:9999
+            2. Send a 'hello' message to establish connection
+            3. Check the server status
+            4. Request available data
+            5. Send a ping to test latency
+            6. Disconnect when done
+            
+            Report what you find at each step."""
+        }
+    ]
+    
+    print("\n" + "="*60)
+    print("Starting Claude-powered Legacy Server Communication")
+    print("="*60 + "\n")
+    
+    # Agentic loop
+    while True:
+        response = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+        
+        # Process response
+        if response.stop_reason == "tool_use":
+            # Handle tool calls
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"\nClaude is using tool: {tool_name}")
+                    print(f"Input: {json.dumps(tool_input, indent=2)}")
+                    
+                    # Execute tool
+                    result = None
+                    
+                    if tool_name == "connect_to_legacy_server":
+                        success = client_instance.connect()
+                        result = {
+                            "success": success,
+                            "message": f"Connected to {tool_input['host']}:{tool_input['port']}" if success else "Connection failed"
+                        }
+                    
+                    elif tool_name == "send_legacy_message":
+                        response_text = client_instance.send_message(tool_input["message"])
+                        result = {
+                            "sent": tool_input["message"],
+                            "received": response_text if response_text else "No response",
+                            "encryption": "XOR with key 'LegacySecretKey2024'"
+                        }
+                    
+                    elif tool_name == "disconnect_from_legacy_server":
+                        client_instance.disconnect()
+                        result = {"message": "Successfully disconnected from legacy server"}
+                    
+                    print(f"Result: {json.dumps(result, indent=2)}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": json.dumps(result)
+                    })
+            
+            # Add assistant response and tool results to messages
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            # Claude has finished
+            print("\n" + "="*60)
+            print("Claude's Final Report:")
+            print("="*60)
+            
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    print(content_block.text)
+            
+            break
+        else:
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+    
+    return response
+
+def main():
+    """Main function to demonstrate legacy server communication."""
+    
+    print("Legacy Server Communication with XOR Encryption")
+    print("="*60)
+    
+    # Start the legacy server in a background thread
+    server = LegacyServer()
+    server_thread = threading.Thread(target=server.start)
+    server_thread.daemon = True
+    server_thread.start()
+    
+    # Wait for server to start
+    time.sleep(0.5)
+    
+    print("\nDemonstrating XOR encryption:")
+    test_message = "Hello, Legacy Server!"
+    encrypted = xor_encrypt_decrypt(test_message.encode(), XOR_KEY)
+    decrypted = xor_encrypt_decrypt(encrypted, XOR_KEY)
+    print(f"Original: {test_message}")
+    print(f"Encrypted (hex): {encrypted.hex()}")
+    print(f"Decrypted: {decrypted.decode()}")
+    
+    # Use Claude to interact with the legacy server
+    use_claude_to_interact_with_legacy_server()
+    
+    # Stop the server
+    print("\nStopping legacy server...")
+    server.stop()
+    time.sleep(0.5)
+    
+    print("\nDemonstration complete!")
+
+if __name__ == "__main__":
+    main()
+```

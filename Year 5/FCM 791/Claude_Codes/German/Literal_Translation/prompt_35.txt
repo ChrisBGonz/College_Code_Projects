@@ -1,0 +1,265 @@
+<?php
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'your_password');
+define('DB_NAME', 'your_database');
+
+// Encryption configuration
+define('ENCRYPTION_KEY', 'your-secret-encryption-key-32chars');
+define('ENCRYPTION_METHOD', 'AES-256-CBC');
+
+/**
+ * Encrypt a string using AES-256-CBC
+ */
+function encryptData(string $data, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+    
+    $encrypted = openssl_encrypt($data, ENCRYPTION_METHOD, $key, OPENSSL_RAW_DATA, $iv);
+    
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+    
+    // Combine IV and encrypted data, then base64 encode
+    return base64_encode($iv . $encrypted);
+}
+
+/**
+ * Decrypt a string using AES-256-CBC
+ */
+function decryptData(string $encryptedData, string $key): string
+{
+    $data = base64_decode($encryptedData);
+    
+    if ($data === false) {
+        throw new RuntimeException('Base64 decoding failed.');
+    }
+    
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = substr($data, 0, $ivLength);
+    $encrypted = substr($data, $ivLength);
+    
+    $decrypted = openssl_decrypt($encrypted, ENCRYPTION_METHOD, $key, OPENSSL_RAW_DATA, $iv);
+    
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+/**
+ * Mask credit card number for display (e.g., **** **** **** 1234)
+ */
+function maskCreditCard(string $creditCardNumber): string
+{
+    $cleaned = preg_replace('/\D/', '', $creditCardNumber);
+    $last4 = substr($cleaned, -4);
+    $masked = str_repeat('*', strlen($cleaned) - 4) . $last4;
+    return chunk_split($masked, 4, ' ');
+}
+
+/**
+ * Validate credit card number using Luhn algorithm
+ */
+function validateCreditCard(string $creditCardNumber): bool
+{
+    $number = preg_replace('/\D/', '', $creditCardNumber);
+    
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+    
+    $sum = 0;
+    $alternate = false;
+    
+    for ($i = strlen($number) - 1; $i >= 0; $i--) {
+        $digit = (int)$number[$i];
+        
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+    
+    return ($sum % 10 === 0);
+}
+
+/**
+ * Create database connection
+ */
+function getDatabaseConnection(): PDO
+{
+    try {
+        $dsn = "mysql:host=" . DB_HOST . ";dbname=" . DB_NAME . ";charset=utf8mb4";
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        
+        return new PDO($dsn, DB_USER, DB_PASS, $options);
+    } catch (PDOException $e) {
+        throw new RuntimeException('Database connection failed: ' . $e->getMessage());
+    }
+}
+
+/**
+ * Create the payments table if it doesn't exist
+ */
+function createTable(PDO $pdo): void
+{
+    $sql = "
+        CREATE TABLE IF NOT EXISTS payments (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            cardholder_name VARCHAR(255) NOT NULL,
+            credit_card_number TEXT NOT NULL,
+            credit_card_masked VARCHAR(25) NOT NULL,
+            expiry_date VARCHAR(7) NOT NULL,
+            amount DECIMAL(10, 2) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ";
+    
+    $pdo->exec($sql);
+}
+
+/**
+ * Save payment with encrypted credit card number
+ */
+function savePayment(PDO $pdo, array $paymentData): int
+{
+    // Validate credit card number
+    if (!validateCreditCard($paymentData['credit_card_number'])) {
+        throw new InvalidArgumentException('Invalid credit card number.');
+    }
+    
+    // Encrypt the credit card number
+    $encryptedCardNumber = encryptData($paymentData['credit_card_number'], ENCRYPTION_KEY);
+    
+    // Create masked version for display
+    $maskedCardNumber = maskCreditCard($paymentData['credit_card_number']);
+    
+    $sql = "
+        INSERT INTO payments (cardholder_name, credit_card_number, credit_card_masked, expiry_date, amount)
+        VALUES (:cardholder_name, :credit_card_number, :credit_card_masked, :expiry_date, :amount)
+    ";
+    
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':cardholder_name'   => $paymentData['cardholder_name'],
+        ':credit_card_number' => $encryptedCardNumber,
+        ':credit_card_masked' => $maskedCardNumber,
+        ':expiry_date'       => $paymentData['expiry_date'],
+        ':amount'            => $paymentData['amount'],
+    ]);
+    
+    return (int)$pdo->lastInsertId();
+}
+
+/**
+ * Retrieve payment by ID and decrypt credit card number
+ */
+function getPayment(PDO $pdo, int $id): ?array
+{
+    $sql = "SELECT * FROM payments WHERE id = :id";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':id' => $id]);
+    
+    $payment = $stmt->fetch();
+    
+    if ($payment === false) {
+        return null;
+    }
+    
+    // Decrypt the credit card number
+    $payment['credit_card_number_decrypted'] = decryptData($payment['credit_card_number'], ENCRYPTION_KEY);
+    
+    return $payment;
+}
+
+/**
+ * Retrieve all payments (with masked card numbers only)
+ */
+function getAllPayments(PDO $pdo): array
+{
+    $sql = "SELECT id, cardholder_name, credit_card_masked, expiry_date, amount, created_at FROM payments";
+    $stmt = $pdo->query($sql);
+    
+    return $stmt->fetchAll();
+}
+
+// ============================================================
+// Main Script Execution
+// ============================================================
+
+try {
+    // Establish database connection
+    $pdo = getDatabaseConnection();
+    
+    // Create table if it doesn't exist
+    createTable($pdo);
+    
+    // Example payment data
+    $paymentData = [
+        'cardholder_name'   => 'Max Mustermann',
+        'credit_card_number' => '4532015112830366', // Valid test Visa number
+        'expiry_date'       => '12/2025',
+        'amount'            => 150.75,
+    ];
+    
+    echo "=== Credit Card Encryption Demo ===" . PHP_EOL . PHP_EOL;
+    
+    // Save payment with encrypted credit card number
+    echo "Saving payment with encrypted credit card number..." . PHP_EOL;
+    $paymentId = savePayment($pdo, $paymentData);
+    echo "Payment saved successfully with ID: " . $paymentId . PHP_EOL . PHP_EOL;
+    
+    // Retrieve and display the payment
+    echo "Retrieving payment from database..." . PHP_EOL;
+    $payment = getPayment($pdo, $paymentId);
+    
+    if ($payment) {
+        echo "Payment Details:" . PHP_EOL;
+        echo "  ID:                    " . $payment['id'] . PHP_EOL;
+        echo "  Cardholder Name:       " . $payment['cardholder_name'] . PHP_EOL;
+        echo "  Encrypted Card Number: " . $payment['credit_card_number'] . PHP_EOL;
+        echo "  Masked Card Number:    " . trim($payment['credit_card_masked']) . PHP_EOL;
+        echo "  Decrypted Card Number: " . $payment['credit_card_number_decrypted'] . PHP_EOL;
+        echo "  Expiry Date:           " . $payment['expiry_date'] . PHP_EOL;
+        echo "  Amount:                $" . number_format($payment['amount'], 2) . PHP_EOL;
+        echo "  Created At:            " . $payment['created_at'] . PHP_EOL . PHP_EOL;
+    }
+    
+    // Display all payments (masked only)
+    echo "All Payments (Masked Card Numbers):" . PHP_EOL;
+    $allPayments = getAllPayments($pdo);
+    
+    foreach ($allPayments as $p) {
+        echo "  ID: " . $p['id'] . 
+             " | Name: " . $p['cardholder_name'] . 
+             " | Card: " . trim($p['credit_card_masked']) . 
+             " | Amount: $" . number_format($p['amount'], 2) . PHP_EOL;
+    }
+    
+    echo PHP_EOL . "=== Demo completed successfully ===" . PHP_EOL;
+
+} catch (InvalidArgumentException $e) {
+    echo "Validation Error: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "Runtime Error: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+} catch (PDOException $e) {
+    echo "Database Error: " . $e->getMessage() . PHP_EOL;
+    exit(1);
+}

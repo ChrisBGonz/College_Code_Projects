@@ -1,0 +1,323 @@
+
+package main
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+type TokenStore struct {
+	mu     sync.RWMutex
+	tokens map[string]*TokenData
+}
+
+type TokenData struct {
+	HashedToken string
+	UserID      string
+	Email       string
+	ExpiresAt   time.Time
+	Used        bool
+	CreatedAt   time.Time
+}
+
+type ResetToken struct {
+	RawToken  string
+	UserID    string
+	Email     string
+	ExpiresAt time.Time
+}
+
+var (
+	ErrTokenNotFound  = errors.New("token not found")
+	ErrTokenExpired   = errors.New("token has expired")
+	ErrTokenUsed      = errors.New("token has already been used")
+	ErrInvalidToken   = errors.New("invalid token")
+	ErrInvalidUserID  = errors.New("invalid user ID")
+	ErrInvalidEmail   = errors.New("invalid email")
+)
+
+const (
+	TokenLength    = 32
+	TokenExpiry    = 1 * time.Hour
+	TokenByteSize  = 32
+)
+
+func NewTokenStore() *TokenStore {
+	store := &TokenStore{
+		tokens: make(map[string]*TokenData),
+	}
+	go store.cleanupExpiredTokens()
+	return store
+}
+
+func generateSecureRandomBytes(n int) ([]byte, error) {
+	bytes := make([]byte, n)
+	_, err := rand.Read(bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+	return bytes, nil
+}
+
+func generateRawToken() (string, error) {
+	bytes, err := generateSecureRandomBytes(TokenByteSize)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(bytes), nil
+}
+
+func hashToken(rawToken string) string {
+	hash := sha256.Sum256([]byte(rawToken))
+	return hex.EncodeToString(hash[:])
+}
+
+func (ts *TokenStore) CreatePasswordResetToken(userID, email string) (*ResetToken, error) {
+	if userID == "" {
+		return nil, ErrInvalidUserID
+	}
+	if email == "" {
+		return nil, ErrInvalidEmail
+	}
+
+	rawToken, err := generateRawToken()
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate token: %w", err)
+	}
+
+	hashedToken := hashToken(rawToken)
+	expiresAt := time.Now().Add(TokenExpiry)
+
+	tokenData := &TokenData{
+		HashedToken: hashedToken,
+		UserID:      userID,
+		Email:       email,
+		ExpiresAt:   expiresAt,
+		Used:        false,
+		CreatedAt:   time.Now(),
+	}
+
+	ts.mu.Lock()
+	ts.invalidateExistingTokensForUser(userID)
+	ts.tokens[hashedToken] = tokenData
+	ts.mu.Unlock()
+
+	resetToken := &ResetToken{
+		RawToken:  rawToken,
+		UserID:    userID,
+		Email:     email,
+		ExpiresAt: expiresAt,
+	}
+
+	return resetToken, nil
+}
+
+func (ts *TokenStore) invalidateExistingTokensForUser(userID string) {
+	for key, data := range ts.tokens {
+		if data.UserID == userID && !data.Used {
+			delete(ts.tokens, key)
+		}
+	}
+}
+
+func (ts *TokenStore) ValidatePasswordResetToken(rawToken string) (*TokenData, error) {
+	if rawToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	hashedToken := hashToken(rawToken)
+
+	ts.mu.RLock()
+	tokenData, exists := ts.tokens[hashedToken]
+	ts.mu.RUnlock()
+
+	if !exists {
+		return nil, ErrTokenNotFound
+	}
+
+	if tokenData.Used {
+		return nil, ErrTokenUsed
+	}
+
+	if time.Now().After(tokenData.ExpiresAt) {
+		ts.mu.Lock()
+		delete(ts.tokens, hashedToken)
+		ts.mu.Unlock()
+		return nil, ErrTokenExpired
+	}
+
+	return tokenData, nil
+}
+
+func (ts *TokenStore) ConsumePasswordResetToken(rawToken string) (*TokenData, error) {
+	if rawToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	hashedToken := hashToken(rawToken)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	tokenData, exists := ts.tokens[hashedToken]
+	if !exists {
+		return nil, ErrTokenNotFound
+	}
+
+	if tokenData.Used {
+		return nil, ErrTokenUsed
+	}
+
+	if time.Now().After(tokenData.ExpiresAt) {
+		delete(ts.tokens, hashedToken)
+		return nil, ErrTokenExpired
+	}
+
+	tokenData.Used = true
+	ts.tokens[hashedToken] = tokenData
+
+	return tokenData, nil
+}
+
+func (ts *TokenStore) RevokeToken(rawToken string) error {
+	if rawToken == "" {
+		return ErrInvalidToken
+	}
+
+	hashedToken := hashToken(rawToken)
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	if _, exists := ts.tokens[hashedToken]; !exists {
+		return ErrTokenNotFound
+	}
+
+	delete(ts.tokens, hashedToken)
+	return nil
+}
+
+func (ts *TokenStore) GetTokenInfo(rawToken string) (*TokenData, error) {
+	if rawToken == "" {
+		return nil, ErrInvalidToken
+	}
+
+	hashedToken := hashToken(rawToken)
+
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+
+	tokenData, exists := ts.tokens[hashedToken]
+	if !exists {
+		return nil, ErrTokenNotFound
+	}
+
+	return tokenData, nil
+}
+
+func (ts *TokenStore) cleanupExpiredTokens() {
+	ticker := time.NewTicker(15 * time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		ts.mu.Lock()
+		now := time.Now()
+		for key, data := range ts.tokens {
+			if now.After(data.ExpiresAt) || data.Used {
+				delete(ts.tokens, key)
+			}
+		}
+		ts.mu.Unlock()
+	}
+}
+
+func (ts *TokenStore) TokenCount() int {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.tokens)
+}
+
+func main() {
+	store := NewTokenStore()
+
+	fmt.Println("=== Password Reset Token Demo ===")
+	fmt.Println()
+
+	resetToken, err := store.CreatePasswordResetToken("user123", "user@example.com")
+	if err != nil {
+		fmt.Printf("Error creating token: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Token created successfully!\n")
+	fmt.Printf("Raw Token: %s\n", resetToken.RawToken[:20]+"...")
+	fmt.Printf("User ID: %s\n", resetToken.UserID)
+	fmt.Printf("Email: %s\n", resetToken.Email)
+	fmt.Printf("Expires At: %s\n", resetToken.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("Time Until Expiry: %s\n", time.Until(resetToken.ExpiresAt).Round(time.Second))
+	fmt.Println()
+
+	fmt.Println("=== Validating Token ===")
+	tokenData, err := store.ValidatePasswordResetToken(resetToken.RawToken)
+	if err != nil {
+		fmt.Printf("Validation error: %v\n", err)
+	} else {
+		fmt.Printf("Token is valid!\n")
+		fmt.Printf("User ID: %s\n", tokenData.UserID)
+		fmt.Printf("Email: %s\n", tokenData.Email)
+		fmt.Printf("Created At: %s\n", tokenData.CreatedAt.Format(time.RFC3339))
+	}
+	fmt.Println()
+
+	fmt.Println("=== Consuming Token ===")
+	consumedData, err := store.ConsumePasswordResetToken(resetToken.RawToken)
+	if err != nil {
+		fmt.Printf("Consumption error: %v\n", err)
+	} else {
+		fmt.Printf("Token consumed successfully!\n")
+		fmt.Printf("Password reset authorized for user: %s\n", consumedData.UserID)
+	}
+	fmt.Println()
+
+	fmt.Println("=== Attempting to Reuse Token ===")
+	_, err = store.ValidatePasswordResetToken(resetToken.RawToken)
+	if err != nil {
+		fmt.Printf("Expected error: %v\n", err)
+	}
+	fmt.Println()
+
+	fmt.Println("=== Testing Invalid Token ===")
+	_, err = store.ValidatePasswordResetToken("invalid-token-xyz")
+	if err != nil {
+		fmt.Printf("Expected error: %v\n", err)
+	}
+	fmt.Println()
+
+	fmt.Println("=== Creating New Token for Same User ===")
+	newToken, err := store.CreatePasswordResetToken("user123", "user@example.com")
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	} else {
+		fmt.Printf("New token created for user123\n")
+		fmt.Printf("Token count in store: %d\n", store.TokenCount())
+		_ = newToken
+	}
+	fmt.Println()
+
+	fmt.Println("=== Revoking Token ===")
+	revokeToken, _ := store.CreatePasswordResetToken("user456", "user456@example.com")
+	fmt.Printf("Token count before revoke: %d\n", store.TokenCount())
+	err = store.RevokeToken(revokeToken.RawToken)
+	if err != nil {
+		fmt.Printf("Revoke error: %v\n", err)
+	} else {
+		fmt.Printf("Token revoked successfully!\n")
+		fmt.Printf("Token count after revoke: %d\n", store.TokenCount())
+	}
+}

@@ -1,0 +1,377 @@
+
+```python
+import os
+import json
+import time
+from datetime import datetime, timedelta
+from anthropic import Anthropic
+
+client = Anthropic()
+conversation_history = []
+
+SYSTEM_PROMPT = """You are a JWT (JSON Web Token) authentication expert assistant. You help users understand, create, decode, and validate JWT tokens. You can:
+
+1. Explain JWT concepts (header, payload, signature)
+2. Help create JWT tokens with custom claims
+3. Decode and analyze JWT tokens
+4. Validate JWT tokens and check expiration
+5. Explain JWT security best practices
+6. Help with JWT authentication flows
+
+When users ask you to create or decode JWTs, provide detailed explanations of each component.
+When showing JWT tokens, always explain the base64-encoded parts.
+Always emphasize security best practices.
+
+You have access to JWT operations through the PyJWT library. When demonstrating JWT operations, show the actual Python code and explain what it does."""
+
+def create_jwt_token(payload: dict, secret: str, algorithm: str = "HS256", expiry_hours: int = 1) -> dict:
+    """Create a JWT token with the given payload."""
+    try:
+        import jwt
+        
+        # Add standard claims
+        now = datetime.utcnow()
+        payload_with_claims = {
+            **payload,
+            "iat": now,
+            "exp": now + timedelta(hours=expiry_hours),
+            "nbf": now
+        }
+        
+        token = jwt.encode(payload_with_claims, secret, algorithm=algorithm)
+        
+        return {
+            "success": True,
+            "token": token,
+            "payload": payload_with_claims,
+            "algorithm": algorithm,
+            "expires_in": f"{expiry_hours} hour(s)"
+        }
+    except ImportError:
+        return {
+            "success": False,
+            "error": "PyJWT library not installed. Install with: pip install PyJWT"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def decode_jwt_token(token: str, secret: str = None, algorithm: str = "HS256") -> dict:
+    """Decode and validate a JWT token."""
+    try:
+        import jwt
+        import base64
+        
+        # First, decode without verification to show structure
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {"success": False, "error": "Invalid JWT format"}
+        
+        # Decode header and payload (add padding if needed)
+        def decode_base64(data):
+            padding = 4 - len(data) % 4
+            if padding != 4:
+                data += '=' * padding
+            return json.loads(base64.urlsafe_b64decode(data))
+        
+        header = decode_base64(parts[0])
+        
+        result = {
+            "success": True,
+            "header": header,
+            "raw_parts": {
+                "header": parts[0],
+                "payload": parts[1],
+                "signature": parts[2]
+            }
+        }
+        
+        if secret:
+            # Verify and decode with secret
+            try:
+                decoded_payload = jwt.decode(token, secret, algorithms=[algorithm])
+                result["payload"] = decoded_payload
+                result["verified"] = True
+                result["valid"] = True
+                
+                # Check expiration
+                if "exp" in decoded_payload:
+                    exp_time = datetime.utcfromtimestamp(decoded_payload["exp"])
+                    result["expires_at"] = exp_time.isoformat()
+                    result["is_expired"] = datetime.utcnow() > exp_time
+                    
+            except jwt.ExpiredSignatureError:
+                # Still decode but mark as expired
+                payload = decode_base64(parts[1])
+                result["payload"] = payload
+                result["verified"] = False
+                result["valid"] = False
+                result["error"] = "Token has expired"
+                result["is_expired"] = True
+            except jwt.InvalidSignatureError:
+                payload = decode_base64(parts[1])
+                result["payload"] = payload
+                result["verified"] = False
+                result["valid"] = False
+                result["error"] = "Invalid signature"
+        else:
+            # Decode without verification
+            payload = decode_base64(parts[1])
+            result["payload"] = payload
+            result["verified"] = False
+            result["warning"] = "Token decoded without verification (no secret provided)"
+        
+        return result
+        
+    except ImportError:
+        return {
+            "success": False,
+            "error": "PyJWT library not installed. Install with: pip install PyJWT"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def validate_jwt_token(token: str, secret: str, algorithm: str = "HS256") -> dict:
+    """Validate a JWT token and return detailed validation results."""
+    try:
+        import jwt
+        
+        result = {
+            "token": token[:50] + "..." if len(token) > 50 else token,
+            "checks": {}
+        }
+        
+        # Check format
+        parts = token.split('.')
+        result["checks"]["format"] = {
+            "valid": len(parts) == 3,
+            "message": "Valid JWT format (3 parts)" if len(parts) == 3 else "Invalid format"
+        }
+        
+        if len(parts) != 3:
+            result["valid"] = False
+            return result
+        
+        # Try to decode and validate
+        try:
+            payload = jwt.decode(token, secret, algorithms=[algorithm])
+            
+            result["checks"]["signature"] = {
+                "valid": True,
+                "message": "Signature is valid"
+            }
+            
+            # Check expiration
+            if "exp" in payload:
+                exp_time = datetime.utcfromtimestamp(payload["exp"])
+                is_expired = datetime.utcnow() > exp_time
+                result["checks"]["expiration"] = {
+                    "valid": not is_expired,
+                    "message": f"Token {'has expired' if is_expired else 'is valid'} (expires: {exp_time.isoformat()})"
+                }
+            else:
+                result["checks"]["expiration"] = {
+                    "valid": True,
+                    "message": "No expiration claim (token never expires)"
+                }
+            
+            # Check not before
+            if "nbf" in payload:
+                nbf_time = datetime.utcfromtimestamp(payload["nbf"])
+                is_before = datetime.utcnow() < nbf_time
+                result["checks"]["not_before"] = {
+                    "valid": not is_before,
+                    "message": f"Token {'not yet valid' if is_before else 'is active'} (valid from: {nbf_time.isoformat()})"
+                }
+            
+            result["payload"] = payload
+            result["valid"] = all(check["valid"] for check in result["checks"].values())
+            
+        except jwt.ExpiredSignatureError:
+            result["checks"]["signature"] = {"valid": True, "message": "Signature is valid"}
+            result["checks"]["expiration"] = {"valid": False, "message": "Token has expired"}
+            result["valid"] = False
+        except jwt.InvalidSignatureError:
+            result["checks"]["signature"] = {"valid": False, "message": "Invalid signature"}
+            result["valid"] = False
+        except Exception as e:
+            result["checks"]["general"] = {"valid": False, "message": str(e)}
+            result["valid"] = False
+        
+        return result
+        
+    except ImportError:
+        return {
+            "success": False,
+            "error": "PyJWT library not installed. Install with: pip install PyJWT"
+        }
+
+def chat_with_jwt_assistant(user_message: str) -> str:
+    """Send a message to the JWT assistant and get a response."""
+    
+    # Check if user is asking for JWT operations
+    message_lower = user_message.lower()
+    
+    # Prepare context with JWT operation results if needed
+    context_message = user_message
+    
+    if "create" in message_lower and "token" in message_lower:
+        # Example token creation
+        example_result = create_jwt_token(
+            payload={"user_id": "123", "username": "john_doe", "role": "admin"},
+            secret="my-secret-key-example",
+            expiry_hours=1
+        )
+        context_message += f"\n\n[JWT Creation Example Result: {json.dumps(example_result, default=str, indent=2)}]"
+    
+    elif "decode" in message_lower and "token" in message_lower:
+        # Check if there's a token in the message
+        words = user_message.split()
+        for word in words:
+            if len(word) > 50 and '.' in word:
+                decode_result = decode_jwt_token(word)
+                context_message += f"\n\n[JWT Decode Result: {json.dumps(decode_result, default=str, indent=2)}]"
+                break
+    
+    elif "validate" in message_lower and "token" in message_lower:
+        # Check if there's a token in the message
+        words = user_message.split()
+        for word in words:
+            if len(word) > 50 and '.' in word:
+                validate_result = validate_jwt_token(word, "example-secret")
+                context_message += f"\n\n[JWT Validation Result: {json.dumps(validate_result, default=str, indent=2)}]"
+                break
+    
+    # Add message to history
+    conversation_history.append({
+        "role": "user",
+        "content": context_message
+    })
+    
+    # Get response from Claude
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=SYSTEM_PROMPT,
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def demonstrate_jwt_operations():
+    """Demonstrate various JWT operations."""
+    print("\n" + "="*60)
+    print("JWT OPERATIONS DEMONSTRATION")
+    print("="*60)
+    
+    # 1. Create a token
+    print("\n1. Creating a JWT Token:")
+    print("-" * 40)
+    secret = "my-super-secret-key-2024"
+    payload = {
+        "user_id": "user_123",
+        "username": "alice",
+        "email": "alice@example.com",
+        "role": "admin",
+        "permissions": ["read", "write", "delete"]
+    }
+    
+    token_result = create_jwt_token(payload, secret, expiry_hours=2)
+    if token_result["success"]:
+        print(f"Token created successfully!")
+        print(f"Token: {token_result['token'][:80]}...")
+        print(f"Algorithm: {token_result['algorithm']}")
+        print(f"Expires in: {token_result['expires_in']}")
+        
+        token = token_result["token"]
+        
+        # 2. Decode the token
+        print("\n2. Decoding the JWT Token:")
+        print("-" * 40)
+        decode_result = decode_jwt_token(token, secret)
+        if decode_result["success"]:
+            print(f"Header: {json.dumps(decode_result['header'], indent=2)}")
+            print(f"Verified: {decode_result.get('verified', False)}")
+            if "payload" in decode_result:
+                payload_display = {k: v for k, v in decode_result["payload"].items() 
+                                  if k not in ["iat", "exp", "nbf"]}
+                print(f"Custom Claims: {json.dumps(payload_display, indent=2)}")
+        
+        # 3. Validate the token
+        print("\n3. Validating the JWT Token:")
+        print("-" * 40)
+        validate_result = validate_jwt_token(token, secret)
+        print(f"Token Valid: {validate_result.get('valid', False)}")
+        for check_name, check_result in validate_result.get("checks", {}).items():
+            status = "✓" if check_result["valid"] else "✗"
+            print(f"  {status} {check_name}: {check_result['message']}")
+    
+    print("\n" + "="*60)
+
+def main():
+    """Main function to run the JWT assistant chatbot."""
+    print("="*60)
+    print("JWT Authentication Assistant")
+    print("="*60)
+    print("\nWelcome! I'm your JWT authentication expert.")
+    print("I can help you with:")
+    print("  - Understanding JWT concepts")
+    print("  - Creating JWT tokens")
+    print("  - Decoding JWT tokens")
+    print("  - Validating JWT tokens")
+    print("  - JWT security best practices")
+    print("\nType 'demo' to see JWT operations in action")
+    print("Type 'quit' or 'exit' to end the conversation")
+    print("="*60 + "\n")
+    
+    # Check if PyJWT is installed
+    try:
+        import jwt
+        print("✓ PyJWT library is available\n")
+    except ImportError:
+        print("⚠ PyJWT library not found. Install with: pip install PyJWT")
+        print("Some features may be limited.\n")
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                print("\nAssistant: Goodbye! Stay secure with your JWT implementations!")
+                break
+            
+            if user_input.lower() == 'demo':
+                demonstrate_jwt_operations()
+                continue
+            
+            print("\nAssistant: ", end="", flush=True)
+            response = chat_with_jwt_assistant(user_input)
+            print(response)
+            print()
+            
+        except KeyboardInterrupt:
+            print("\n\nAssistant: Session interrupted. Goodbye!")
+            break
+        except Exception as e:
+            print(f"\nError: {e}")
+            print("Please try again.\n")
+
+if __name__ == "__main__":
+    main()
+```

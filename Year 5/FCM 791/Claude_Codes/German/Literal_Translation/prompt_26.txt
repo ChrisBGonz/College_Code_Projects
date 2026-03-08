@@ -1,0 +1,167 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  ARTIFACT_NAME: build-artifact
+  BUILD_DIR: dist
+  BUCKET_NAME: ${{ secrets.STORAGE_BUCKET_NAME }}
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Tests
+        run: npm test
+
+      - name: Build Project
+        run: npm run build
+
+      - name: Create Archive
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          zip -r ../${{ env.ARTIFACT_NAME }}.zip .
+          cd ..
+          echo "ARTIFACT_PATH=$(pwd)/${{ env.ARTIFACT_NAME }}.zip" >> $GITHUB_ENV
+
+      - name: Upload Artifact (GitHub)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.zip
+          retention-days: 7
+
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Generate Artifact Metadata
+        run: |
+          echo "TIMESTAMP=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Upload to GCS
+        run: |
+          DESTINATION="gs://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/${{ env.ARTIFACT_NAME }}.zip"
+          gsutil cp ${{ env.ARTIFACT_NAME }}.zip "$DESTINATION"
+          echo "Artifact uploaded to: $DESTINATION"
+
+      - name: Update Latest Pointer
+        run: |
+          gsutil cp \
+            "gs://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/${{ env.ARTIFACT_NAME }}.zip" \
+            "gs://${{ env.BUCKET_NAME }}/artifacts/latest/${{ env.ARTIFACT_NAME }}.zip"
+
+      - name: Verify Upload
+        run: |
+          gsutil ls -l "gs://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/${{ env.ARTIFACT_NAME }}.zip"
+
+  upload-to-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Generate Artifact Metadata
+        run: |
+          echo "TIMESTAMP=$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+          echo "SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)" >> $GITHUB_ENV
+
+      - name: Upload to S3
+        run: |
+          DESTINATION="s3://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/${{ env.ARTIFACT_NAME }}.zip"
+          aws s3 cp ${{ env.ARTIFACT_NAME }}.zip "$DESTINATION"
+          echo "Artifact uploaded to: $DESTINATION"
+
+      - name: Update Latest Pointer
+        run: |
+          aws s3 cp \
+            "s3://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/${{ env.ARTIFACT_NAME }}.zip" \
+            "s3://${{ env.BUCKET_NAME }}/artifacts/latest/${{ env.ARTIFACT_NAME }}.zip"
+
+      - name: Verify Upload
+        run: |
+          aws s3 ls "s3://${{ env.BUCKET_NAME }}/artifacts/${{ env.TIMESTAMP }}-${{ env.SHORT_SHA }}/"
+
+  notify:
+    name: Notify on Completion
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-gcs]
+    if: always()
+
+    steps:
+      - name: Notify Success
+        if: needs.build.result == 'success' && needs.upload-to-gcs.result == 'success'
+        run: |
+          echo "Build and upload completed successfully!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+      - name: Notify Failure
+        if: needs.build.result == 'failure' || needs.upload-to-gcs.result == 'failure'
+        run: |
+          echo "Build or upload failed!"
+          echo "Build status: ${{ needs.build.result }}"
+          echo "Upload status: ${{ needs.upload-to-gcs.result }}"
+          exit 1
+```

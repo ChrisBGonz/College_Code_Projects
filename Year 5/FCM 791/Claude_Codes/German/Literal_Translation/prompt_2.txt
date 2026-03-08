@@ -1,0 +1,400 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import * as http from "http";
+import * as url from "url";
+
+const client = new Anthropic();
+
+// Simulated user database
+const userDatabase: Record<
+  string,
+  { id: string; email: string; displayName: string; updatedAt: string }
+> = {
+  user123: {
+    id: "user123",
+    email: "john.doe@example.com",
+    displayName: "John Doe",
+    updatedAt: new Date().toISOString(),
+  },
+  user456: {
+    id: "user456",
+    email: "jane.smith@example.com",
+    displayName: "Jane Smith",
+    updatedAt: new Date().toISOString(),
+  },
+};
+
+// Tool definitions for Claude
+const tools: Anthropic.Tool[] = [
+  {
+    name: "validate_email",
+    description:
+      "Validates if an email address is in the correct format and checks if it's already in use by another user",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        email: {
+          type: "string",
+          description: "The email address to validate",
+        },
+        userId: {
+          type: "string",
+          description: "The ID of the user making the update request",
+        },
+      },
+      required: ["email", "userId"],
+    },
+  },
+  {
+    name: "validate_display_name",
+    description:
+      "Validates if a display name meets the requirements (2-50 characters, alphanumeric and spaces only)",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        displayName: {
+          type: "string",
+          description: "The display name to validate",
+        },
+      },
+      required: ["displayName"],
+    },
+  },
+  {
+    name: "update_user_profile",
+    description:
+      "Updates the user profile in the database with the new email and/or display name",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        userId: {
+          type: "string",
+          description: "The ID of the user to update",
+        },
+        email: {
+          type: "string",
+          description: "The new email address (optional)",
+        },
+        displayName: {
+          type: "string",
+          description: "The new display name (optional)",
+        },
+      },
+      required: ["userId"],
+    },
+  },
+  {
+    name: "get_user_profile",
+    description: "Retrieves the current user profile from the database",
+    input_schema: {
+      type: "object" as const,
+      properties: {
+        userId: {
+          type: "string",
+          description: "The ID of the user to retrieve",
+        },
+      },
+      required: ["userId"],
+    },
+  },
+];
+
+// Tool execution functions
+function validateEmail(
+  email: string,
+  userId: string
+): { valid: boolean; error?: string } {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  if (!emailRegex.test(email)) {
+    return { valid: false, error: "Invalid email format" };
+  }
+
+  // Check if email is already in use by another user
+  const existingUser = Object.values(userDatabase).find(
+    (user) => user.email === email && user.id !== userId
+  );
+
+  if (existingUser) {
+    return { valid: false, error: "Email address is already in use" };
+  }
+
+  return { valid: true };
+}
+
+function validateDisplayName(displayName: string): {
+  valid: boolean;
+  error?: string;
+} {
+  if (displayName.length < 2 || displayName.length > 50) {
+    return {
+      valid: false,
+      error: "Display name must be between 2 and 50 characters",
+    };
+  }
+
+  const nameRegex = /^[a-zA-Z0-9\s]+$/;
+  if (!nameRegex.test(displayName)) {
+    return {
+      valid: false,
+      error: "Display name can only contain letters, numbers, and spaces",
+    };
+  }
+
+  return { valid: true };
+}
+
+function updateUserProfile(
+  userId: string,
+  email?: string,
+  displayName?: string
+): { success: boolean; user?: (typeof userDatabase)[string]; error?: string } {
+  if (!userDatabase[userId]) {
+    return { success: false, error: "User not found" };
+  }
+
+  if (email) {
+    userDatabase[userId].email = email;
+  }
+
+  if (displayName) {
+    userDatabase[userId].displayName = displayName;
+  }
+
+  userDatabase[userId].updatedAt = new Date().toISOString();
+
+  return { success: true, user: userDatabase[userId] };
+}
+
+function getUserProfile(userId: string): {
+  found: boolean;
+  user?: (typeof userDatabase)[string];
+} {
+  const user = userDatabase[userId];
+  if (!user) {
+    return { found: false };
+  }
+  return { found: true, user };
+}
+
+// Process tool calls
+function processToolCall(
+  toolName: string,
+  toolInput: Record<string, string>
+): string {
+  switch (toolName) {
+    case "validate_email":
+      return JSON.stringify(validateEmail(toolInput.email, toolInput.userId));
+
+    case "validate_display_name":
+      return JSON.stringify(validateDisplayName(toolInput.displayName));
+
+    case "update_user_profile":
+      return JSON.stringify(
+        updateUserProfile(toolInput.userId, toolInput.email, toolInput.displayName)
+      );
+
+    case "get_user_profile":
+      return JSON.stringify(getUserProfile(toolInput.userId));
+
+    default:
+      return JSON.stringify({ error: "Unknown tool" });
+  }
+}
+
+// Main API handler function
+async function handleUpdateProfile(requestBody: {
+  userId: string;
+  email?: string;
+  displayName?: string;
+}): Promise<{ success: boolean; message: string; user?: object }> {
+  const { userId, email, displayName } = requestBody;
+
+  if (!userId) {
+    return { success: false, message: "User ID is required" };
+  }
+
+  if (!email && !displayName) {
+    return {
+      success: false,
+      message: "At least one field (email or displayName) must be provided",
+    };
+  }
+
+  const userMessage = `
+    Please help me update the user profile for user ID: ${userId}
+    ${email ? `New email: ${email}` : ""}
+    ${displayName ? `New display name: ${displayName}` : ""}
+    
+    Please:
+    1. First get the current user profile to verify the user exists
+    2. Validate any provided fields (email format and uniqueness, display name requirements)
+    3. If validation passes, update the profile
+    4. Return a clear success or error message
+  `;
+
+  const messages: Anthropic.MessageParam[] = [
+    { role: "user", content: userMessage },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  // Agentic loop
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlocks = response.content.filter(
+      (block): block is Anthropic.ToolUseBlock => block.type === "tool_use"
+    );
+
+    const toolResults: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map(
+      (toolUse) => ({
+        type: "tool_result" as const,
+        tool_use_id: toolUse.id,
+        content: processToolCall(toolUse.name, toolUse.input as Record<string, string>),
+      })
+    );
+
+    messages.push({ role: "assistant", content: response.content });
+    messages.push({ role: "user", content: toolResults });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  // Extract final text response
+  const textBlock = response.content.find(
+    (block): block is Anthropic.TextBlock => block.type === "text"
+  );
+
+  const finalMessage = textBlock?.text || "Profile update completed";
+
+  // Check if update was successful by looking at the database
+  const updatedUser = userDatabase[userId];
+  const success =
+    finalMessage.toLowerCase().includes("success") ||
+    finalMessage.toLowerCase().includes("updated") ||
+    finalMessage.toLowerCase().includes("erfolgreich");
+
+  return {
+    success,
+    message: finalMessage,
+    user: success ? updatedUser : undefined,
+  };
+}
+
+// HTTP Server
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url || "", true);
+
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  if (parsedUrl.pathname === "/api/user/update-profile" && req.method === "POST") {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      try {
+        const requestBody = JSON.parse(body);
+        console.log("Received update request:", requestBody);
+
+        const result = await handleUpdateProfile(requestBody);
+
+        res.writeHead(result.success ? 200 : 400);
+        res.end(JSON.stringify(result));
+      } catch (error) {
+        console.error("Error processing request:", error);
+        res.writeHead(500);
+        res.end(
+          JSON.stringify({
+            success: false,
+            message: "Internal server error",
+          })
+        );
+      }
+    });
+  } else {
+    res.writeHead(404);
+    res.end(JSON.stringify({ error: "Endpoint not found" }));
+  }
+});
+
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`API endpoint: POST http://localhost:${PORT}/api/user/update-profile`);
+  console.log("\nExample request body:");
+  console.log(
+    JSON.stringify(
+      {
+        userId: "user123",
+        email: "newemail@example.com",
+        displayName: "New Name",
+      },
+      null,
+      2
+    )
+  );
+});
+
+// Test the API with example requests
+async function runTests() {
+  console.log("\n=== Running API Tests ===\n");
+
+  // Test 1: Update both email and display name
+  console.log("Test 1: Update email and display name");
+  const result1 = await handleUpdateProfile({
+    userId: "user123",
+    email: "updated.john@example.com",
+    displayName: "John Updated",
+  });
+  console.log("Result:", JSON.stringify(result1, null, 2));
+
+  // Test 2: Update only display name
+  console.log("\nTest 2: Update only display name");
+  const result2 = await handleUpdateProfile({
+    userId: "user456",
+    displayName: "Jane Updated Smith",
+  });
+  console.log("Result:", JSON.stringify(result2, null, 2));
+
+  // Test 3: Invalid email
+  console.log("\nTest 3: Invalid email format");
+  const result3 = await handleUpdateProfile({
+    userId: "user123",
+    email: "invalid-email",
+  });
+  console.log("Result:", JSON.stringify(result3, null, 2));
+
+  // Test 4: Non-existent user
+  console.log("\nTest 4: Non-existent user");
+  const result4 = await handleUpdateProfile({
+    userId: "user999",
+    email: "test@example.com",
+  });
+  console.log("Result:", JSON.stringify(result4, null, 2));
+}
+
+// Run tests after server starts
+setTimeout(runTests, 1000);
+```

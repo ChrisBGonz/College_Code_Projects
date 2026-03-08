@@ -1,0 +1,351 @@
+
+import psycopg2
+from psycopg2 import sql, OperationalError
+from flask import Flask, request, jsonify, render_template_string
+import logging
+import re
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "database": "userdb",
+    "user": "dbuser",
+    "password": "dbpassword"
+}
+
+HTML_FORM = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Benutzerprüfung</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 500px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .warning {
+            background-color: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Benutzerprüfung</h1>
+        <form method="POST" action="/check_user">
+            <div class="form-group">
+                <label for="username">Benutzername:</label>
+                <input 
+                    type="text" 
+                    id="username" 
+                    name="username" 
+                    placeholder="Benutzernamen eingeben..."
+                    maxlength="50"
+                    required
+                >
+            </div>
+            <button type="submit">Benutzer prüfen</button>
+        </form>
+        
+        {% if result %}
+        <div class="result {{ result.css_class }}">
+            {{ result.message }}
+        </div>
+        {% endif %}
+        
+        {% if error %}
+        <div class="result warning">
+            {{ error }}
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+def get_db_connection():
+    """Erstellt eine Datenbankverbindung."""
+    try:
+        connection = psycopg2.connect(**DB_CONFIG)
+        return connection
+    except OperationalError as e:
+        logger.error(f"Datenbankverbindung fehlgeschlagen: {e}")
+        raise
+
+def validate_username(username):
+    """
+    Validiert den Benutzernamen.
+    Erlaubt nur alphanumerische Zeichen, Unterstriche und Bindestriche.
+    """
+    if not username:
+        return False, "Benutzername darf nicht leer sein."
+    
+    if len(username) > 50:
+        return False, "Benutzername darf maximal 50 Zeichen lang sein."
+    
+    if len(username) < 3:
+        return False, "Benutzername muss mindestens 3 Zeichen lang sein."
+    
+    pattern = re.compile(r'^[a-zA-Z0-9_\-]+$')
+    if not pattern.match(username):
+        return False, "Benutzername darf nur Buchstaben, Zahlen, Unterstriche und Bindestriche enthalten."
+    
+    return True, None
+
+def check_user_exists(username):
+    """
+    Prüft, ob ein Benutzer in der Datenbank existiert.
+    Verwendet parametrisierte Abfragen zur Vermeidung von SQL-Injection.
+    """
+    connection = None
+    cursor = None
+    
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        query = sql.SQL("SELECT id, username, email, created_at FROM users WHERE username = %s")
+        cursor.execute(query, (username,))
+        
+        user = cursor.fetchone()
+        
+        if user:
+            logger.info(f"Benutzer '{username}' gefunden (ID: {user[0]})")
+            return True, {
+                "id": user[0],
+                "username": user[1],
+                "email": user[2],
+                "created_at": str(user[3])
+            }
+        else:
+            logger.info(f"Benutzer '{username}' nicht gefunden")
+            return False, None
+            
+    except psycopg2.Error as e:
+        logger.error(f"Datenbankfehler bei der Abfrage: {e}")
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+def initialize_database():
+    """
+    Initialisiert die Datenbank mit einer Beispieltabelle und Testdaten.
+    Wird nur für Demonstrationszwecke verwendet.
+    """
+    connection = None
+    cursor = None
+    
+    try:
+        connection = get_db_connection()
+        cursor = connection.cursor()
+        
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        
+        test_users = [
+            ("admin", "admin@example.com", "hashed_password_1"),
+            ("john_doe", "john@example.com", "hashed_password_2"),
+            ("jane_smith", "jane@example.com", "hashed_password_3"),
+            ("test_user", "test@example.com", "hashed_password_4"),
+        ]
+        
+        for username, email, password_hash in test_users:
+            cursor.execute("""
+                INSERT INTO users (username, email, password_hash)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (username) DO NOTHING
+            """, (username, email, password_hash))
+        
+        connection.commit()
+        logger.info("Datenbank erfolgreich initialisiert")
+        
+    except psycopg2.Error as e:
+        logger.error(f"Fehler bei der Datenbankinitialisierung: {e}")
+        if connection:
+            connection.rollback()
+        raise
+    finally:
+        if cursor:
+            cursor.close()
+        if connection:
+            connection.close()
+
+@app.route("/", methods=["GET"])
+def index():
+    """Zeigt das Webformular an."""
+    return render_template_string(HTML_FORM)
+
+@app.route("/check_user", methods=["POST"])
+def check_user():
+    """Verarbeitet die Formularanfrage und prüft den Benutzer."""
+    username = request.form.get("username", "").strip()
+    
+    is_valid, validation_error = validate_username(username)
+    if not is_valid:
+        return render_template_string(
+            HTML_FORM,
+            error=f"Ungültiger Benutzername: {validation_error}"
+        )
+    
+    try:
+        exists, user_data = check_user_exists(username)
+        
+        if exists:
+            result = {
+                "css_class": "success",
+                "message": f"✓ Benutzer '{username}' existiert in der Datenbank. "
+                          f"(Registriert am: {user_data['created_at'][:10]})"
+            }
+        else:
+            result = {
+                "css_class": "error",
+                "message": f"✗ Benutzer '{username}' wurde nicht gefunden."
+            }
+        
+        return render_template_string(HTML_FORM, result=result)
+        
+    except OperationalError:
+        return render_template_string(
+            HTML_FORM,
+            error="Datenbankverbindung fehlgeschlagen. Bitte versuchen Sie es später erneut."
+        )
+    except psycopg2.Error as e:
+        logger.error(f"Unerwarteter Datenbankfehler: {e}")
+        return render_template_string(
+            HTML_FORM,
+            error="Ein Fehler ist aufgetreten. Bitte versuchen Sie es später erneut."
+        )
+
+@app.route("/api/check_user", methods=["POST"])
+def api_check_user():
+    """API-Endpunkt für die Benutzerprüfung (gibt JSON zurück)."""
+    data = request.get_json()
+    
+    if not data or "username" not in data:
+        return jsonify({
+            "success": False,
+            "error": "Kein Benutzername angegeben"
+        }), 400
+    
+    username = data["username"].strip()
+    
+    is_valid, validation_error = validate_username(username)
+    if not is_valid:
+        return jsonify({
+            "success": False,
+            "error": validation_error
+        }), 400
+    
+    try:
+        exists, user_data = check_user_exists(username)
+        
+        return jsonify({
+            "success": True,
+            "exists": exists,
+            "username": username,
+            "user_data": user_data if exists else None
+        })
+        
+    except OperationalError:
+        return jsonify({
+            "success": False,
+            "error": "Datenbankverbindung fehlgeschlagen"
+        }), 503
+    except psycopg2.Error as e:
+        logger.error(f"API Datenbankfehler: {e}")
+        return jsonify({
+            "success": False,
+            "error": "Interner Serverfehler"
+        }), 500
+
+if __name__ == "__main__":
+    try:
+        logger.info("Initialisiere Datenbank...")
+        initialize_database()
+        logger.info("Starte Flask-Anwendung...")
+        app.run(
+            host="0.0.0.0",
+            port=5000,
+            debug=False
+        )
+    except Exception as e:
+        logger.error(f"Anwendung konnte nicht gestartet werden: {e}")
+        raise

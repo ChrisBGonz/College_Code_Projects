@@ -1,0 +1,191 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+app.use(express.json());
+
+const anthropic = new Anthropic();
+
+// Tool definition for listing files
+const tools = [
+  {
+    name: "list_files_in_folder",
+    description:
+      "Lists all files in a specified folder within the private_vault directory of a user",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_name: {
+          type: "string",
+          description: "The name of the folder to list files from",
+        },
+        user_id: {
+          type: "string",
+          description: "The user ID whose private_vault to access",
+        },
+      },
+      required: ["folder_name", "user_id"],
+    },
+  },
+];
+
+// Function to actually list files
+function listFilesInFolder(folderName, userId) {
+  const vaultPath = path.join(
+    __dirname,
+    "private_vault",
+    userId,
+    folderName
+  );
+
+  // Check if directory exists
+  if (!fs.existsSync(vaultPath)) {
+    // Create demo directory structure for testing
+    fs.mkdirSync(vaultPath, { recursive: true });
+
+    // Create some demo files
+    const demoFiles = [
+      "document1.pdf",
+      "image1.jpg",
+      "spreadsheet.xlsx",
+      "notes.txt",
+    ];
+    demoFiles.forEach((file) => {
+      fs.writeFileSync(path.join(vaultPath, file), `Demo content for ${file}`);
+    });
+  }
+
+  const files = fs.readdirSync(vaultPath);
+  const fileDetails = files.map((file) => {
+    const filePath = path.join(vaultPath, file);
+    const stats = fs.statSync(filePath);
+    return {
+      name: file,
+      size: stats.size,
+      isDirectory: stats.isDirectory(),
+      lastModified: stats.mtime,
+    };
+  });
+
+  return fileDetails;
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files_in_folder") {
+    const { folder_name, user_id } = toolInput;
+    return listFilesInFolder(folder_name, user_id);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+// API endpoint
+app.get("/api/files", async (req, res) => {
+  const { folder_name, user_id } = req.query;
+
+  if (!folder_name) {
+    return res.status(400).json({ error: "folder_name parameter is required" });
+  }
+
+  if (!user_id) {
+    return res.status(400).json({ error: "user_id parameter is required" });
+  }
+
+  try {
+    // Initial message to Claude
+    const messages = [
+      {
+        role: "user",
+        content: `Please list all files in the folder "${folder_name}" for user "${user_id}" in their private vault.`,
+      },
+    ];
+
+    let response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(
+        (block) => block.type === "tool_use"
+      );
+
+      if (!toolUseBlock) {
+        break;
+      }
+
+      const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+
+      // Add assistant response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content,
+      });
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseBlock.id,
+            content: JSON.stringify(toolResult),
+          },
+        ],
+      });
+
+      // Continue the conversation
+      response = await anthropic.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract final text response
+    const finalResponse = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    // Also get the actual file list for structured response
+    const fileList = listFilesInFolder(folder_name, user_id);
+
+    res.json({
+      success: true,
+      folder: folder_name,
+      user_id: user_id,
+      files: fileList,
+      ai_summary: finalResponse,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      message: error.message,
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(
+    `Try: GET http://localhost:${PORT}/api/files?folder_name=documents&user_id=user123`
+  );
+});
+
+module.exports = app;
+```
