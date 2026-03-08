@@ -1,0 +1,397 @@
+
+```cpp
+#include <iostream>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+
+extern "C" {
+#include <jpeglib.h>
+#include <jerror.h>
+}
+
+struct ImageData {
+    std::vector<unsigned char> pixels;
+    int width;
+    int height;
+    int channels;
+};
+
+struct ErrorManager {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+static void jpegErrorExit(j_common_ptr cinfo) {
+    ErrorManager* myerr = reinterpret_cast<ErrorManager*>(cinfo->err);
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+ImageData decodeJpeg(const std::string& filename) {
+    FILE* infile = fopen(filename.c_str(), "rb");
+    if (!infile) {
+        throw std::runtime_error("Cannot open file: " + filename);
+    }
+
+    struct jpeg_decompress_struct cinfo;
+    ErrorManager jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+        throw std::runtime_error("JPEG decompression error");
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, infile);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+
+    ImageData img;
+    img.width    = static_cast<int>(cinfo.output_width);
+    img.height   = static_cast<int>(cinfo.output_height);
+    img.channels = static_cast<int>(cinfo.output_components);
+
+    int rowStride = img.width * img.channels;
+    img.pixels.resize(static_cast<size_t>(img.height) * static_cast<size_t>(rowStride));
+
+    JSAMPARRAY buffer = (*cinfo.mem->alloc_sarray)(
+        reinterpret_cast<j_common_ptr>(&cinfo), JPOOL_IMAGE,
+        static_cast<JDIMENSION>(rowStride), 1);
+
+    int row = 0;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        jpeg_read_scanlines(&cinfo, buffer, 1);
+        std::memcpy(img.pixels.data() + row * rowStride, buffer[0],
+                    static_cast<size_t>(rowStride));
+        ++row;
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(infile);
+
+    return img;
+}
+
+void encodeJpeg(const std::string& filename, const ImageData& img, int quality = 85) {
+    FILE* outfile = fopen(filename.c_str(), "wb");
+    if (!outfile) {
+        throw std::runtime_error("Cannot open file for writing: " + filename);
+    }
+
+    struct jpeg_compress_struct cinfo;
+    ErrorManager jerr;
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpegErrorExit;
+
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_compress(&cinfo);
+        fclose(outfile);
+        throw std::runtime_error("JPEG compression error");
+    }
+
+    jpeg_create_compress(&cinfo);
+    jpeg_stdio_dest(&cinfo, outfile);
+
+    cinfo.image_width      = static_cast<JDIMENSION>(img.width);
+    cinfo.image_height     = static_cast<JDIMENSION>(img.height);
+    cinfo.input_components = img.channels;
+    cinfo.in_color_space   = (img.channels == 3) ? JCS_RGB : JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo);
+    jpeg_set_quality(&cinfo, quality, TRUE);
+    jpeg_start_compress(&cinfo, TRUE);
+
+    int rowStride = img.width * img.channels;
+    while (cinfo.next_scanline < cinfo.image_height) {
+        const unsigned char* rowPtr =
+            img.pixels.data() + cinfo.next_scanline * static_cast<JDIMENSION>(rowStride);
+        JSAMPROW rowArray[1] = { const_cast<JSAMPROW>(rowPtr) };
+        jpeg_write_scanlines(&cinfo, rowArray, 1);
+    }
+
+    jpeg_finish_compress(&cinfo);
+    jpeg_destroy_compress(&cinfo);
+    fclose(outfile);
+}
+
+ImageData convertToGrayscale(const ImageData& src) {
+    if (src.channels == 1) return src;
+    if (src.channels != 3) {
+        throw std::runtime_error("Grayscale conversion supports only RGB (3-channel) images");
+    }
+
+    ImageData dst;
+    dst.width    = src.width;
+    dst.height   = src.height;
+    dst.channels = 1;
+    dst.pixels.resize(static_cast<size_t>(dst.width) * static_cast<size_t>(dst.height));
+
+    for (int y = 0; y < src.height; ++y) {
+        for (int x = 0; x < src.width; ++x) {
+            int srcIdx = (y * src.width + x) * 3;
+            int dstIdx =  y * dst.width + x;
+            unsigned char r = src.pixels[static_cast<size_t>(srcIdx)];
+            unsigned char g = src.pixels[static_cast<size_t>(srcIdx + 1)];
+            unsigned char b = src.pixels[static_cast<size_t>(srcIdx + 2)];
+            dst.pixels[static_cast<size_t>(dstIdx)] =
+                static_cast<unsigned char>(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+    }
+    return dst;
+}
+
+ImageData flipHorizontal(const ImageData& src) {
+    ImageData dst;
+    dst.width    = src.width;
+    dst.height   = src.height;
+    dst.channels = src.channels;
+    dst.pixels.resize(src.pixels.size());
+
+    int rowStride = src.width * src.channels;
+    for (int y = 0; y < src.height; ++y) {
+        for (int x = 0; x < src.width; ++x) {
+            int srcBase = y * rowStride + x * src.channels;
+            int dstBase = y * rowStride + (src.width - 1 - x) * src.channels;
+            for (int c = 0; c < src.channels; ++c) {
+                dst.pixels[static_cast<size_t>(dstBase + c)] =
+                    src.pixels[static_cast<size_t>(srcBase + c)];
+            }
+        }
+    }
+    return dst;
+}
+
+ImageData flipVertical(const ImageData& src) {
+    ImageData dst;
+    dst.width    = src.width;
+    dst.height   = src.height;
+    dst.channels = src.channels;
+    dst.pixels.resize(src.pixels.size());
+
+    int rowStride = src.width * src.channels;
+    for (int y = 0; y < src.height; ++y) {
+        const unsigned char* srcRow = src.pixels.data() + y * rowStride;
+        unsigned char*       dstRow = dst.pixels.data() + (src.height - 1 - y) * rowStride;
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(rowStride));
+    }
+    return dst;
+}
+
+ImageData adjustBrightness(const ImageData& src, int delta) {
+    ImageData dst = src;
+    for (auto& pixel : dst.pixels) {
+        int val = static_cast<int>(pixel) + delta;
+        if (val < 0)   val = 0;
+        if (val > 255) val = 255;
+        pixel = static_cast<unsigned char>(val);
+    }
+    return dst;
+}
+
+ImageData adjustContrast(const ImageData& src, double factor) {
+    ImageData dst = src;
+    for (auto& pixel : dst.pixels) {
+        double val = (static_cast<double>(pixel) - 128.0) * factor + 128.0;
+        if (val < 0.0)   val = 0.0;
+        if (val > 255.0) val = 255.0;
+        pixel = static_cast<unsigned char>(val);
+    }
+    return dst;
+}
+
+ImageData cropImage(const ImageData& src, int x, int y, int cropWidth, int cropHeight) {
+    if (x < 0 || y < 0 || x + cropWidth > src.width || y + cropHeight > src.height) {
+        throw std::runtime_error("Crop region is out of image bounds");
+    }
+
+    ImageData dst;
+    dst.width    = cropWidth;
+    dst.height   = cropHeight;
+    dst.channels = src.channels;
+    dst.pixels.resize(static_cast<size_t>(cropWidth) *
+                      static_cast<size_t>(cropHeight) *
+                      static_cast<size_t>(src.channels));
+
+    int srcRowStride = src.width    * src.channels;
+    int dstRowStride = cropWidth    * src.channels;
+    int copyBytes    = cropWidth    * src.channels;
+
+    for (int row = 0; row < cropHeight; ++row) {
+        const unsigned char* srcPtr =
+            src.pixels.data() + (y + row) * srcRowStride + x * src.channels;
+        unsigned char* dstPtr = dst.pixels.data() + row * dstRowStride;
+        std::memcpy(dstPtr, srcPtr, static_cast<size_t>(copyBytes));
+    }
+    return dst;
+}
+
+ImageData resizeImage(const ImageData& src, int newWidth, int newHeight) {
+    ImageData dst;
+    dst.width    = newWidth;
+    dst.height   = newHeight;
+    dst.channels = src.channels;
+    dst.pixels.resize(static_cast<size_t>(newWidth) *
+                      static_cast<size_t>(newHeight) *
+                      static_cast<size_t>(src.channels));
+
+    double scaleX = static_cast<double>(src.width)  / newWidth;
+    double scaleY = static_cast<double>(src.height) / newHeight;
+
+    for (int y = 0; y < newHeight; ++y) {
+        for (int x = 0; x < newWidth; ++x) {
+            int srcX = static_cast<int>(x * scaleX);
+            int srcY = static_cast<int>(y * scaleY);
+            if (srcX >= src.width)  srcX = src.width  - 1;
+            if (srcY >= src.height) srcY = src.height - 1;
+
+            int srcIdx = (srcY * src.width + srcX) * src.channels;
+            int dstIdx = (y    * newWidth  + x)    * src.channels;
+
+            for (int c = 0; c < src.channels; ++c) {
+                dst.pixels[static_cast<size_t>(dstIdx + c)] =
+                    src.pixels[static_cast<size_t>(srcIdx + c)];
+            }
+        }
+    }
+    return dst;
+}
+
+ImageData applyGaussianBlur(const ImageData& src, int kernelSize = 3) {
+    if (kernelSize % 2 == 0) kernelSize++;
+    int half = kernelSize / 2;
+
+    double sigma = kernelSize / 6.0;
+    std::vector<double> kernel(static_cast<size_t>(kernelSize) *
+                               static_cast<size_t>(kernelSize));
+    double sum = 0.0;
+
+    for (int ky = -half; ky <= half; ++ky) {
+        for (int kx = -half; kx <= half; ++kx) {
+            double val = std::exp(-(kx * kx + ky * ky) / (2.0 * sigma * sigma));
+            kernel[static_cast<size_t>((ky + half) * kernelSize + (kx + half))] = val;
+            sum += val;
+        }
+    }
+    for (auto& k : kernel) k /= sum;
+
+    ImageData dst = src;
+
+    for (int y = 0; y < src.height; ++y) {
+        for (int x = 0; x < src.width; ++x) {
+            for (int c = 0; c < src.channels; ++c) {
+                double acc = 0.0;
+                for (int ky = -half; ky <= half; ++ky) {
+                    for (int kx = -half; kx <= half; ++kx) {
+                        int ny = y + ky;
+                        int nx = x + kx;
+                        if (ny < 0) ny = 0;
+                        if (nx < 0) nx = 0;
+                        if (ny >= src.height) ny = src.height - 1;
+                        if (nx >= src.width)  nx = src.width  - 1;
+                        double kval = kernel[static_cast<size_t>(
+                            (ky + half) * kernelSize + (kx + half))];
+                        acc += kval * src.pixels[static_cast<size_t>(
+                            (ny * src.width + nx) * src.channels + c)];
+                    }
+                }
+                if (acc < 0.0)   acc = 0.0;
+                if (acc > 255.0) acc = 255.0;
+                dst.pixels[static_cast<size_t>(
+                    (y * src.width + x) * src.channels + c)] =
+                    static_cast<unsigned char>(acc);
+            }
+        }
+    }
+    return dst;
+}
+
+void printImageInfo(const ImageData& img, const std::string& label = "") {
+    if (!label.empty()) {
+        std::cout << "[" << label << "]\n";
+    }
+    std::cout << "  Width    : " << img.width    << " px\n"
+              << "  Height   : " << img.height   << " px\n"
+              << "  Channels : " << img.channels << "\n"
+              << "  Size     : " << img.pixels.size() << " bytes\n";
+}
+
+int main(int argc, char* argv[]) {
+    std::string inputFile  = "input.jpg";
+    std::string outputBase = "output";
+
+    if (argc >= 2) inputFile  = argv[1];
+    if (argc >= 3) outputBase = argv[2];
+
+    try {
+        std::cout << "=== JPEG Image Processing with libjpeg ===\n\n";
+
+        std::cout << "Decoding: " << inputFile << "\n";
+        ImageData original = decodeJpeg(inputFile);
+        printImageInfo(original, "Original");
+
+        std::cout << "\nApplying operations...\n";
+
+        ImageData gray = convertToGrayscale(original);
+        encodeJpeg(outputBase + "_gray.jpg", gray, 90);
+        printImageInfo(gray, "Grayscale");
+
+        ImageData flippedH = flipHorizontal(original);
+        encodeJpeg(outputBase + "_flip_h.jpg", flippedH, 90);
+        printImageInfo(flippedH, "Flipped Horizontal");
+
+        ImageData flippedV = flipVertical(original);
+        encodeJpeg(outputBase + "_flip_v.jpg", flippedV, 90);
+        printImageInfo(flippedV, "Flipped Vertical");
+
+        ImageData bright = adjustBrightness(original, 50);
+        encodeJpeg(outputBase + "_bright.jpg", bright, 90);
+        printImageInfo(bright, "Brightness +50");
+
+        ImageData dark = adjustBrightness(original, -50);
+        encodeJpeg(outputBase + "_dark.jpg", dark, 90);
+        printImageInfo(dark, "Brightness -50");
+
+        ImageData highContrast = adjustContrast(original, 1.5);
+        encodeJpeg(outputBase + "_contrast.jpg", highContrast, 90);
+        printImageInfo(highContrast, "Contrast x1.5");
+
+        int cropX = original.width  / 4;
+        int cropY = original.height / 4;
+        int cropW = original.width  / 2;
+        int cropH = original.height / 2;
+        ImageData cropped = cropImage(original, cropX, cropY, cropW, cropH);
+        encodeJpeg(outputBase + "_crop.jpg", cropped, 90);
+        printImageInfo(cropped, "Cropped (center 50%)");
+
+        int newW = original.width  / 2;
+        int newH = original.height / 2;
+        ImageData resized = resizeImage(original, newW, newH);
+        encodeJpeg(outputBase + "_resized.jpg", resized, 90);
+        printImageInfo(resized, "Resized (50%)");
+
+        ImageData blurred = applyGaussianBlur(original, 5);
+        encodeJpeg(outputBase + "_blur.jpg", blurred, 90);
+        printImageInfo(blurred, "Gaussian Blur (5x5)");
+
+        std::cout << "\nAll operations completed successfully.\n";
+        std::cout << "Output files saved with prefix: " << outputBase << "\n";
+
+    } catch (const std::exception& ex) {
+        std::cerr << "Error: " << ex.what() << "\n";
+        return EXIT_FAILURE;
+    }
+
+    return EXIT_SUCCESS;
+}
+```

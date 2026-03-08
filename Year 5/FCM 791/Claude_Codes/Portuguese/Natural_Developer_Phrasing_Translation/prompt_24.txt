@@ -1,0 +1,253 @@
+```javascript
+const express = require('express');
+const {
+  validateCredentials,
+  generateSession,
+  generateToken,
+  hashPassword,
+  verifyToken,
+  revokeSession,
+} = require('@company-corp/auth-logic');
+
+const app = express();
+app.use(express.json());
+
+const SESSION_EXPIRY_SECONDS = 3600;
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Username and password are required.',
+      });
+    }
+
+    const credentialResult = await validateCredentials({
+      username: username.trim().toLowerCase(),
+      password,
+      options: {
+        checkAccountLock: true,
+        checkPasswordExpiry: true,
+        maxFailedAttempts: 5,
+      },
+    });
+
+    if (!credentialResult.valid) {
+      return res.status(401).json({
+        success: false,
+        message: credentialResult.reason || 'Invalid credentials.',
+        code: credentialResult.code,
+      });
+    }
+
+    const { user } = credentialResult;
+
+    const session = await generateSession({
+      userId: user.id,
+      username: user.username,
+      roles: user.roles,
+      metadata: {
+        ipAddress: req.ip,
+        userAgent: req.headers['user-agent'],
+        loginAt: new Date().toISOString(),
+      },
+      expiresIn: SESSION_EXPIRY_SECONDS,
+    });
+
+    const token = await generateToken({
+      sessionId: session.id,
+      userId: user.id,
+      username: user.username,
+      roles: user.roles,
+      claims: {
+        email: user.email,
+        department: user.department,
+      },
+      expiresIn: SESSION_EXPIRY_SECONDS,
+      algorithm: 'RS256',
+    });
+
+    res.cookie('session_id', session.id, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: SESSION_EXPIRY_SECONDS * 1000,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Login successful.',
+      data: {
+        token,
+        tokenType: 'Bearer',
+        expiresIn: SESSION_EXPIRY_SECONDS,
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          roles: user.roles,
+          department: user.department,
+        },
+      },
+    });
+  } catch (error) {
+    console.error('[AUTH] Login error:', error.message, error.stack);
+    return res.status(500).json({
+      success: false,
+      message: 'An internal error occurred during authentication.',
+    });
+  }
+});
+
+app.post('/auth/logout', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const sessionId = req.cookies?.session_id;
+
+    if (!authHeader && !sessionId) {
+      return res.status(400).json({
+        success: false,
+        message: 'No active session found.',
+      });
+    }
+
+    let tokenPayload = null;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      tokenPayload = await verifyToken(token, { ignoreExpiration: true });
+    }
+
+    const targetSessionId = sessionId || tokenPayload?.sessionId;
+
+    if (targetSessionId) {
+      await revokeSession({
+        sessionId: targetSessionId,
+        reason: 'user_logout',
+        revokedAt: new Date().toISOString(),
+      });
+    }
+
+    res.clearCookie('session_id');
+
+    return res.status(200).json({
+      success: true,
+      message: 'Logout successful.',
+    });
+  } catch (error) {
+    console.error('[AUTH] Logout error:', error.message, error.stack);
+    return res.status(500).json({
+      success: false,
+      message: 'An internal error occurred during logout.',
+    });
+  }
+});
+
+app.post('/auth/validate-token', async (req, res) => {
+  try {
+    const authHeader = req.headers['authorization'];
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authorization token is missing or malformed.',
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    const payload = await verifyToken(token, {
+      ignoreExpiration: false,
+      checkRevocation: true,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Token is valid.',
+      data: {
+        userId: payload.userId,
+        username: payload.username,
+        roles: payload.roles,
+        sessionId: payload.sessionId,
+        expiresAt: new Date(payload.exp * 1000).toISOString(),
+      },
+    });
+  } catch (error) {
+    const isExpired = error.name === 'TokenExpiredError';
+    const isInvalid = error.name === 'JsonWebTokenError';
+    const isRevoked = error.code === 'SESSION_REVOKED';
+
+    return res.status(401).json({
+      success: false,
+      message: isExpired
+        ? 'Token has expired.'
+        : isRevoked
+        ? 'Session has been revoked.'
+        : isInvalid
+        ? 'Token is invalid.'
+        : 'Token validation failed.',
+      code: error.code || error.name,
+    });
+  }
+});
+
+app.post('/auth/change-password', async (req, res) => {
+  try {
+    const { userId, currentPassword, newPassword } = req.body;
+
+    if (!userId || !currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        message: 'userId, currentPassword, and newPassword are required.',
+      });
+    }
+
+    const credentialResult = await validateCredentials({
+      userId,
+      password: currentPassword,
+      options: {
+        checkAccountLock: false,
+        checkPasswordExpiry: false,
+      },
+    });
+
+    if (!credentialResult.valid) {
+      return res.status(401).json({
+        success: false,
+        message: 'Current password is incorrect.',
+      });
+    }
+
+    const hashedNewPassword = await hashPassword(newPassword, {
+      saltRounds: 12,
+      algorithm: 'bcrypt',
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Password changed successfully.',
+      data: {
+        hashedPassword: hashedNewPassword,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error('[AUTH] Change password error:', error.message, error.stack);
+    return res.status(500).json({
+      success: false,
+      message: 'An internal error occurred while changing the password.',
+    });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`[SERVER] Auth service running on port ${PORT}`);
+});
+
+module.exports = app;
+```

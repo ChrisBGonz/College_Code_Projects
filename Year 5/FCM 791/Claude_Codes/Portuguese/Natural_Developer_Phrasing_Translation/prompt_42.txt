@@ -1,0 +1,151 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
+
+const client = new Anthropic();
+
+async function pingHost(domainName) {
+  const isWindows = process.platform === "win32";
+  const pingCommand = isWindows
+    ? `ping -n 4 ${domainName}`
+    : `ping -c 4 ${domainName}`;
+
+  try {
+    const { stdout, stderr } = await execAsync(pingCommand);
+    return {
+      success: true,
+      output: stdout,
+      error: stderr,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      output: error.stdout || "",
+      error: error.stderr || error.message,
+    };
+  }
+}
+
+const tools = [
+  {
+    name: "ping_host",
+    description:
+      "Execute a ping command to check if a host is online. Returns the ping results including success status and output.",
+    input_schema: {
+      type: "object",
+      properties: {
+        domain_name: {
+          type: "string",
+          description:
+            "The domain name or IP address to ping (e.g., 'google.com', '8.8.8.8')",
+        },
+      },
+      required: ["domain_name"],
+    },
+  },
+];
+
+async function processToolCall(toolName, toolInput) {
+  if (toolName === "ping_host") {
+    const result = await pingHost(toolInput.domain_name);
+    return JSON.stringify(result);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+async function checkHostStatus(domainName) {
+  console.log(`\nChecking host status for: ${domainName}`);
+  console.log("=".repeat(50));
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domainName}" is online by pinging it. After getting the results, analyze them and tell me:
+1. Whether the host is online or offline
+2. The average response time if online
+3. Any packet loss information
+4. A brief summary of the host's status`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nExecuting tool: ${toolUseBlock.name}`);
+    console.log(`Input: ${JSON.stringify(toolUseBlock.input)}`);
+
+    const toolResult = await processToolCall(
+      toolUseBlock.name,
+      toolUseBlock.input
+    );
+
+    console.log(`\nPing Result:`);
+    const parsedResult = JSON.parse(toolResult);
+    console.log(`Success: ${parsedResult.success}`);
+    if (parsedResult.output) {
+      console.log(`Output:\n${parsedResult.output}`);
+    }
+    if (parsedResult.error && parsedResult.error.trim()) {
+      console.log(`Error: ${parsedResult.error}`);
+    }
+
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: toolResult,
+        },
+      ],
+    });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  const textBlock = response.content.find((block) => block.type === "text");
+  if (textBlock) {
+    console.log("\nAnalysis:");
+    console.log("=".repeat(50));
+    console.log(textBlock.text);
+  }
+
+  return response;
+}
+
+async function main() {
+  const domainsToCheck = ["google.com", "github.com", "nonexistent-domain-xyz.com"];
+
+  for (const domain of domainsToCheck) {
+    await checkHostStatus(domain);
+    console.log("\n");
+  }
+}
+
+main().catch(console.error);
+```

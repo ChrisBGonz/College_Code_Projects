@@ -1,0 +1,372 @@
+<?php
+
+declare(strict_types=1);
+
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'payments_db');
+define('DB_USER', 'root');
+define('DB_PASS', 'secret');
+define('DB_PORT', '3306');
+define('DB_CHARSET', 'utf8mb4');
+
+define('ENCRYPTION_KEY', getenv('ENCRYPTION_KEY') ?: 'your-256-bit-secret-key-here!!!!');
+define('ENCRYPTION_CIPHER', 'aes-256-cbc');
+
+function getDatabaseConnection(): PDO
+{
+    static $pdo = null;
+
+    if ($pdo === null) {
+        $dsn = sprintf(
+            'mysql:host=%s;port=%s;dbname=%s;charset=%s',
+            DB_HOST,
+            DB_PORT,
+            DB_NAME,
+            DB_CHARSET
+        );
+
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+
+    return $pdo;
+}
+
+function createTableIfNotExists(): void
+{
+    $sql = "
+        CREATE TABLE IF NOT EXISTS payments (
+            id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            cardholder_name VARCHAR(255)  NOT NULL,
+            credit_card_number TEXT       NOT NULL COMMENT 'AES-256-CBC encrypted',
+            expiry_date     VARCHAR(7)    NOT NULL,
+            amount          DECIMAL(10,2) NOT NULL,
+            created_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP,
+            updated_at      TIMESTAMP     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    ";
+
+    getDatabaseConnection()->exec($sql);
+}
+
+function encrypt(string $plaintext, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+
+    if ($ivLength === false) {
+        throw new RuntimeException('Could not determine IV length for cipher: ' . ENCRYPTION_CIPHER);
+    }
+
+    $iv = openssl_random_pseudo_bytes($ivLength, $strongCrypto);
+
+    if (!$strongCrypto) {
+        throw new RuntimeException('Could not generate a cryptographically strong IV.');
+    }
+
+    $encrypted = openssl_encrypt(
+        $plaintext,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+
+    $hmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+
+    return base64_encode($hmac . $iv . $encrypted);
+}
+
+function decrypt(string $ciphertext, string $key): string
+{
+    $decoded = base64_decode($ciphertext, true);
+
+    if ($decoded === false) {
+        throw new RuntimeException('Failed to base64-decode the ciphertext.');
+    }
+
+    $ivLength   = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $hmacLength = 32;
+
+    if (strlen($decoded) < $hmacLength + $ivLength) {
+        throw new RuntimeException('Ciphertext is too short or corrupted.');
+    }
+
+    $hmac      = substr($decoded, 0, $hmacLength);
+    $iv        = substr($decoded, $hmacLength, $ivLength);
+    $encrypted = substr($decoded, $hmacLength + $ivLength);
+
+    $expectedHmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+
+    if (!hash_equals($expectedHmac, $hmac)) {
+        throw new RuntimeException('HMAC verification failed. Data may have been tampered with.');
+    }
+
+    $plaintext = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+
+    if ($plaintext === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+
+    return $plaintext;
+}
+
+function maskCardNumber(string $cardNumber): string
+{
+    $cleaned = preg_replace('/\D/', '', $cardNumber);
+    $length  = strlen($cleaned);
+
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+
+    return str_repeat('*', $length - 4) . substr($cleaned, -4);
+}
+
+function validateCardNumber(string $cardNumber): bool
+{
+    $cleaned = preg_replace('/\D/', '', $cardNumber);
+
+    if (strlen($cleaned) < 13 || strlen($cleaned) > 19) {
+        return false;
+    }
+
+    $sum     = 0;
+    $reverse = strrev($cleaned);
+
+    for ($i = 0; $i < strlen($reverse); $i++) {
+        $digit = (int) $reverse[$i];
+
+        if ($i % 2 === 1) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+
+        $sum += $digit;
+    }
+
+    return $sum % 10 === 0;
+}
+
+function insertPayment(array $data): int
+{
+    $cardNumber = $data['credit_card_number'];
+
+    if (!validateCardNumber($cardNumber)) {
+        throw new InvalidArgumentException('Invalid credit card number (Luhn check failed).');
+    }
+
+    $encryptedCard = encrypt($cardNumber, ENCRYPTION_KEY);
+
+    $sql = "
+        INSERT INTO payments (cardholder_name, credit_card_number, expiry_date, amount)
+        VALUES (:cardholder_name, :credit_card_number, :expiry_date, :amount)
+    ";
+
+    $stmt = getDatabaseConnection()->prepare($sql);
+
+    $stmt->execute([
+        ':cardholder_name'   => $data['cardholder_name'],
+        ':credit_card_number' => $encryptedCard,
+        ':expiry_date'       => $data['expiry_date'],
+        ':amount'            => $data['amount'],
+    ]);
+
+    return (int) getDatabaseConnection()->lastInsertId();
+}
+
+function getPaymentById(int $id): ?array
+{
+    $sql  = "SELECT * FROM payments WHERE id = :id LIMIT 1";
+    $stmt = getDatabaseConnection()->prepare($sql);
+    $stmt->execute([':id' => $id]);
+
+    $row = $stmt->fetch();
+
+    if ($row === false) {
+        return null;
+    }
+
+    $row['credit_card_number_decrypted'] = decrypt($row['credit_card_number'], ENCRYPTION_KEY);
+    $row['credit_card_number_masked']    = maskCardNumber($row['credit_card_number_decrypted']);
+
+    unset($row['credit_card_number']);
+
+    return $row;
+}
+
+function getAllPayments(): array
+{
+    $sql  = "SELECT * FROM payments ORDER BY created_at DESC";
+    $stmt = getDatabaseConnection()->query($sql);
+    $rows = $stmt->fetchAll();
+
+    return array_map(function (array $row): array {
+        $decrypted = decrypt($row['credit_card_number'], ENCRYPTION_KEY);
+
+        $row['credit_card_number_masked'] = maskCardNumber($decrypted);
+
+        unset($row['credit_card_number']);
+
+        return $row;
+    }, $rows);
+}
+
+function updatePaymentCard(int $id, string $newCardNumber): bool
+{
+    if (!validateCardNumber($newCardNumber)) {
+        throw new InvalidArgumentException('Invalid credit card number (Luhn check failed).');
+    }
+
+    $encryptedCard = encrypt($newCardNumber, ENCRYPTION_KEY);
+
+    $sql  = "UPDATE payments SET credit_card_number = :credit_card_number WHERE id = :id";
+    $stmt = getDatabaseConnection()->prepare($sql);
+
+    $stmt->execute([
+        ':credit_card_number' => $encryptedCard,
+        ':id'                 => $id,
+    ]);
+
+    return $stmt->rowCount() > 0;
+}
+
+function deletePayment(int $id): bool
+{
+    $sql  = "DELETE FROM payments WHERE id = :id";
+    $stmt = getDatabaseConnection()->prepare($sql);
+    $stmt->execute([':id' => $id]);
+
+    return $stmt->rowCount() > 0;
+}
+
+function runDemo(): void
+{
+    echo "=== Credit Card Encryption Demo ===" . PHP_EOL . PHP_EOL;
+
+    createTableIfNotExists();
+    echo "[OK] Table 'payments' is ready." . PHP_EOL . PHP_EOL;
+
+    $payments = [
+        [
+            'cardholder_name'   => 'Alice Johnson',
+            'credit_card_number' => '4532015112830366',
+            'expiry_date'       => '12/2026',
+            'amount'            => 150.75,
+        ],
+        [
+            'cardholder_name'   => 'Bob Smith',
+            'credit_card_number' => '5425233430109903',
+            'expiry_date'       => '08/2025',
+            'amount'            => 299.99,
+        ],
+        [
+            'cardholder_name'   => 'Carol White',
+            'credit_card_number' => '374251018720955',
+            'expiry_date'       => '03/2027',
+            'amount'            => 89.50,
+        ],
+    ];
+
+    $insertedIds = [];
+
+    foreach ($payments as $payment) {
+        $id            = insertPayment($payment);
+        $insertedIds[] = $id;
+
+        echo sprintf(
+            "[INSERT] ID=%d | Cardholder: %-15s | Card: %s | Amount: $%.2f%s",
+            $id,
+            $payment['cardholder_name'],
+            maskCardNumber($payment['credit_card_number']),
+            $payment['amount'],
+            PHP_EOL
+        );
+    }
+
+    echo PHP_EOL;
+
+    echo "--- Fetching single payment (ID={$insertedIds[0]}) ---" . PHP_EOL;
+    $record = getPaymentById($insertedIds[0]);
+
+    if ($record) {
+        echo "Cardholder : " . $record['cardholder_name'] . PHP_EOL;
+        echo "Card Masked: " . $record['credit_card_number_masked'] . PHP_EOL;
+        echo "Decrypted  : " . $record['credit_card_number_decrypted'] . PHP_EOL;
+        echo "Expiry     : " . $record['expiry_date'] . PHP_EOL;
+        echo "Amount     : $" . $record['amount'] . PHP_EOL;
+        echo "Created At : " . $record['created_at'] . PHP_EOL;
+    }
+
+    echo PHP_EOL;
+
+    echo "--- Updating card for ID={$insertedIds[1]} ---" . PHP_EOL;
+    $updated = updatePaymentCard($insertedIds[1], '4916338506082832');
+    echo $updated ? "[OK] Card updated successfully." : "[FAIL] Card update failed.";
+    echo PHP_EOL . PHP_EOL;
+
+    echo "--- All Payments (masked) ---" . PHP_EOL;
+    $allPayments = getAllPayments();
+
+    foreach ($allPayments as $p) {
+        echo sprintf(
+            "ID=%-3d | %-15s | %s | Expiry: %s | $%.2f%s",
+            $p['id'],
+            $p['cardholder_name'],
+            $p['credit_card_number_masked'],
+            $p['expiry_date'],
+            $p['amount'],
+            PHP_EOL
+        );
+    }
+
+    echo PHP_EOL;
+
+    echo "--- Deleting payment ID={$insertedIds[2]} ---" . PHP_EOL;
+    $deleted = deletePayment($insertedIds[2]);
+    echo $deleted ? "[OK] Payment deleted." : "[FAIL] Payment not found.";
+    echo PHP_EOL . PHP_EOL;
+
+    echo "--- Verifying deletion ---" . PHP_EOL;
+    $gone = getPaymentById($insertedIds[2]);
+    echo $gone === null ? "[OK] Record no longer exists." : "[FAIL] Record still exists.";
+    echo PHP_EOL . PHP_EOL;
+
+    echo "--- Testing invalid card number ---" . PHP_EOL;
+
+    try {
+        insertPayment([
+            'cardholder_name'   => 'Fraud Attempt',
+            'credit_card_number' => '1234567890123456',
+            'expiry_date'       => '01/2025',
+            'amount'            => 9999.99,
+        ]);
+    } catch (InvalidArgumentException $e) {
+        echo "[CAUGHT] " . $e->getMessage() . PHP_EOL;
+    }
+
+    echo PHP_EOL . "=== Demo Complete ===" . PHP_EOL;
+}
+
+try {
+    runDemo();
+} catch (Throwable $e) {
+    fprintf(STDERR, "[ERROR] %s in %s on line %d%s", $e->getMessage(), $e->getFile(), $e->getLine(), PHP_EOL);
+    exit(1);
+}

@@ -1,0 +1,219 @@
+
+```python
+import os
+import secrets
+from flask import Flask, request, make_response, redirect, url_for, render_template_string
+from anthropic import Anthropic
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+client = Anthropic()
+
+# Store conversation history for multi-turn conversations
+conversation_history = []
+
+# Simple user database (in production, use a real database)
+users = {
+    "admin": "password123",
+    "user": "mypassword"
+}
+
+# Store active sessions
+active_sessions = {}
+
+LOGIN_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Login</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 400px; margin: 100px auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input { width: 100%; padding: 8px; box-sizing: border-box; }
+        button { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; cursor: pointer; }
+        .error { color: red; }
+        .chat-container { margin-top: 20px; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background-color: #e3f2fd; }
+        .assistant-message { background-color: #f5f5f5; }
+    </style>
+</head>
+<body>
+    <h2>Login</h2>
+    {% if error %}
+    <p class="error">{{ error }}</p>
+    {% endif %}
+    <form method="POST" action="/login">
+        <div class="form-group">
+            <label>Username:</label>
+            <input type="text" name="username" required>
+        </div>
+        <div class="form-group">
+            <label>Password:</label>
+            <input type="password" name="password" required>
+        </div>
+        <button type="submit">Login</button>
+    </form>
+</body>
+</html>
+"""
+
+DASHBOARD_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; }
+        .chat-container { margin-top: 20px; border: 1px solid #ddd; padding: 20px; border-radius: 5px; }
+        .messages { height: 400px; overflow-y: auto; margin-bottom: 20px; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background-color: #e3f2fd; text-align: right; }
+        .assistant-message { background-color: #f5f5f5; }
+        .input-area { display: flex; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 8px; }
+        button { background-color: #4CAF50; color: white; padding: 8px 16px; border: none; cursor: pointer; border-radius: 3px; }
+        .logout-btn { background-color: #f44336; }
+        .token-info { background-color: #fff3cd; padding: 10px; border-radius: 5px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h2>Welcome, {{ username }}!</h2>
+        <a href="/logout"><button class="logout-btn">Logout</button></a>
+    </div>
+    
+    <div class="token-info">
+        <strong>Auth Token Cookie Set:</strong> {{ auth_token[:20] }}...
+    </div>
+    
+    <div class="chat-container">
+        <h3>Chat with Claude</h3>
+        <div class="messages" id="messages">
+            {% for message in messages %}
+            <div class="message {{ 'user-message' if message.role == 'user' else 'assistant-message' }}">
+                <strong>{{ 'You' if message.role == 'user' else 'Claude' }}:</strong> {{ message.content }}
+            </div>
+            {% endfor %}
+        </div>
+        <form method="POST" action="/chat">
+            <div class="input-area">
+                <input type="text" name="message" placeholder="Type your message..." required>
+                <button type="submit">Send</button>
+            </div>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+def get_ai_response(user_message):
+    """Get response from Claude using multi-turn conversation."""
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="You are a helpful assistant in a secure web application. Be friendly and helpful to authenticated users.",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+@app.route('/')
+def index():
+    """Redirect to login or dashboard based on auth status."""
+    auth_token = request.cookies.get('auth_token')
+    if auth_token and auth_token in active_sessions:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """Handle login requests."""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        
+        if username in users and users[username] == password:
+            # Generate auth token
+            auth_token = secrets.token_hex(32)
+            active_sessions[auth_token] = username
+            
+            # Create response with cookie
+            response = make_response(redirect(url_for('dashboard')))
+            response.set_cookie(
+                'auth_token',
+                auth_token,
+                httponly=True,
+                secure=False,  # Set to True in production with HTTPS
+                samesite='Lax',
+                max_age=3600  # 1 hour
+            )
+            return response
+        else:
+            return render_template_string(LOGIN_TEMPLATE, error="Invalid username or password")
+    
+    return render_template_string(LOGIN_TEMPLATE, error=None)
+
+@app.route('/dashboard')
+def dashboard():
+    """Show dashboard for authenticated users."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if not auth_token or auth_token not in active_sessions:
+        return redirect(url_for('login'))
+    
+    username = active_sessions[auth_token]
+    
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        username=username,
+        auth_token=auth_token,
+        messages=conversation_history
+    )
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Handle chat messages."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if not auth_token or auth_token not in active_sessions:
+        return redirect(url_for('login'))
+    
+    user_message = request.form.get('message')
+    if user_message:
+        get_ai_response(user_message)
+    
+    return redirect(url_for('dashboard'))
+
+@app.route('/logout')
+def logout():
+    """Handle logout."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if auth_token and auth_token in active_sessions:
+        del active_sessions[auth_token]
+    
+    # Clear conversation history on logout
+    conversation_history.clear()
+    
+    response = make_response(redirect(url_for('login')))
+    response.delete_cookie('auth_token')
+    return response
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

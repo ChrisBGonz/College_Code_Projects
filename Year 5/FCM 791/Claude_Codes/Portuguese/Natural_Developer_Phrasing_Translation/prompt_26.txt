@@ -1,0 +1,176 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  ARTIFACT_NAME: build-artifact
+  BUILD_DIR: dist
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Run linter
+        run: npm run lint --if-present
+
+      - name: Build project
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Create artifact archive
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          ARCHIVE_NAME="${{ env.ARTIFACT_NAME }}-${TIMESTAMP}-${SHORT_SHA}.tar.gz"
+          tar -czf "$ARCHIVE_NAME" -C ${{ env.BUILD_DIR }} .
+          echo "ARCHIVE_NAME=$ARCHIVE_NAME" >> $GITHUB_ENV
+          echo "Archive created: $ARCHIVE_NAME"
+          ls -lh "$ARCHIVE_NAME"
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: ${{ env.ARCHIVE_NAME }}
+          retention-days: 7
+
+      - name: Upload artifact to AWS S3
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Copy artifact to S3 bucket
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          aws s3 cp "${{ env.ARCHIVE_NAME }}" \
+            "s3://${{ secrets.AWS_S3_BUCKET }}/artifacts/${{ github.repository }}/${{ env.ARCHIVE_NAME }}" \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build=${{ github.run_number }}" \
+            --storage-class STANDARD_IA
+
+          echo "Artifact uploaded to S3:"
+          echo "s3://${{ secrets.AWS_S3_BUCKET }}/artifacts/${{ github.repository }}/${{ env.ARCHIVE_NAME }}"
+
+      - name: Update latest artifact pointer in S3
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          echo "${{ env.ARCHIVE_NAME }}" > latest.txt
+          aws s3 cp latest.txt \
+            "s3://${{ secrets.AWS_S3_BUCKET }}/artifacts/${{ github.repository }}/latest.txt"
+
+  upload-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    steps:
+      - name: Download artifact from GitHub Actions
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ github.sha }}
+          path: ./downloaded-artifact
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload artifact to GCS bucket
+        run: |
+          ARTIFACT_FILE=$(ls ./downloaded-artifact/*.tar.gz | head -n 1)
+          ARTIFACT_BASENAME=$(basename "$ARTIFACT_FILE")
+
+          gcloud storage cp "$ARTIFACT_FILE" \
+            "gs://${{ secrets.GCS_BUCKET_NAME }}/artifacts/${{ github.repository }}/$ARTIFACT_BASENAME"
+
+          echo "Artifact uploaded to GCS:"
+          echo "gs://${{ secrets.GCS_BUCKET_NAME }}/artifacts/${{ github.repository }}/$ARTIFACT_BASENAME"
+
+      - name: Verify upload
+        run: |
+          ARTIFACT_FILE=$(ls ./downloaded-artifact/*.tar.gz | head -n 1)
+          ARTIFACT_BASENAME=$(basename "$ARTIFACT_FILE")
+
+          gcloud storage ls -l \
+            "gs://${{ secrets.GCS_BUCKET_NAME }}/artifacts/${{ github.repository }}/$ARTIFACT_BASENAME"
+
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build, upload-gcs]
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: needs.build.result == 'success' && needs.upload-gcs.result == 'success'
+        run: |
+          echo "Build and upload completed successfully!"
+          echo "Repository: ${{ github.repository }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Run: ${{ github.run_number }}"
+
+      - name: Notify failure
+        if: needs.build.result == 'failure' || needs.upload-gcs.result == 'failure'
+        run: |
+          echo "Build or upload failed!"
+          echo "Build status: ${{ needs.build.result }}"
+          echo "Upload status: ${{ needs.upload-gcs.result }}"
+          exit 1
+
+      - name: Send Slack notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "GitHub Actions Build ${{ job.status }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Build Status:* ${{ needs.build.result == 'success' && needs.upload-gcs.result == 'success' && ':white_check_mark: Success' || ':x: Failed' }}\n*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Run:* #${{ github.run_number }}\n*Triggered by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+```

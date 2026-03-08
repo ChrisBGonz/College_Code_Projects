@@ -1,0 +1,368 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Threading.Tasks;
+using Microsoft.EntityFrameworkCore;
+
+// Domain Model
+public class Product
+{
+    public int Id { get; set; }
+    public string Name { get; set; }
+    public decimal Price { get; set; }
+    public string Category { get; set; }
+    public DateTime CreatedAt { get; set; }
+}
+
+// DbContext for Entity Framework
+public class AppDbContext : DbContext
+{
+    public DbSet<Product> Products { get; set; }
+
+    public AppDbContext(DbContextOptions<AppDbContext> options) : base(options)
+    {
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        modelBuilder.Entity<Product>().ToTable("Products");
+    }
+}
+
+// Column Whitelist Validator
+public static class ColumnValidator
+{
+    // Define allowed columns for each table
+    private static readonly Dictionary<string, HashSet<string>> AllowedColumns = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase)
+    {
+        {
+            "Products", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Id", "Name", "Price", "Category", "CreatedAt"
+            }
+        },
+        {
+            "Orders", new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "Id", "CustomerId", "TotalAmount", "OrderDate", "Status"
+            }
+        }
+    };
+
+    public static bool IsValidColumn(string tableName, string columnName)
+    {
+        if (string.IsNullOrWhiteSpace(tableName) || string.IsNullOrWhiteSpace(columnName))
+            return false;
+
+        if (!AllowedColumns.TryGetValue(tableName, out var columns))
+            return false;
+
+        return columns.Contains(columnName);
+    }
+
+    public static string ValidateAndGetColumn(string tableName, string columnName)
+    {
+        if (!IsValidColumn(tableName, columnName))
+        {
+            throw new ArgumentException($"Column '{columnName}' is not allowed for table '{tableName}'. SQL injection attempt prevented.");
+        }
+
+        return columnName;
+    }
+
+    public static IEnumerable<string> GetAllowedColumns(string tableName)
+    {
+        if (AllowedColumns.TryGetValue(tableName, out var columns))
+            return columns;
+
+        return Enumerable.Empty<string>();
+    }
+}
+
+// Repository with Dynamic Sorting
+public class ProductRepository
+{
+    private readonly string _connectionString;
+    private readonly AppDbContext _context;
+
+    public ProductRepository(string connectionString, AppDbContext context)
+    {
+        _connectionString = connectionString;
+        _context = context;
+    }
+
+    // Method using ADO.NET with whitelist validation
+    public async Task<List<Product>> GetProductsSortedAdoNet(string columnName, bool ascending = true)
+    {
+        // Validate column name against whitelist
+        string validatedColumn = ColumnValidator.ValidateAndGetColumn("Products", columnName);
+        string sortDirection = ascending ? "ASC" : "DESC";
+
+        // Safe to use validated column name in query
+        string query = $"SELECT Id, Name, Price, Category, CreatedAt FROM Products ORDER BY [{validatedColumn}] {sortDirection}";
+
+        var products = new List<Product>();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+
+            using (var command = new SqlCommand(query, connection))
+            {
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        products.Add(new Product
+                        {
+                            Id = reader.GetInt32(0),
+                            Name = reader.GetString(1),
+                            Price = reader.GetDecimal(2),
+                            Category = reader.GetString(3),
+                            CreatedAt = reader.GetDateTime(4)
+                        });
+                    }
+                }
+            }
+        }
+
+        return products;
+    }
+
+    // Method using Entity Framework with dynamic sorting
+    public async Task<List<Product>> GetProductsSortedEF(string columnName, bool ascending = true)
+    {
+        // Validate column name against whitelist
+        string validatedColumn = ColumnValidator.ValidateAndGetColumn("Products", columnName);
+        string sortDirection = ascending ? "ASC" : "DESC";
+
+        // Using raw SQL with EF Core (validated column name)
+        string query = $"SELECT * FROM Products ORDER BY [{validatedColumn}] {sortDirection}";
+
+        return await _context.Products
+            .FromSqlRaw(query)
+            .ToListAsync();
+    }
+
+    // Method using LINQ with dynamic sorting (most type-safe approach)
+    public async Task<List<Product>> GetProductsSortedLinq(string columnName, bool ascending = true)
+    {
+        // Validate column name against whitelist
+        ColumnValidator.ValidateAndGetColumn("Products", columnName);
+
+        IQueryable<Product> query = _context.Products;
+
+        // Apply sorting based on validated column name
+        query = columnName.ToLower() switch
+        {
+            "id" => ascending ? query.OrderBy(p => p.Id) : query.OrderByDescending(p => p.Id),
+            "name" => ascending ? query.OrderBy(p => p.Name) : query.OrderByDescending(p => p.Name),
+            "price" => ascending ? query.OrderBy(p => p.Price) : query.OrderByDescending(p => p.Price),
+            "category" => ascending ? query.OrderBy(p => p.Category) : query.OrderByDescending(p => p.Category),
+            "createdat" => ascending ? query.OrderBy(p => p.CreatedAt) : query.OrderByDescending(p => p.CreatedAt),
+            _ => throw new ArgumentException($"Sorting by '{columnName}' is not supported.")
+        };
+
+        return await query.ToListAsync();
+    }
+
+    // Method with pagination support
+    public async Task<(List<Product> Items, int TotalCount)> GetProductsSortedPaged(
+        string columnName,
+        bool ascending = true,
+        int pageNumber = 1,
+        int pageSize = 10)
+    {
+        // Validate column name against whitelist
+        string validatedColumn = ColumnValidator.ValidateAndGetColumn("Products", columnName);
+        string sortDirection = ascending ? "ASC" : "DESC";
+
+        int offset = (pageNumber - 1) * pageSize;
+
+        string countQuery = "SELECT COUNT(*) FROM Products";
+        string dataQuery = $@"
+            SELECT Id, Name, Price, Category, CreatedAt 
+            FROM Products 
+            ORDER BY [{validatedColumn}] {sortDirection}
+            OFFSET @Offset ROWS FETCH NEXT @PageSize ROWS ONLY";
+
+        var products = new List<Product>();
+        int totalCount = 0;
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            await connection.OpenAsync();
+
+            // Get total count
+            using (var countCommand = new SqlCommand(countQuery, connection))
+            {
+                totalCount = (int)await countCommand.ExecuteScalarAsync();
+            }
+
+            // Get paged data
+            using (var command = new SqlCommand(dataQuery, connection))
+            {
+                command.Parameters.AddWithValue("@Offset", offset);
+                command.Parameters.AddWithValue("@PageSize", pageSize);
+
+                using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        products.Add(new Product
+                        {
+                            Id = reader.GetInt32(0),
+                            Name = reader.GetString(1),
+                            Price = reader.GetDecimal(2),
+                            Category = reader.GetString(3),
+                            CreatedAt = reader.GetDateTime(4)
+                        });
+                    }
+                }
+            }
+        }
+
+        return (products, totalCount);
+    }
+}
+
+// Example usage and demonstration
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        Console.WriteLine("=== Dynamic SQL Sorting with SQL Injection Prevention ===\n");
+
+        // Demonstrate column validation
+        DemonstrateColumnValidation();
+
+        // Demonstrate with mock data (without actual database connection)
+        DemonstrateWithMockData();
+
+        Console.WriteLine("\n=== Example Complete ===");
+    }
+
+    private static void DemonstrateColumnValidation()
+    {
+        Console.WriteLine("--- Column Validation Examples ---\n");
+
+        // Valid columns
+        string[] validColumns = { "Id", "Name", "Price", "Category", "CreatedAt" };
+        foreach (var column in validColumns)
+        {
+            bool isValid = ColumnValidator.IsValidColumn("Products", column);
+            Console.WriteLine($"Column '{column}': {(isValid ? "✓ VALID" : "✗ INVALID")}");
+        }
+
+        Console.WriteLine();
+
+        // SQL Injection attempts
+        string[] injectionAttempts = {
+            "Name; DROP TABLE Products--",
+            "1=1 UNION SELECT * FROM Users--",
+            "Name' OR '1'='1",
+            "'; DELETE FROM Products--",
+            "Name ORDER BY 1--"
+        };
+
+        Console.WriteLine("SQL Injection Attempts (all should be blocked):");
+        foreach (var attempt in injectionAttempts)
+        {
+            bool isValid = ColumnValidator.IsValidColumn("Products", attempt);
+            Console.WriteLine($"  '{attempt}': {(isValid ? "✓ VALID (DANGER!)" : "✗ BLOCKED - SQL Injection prevented")}");
+        }
+
+        Console.WriteLine();
+
+        // Show allowed columns
+        Console.WriteLine("Allowed columns for 'Products' table:");
+        var allowedColumns = ColumnValidator.GetAllowedColumns("Products");
+        Console.WriteLine($"  {string.Join(", ", allowedColumns)}");
+
+        Console.WriteLine();
+    }
+
+    private static void DemonstrateWithMockData()
+    {
+        Console.WriteLine("--- Dynamic Sorting Demonstration with Mock Data ---\n");
+
+        // Create mock products
+        var products = new List<Product>
+        {
+            new Product { Id = 1, Name = "Laptop", Price = 999.99m, Category = "Electronics", CreatedAt = DateTime.Now.AddDays(-10) },
+            new Product { Id = 2, Name = "Mouse", Price = 29.99m, Category = "Electronics", CreatedAt = DateTime.Now.AddDays(-5) },
+            new Product { Id = 3, Name = "Desk", Price = 299.99m, Category = "Furniture", CreatedAt = DateTime.Now.AddDays(-20) },
+            new Product { Id = 4, Name = "Chair", Price = 199.99m, Category = "Furniture", CreatedAt = DateTime.Now.AddDays(-15) },
+            new Product { Id = 5, Name = "Monitor", Price = 399.99m, Category = "Electronics", CreatedAt = DateTime.Now.AddDays(-3) }
+        };
+
+        // Demonstrate sorting by different columns
+        string[] columnsToSort = { "Name", "Price", "Category", "CreatedAt" };
+
+        foreach (var column in columnsToSort)
+        {
+            try
+            {
+                // Validate column
+                string validatedColumn = ColumnValidator.ValidateAndGetColumn("Products", column);
+
+                // Sort mock data
+                var sortedProducts = SortProducts(products, validatedColumn, ascending: true);
+
+                Console.WriteLine($"Sorted by '{column}' ASC:");
+                foreach (var product in sortedProducts)
+                {
+                    Console.WriteLine($"  [{product.Id}] {product.Name} - ${product.Price:F2} ({product.Category})");
+                }
+                Console.WriteLine();
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}\n");
+            }
+        }
+
+        // Demonstrate SQL injection prevention
+        Console.WriteLine("--- Attempting SQL Injection ---\n");
+        string maliciousInput = "Name; DROP TABLE Products--";
+
+        try
+        {
+            Console.WriteLine($"Attempting to sort by: '{maliciousInput}'");
+            ColumnValidator.ValidateAndGetColumn("Products", maliciousInput);
+            Console.WriteLine("ERROR: SQL Injection was NOT prevented!");
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"✓ SQL Injection PREVENTED: {ex.Message}");
+        }
+
+        Console.WriteLine();
+
+        // Show example of generated safe query
+        Console.WriteLine("--- Example of Safe Query Generation ---\n");
+        string safeColumn = "Price";
+        string validColumn = ColumnValidator.ValidateAndGetColumn("Products", safeColumn);
+        string safeQuery = $"SELECT * FROM Products ORDER BY [{validColumn}] DESC";
+        Console.WriteLine($"Safe query generated: {safeQuery}");
+        Console.WriteLine("Note: Column name is validated against whitelist before being used in query.");
+    }
+
+    private static List<Product> SortProducts(List<Product> products, string columnName, bool ascending)
+    {
+        return columnName.ToLower() switch
+        {
+            "id" => ascending ? products.OrderBy(p => p.Id).ToList() : products.OrderByDescending(p => p.Id).ToList(),
+            "name" => ascending ? products.OrderBy(p => p.Name).ToList() : products.OrderByDescending(p => p.Name).ToList(),
+            "price" => ascending ? products.OrderBy(p => p.Price).ToList() : products.OrderByDescending(p => p.Price).ToList(),
+            "category" => ascending ? products.OrderBy(p => p.Category).ToList() : products.OrderByDescending(p => p.Category).ToList(),
+            "createdat" => ascending ? products.OrderBy(p => p.CreatedAt).ToList() : products.OrderByDescending(p => p.CreatedAt).ToList(),
+            _ => products
+        };
+    }
+}
+```

@@ -1,0 +1,329 @@
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Security.Claims;
+using System.Threading.Tasks;
+
+namespace UserManagement.Controllers
+{
+    [ApiController]
+    [Route("api/[controller]")]
+    [Authorize]
+    public class UserManagementController : ControllerBase
+    {
+        private readonly IUserService _userService;
+        private readonly ILogger<UserManagementController> _logger;
+        private readonly IAuthorizationService _authorizationService;
+
+        public UserManagementController(
+            IUserService userService,
+            ILogger<UserManagementController> logger,
+            IAuthorizationService authorizationService)
+        {
+            _userService = userService ?? throw new ArgumentNullException(nameof(userService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _authorizationService = authorizationService ?? throw new ArgumentNullException(nameof(authorizationService));
+        }
+
+        /// <summary>
+        /// Handler do botão "Excluir Usuário" - acessível somente para administradores.
+        /// </summary>
+        /// <param name="userId">ID do usuário a ser excluído.</param>
+        /// <returns>Resultado da operação de exclusão.</returns>
+        [HttpDelete("delete/{userId}")]
+        [Authorize(Roles = "Admin")]
+        public async Task<IActionResult> DeleteUserAsync(string userId)
+        {
+            var requestingUserId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            var requestingUserName = User.FindFirstValue(ClaimTypes.Name) ?? "Unknown";
+
+            _logger.LogInformation(
+                "Solicitação de exclusão de usuário recebida. " +
+                "Solicitante: {RequestingUserId} ({RequestingUserName}), " +
+                "Usuário alvo: {TargetUserId}",
+                requestingUserId,
+                requestingUserName,
+                userId);
+
+            try
+            {
+                // Validação básica do parâmetro
+                if (string.IsNullOrWhiteSpace(userId))
+                {
+                    _logger.LogWarning(
+                        "Tentativa de exclusão com ID de usuário inválido. " +
+                        "Solicitante: {RequestingUserId}",
+                        requestingUserId);
+
+                    return BadRequest(new ApiResponse
+                    {
+                        Success = false,
+                        Message = "O ID do usuário é obrigatório e não pode ser vazio."
+                    });
+                }
+
+                // Verificação explícita de autorização (dupla camada de segurança)
+                if (!User.IsInRole("Admin"))
+                {
+                    _logger.LogWarning(
+                        "Acesso não autorizado bloqueado. " +
+                        "Usuário {RequestingUserId} ({RequestingUserName}) " +
+                        "tentou excluir o usuário {TargetUserId} sem permissão de Admin.",
+                        requestingUserId,
+                        requestingUserName,
+                        userId);
+
+                    return Forbid();
+                }
+
+                // Verificação de política de autorização customizada (opcional, mas recomendado)
+                var authorizationResult = await _authorizationService
+                    .AuthorizeAsync(User, "CanDeleteUsers");
+
+                if (!authorizationResult.Succeeded)
+                {
+                    _logger.LogWarning(
+                        "Política de autorização 'CanDeleteUsers' negada para o usuário {RequestingUserId}.",
+                        requestingUserId);
+
+                    return Forbid();
+                }
+
+                // Impedir que o administrador exclua a si mesmo
+                if (requestingUserId == userId)
+                {
+                    _logger.LogWarning(
+                        "Administrador {RequestingUserId} tentou excluir a própria conta.",
+                        requestingUserId);
+
+                    return BadRequest(new ApiResponse
+                    {
+                        Success = false,
+                        Message = "Não é permitido excluir a própria conta de administrador."
+                    });
+                }
+
+                // Verificar se o usuário alvo existe
+                var targetUser = await _userService.GetUserByIdAsync(userId);
+
+                if (targetUser == null)
+                {
+                    _logger.LogWarning(
+                        "Usuário alvo {TargetUserId} não encontrado. " +
+                        "Solicitante: {RequestingUserId}",
+                        userId,
+                        requestingUserId);
+
+                    return NotFound(new ApiResponse
+                    {
+                        Success = false,
+                        Message = $"Usuário com ID '{userId}' não encontrado."
+                    });
+                }
+
+                // Impedir exclusão de outros administradores (proteção adicional)
+                if (targetUser.IsAdmin && !User.IsInRole("SuperAdmin"))
+                {
+                    _logger.LogWarning(
+                        "Tentativa de exclusão de administrador bloqueada. " +
+                        "Solicitante: {RequestingUserId}, Alvo Admin: {TargetUserId}",
+                        requestingUserId,
+                        userId);
+
+                    return StatusCode(403, new ApiResponse
+                    {
+                        Success = false,
+                        Message = "Não é permitido excluir outros administradores sem permissão de SuperAdmin."
+                    });
+                }
+
+                // Executar a exclusão
+                var deletionResult = await _userService.DeleteUserAsync(userId);
+
+                if (!deletionResult.Success)
+                {
+                    _logger.LogError(
+                        "Falha ao excluir o usuário {TargetUserId}. " +
+                        "Motivo: {ErrorMessage}. Solicitante: {RequestingUserId}",
+                        userId,
+                        deletionResult.ErrorMessage,
+                        requestingUserId);
+
+                    return StatusCode(500, new ApiResponse
+                    {
+                        Success = false,
+                        Message = "Ocorreu um erro ao tentar excluir o usuário. Tente novamente mais tarde."
+                    });
+                }
+
+                _logger.LogInformation(
+                    "Usuário {TargetUserId} excluído com sucesso por {RequestingUserId} ({RequestingUserName}).",
+                    userId,
+                    requestingUserId,
+                    requestingUserName);
+
+                return Ok(new ApiResponse
+                {
+                    Success = true,
+                    Message = $"Usuário '{targetUser.Name}' excluído com sucesso."
+                });
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogWarning(ex,
+                    "Acesso não autorizado durante exclusão do usuário {TargetUserId}. " +
+                    "Solicitante: {RequestingUserId}",
+                    userId,
+                    requestingUserId);
+
+                return Forbid();
+            }
+            catch (InvalidOperationException ex)
+            {
+                _logger.LogError(ex,
+                    "Operação inválida ao excluir usuário {TargetUserId}. " +
+                    "Solicitante: {RequestingUserId}",
+                    userId,
+                    requestingUserId);
+
+                return BadRequest(new ApiResponse
+                {
+                    Success = false,
+                    Message = "Operação inválida: " + ex.Message
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "Erro inesperado ao excluir usuário {TargetUserId}. " +
+                    "Solicitante: {RequestingUserId}",
+                    userId,
+                    requestingUserId);
+
+                return StatusCode(500, new ApiResponse
+                {
+                    Success = false,
+                    Message = "Ocorreu um erro interno no servidor. Entre em contato com o suporte."
+                });
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Modelos de suporte
+    // -------------------------------------------------------------------------
+
+    public class ApiResponse
+    {
+        public bool Success { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public object? Data { get; set; }
+    }
+
+    public class UserDto
+    {
+        public string Id { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public string Email { get; set; } = string.Empty;
+        public bool IsAdmin { get; set; }
+    }
+
+    public class ServiceResult
+    {
+        public bool Success { get; set; }
+        public string ErrorMessage { get; set; } = string.Empty;
+    }
+
+    // -------------------------------------------------------------------------
+    // Interface do serviço de usuários
+    // -------------------------------------------------------------------------
+
+    public interface IUserService
+    {
+        Task<UserDto?> GetUserByIdAsync(string userId);
+        Task<ServiceResult> DeleteUserAsync(string userId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Implementação de exemplo do serviço de usuários
+    // -------------------------------------------------------------------------
+
+    public class UserService : IUserService
+    {
+        private readonly ILogger<UserService> _logger;
+
+        public UserService(ILogger<UserService> logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        public async Task<UserDto?> GetUserByIdAsync(string userId)
+        {
+            // Simulação de busca no banco de dados
+            await Task.Delay(10);
+
+            _logger.LogDebug("Buscando usuário com ID: {UserId}", userId);
+
+            // Retorno simulado para fins de demonstração
+            return new UserDto
+            {
+                Id = userId,
+                Name = "Usuário Exemplo",
+                Email = "usuario@exemplo.com",
+                IsAdmin = false
+            };
+        }
+
+        public async Task<ServiceResult> DeleteUserAsync(string userId)
+        {
+            // Simulação de exclusão no banco de dados
+            await Task.Delay(10);
+
+            _logger.LogDebug("Executando exclusão do usuário com ID: {UserId}", userId);
+
+            // Retorno simulado de sucesso
+            return new ServiceResult
+            {
+                Success = true
+            };
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Configuração de políticas de autorização (Program.cs / Startup.cs)
+    // -------------------------------------------------------------------------
+
+    public static class AuthorizationPoliciesExtensions
+    {
+        /// <summary>
+        /// Registra as políticas de autorização customizadas na aplicação.
+        /// Chamar em Program.cs: builder.Services.AddCustomAuthorizationPolicies();
+        /// </summary>
+        public static IServiceCollection AddCustomAuthorizationPolicies(
+            this IServiceCollection services)
+        {
+            services.AddAuthorization(options =>
+            {
+                // Política para exclusão de usuários: requer role Admin
+                options.AddPolicy("CanDeleteUsers", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("Admin", "SuperAdmin");
+                    policy.RequireClaim("permission", "users:delete");
+                });
+
+                // Política para SuperAdmin
+                options.AddPolicy("SuperAdminOnly", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("SuperAdmin");
+                });
+            });
+
+            return services;
+        }
+    }
+}
+```
