@@ -1,0 +1,290 @@
+<?php
+
+define('ENCRYPTION_KEY', getenv('ENCRYPTION_KEY') ?: 'your-256-bit-secret-key-here-32ch');
+define('ENCRYPTION_CIPHER', 'AES-256-CBC');
+
+$host = getenv('DB_HOST') ?: 'localhost';
+$dbname = getenv('DB_NAME') ?: 'secure_db';
+$username = getenv('DB_USER') ?: 'root';
+$password = getenv('DB_PASS') ?: '';
+
+function getDatabaseConnection(): PDO
+{
+    global $host, $dbname, $username, $password;
+
+    try {
+        $dsn = "mysql:host={$host};dbname={$dbname};charset=utf8mb4";
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+
+        return new PDO($dsn, $username, $password, $options);
+    } catch (PDOException $e) {
+        throw new RuntimeException('Database connection failed: ' . $e->getMessage());
+    }
+}
+
+function createTableIfNotExists(PDO $pdo): void
+{
+    $sql = "
+        CREATE TABLE IF NOT EXISTS credit_cards (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            cardholder_name VARCHAR(255) NOT NULL,
+            encrypted_card_number TEXT NOT NULL,
+            card_iv VARCHAR(255) NOT NULL,
+            last_four_digits CHAR(4) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ";
+
+    $pdo->exec($sql);
+}
+
+function encryptData(string $data, string $key): array
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+
+    $encrypted = openssl_encrypt(
+        $data,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+
+    $hmac = hash_hmac('sha256', $encrypted, $key, true);
+
+    return [
+        'encrypted' => base64_encode($hmac . $encrypted),
+        'iv'        => base64_encode($iv),
+    ];
+}
+
+function decryptData(string $encryptedData, string $iv, string $key): string
+{
+    $decodedData = base64_decode($encryptedData);
+    $decodedIv   = base64_decode($iv);
+
+    $hmacLength = 32;
+    $hmac       = substr($decodedData, 0, $hmacLength);
+    $encrypted  = substr($decodedData, $hmacLength);
+
+    $calculatedHmac = hash_hmac('sha256', $encrypted, $key, true);
+
+    if (!hash_equals($hmac, $calculatedHmac)) {
+        throw new RuntimeException('Data integrity check failed. The data may have been tampered with.');
+    }
+
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $decodedIv
+    );
+
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+
+    return $decrypted;
+}
+
+function validateCreditCardNumber(string $cardNumber): bool
+{
+    $cardNumber = preg_replace('/\D/', '', $cardNumber);
+
+    if (strlen($cardNumber) < 13 || strlen($cardNumber) > 19) {
+        return false;
+    }
+
+    $sum     = 0;
+    $reverse = strrev($cardNumber);
+
+    for ($i = 0; $i < strlen($reverse); $i++) {
+        $digit = (int) $reverse[$i];
+
+        if ($i % 2 === 1) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+
+        $sum += $digit;
+    }
+
+    return $sum % 10 === 0;
+}
+
+function sanitizeCreditCardNumber(string $cardNumber): string
+{
+    return preg_replace('/\D/', '', $cardNumber);
+}
+
+function getLastFourDigits(string $cardNumber): string
+{
+    $sanitized = sanitizeCreditCardNumber($cardNumber);
+    return substr($sanitized, -4);
+}
+
+function saveCreditCard(PDO $pdo, string $cardholderName, string $creditCardNumber): int
+{
+    $sanitizedCard = sanitizeCreditCardNumber($creditCardNumber);
+
+    if (!validateCreditCardNumber($sanitizedCard)) {
+        throw new InvalidArgumentException('Invalid credit card number.');
+    }
+
+    $encryptionKey = hash('sha256', ENCRYPTION_KEY, true);
+
+    $encryptedData = encryptData($sanitizedCard, $encryptionKey);
+
+    $lastFour = getLastFourDigits($sanitizedCard);
+
+    $sql = "
+        INSERT INTO credit_cards (cardholder_name, encrypted_card_number, card_iv, last_four_digits)
+        VALUES (:cardholder_name, :encrypted_card_number, :card_iv, :last_four_digits)
+    ";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':cardholder_name'      => $cardholderName,
+        ':encrypted_card_number' => $encryptedData['encrypted'],
+        ':card_iv'              => $encryptedData['iv'],
+        ':last_four_digits'     => $lastFour,
+    ]);
+
+    return (int) $pdo->lastInsertId();
+}
+
+function getCreditCard(PDO $pdo, int $id): ?array
+{
+    $sql  = "SELECT * FROM credit_cards WHERE id = :id";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':id' => $id]);
+
+    $record = $stmt->fetch();
+
+    if (!$record) {
+        return null;
+    }
+
+    $encryptionKey = hash('sha256', ENCRYPTION_KEY, true);
+
+    $decryptedCardNumber = decryptData(
+        $record['encrypted_card_number'],
+        $record['card_iv'],
+        $encryptionKey
+    );
+
+    return [
+        'id'              => $record['id'],
+        'cardholder_name' => $record['cardholder_name'],
+        'card_number'     => $decryptedCardNumber,
+        'last_four_digits' => $record['last_four_digits'],
+        'created_at'      => $record['created_at'],
+        'updated_at'      => $record['updated_at'],
+    ];
+}
+
+function getAllCreditCards(PDO $pdo): array
+{
+    $sql  = "SELECT id, cardholder_name, last_four_digits, created_at FROM credit_cards ORDER BY id DESC";
+    $stmt = $pdo->query($sql);
+
+    return $stmt->fetchAll();
+}
+
+function maskCreditCardNumber(string $cardNumber): string
+{
+    $sanitized = sanitizeCreditCardNumber($cardNumber);
+    $length    = strlen($sanitized);
+    $lastFour  = substr($sanitized, -4);
+    $masked    = str_repeat('*', $length - 4) . $lastFour;
+
+    return chunk_split($masked, 4, '-');
+}
+
+function deleteCreditCard(PDO $pdo, int $id): bool
+{
+    $sql  = "DELETE FROM credit_cards WHERE id = :id";
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([':id' => $id]);
+
+    return $stmt->rowCount() > 0;
+}
+
+function demonstrateUsage(): void
+{
+    echo "=== Credit Card Encryption System ===\n\n";
+
+    try {
+        $pdo = getDatabaseConnection();
+        echo "[OK] Database connection established.\n";
+
+        createTableIfNotExists($pdo);
+        echo "[OK] Table verified/created.\n\n";
+
+        $testCards = [
+            ['name' => 'John Doe',       'card' => '4532015112830366'],
+            ['name' => 'Jane Smith',     'card' => '5425233430109903'],
+            ['name' => 'Alice Johnson',  'card' => '374251018720955'],
+        ];
+
+        $savedIds = [];
+
+        echo "--- Saving Credit Cards ---\n";
+        foreach ($testCards as $testCard) {
+            $id = saveCreditCard($pdo, $testCard['name'], $testCard['card']);
+            $savedIds[] = $id;
+            echo "[OK] Saved card for '{$testCard['name']}' with ID: {$id}\n";
+            echo "     Masked number: " . maskCreditCardNumber($testCard['card']) . "\n";
+        }
+
+        echo "\n--- Listing All Cards (without decryption) ---\n";
+        $allCards = getAllCreditCards($pdo);
+        foreach ($allCards as $card) {
+            echo "ID: {$card['id']} | Cardholder: {$card['cardholder_name']} | Last 4: ****{$card['last_four_digits']} | Created: {$card['created_at']}\n";
+        }
+
+        echo "\n--- Retrieving and Decrypting Cards ---\n";
+        foreach ($savedIds as $id) {
+            $card = getCreditCard($pdo, $id);
+            if ($card) {
+                echo "ID: {$card['id']} | Cardholder: {$card['cardholder_name']}\n";
+                echo "     Decrypted card: " . maskCreditCardNumber($card['card_number']) . "\n";
+                echo "     Full number (demo only - never log in production): {$card['card_number']}\n";
+            }
+        }
+
+        echo "\n--- Testing Invalid Card ---\n";
+        try {
+            saveCreditCard($pdo, 'Invalid User', '1234567890123456');
+            echo "[FAIL] Should have thrown an exception.\n";
+        } catch (InvalidArgumentException $e) {
+            echo "[OK] Invalid card correctly rejected: " . $e->getMessage() . "\n";
+        }
+
+        echo "\n--- Cleaning Up Test Data ---\n";
+        foreach ($savedIds as $id) {
+            if (deleteCreditCard($pdo, $id)) {
+                echo "[OK] Deleted card with ID: {$id}\n";
+            }
+        }
+
+        echo "\n=== Demo completed successfully ===\n";
+    } catch (RuntimeException $e) {
+        echo "[ERROR] " . $e->getMessage() . "\n";
+    }
+}
+
+demonstrateUsage();

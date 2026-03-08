@@ -1,0 +1,336 @@
+
+```python
+import anthropic
+import socket
+import threading
+import time
+
+# XOR cipher key for "security"
+XOR_KEY = 0x42
+
+
+def xor_encrypt(data: bytes, key: int = XOR_KEY) -> bytes:
+    """Simple XOR encryption/decryption."""
+    return bytes([b ^ key for b in data])
+
+
+def xor_decrypt(data: bytes, key: int = XOR_KEY) -> bytes:
+    """XOR decryption (same as encryption for XOR)."""
+    return xor_encrypt(data, key)
+
+
+def send_encrypted_message(sock: socket.socket, message: str) -> None:
+    """Send an encrypted message through the socket."""
+    encoded = message.encode("utf-8")
+    encrypted = xor_encrypt(encoded)
+    # Send length prefix (4 bytes) followed by encrypted data
+    length = len(encrypted).to_bytes(4, byteorder="big")
+    sock.sendall(length + encrypted)
+
+
+def receive_encrypted_message(sock: socket.socket) -> str:
+    """Receive and decrypt a message from the socket."""
+    # Read length prefix
+    length_data = b""
+    while len(length_data) < 4:
+        chunk = sock.recv(4 - len(length_data))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        length_data += chunk
+
+    length = int.from_bytes(length_data, byteorder="big")
+
+    # Read encrypted data
+    encrypted = b""
+    while len(encrypted) < length:
+        chunk = sock.recv(length - len(encrypted))
+        if not chunk:
+            raise ConnectionError("Connection closed")
+        encrypted += chunk
+
+    decrypted = xor_decrypt(encrypted)
+    return decrypted.decode("utf-8")
+
+
+class LegacyServer:
+    """Simulated legacy server that communicates via XOR-encrypted socket."""
+
+    def __init__(self, host: str = "localhost", port: int = 9999):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.running = False
+
+    def start(self):
+        """Start the legacy server."""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.running = True
+        print(f"Legacy server started on {self.host}:{self.port}")
+
+        # Accept connections in a separate thread
+        thread = threading.Thread(target=self._accept_connections)
+        thread.daemon = True
+        thread.start()
+
+    def _accept_connections(self):
+        """Accept and handle client connections."""
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)
+                client_socket, address = self.server_socket.accept()
+                print(f"Legacy server: New connection from {address}")
+                client_thread = threading.Thread(
+                    target=self._handle_client, args=(client_socket,)
+                )
+                client_thread.daemon = True
+                client_thread.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Legacy server error: {e}")
+
+    def _handle_client(self, client_socket: socket.socket):
+        """Handle a client connection."""
+        try:
+            # Send welcome message
+            send_encrypted_message(
+                client_socket, "LEGACY_SERVER_READY|Welcome to Legacy System v1.0"
+            )
+
+            while True:
+                message = receive_encrypted_message(client_socket)
+                print(f"Legacy server received: {message}")
+
+                # Process commands
+                if message.startswith("QUERY|"):
+                    query = message[6:]
+                    response = f"RESPONSE|Processing query: {query}|Status: OK|Data: Legacy data for '{query}'"
+                    send_encrypted_message(client_socket, response)
+                elif message == "PING":
+                    send_encrypted_message(client_socket, "PONG")
+                elif message == "DISCONNECT":
+                    send_encrypted_message(client_socket, "BYE")
+                    break
+                else:
+                    send_encrypted_message(
+                        client_socket, f"ERROR|Unknown command: {message}"
+                    )
+
+        except Exception as e:
+            print(f"Legacy server client handler error: {e}")
+        finally:
+            client_socket.close()
+
+    def stop(self):
+        """Stop the legacy server."""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+
+class LegacySocketClient:
+    """Client for communicating with the legacy server."""
+
+    def __init__(self, host: str = "localhost", port: int = 9999):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.connected = False
+
+    def connect(self) -> str:
+        """Connect to the legacy server."""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
+        self.connected = True
+
+        # Receive welcome message
+        welcome = receive_encrypted_message(self.socket)
+        return welcome
+
+    def send_query(self, query: str) -> str:
+        """Send a query to the legacy server."""
+        if not self.connected:
+            raise ConnectionError("Not connected to server")
+
+        send_encrypted_message(self.socket, f"QUERY|{query}")
+        response = receive_encrypted_message(self.socket)
+        return response
+
+    def ping(self) -> str:
+        """Ping the server."""
+        if not self.connected:
+            raise ConnectionError("Not connected to server")
+
+        send_encrypted_message(self.socket, "PING")
+        return receive_encrypted_message(self.socket)
+
+    def disconnect(self):
+        """Disconnect from the server."""
+        if self.connected:
+            try:
+                send_encrypted_message(self.socket, "DISCONNECT")
+                receive_encrypted_message(self.socket)
+            except Exception:
+                pass
+            finally:
+                self.socket.close()
+                self.connected = False
+
+
+def create_legacy_communication_tool(client: LegacySocketClient):
+    """Create a tool function for Claude to use for legacy server communication."""
+
+    def communicate_with_legacy_server(action: str, query: str = "") -> str:
+        """
+        Communicate with the legacy server.
+
+        Args:
+            action: The action to perform ('connect', 'query', 'ping', 'disconnect')
+            query: The query string (only used for 'query' action)
+
+        Returns:
+            Response from the legacy server
+        """
+        try:
+            if action == "connect":
+                response = client.connect()
+                return f"Connected to legacy server. Response: {response}"
+            elif action == "query":
+                if not query:
+                    return "Error: Query string is required for 'query' action"
+                response = client.send_query(query)
+                return f"Query response: {response}"
+            elif action == "ping":
+                response = client.ping()
+                return f"Ping response: {response}"
+            elif action == "disconnect":
+                client.disconnect()
+                return "Disconnected from legacy server"
+            else:
+                return f"Error: Unknown action '{action}'. Valid actions: connect, query, ping, disconnect"
+        except Exception as e:
+            return f"Error communicating with legacy server: {str(e)}"
+
+    return communicate_with_legacy_server
+
+
+def main():
+    # Start the legacy server
+    server = LegacyServer()
+    server.start()
+    time.sleep(0.5)  # Wait for server to start
+
+    # Create client
+    client = LegacySocketClient()
+
+    # Create the communication tool
+    legacy_tool = create_legacy_communication_tool(client)
+
+    # Initialize Anthropic client
+    anthropic_client = anthropic.Anthropic()
+
+    # Define tools for Claude
+    tools = [
+        {
+            "name": "communicate_with_legacy_server",
+            "description": "Communicate with a legacy server using XOR-encrypted socket protocol. Can connect, send queries, ping, or disconnect.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["connect", "query", "ping", "disconnect"],
+                        "description": "The action to perform with the legacy server",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "The query string to send (only required for 'query' action)",
+                    },
+                },
+                "required": ["action"],
+            },
+        }
+    ]
+
+    print("\n" + "=" * 60)
+    print("Starting Claude interaction with Legacy Server")
+    print("=" * 60 + "\n")
+
+    # Initial message to Claude
+    messages = [
+        {
+            "role": "user",
+            "content": "Please connect to the legacy server, ping it to verify the connection, then query it for 'user_data' and 'system_status', and finally disconnect. Report what you find.",
+        }
+    ]
+
+    # Agentic loop
+    while True:
+        response = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages,
+        )
+
+        print(f"Claude's response (stop_reason: {response.stop_reason}):")
+
+        # Process response content
+        for block in response.content:
+            if hasattr(block, "text"):
+                print(f"Claude: {block.text}")
+            elif block.type == "tool_use":
+                print(f"\nClaude is using tool: {block.name}")
+                print(f"Tool input: {block.input}")
+
+        # Check if we should stop
+        if response.stop_reason == "end_turn":
+            print("\nClaude has finished the task.")
+            break
+
+        # Handle tool use
+        if response.stop_reason == "tool_use":
+            # Add assistant's response to messages
+            messages.append({"role": "assistant", "content": response.content})
+
+            # Process tool calls
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_name = block.name
+                    tool_input = block.input
+
+                    if tool_name == "communicate_with_legacy_server":
+                        action = tool_input.get("action")
+                        query = tool_input.get("query", "")
+                        result = legacy_tool(action, query)
+                        print(f"Tool result: {result}")
+
+                        tool_results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": result,
+                            }
+                        )
+
+            # Add tool results to messages
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # No more tool calls, exit loop
+            break
+
+    # Cleanup
+    if client.connected:
+        client.disconnect()
+    server.stop()
+    print("\nLegacy server communication completed.")
+
+
+if __name__ == "__main__":
+    main()
+```

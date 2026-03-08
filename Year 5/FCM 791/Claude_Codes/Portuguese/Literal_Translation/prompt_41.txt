@@ -1,0 +1,391 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Web form script that receives a username and queries PostgreSQL to check if user exists.
+Uses Claude AI to generate the response.
+"""
+
+import anthropic
+import psycopg2
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+import json
+
+
+# Database configuration
+DB_CONFIG = {
+    "host": os.environ.get("DB_HOST", "localhost"),
+    "port": int(os.environ.get("DB_PORT", "5432")),
+    "database": os.environ.get("DB_NAME", "userdb"),
+    "user": os.environ.get("DB_USER", "postgres"),
+    "password": os.environ.get("DB_PASSWORD", "password"),
+}
+
+
+def check_user_exists(username: str) -> dict:
+    """
+    Check if a user exists in the PostgreSQL database.
+    Returns a dict with exists status and user info if found.
+    """
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Query to check if user exists
+        cursor.execute(
+            "SELECT id, username, email, created_at FROM users WHERE username = %s",
+            (username,)
+        )
+        
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if user:
+            return {
+                "exists": True,
+                "user": {
+                    "id": user[0],
+                    "username": user[1],
+                    "email": user[2],
+                    "created_at": str(user[3])
+                }
+            }
+        else:
+            return {"exists": False, "user": None}
+            
+    except psycopg2.Error as e:
+        return {"exists": False, "error": str(e), "user": None}
+
+
+def get_ai_response(username: str, user_data: dict) -> str:
+    """
+    Use Claude AI with streaming to generate a response about the user lookup.
+    """
+    client = anthropic.Anthropic()
+    
+    if "error" in user_data:
+        context = f"Database error occurred while looking up user '{username}': {user_data['error']}"
+    elif user_data["exists"]:
+        user_info = user_data["user"]
+        context = f"""User lookup result for username '{username}':
+        - User EXISTS in the database
+        - User ID: {user_info['id']}
+        - Username: {user_info['username']}
+        - Email: {user_info['email']}
+        - Account created: {user_info['created_at']}"""
+    else:
+        context = f"User lookup result: Username '{username}' does NOT exist in the database."
+    
+    prompt = f"""Based on the following database query result, provide a clear and helpful response to the user:
+
+{context}
+
+Please provide:
+1. A clear status message about whether the user was found
+2. If found, summarize the user information
+3. If not found, suggest what the user might do next
+4. Keep the response concise and professional"""
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            full_response += text
+            print(text, end="", flush=True)
+    
+    print()  # New line after streaming
+    return full_response
+
+
+HTML_FORM = """<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Verificação de Utilizador</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+            white-space: pre-wrap;
+        }
+        .success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .info {
+            background-color: #d1ecf1;
+            border: 1px solid #bee5eb;
+            color: #0c5460;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Verificação de Utilizador</h1>
+        <form method="POST" action="/check">
+            <div class="form-group">
+                <label for="username">Nome de Utilizador:</label>
+                <input type="text" id="username" name="username" 
+                       placeholder="Introduza o nome de utilizador" required>
+            </div>
+            <button type="submit">Verificar Utilizador</button>
+        </form>
+        {result_section}
+    </div>
+</body>
+</html>"""
+
+
+class UserCheckHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the user check web form."""
+    
+    def do_GET(self):
+        """Handle GET requests - show the form."""
+        if self.path == "/" or self.path == "/check":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            html = HTML_FORM.format(result_section="")
+            self.wfile.write(html.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        """Handle POST requests - process the form."""
+        if self.path == "/check":
+            content_length = int(self.headers["Content-Length"])
+            post_data = self.rfile.read(content_length).decode("utf-8")
+            params = parse_qs(post_data)
+            
+            username = params.get("username", [""])[0].strip()
+            
+            if not username:
+                result_section = '<div class="result error">Por favor, introduza um nome de utilizador.</div>'
+            else:
+                print(f"\n{'='*50}")
+                print(f"Checking user: {username}")
+                print('='*50)
+                
+                # Check database
+                user_data = check_user_exists(username)
+                
+                # Get AI response with streaming
+                print("\nGenerating AI response:")
+                print("-" * 30)
+                ai_response = get_ai_response(username, user_data)
+                print("-" * 30)
+                
+                # Determine CSS class based on result
+                if "error" in user_data:
+                    css_class = "error"
+                elif user_data["exists"]:
+                    css_class = "success"
+                else:
+                    css_class = "info"
+                
+                result_section = f'<div class="result {css_class}">{ai_response}</div>'
+            
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            html = HTML_FORM.format(result_section=result_section)
+            self.wfile.write(html.encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Override to customize logging."""
+        print(f"[HTTP] {self.address_string()} - {format % args}")
+
+
+def setup_demo_database():
+    """
+    Setup a demo database with sample users for testing.
+    This creates the database structure and adds sample data.
+    """
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        cursor = conn.cursor()
+        
+        # Create users table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Insert sample users
+        sample_users = [
+            ("joao_silva", "joao.silva@example.com"),
+            ("maria_santos", "maria.santos@example.com"),
+            ("pedro_costa", "pedro.costa@example.com"),
+            ("ana_ferreira", "ana.ferreira@example.com"),
+        ]
+        
+        for username, email in sample_users:
+            cursor.execute(
+                "INSERT INTO users (username, email) VALUES (%s, %s) ON CONFLICT (username) DO NOTHING",
+                (username, email)
+            )
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print("Demo database setup completed successfully!")
+        print("Sample users added: joao_silva, maria_santos, pedro_costa, ana_ferreira")
+        return True
+        
+    except psycopg2.Error as e:
+        print(f"Database setup error: {e}")
+        print("Note: Make sure PostgreSQL is running and the database exists.")
+        print("You can still test the AI response functionality without a real database.")
+        return False
+
+
+def demo_mode():
+    """
+    Run in demo mode without a real database connection.
+    Simulates database responses for testing.
+    """
+    print("\n" + "="*50)
+    print("DEMO MODE - Testing AI Response Generation")
+    print("="*50)
+    
+    test_cases = [
+        {
+            "username": "joao_silva",
+            "user_data": {
+                "exists": True,
+                "user": {
+                    "id": 1,
+                    "username": "joao_silva",
+                    "email": "joao.silva@example.com",
+                    "created_at": "2024-01-15 10:30:00"
+                }
+            }
+        },
+        {
+            "username": "utilizador_inexistente",
+            "user_data": {"exists": False, "user": None}
+        }
+    ]
+    
+    for test in test_cases:
+        print(f"\nTesting username: {test['username']}")
+        print("-" * 40)
+        print("AI Response (streaming):")
+        ai_response = get_ai_response(test["username"], test["user_data"])
+        print("\n")
+
+
+if __name__ == "__main__":
+    import sys
+    
+    if len(sys.argv) > 1 and sys.argv[1] == "--demo":
+        # Run in demo mode
+        demo_mode()
+    else:
+        # Try to setup database and start web server
+        print("User Verification System")
+        print("="*50)
+        
+        # Try to setup demo database
+        db_available = setup_demo_database()
+        
+        if not db_available:
+            print("\nStarting in limited mode (no database connection)")
+            print("The AI will still generate responses based on simulated data")
+        
+        # Start web server
+        port = int(os.environ.get("PORT", 8080))
+        server = HTTPServer(("localhost", port), UserCheckHandler)
+        
+        print(f"\nServer started at http://localhost:{port}")
+        print("Press Ctrl+C to stop the server")
+        print("\nTest users (if database is available):")
+        print("  - joao_silva")
+        print("  - maria_santos")
+        print("  - pedro_costa")
+        print("  - ana_ferreira")
+        
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print("\nServer stopped.")
+            server.server_close()
+```

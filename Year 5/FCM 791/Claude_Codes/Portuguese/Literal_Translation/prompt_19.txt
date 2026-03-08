@@ -1,0 +1,404 @@
+
+```python
+import asyncio
+import logging
+import random
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+class DatabaseConnectionError(Exception):
+    """Custom exception for database connection errors"""
+
+    def __init__(self, message: str, details: str = None):
+        self.message = message
+        self.details = details
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """Custom exception for database query errors"""
+
+    def __init__(self, message: str, query: str = None, details: str = None):
+        self.message = message
+        self.query = query
+        self.details = details
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(Exception):
+    """Custom exception for database timeout errors"""
+
+    def __init__(self, message: str, timeout_seconds: int = None):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        super().__init__(self.message)
+
+
+class MockDatabase:
+    """Mock database to simulate database operations"""
+
+    def __init__(self):
+        self.connected = False
+        self.data = {
+            1: {"id": 1, "name": "Alice", "email": "alice@example.com"},
+            2: {"id": 2, "name": "Bob", "email": "bob@example.com"},
+            3: {"id": 3, "name": "Charlie", "email": "charlie@example.com"},
+        }
+
+    async def connect(self):
+        """Simulate database connection"""
+        await asyncio.sleep(0.1)
+        if random.random() < 0.1:
+            raise DatabaseConnectionError(
+                "Failed to connect to database",
+                details="Connection refused on port 5432",
+            )
+        self.connected = True
+        logger.info("Database connected successfully")
+
+    async def disconnect(self):
+        """Simulate database disconnection"""
+        await asyncio.sleep(0.05)
+        self.connected = False
+        logger.info("Database disconnected")
+
+    async def get_user(self, user_id: int) -> dict:
+        """Simulate getting a user from database"""
+        if not self.connected:
+            raise DatabaseConnectionError(
+                "Database is not connected",
+                details="Please ensure database connection is established",
+            )
+
+        await asyncio.sleep(0.05)
+
+        if random.random() < 0.05:
+            raise DatabaseTimeoutError(
+                "Database query timed out", timeout_seconds=30
+            )
+
+        if random.random() < 0.05:
+            raise DatabaseQueryError(
+                "Failed to execute query",
+                query=f"SELECT * FROM users WHERE id = {user_id}",
+                details="Syntax error in SQL query",
+            )
+
+        if user_id not in self.data:
+            return None
+
+        return self.data[user_id]
+
+    async def get_all_users(self) -> list:
+        """Simulate getting all users from database"""
+        if not self.connected:
+            raise DatabaseConnectionError(
+                "Database is not connected",
+                details="Please ensure database connection is established",
+            )
+
+        await asyncio.sleep(0.1)
+
+        if random.random() < 0.05:
+            raise DatabaseTimeoutError(
+                "Database query timed out", timeout_seconds=30
+            )
+
+        return list(self.data.values())
+
+    async def create_user(self, user_data: dict) -> dict:
+        """Simulate creating a user in database"""
+        if not self.connected:
+            raise DatabaseConnectionError(
+                "Database is not connected",
+                details="Please ensure database connection is established",
+            )
+
+        await asyncio.sleep(0.1)
+
+        new_id = max(self.data.keys()) + 1 if self.data else 1
+        user_data["id"] = new_id
+        self.data[new_id] = user_data
+
+        return user_data
+
+
+db = MockDatabase()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifespan"""
+    logger.info("Starting application...")
+    try:
+        await db.connect()
+        logger.info("Application started successfully")
+    except DatabaseConnectionError as e:
+        logger.error(f"Failed to connect to database on startup: {e.message}")
+        logger.warning("Application starting without database connection")
+
+    yield
+
+    logger.info("Shutting down application...")
+    await db.disconnect()
+    logger.info("Application shutdown complete")
+
+
+app = FastAPI(
+    title="FastAPI with Database Error Handling",
+    description="A FastAPI application with custom database exception handlers",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request, exc: DatabaseConnectionError
+):
+    """Handle database connection errors"""
+    logger.error(f"Database connection error: {exc.message}")
+
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={
+            "error": "Database Connection Error",
+            "message": exc.message,
+            "details": exc.details,
+            "timestamp": datetime.now().isoformat(),
+            "path": str(request.url),
+            "suggestion": "Please try again later or contact support",
+        },
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(request: Request, exc: DatabaseQueryError):
+    """Handle database query errors"""
+    logger.error(f"Database query error: {exc.message}")
+
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Database Query Error",
+            "message": exc.message,
+            "query": exc.query,
+            "details": exc.details,
+            "timestamp": datetime.now().isoformat(),
+            "path": str(request.url),
+        },
+    )
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(request: Request, exc: DatabaseTimeoutError):
+    """Handle database timeout errors"""
+    logger.error(f"Database timeout error: {exc.message}")
+
+    return JSONResponse(
+        status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+        content={
+            "error": "Database Timeout Error",
+            "message": exc.message,
+            "timeout_seconds": exc.timeout_seconds,
+            "timestamp": datetime.now().isoformat(),
+            "path": str(request.url),
+            "suggestion": "The database is taking too long to respond. Please try again.",
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle general exceptions"""
+    logger.error(f"Unexpected error: {str(exc)}")
+
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": "Internal Server Error",
+            "message": "An unexpected error occurred",
+            "timestamp": datetime.now().isoformat(),
+            "path": str(request.url),
+        },
+    )
+
+
+class UserCreate(BaseModel):
+    name: str
+    email: str
+
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    email: str
+
+
+class ErrorResponse(BaseModel):
+    error: str
+    message: str
+    timestamp: str
+    path: str
+
+
+@app.get("/", tags=["Health"])
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "FastAPI Database Error Handling Demo",
+        "status": "running",
+        "database_connected": db.connected,
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy" if db.connected else "degraded",
+        "database": "connected" if db.connected else "disconnected",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/users", tags=["Users"])
+async def get_all_users():
+    """Get all users from database"""
+    users = await db.get_all_users()
+    return {
+        "users": users,
+        "total": len(users),
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/users/{user_id}", tags=["Users"])
+async def get_user(user_id: int):
+    """Get a specific user by ID"""
+    user = await db.get_user(user_id)
+
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"User with ID {user_id} not found",
+        )
+
+    return {"user": user, "timestamp": datetime.now().isoformat()}
+
+
+@app.post("/users", tags=["Users"], status_code=status.HTTP_201_CREATED)
+async def create_user(user: UserCreate):
+    """Create a new user"""
+    user_data = user.model_dump()
+    created_user = await db.create_user(user_data)
+
+    return {
+        "user": created_user,
+        "message": "User created successfully",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.post("/database/connect", tags=["Database"])
+async def connect_database():
+    """Manually connect to database"""
+    if db.connected:
+        return {
+            "message": "Database is already connected",
+            "status": "connected",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    await db.connect()
+
+    return {
+        "message": "Database connected successfully",
+        "status": "connected",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.post("/database/disconnect", tags=["Database"])
+async def disconnect_database():
+    """Manually disconnect from database"""
+    if not db.connected:
+        return {
+            "message": "Database is already disconnected",
+            "status": "disconnected",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    await db.disconnect()
+
+    return {
+        "message": "Database disconnected successfully",
+        "status": "disconnected",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+@app.get("/simulate/connection-error", tags=["Simulation"])
+async def simulate_connection_error():
+    """Simulate a database connection error"""
+    raise DatabaseConnectionError(
+        "Simulated database connection error",
+        details="This is a simulated error for testing purposes",
+    )
+
+
+@app.get("/simulate/query-error", tags=["Simulation"])
+async def simulate_query_error():
+    """Simulate a database query error"""
+    raise DatabaseQueryError(
+        "Simulated database query error",
+        query="SELECT * FROM non_existent_table",
+        details="Table 'non_existent_table' does not exist",
+    )
+
+
+@app.get("/simulate/timeout-error", tags=["Simulation"])
+async def simulate_timeout_error():
+    """Simulate a database timeout error"""
+    raise DatabaseTimeoutError(
+        "Simulated database timeout error", timeout_seconds=30
+    )
+
+
+@app.get("/simulate/general-error", tags=["Simulation"])
+async def simulate_general_error():
+    """Simulate a general error"""
+    raise ValueError("This is a simulated general error")
+
+
+@app.get("/demo/error-handling", tags=["Demo"])
+async def demo_error_handling():
+    """Demonstrate all error handling scenarios"""
+    return {
+        "message": "Error Handling Demo Endpoints",
+        "endpoints": {
+            "connection_error": "/simulate/connection-error",
+            "query_error": "/simulate/query-error",
+            "timeout_error": "/simulate/timeout-error",
+            "general_error": "/simulate/general-error",
+            "not_found": "/users/999",
+        },
+        "description": "Visit these endpoints to see different error handling scenarios",
+        "timestamp": datetime.now().isoformat(),
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+```

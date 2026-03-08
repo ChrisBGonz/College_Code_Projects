@@ -1,0 +1,216 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  ARTIFACT_NAME: build-artifact
+  BUILD_DIR: dist
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test --if-present
+
+      - name: Build project
+        run: npm run build
+
+      - name: Create artifact archive
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          zip -r ../${{ env.ARTIFACT_NAME }}.zip .
+          cd ..
+          echo "ARTIFACT_PATH=$(pwd)/${{ env.ARTIFACT_NAME }}.zip" >> $GITHUB_ENV
+          echo "ARTIFACT_SIZE=$(du -sh ${{ env.ARTIFACT_NAME }}.zip | cut -f1)" >> $GITHUB_ENV
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}.zip
+          retention-days: 30
+
+      - name: Generate artifact metadata
+        run: |
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_ENV
+          echo "COMMIT_SHA=${{ github.sha }}" >> $GITHUB_ENV
+          echo "BRANCH_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+
+  upload-to-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    environment: production
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        run: |
+          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          S3_KEY="artifacts/${{ github.ref_name }}/${TIMESTAMP}-${SHORT_SHA}/${{ env.ARTIFACT_NAME }}.zip"
+
+          aws s3 cp ${{ env.ARTIFACT_NAME }}.zip \
+            s3://${{ secrets.AWS_S3_BUCKET }}/${S3_KEY} \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --storage-class STANDARD_IA
+
+          echo "S3_URI=s3://${{ secrets.AWS_S3_BUCKET }}/${S3_KEY}" >> $GITHUB_ENV
+          echo "Artifact uploaded to: s3://${{ secrets.AWS_S3_BUCKET }}/${S3_KEY}"
+
+      - name: Update latest artifact pointer
+        run: |
+          echo "${{ github.sha }}" | aws s3 cp - \
+            s3://${{ secrets.AWS_S3_BUCKET }}/artifacts/${{ github.ref_name }}/latest.txt \
+            --content-type "text/plain"
+
+      - name: Verify upload
+        run: |
+          aws s3 ls ${{ env.S3_URI }} --human-readable
+          echo "Upload verified successfully!"
+
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+    environment: production
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload artifact to GCS
+        run: |
+          TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          GCS_PATH="gs://${{ secrets.GCS_BUCKET }}/artifacts/${{ github.ref_name }}/${TIMESTAMP}-${SHORT_SHA}/${{ env.ARTIFACT_NAME }}.zip"
+
+          gsutil -h "x-goog-meta-commit:${{ github.sha }}" \
+                 -h "x-goog-meta-branch:${{ github.ref_name }}" \
+                 cp ${{ env.ARTIFACT_NAME }}.zip ${GCS_PATH}
+
+          echo "Artifact uploaded to: ${GCS_PATH}"
+
+  upload-to-azure:
+    name: Upload to Azure Blob Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+    environment: production
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Upload artifact to Azure Blob Storage
+        uses: azure/CLI@v2
+        with:
+          inlineScript: |
+            TIMESTAMP=$(date -u +'%Y%m%d%H%M%S')
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            BLOB_NAME="artifacts/${{ github.ref_name }}/${TIMESTAMP}-${SHORT_SHA}/${{ env.ARTIFACT_NAME }}.zip"
+
+            az storage blob upload \
+              --account-name ${{ secrets.AZURE_STORAGE_ACCOUNT }} \
+              --account-key ${{ secrets.AZURE_STORAGE_KEY }} \
+              --container-name ${{ secrets.AZURE_CONTAINER_NAME }} \
+              --name ${BLOB_NAME} \
+              --file ${{ env.ARTIFACT_NAME }}.zip \
+              --metadata commit=${{ github.sha }} branch=${{ github.ref_name }}
+
+            echo "Artifact uploaded to Azure Blob: ${BLOB_NAME}"
+
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-s3]
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: needs.build.result == 'success' && needs.upload-to-s3.result == 'success'
+        run: |
+          echo "Build and upload completed successfully!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+      - name: Notify failure
+        if: needs.build.result == 'failure' || needs.upload-to-s3.result == 'failure'
+        run: |
+          echo "Build or upload failed!"
+          echo "Check the logs for more details."
+          exit 1
+
+      - name: Send Slack notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "Build ${{ needs.build.result == 'success' && needs.upload-to-s3.result == 'success' && 'succeeded' || 'failed' }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Build Status:* ${{ needs.build.result == 'success' && needs.upload-to-s3.result == 'success' && ':white_check_mark: Success' || ':x: Failed' }}\n*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* ${{ github.sha }}\n*Triggered by:* ${{ github.actor }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+```

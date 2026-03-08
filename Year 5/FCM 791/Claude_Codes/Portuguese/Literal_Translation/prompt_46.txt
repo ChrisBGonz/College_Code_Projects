@@ -1,0 +1,253 @@
+
+```python
+import anthropic
+import requests
+from urllib.parse import urlparse, urlencode, parse_qs
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "validate_url",
+        "description": "Validates if a URL is properly formatted and safe to redirect to",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to validate"
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "perform_redirect",
+        "description": "Performs an HTTP redirect to the specified URL and returns the response",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to redirect to"
+                },
+                "follow_redirects": {
+                    "type": "boolean",
+                    "description": "Whether to follow redirect chains",
+                    "default": True
+                }
+            },
+            "required": ["url"]
+        }
+    },
+    {
+        "name": "parse_query_params",
+        "description": "Parses query parameters from a URL string",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL containing query parameters"
+                }
+            },
+            "required": ["url"]
+        }
+    }
+]
+
+def validate_url(url: str) -> dict:
+    """Validates if a URL is properly formatted"""
+    try:
+        parsed = urlparse(url)
+        is_valid = all([parsed.scheme, parsed.netloc])
+        is_safe = parsed.scheme in ['http', 'https']
+        
+        return {
+            "is_valid": is_valid,
+            "is_safe": is_safe,
+            "scheme": parsed.scheme,
+            "netloc": parsed.netloc,
+            "path": parsed.path,
+            "message": "URL is valid and safe" if (is_valid and is_safe) else "URL validation failed"
+        }
+    except Exception as e:
+        return {
+            "is_valid": False,
+            "is_safe": False,
+            "error": str(e),
+            "message": f"URL validation error: {str(e)}"
+        }
+
+def perform_redirect(url: str, follow_redirects: bool = True) -> dict:
+    """Performs an HTTP redirect to the specified URL"""
+    try:
+        response = requests.get(
+            url,
+            allow_redirects=follow_redirects,
+            timeout=10,
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Python Redirect Script)'
+            }
+        )
+        
+        redirect_history = []
+        if response.history:
+            for resp in response.history:
+                redirect_history.append({
+                    "url": resp.url,
+                    "status_code": resp.status_code
+                })
+        
+        return {
+            "success": True,
+            "final_url": response.url,
+            "status_code": response.status_code,
+            "redirect_history": redirect_history,
+            "content_type": response.headers.get('Content-Type', 'unknown'),
+            "message": f"Successfully redirected to {response.url} with status {response.status_code}"
+        }
+    except requests.exceptions.ConnectionError as e:
+        return {
+            "success": False,
+            "error": "Connection error",
+            "message": f"Failed to connect: {str(e)}"
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "error": "Timeout",
+            "message": "Request timed out after 10 seconds"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Redirect failed: {str(e)}"
+        }
+
+def parse_query_params(url: str) -> dict:
+    """Parses query parameters from a URL"""
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        
+        flat_params = {k: v[0] if len(v) == 1 else v for k, v in params.items()}
+        
+        return {
+            "success": True,
+            "params": flat_params,
+            "redirect_url": flat_params.get('redirect_url', None),
+            "message": f"Found {len(flat_params)} query parameters"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": f"Failed to parse query parameters: {str(e)}"
+        }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results"""
+    if tool_name == "validate_url":
+        result = validate_url(tool_input["url"])
+    elif tool_name == "perform_redirect":
+        result = perform_redirect(
+            tool_input["url"],
+            tool_input.get("follow_redirects", True)
+        )
+    elif tool_name == "parse_query_params":
+        result = parse_query_params(tool_input["url"])
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return str(result)
+
+def handle_redirect_request(request_url: str) -> str:
+    """
+    Main function that uses Claude to handle redirect requests.
+    
+    Args:
+        request_url: The full URL with query parameters (e.g., "http://example.com?redirect_url=https://google.com")
+    
+    Returns:
+        A string describing the redirect result
+    """
+    messages = [
+        {
+            "role": "user",
+            "content": f"""I have a URL request that needs to be processed for redirection: {request_url}
+            
+Please:
+1. Parse the query parameters from this URL to find the 'redirect_url' parameter
+2. Validate the redirect URL to ensure it's safe and properly formatted
+3. If valid, perform the redirect and report the result
+4. If invalid, explain why the redirect cannot be performed
+
+Use the available tools to complete this task."""
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "end_turn":
+            final_text = ""
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    final_text += block.text
+            return final_text
+        
+        if response.stop_reason == "tool_use":
+            messages.append({
+                "role": "assistant",
+                "content": response.content
+            })
+            
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    tool_result = process_tool_call(block.name, block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": tool_result
+                    })
+            
+            if tool_results:
+                messages.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+        else:
+            break
+    
+    return "Redirect processing completed"
+
+def main():
+    test_cases = [
+        "http://myapp.com/redirect?redirect_url=https://www.google.com",
+        "http://myapp.com/redirect?redirect_url=https://github.com&source=email",
+        "http://myapp.com/redirect?redirect_url=javascript:alert('xss')",
+        "http://myapp.com/redirect?other_param=value",
+    ]
+    
+    print("=" * 60)
+    print("URL Redirect Handler with Claude AI")
+    print("=" * 60)
+    
+    for test_url in test_cases:
+        print(f"\nProcessing: {test_url}")
+        print("-" * 40)
+        result = handle_redirect_request(test_url)
+        print(result)
+        print()
+
+if __name__ == "__main__":
+    main()
+```

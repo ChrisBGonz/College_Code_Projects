@@ -1,0 +1,324 @@
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+)
+
+type Config struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+type ResponseData struct {
+	Message   string            `json:"message"`
+	Timestamp string            `json:"timestamp"`
+	Headers   map[string]string `json:"headers,omitempty"`
+}
+
+func NewDefaultConfig() *Config {
+	return &Config{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+			"https://www.myapp.com",
+		},
+		AllowedMethods: []string{
+			"GET",
+			"POST",
+			"PUT",
+			"PATCH",
+			"DELETE",
+			"OPTIONS",
+			"HEAD",
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Requested-With",
+			"Origin",
+			"X-Api-Key",
+		},
+		ExposedHeaders: []string{
+			"Content-Length",
+			"Content-Type",
+			"X-Request-Id",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	}
+}
+
+func (c *Config) isOriginAllowed(origin string) bool {
+	for _, allowedOrigin := range c.AllowedOrigins {
+		if allowedOrigin == "*" {
+			return true
+		}
+		if allowedOrigin == origin {
+			return true
+		}
+		if strings.HasPrefix(allowedOrigin, "*.") {
+			domain := allowedOrigin[2:]
+			if strings.HasSuffix(origin, "."+domain) || origin == "https://"+domain || origin == "http://"+domain {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func CORSMiddleware(config *Config) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			if origin == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			if !config.isOriginAllowed(origin) {
+				log.Printf("[CORS] Blocked request from origin: %s | Path: %s | Method: %s", origin, r.URL.Path, r.Method)
+				http.Error(w, "CORS: Origin not allowed", http.StatusForbidden)
+				return
+			}
+
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+
+			if config.AllowCredentials {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+
+			if len(config.ExposedHeaders) > 0 {
+				w.Header().Set("Access-Control-Expose-Headers", strings.Join(config.ExposedHeaders, ", "))
+			}
+
+			if r.Method == http.MethodOptions {
+				w.Header().Set("Access-Control-Allow-Methods", strings.Join(config.AllowedMethods, ", "))
+				w.Header().Set("Access-Control-Allow-Headers", strings.Join(config.AllowedHeaders, ", "))
+
+				if config.MaxAge > 0 {
+					w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
+				}
+
+				log.Printf("[CORS] Preflight request from origin: %s | Path: %s", origin, r.URL.Path)
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			log.Printf("[CORS] Allowed request from origin: %s | Path: %s | Method: %s", origin, r.URL.Path, r.Method)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+func LoggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		log.Printf("[REQUEST] %s %s %s | RemoteAddr: %s | UserAgent: %s",
+			r.Method,
+			r.URL.Path,
+			r.Proto,
+			r.RemoteAddr,
+			r.UserAgent(),
+		)
+		next.ServeHTTP(w, r)
+		log.Printf("[RESPONSE] %s %s | Duration: %v", r.Method, r.URL.Path, time.Since(start))
+	})
+}
+
+func ChainMiddleware(h http.Handler, middlewares ...func(http.Handler) http.Handler) http.Handler {
+	for i := len(middlewares) - 1; i >= 0; i-- {
+		h = middlewares[i](h)
+	}
+	return h
+}
+
+func writeJSONResponse(w http.ResponseWriter, statusCode int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("[ERROR] Failed to encode JSON response: %v", err)
+	}
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	response := ResponseData{
+		Message:   "Welcome to the API! CORS is configured for https://myapp.com",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSONResponse(w, http.StatusOK, response)
+}
+
+func apiDataHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	response := ResponseData{
+		Message:   "Data fetched successfully",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Headers: map[string]string{
+			"Content-Type": r.Header.Get("Content-Type"),
+			"Origin":       r.Header.Get("Origin"),
+			"User-Agent":   r.Header.Get("User-Agent"),
+		},
+	}
+
+	writeJSONResponse(w, http.StatusOK, response)
+}
+
+func apiCreateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var body map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "Invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	response := ResponseData{
+		Message:   "Resource created successfully",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSONResponse(w, http.StatusCreated, response)
+}
+
+func apiUpdateHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPut && r.Method != http.MethodPatch {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	response := ResponseData{
+		Message:   "Resource updated successfully",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSONResponse(w, http.StatusOK, response)
+}
+
+func apiDeleteHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	response := ResponseData{
+		Message:   "Resource deleted successfully",
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSONResponse(w, http.StatusOK, response)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	response := map[string]string{
+		"status":    "healthy",
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+	}
+
+	writeJSONResponse(w, http.StatusOK, response)
+}
+
+func corsInfoHandler(config *Config) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		info := map[string]interface{}{
+			"allowed_origins":   config.AllowedOrigins,
+			"allowed_methods":   config.AllowedMethods,
+			"allowed_headers":   config.AllowedHeaders,
+			"exposed_headers":   config.ExposedHeaders,
+			"allow_credentials": config.AllowCredentials,
+			"max_age_seconds":   config.MaxAge,
+		}
+
+		writeJSONResponse(w, http.StatusOK, info)
+	}
+}
+
+func setupRoutes(config *Config) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", homeHandler)
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/cors-info", corsInfoHandler(config))
+	mux.HandleFunc("/api/data", apiDataHandler)
+	mux.HandleFunc("/api/create", apiCreateHandler)
+	mux.HandleFunc("/api/update", apiUpdateHandler)
+	mux.HandleFunc("/api/delete", apiDeleteHandler)
+
+	corsMiddleware := CORSMiddleware(config)
+
+	handler := ChainMiddleware(mux, LoggingMiddleware, corsMiddleware)
+
+	return handler
+}
+
+func main() {
+	logger := log.New(os.Stdout, "", log.LstdFlags|log.Lshortfile)
+	log.SetOutput(logger.Writer())
+
+	config := NewDefaultConfig()
+
+	logger.Println("=== CORS Configuration ===")
+	logger.Printf("Allowed Origins  : %v", config.AllowedOrigins)
+	logger.Printf("Allowed Methods  : %v", config.AllowedMethods)
+	logger.Printf("Allowed Headers  : %v", config.AllowedHeaders)
+	logger.Printf("Exposed Headers  : %v", config.ExposedHeaders)
+	logger.Printf("Allow Credentials: %v", config.AllowCredentials)
+	logger.Printf("Max Age (seconds): %d", config.MaxAge)
+	logger.Println("==========================")
+
+	handler := setupRoutes(config)
+
+	port := ":8080"
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = ":" + envPort
+	}
+
+	server := &http.Server{
+		Addr:         port,
+		Handler:      handler,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	logger.Printf("Server starting on port %s", port)
+	logger.Printf("CORS enabled for: %v", config.AllowedOrigins)
+	logger.Println("Available endpoints:")
+	logger.Println("  GET  /           - Home")
+	logger.Println("  GET  /health     - Health check")
+	logger.Println("  GET  /cors-info  - CORS configuration info")
+	logger.Println("  GET  /api/data   - Fetch data")
+	logger.Println("  POST /api/create - Create resource")
+	logger.Println("  PUT  /api/update - Update resource")
+	logger.Println("  DEL  /api/delete - Delete resource")
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		logger.Fatalf("Server failed to start: %v", err)
+	}
+}

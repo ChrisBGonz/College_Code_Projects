@@ -1,0 +1,251 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Script to automate updating all dependencies in a Java Maven project to their latest versions.
+Uses Claude AI to analyze and suggest dependency updates.
+"""
+
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+import anthropic
+
+def read_pom_xml(pom_path: str = "pom.xml") -> str:
+    """Read the pom.xml file content."""
+    pom_file = Path(pom_path)
+    if not pom_file.exists():
+        raise FileNotFoundError(f"pom.xml not found at {pom_path}")
+    return pom_file.read_text(encoding="utf-8")
+
+def run_maven_command(command: list[str]) -> tuple[str, str, int]:
+    """Run a Maven command and return stdout, stderr, and return code."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return result.stdout, result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "", "Command timed out", 1
+    except FileNotFoundError:
+        return "", "Maven (mvn) not found. Please install Maven.", 1
+
+def get_dependency_updates() -> str:
+    """Run Maven versions plugin to check for dependency updates."""
+    print("Checking for dependency updates using Maven versions plugin...")
+    stdout, stderr, returncode = run_maven_command([
+        "mvn", "versions:display-dependency-updates", "-q"
+    ])
+    
+    if returncode != 0:
+        print(f"Warning: Maven command failed: {stderr}")
+        return ""
+    
+    return stdout
+
+def get_plugin_updates() -> str:
+    """Run Maven versions plugin to check for plugin updates."""
+    print("Checking for plugin updates using Maven versions plugin...")
+    stdout, stderr, returncode = run_maven_command([
+        "mvn", "versions:display-plugin-updates", "-q"
+    ])
+    
+    if returncode != 0:
+        print(f"Warning: Maven command failed: {stderr}")
+        return ""
+    
+    return stdout
+
+def analyze_with_claude(pom_content: str, dependency_updates: str, plugin_updates: str) -> str:
+    """Use Claude to analyze the pom.xml and suggest updates with streaming."""
+    client = anthropic.Anthropic()
+    
+    prompt = f"""You are a Java Maven expert. Analyze the following pom.xml file and the available updates, then provide a comprehensive update plan.
+
+Current pom.xml content:
+```xml
+{pom_content}
+```
+
+Available dependency updates from Maven versions plugin:
+```
+{dependency_updates if dependency_updates else "Maven versions plugin output not available"}
+```
+
+Available plugin updates from Maven versions plugin:
+```
+{plugin_updates if plugin_updates else "Maven versions plugin output not available"}
+```
+
+Please provide:
+1. A detailed analysis of the current dependencies and their versions
+2. Specific recommendations for which dependencies should be updated and to what version
+3. Any potential breaking changes or compatibility issues to watch out for
+4. The exact Maven commands to run to update the dependencies
+5. An updated pom.xml with the recommended version changes (if the pom.xml was provided)
+6. Best practices for maintaining dependencies in this project
+
+Focus on:
+- Security vulnerabilities in outdated versions
+- Performance improvements in newer versions
+- Compatibility between different dependency versions
+- Spring Boot/Spring Framework version compatibility (if applicable)
+- Java version compatibility
+
+Format your response clearly with sections for each point."""
+
+    print("\nAnalyzing dependencies with Claude AI...")
+    print("=" * 60)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "=" * 60)
+    return full_response
+
+def apply_updates_automatically() -> bool:
+    """Apply dependency updates automatically using Maven versions plugin."""
+    print("\nDo you want to apply updates automatically using Maven versions plugin?")
+    print("This will update all dependencies to their latest versions.")
+    response = input("Enter 'yes' to proceed or 'no' to skip: ").strip().lower()
+    
+    if response != 'yes':
+        print("Skipping automatic updates.")
+        return False
+    
+    print("\nApplying dependency updates...")
+    stdout, stderr, returncode = run_maven_command([
+        "mvn", "versions:use-latest-versions"
+    ])
+    
+    if returncode == 0:
+        print("✓ Dependencies updated successfully!")
+        print(stdout)
+        return True
+    else:
+        print(f"✗ Failed to update dependencies: {stderr}")
+        return False
+
+def verify_build() -> bool:
+    """Verify that the project still builds after updates."""
+    print("\nVerifying project build after updates...")
+    stdout, stderr, returncode = run_maven_command([
+        "mvn", "clean", "compile", "-q"
+    ])
+    
+    if returncode == 0:
+        print("✓ Project builds successfully after updates!")
+        return True
+    else:
+        print(f"✗ Build failed after updates: {stderr}")
+        print("You may need to manually resolve compatibility issues.")
+        return False
+
+def run_tests() -> bool:
+    """Run tests to verify functionality after updates."""
+    print("\nDo you want to run tests to verify functionality?")
+    response = input("Enter 'yes' to run tests or 'no' to skip: ").strip().lower()
+    
+    if response != 'yes':
+        print("Skipping test execution.")
+        return True
+    
+    print("Running tests...")
+    stdout, stderr, returncode = run_maven_command([
+        "mvn", "test", "-q"
+    ])
+    
+    if returncode == 0:
+        print("✓ All tests passed!")
+        return True
+    else:
+        print(f"✗ Some tests failed: {stderr}")
+        print("Please review the test failures and fix any compatibility issues.")
+        return False
+
+def save_analysis_report(analysis: str, output_file: str = "dependency_update_report.md"):
+    """Save the Claude analysis to a markdown file."""
+    report_path = Path(output_file)
+    
+    report_content = f"""# Maven Dependency Update Report
+
+## Analysis by Claude AI
+
+{analysis}
+
+---
+*Report generated automatically by Maven Dependency Updater*
+"""
+    
+    report_path.write_text(report_content, encoding="utf-8")
+    print(f"\n✓ Analysis report saved to: {output_file}")
+
+def main():
+    """Main function to orchestrate the dependency update process."""
+    print("Maven Dependency Updater")
+    print("=" * 60)
+    
+    # Check if pom.xml exists
+    pom_path = "pom.xml"
+    if len(sys.argv) > 1:
+        pom_path = sys.argv[1]
+    
+    try:
+        # Read pom.xml
+        print(f"Reading {pom_path}...")
+        pom_content = read_pom_xml(pom_path)
+        print(f"✓ Successfully read {pom_path}")
+        
+        # Get current dependency updates from Maven
+        dependency_updates = get_dependency_updates()
+        plugin_updates = get_plugin_updates()
+        
+        # Analyze with Claude
+        analysis = analyze_with_claude(pom_content, dependency_updates, plugin_updates)
+        
+        # Save the analysis report
+        save_analysis_report(analysis)
+        
+        # Ask if user wants to apply updates automatically
+        updates_applied = apply_updates_automatically()
+        
+        if updates_applied:
+            # Verify build
+            build_success = verify_build()
+            
+            if build_success:
+                # Run tests
+                run_tests()
+        
+        print("\n" + "=" * 60)
+        print("Dependency update process completed!")
+        print("Please review the dependency_update_report.md for detailed recommendations.")
+        
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        print("Please run this script from your Maven project root directory.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```

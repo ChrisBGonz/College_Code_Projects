@@ -1,0 +1,217 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+const cookieParser = require("cookie-parser");
+
+const app = express();
+const client = new Anthropic();
+
+// Simple encryption/decryption using base64 and a secret key
+const SECRET_KEY = process.env.COOKIE_SECRET || "my-secret-key-12345";
+
+function encryptValue(value) {
+  const combined = `${SECRET_KEY}:${value}`;
+  return Buffer.from(combined).toString("base64");
+}
+
+function decryptValue(encryptedValue) {
+  try {
+    const decoded = Buffer.from(encryptedValue, "base64").toString("utf8");
+    const colonIndex = decoded.indexOf(":");
+    if (colonIndex === -1) return null;
+
+    const key = decoded.substring(0, colonIndex);
+    const value = decoded.substring(colonIndex + 1);
+
+    if (key !== SECRET_KEY) return null;
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+// Middleware to encrypt all cookies before sending response
+function encryptCookiesMiddleware(req, res, next) {
+  const originalCookie = res.cookie.bind(res);
+
+  // Override res.cookie to encrypt values
+  res.cookie = function (name, value, options) {
+    const valueToEncrypt =
+      typeof value === "object" ? JSON.stringify(value) : String(value);
+    const encryptedValue = encryptValue(valueToEncrypt);
+    return originalCookie(name, encryptedValue, options);
+  };
+
+  next();
+}
+
+// Middleware to decrypt cookies from incoming requests
+function decryptCookiesMiddleware(req, res, next) {
+  if (req.cookies) {
+    const decryptedCookies = {};
+
+    for (const [name, value] of Object.entries(req.cookies)) {
+      const decryptedValue = decryptValue(value);
+      if (decryptedValue !== null) {
+        try {
+          // Try to parse as JSON if it was an object
+          decryptedCookies[name] = JSON.parse(decryptedValue);
+        } catch {
+          decryptedCookies[name] = decryptedValue;
+        }
+      } else {
+        // Keep original value if decryption fails
+        decryptedCookies[name] = value;
+      }
+    }
+
+    req.cookies = decryptedCookies;
+  }
+
+  next();
+}
+
+// Apply middlewares
+app.use(cookieParser());
+app.use(encryptCookiesMiddleware);
+app.use(decryptCookiesMiddleware);
+app.use(express.json());
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+// Route to demonstrate cookie encryption with AI assistance
+app.post("/chat", async (req, res) => {
+  const { message, sessionId } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Store session ID in encrypted cookie
+  if (sessionId) {
+    res.cookie("sessionId", sessionId, {
+      httpOnly: true,
+      maxAge: 3600000, // 1 hour
+    });
+  }
+
+  // Add user message to history
+  conversationHistory.push({
+    role: "user",
+    content: message,
+  });
+
+  // Create a streaming response
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  let fullResponse = "";
+
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    system:
+      "You are a helpful assistant that explains cookie encryption and security best practices. When asked about cookies, explain how they should be encrypted and why it's important for security.",
+    messages: conversationHistory,
+  });
+
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      const text = chunk.delta.text;
+      fullResponse += text;
+
+      // Send chunk to client
+      res.write(`data: ${JSON.stringify({ text })}\n\n`);
+    }
+  }
+
+  // Add assistant response to history
+  conversationHistory.push({
+    role: "assistant",
+    content: fullResponse,
+  });
+
+  // Store conversation count in encrypted cookie
+  const currentCount = req.cookies.messageCount
+    ? parseInt(req.cookies.messageCount) + 1
+    : 1;
+  res.cookie("messageCount", currentCount.toString(), {
+    httpOnly: true,
+    maxAge: 3600000,
+  });
+
+  res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+  res.end();
+});
+
+// Route to check current cookies (for demonstration)
+app.get("/cookies", (req, res) => {
+  res.json({
+    message: "Current decrypted cookies",
+    cookies: req.cookies,
+    note: "These cookies are stored encrypted in the browser but decrypted here for display",
+  });
+});
+
+// Route to clear cookies
+app.post("/clear-cookies", (req, res) => {
+  res.clearCookie("sessionId");
+  res.clearCookie("messageCount");
+  res.json({ message: "Cookies cleared" });
+});
+
+// Demo route to show encryption in action
+app.get("/demo", async (req, res) => {
+  // Set some demo cookies
+  res.cookie("userPreference", "dark-mode", { httpOnly: true });
+  res.cookie("language", "pt-BR", { httpOnly: true });
+  res.cookie("userData", { name: "John", role: "admin" }, { httpOnly: true });
+
+  // Ask Claude about cookie encryption
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 512,
+    messages: [
+      {
+        role: "user",
+        content:
+          "Briefly explain why encrypting cookies is important for web security in 2-3 sentences.",
+      },
+    ],
+  });
+
+  let explanation = "";
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      explanation += chunk.delta.text;
+    }
+  }
+
+  res.json({
+    message: "Demo cookies set (encrypted in browser)",
+    cookiesSet: ["userPreference", "language", "userData"],
+    securityExplanation: explanation,
+    note: "Check your browser's developer tools to see the encrypted cookie values",
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookie encryption middleware active`);
+  console.log(`\nAvailable routes:`);
+  console.log(`  POST /chat - Chat with AI about cookie security`);
+  console.log(`  GET /cookies - View current decrypted cookies`);
+  console.log(`  POST /clear-cookies - Clear all cookies`);
+  console.log(`  GET /demo - Demo cookie encryption with AI explanation`);
+});
+```

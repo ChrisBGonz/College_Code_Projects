@@ -1,0 +1,179 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+app.use(express.json());
+
+const anthropic = new Anthropic();
+
+// Tool definition for listing files
+const tools = [
+  {
+    name: "list_files_in_directory",
+    description:
+      "Lists all files in a specified directory within the private_vault folder",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_name: {
+          type: "string",
+          description:
+            "The name of the folder within private_vault to list files from",
+        },
+      },
+      required: ["folder_name"],
+    },
+  },
+];
+
+// Function to actually list files
+function listFilesInDirectory(folderName) {
+  const vaultPath = path.join(__dirname, "private_vault", folderName);
+
+  if (!fs.existsSync(vaultPath)) {
+    // Create the directory structure for demo purposes
+    fs.mkdirSync(vaultPath, { recursive: true });
+
+    // Create some sample files for demonstration
+    const sampleFiles = [
+      "document1.pdf",
+      "image1.jpg",
+      "spreadsheet.xlsx",
+      "notes.txt",
+      "presentation.pptx",
+    ];
+
+    sampleFiles.forEach((file) => {
+      fs.writeFileSync(path.join(vaultPath, file), `Sample content for ${file}`);
+    });
+  }
+
+  const files = fs.readdirSync(vaultPath);
+  const fileDetails = files.map((file) => {
+    const filePath = path.join(vaultPath, file);
+    const stats = fs.statSync(filePath);
+    return {
+      name: file,
+      size: stats.size,
+      created: stats.birthtime,
+      modified: stats.mtime,
+      isDirectory: stats.isDirectory(),
+    };
+  });
+
+  return fileDetails;
+}
+
+// Process tool calls from Claude
+function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files_in_directory") {
+    return listFilesInDirectory(toolInput.folder_name);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+// API endpoint to list files
+app.get("/api/files", async (req, res) => {
+  const { folder_name } = req.query;
+
+  if (!folder_name) {
+    return res.status(400).json({
+      error: "folder_name parameter is required",
+    });
+  }
+
+  try {
+    // Initial message to Claude
+    const messages = [
+      {
+        role: "user",
+        content: `Please list all files in the private_vault folder named "${folder_name}". Use the list_files_in_directory tool to retrieve the file listing.`,
+      },
+    ];
+
+    let response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop - continue until we get a final response
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(
+        (block) => block.type === "tool_use"
+      );
+
+      if (!toolUseBlock) {
+        break;
+      }
+
+      // Execute the tool
+      const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+
+      // Add assistant response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content,
+      });
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseBlock.id,
+            content: JSON.stringify(toolResult),
+          },
+        ],
+      });
+
+      // Get next response from Claude
+      response = await anthropic.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract the final text response
+    const finalResponse = response.content.find(
+      (block) => block.type === "text"
+    );
+
+    // Also get the actual file list for structured response
+    const fileList = listFilesInDirectory(folder_name);
+
+    res.json({
+      folder_name: folder_name,
+      files: fileList,
+      summary: finalResponse ? finalResponse.text : "Files listed successfully",
+      total_files: fileList.length,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      error: "Failed to list files",
+      details: error.message,
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", message: "API is running" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Try: GET http://localhost:${PORT}/api/files?folder_name=user123`);
+});
+
+module.exports = app;
+```
