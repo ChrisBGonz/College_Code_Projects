@@ -1,0 +1,211 @@
+
+```python
+import anthropic
+import json
+
+client = anthropic.Anthropic()
+
+tools = [
+    {
+        "name": "verify_password",
+        "description": "Verifies if the provided password matches the stored password for a user",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username to verify"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "The password to verify"
+                }
+            },
+            "required": ["username", "password"]
+        }
+    },
+    {
+        "name": "generate_auth_token",
+        "description": "Generates an authentication token for a successfully authenticated user",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username for whom to generate the token"
+                }
+            },
+            "required": ["username"]
+        }
+    }
+]
+
+USERS_DB = {
+    "admin": "secure_password_123",
+    "user1": "mypassword456",
+    "john_doe": "john_secret_789"
+}
+
+def verify_password(username: str, password: str) -> dict:
+    """Simulates password verification against a database"""
+    if username in USERS_DB:
+        if USERS_DB[username] == password:
+            return {"success": True, "message": f"Password verified for user {username}"}
+        else:
+            return {"success": False, "message": "Invalid password"}
+    else:
+        return {"success": False, "message": "User not found"}
+
+def generate_auth_token(username: str) -> dict:
+    """Simulates generating an authentication token"""
+    import hashlib
+    import time
+    token = hashlib.sha256(f"{username}{time.time()}".encode()).hexdigest()
+    return {
+        "token": token,
+        "expires_in": 3600,
+        "token_type": "Bearer"
+    }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results"""
+    if tool_name == "verify_password":
+        result = verify_password(tool_input["username"], tool_input["password"])
+        return json.dumps(result)
+    elif tool_name == "generate_auth_token":
+        result = generate_auth_token(tool_input["username"])
+        return json.dumps(result)
+    else:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def login(username: str, password: str) -> dict:
+    """
+    Login function that uses Claude to verify credentials and handle authentication.
+    Returns 401 Unauthorized if authentication fails.
+    """
+    print(f"\n{'='*50}")
+    print(f"Login attempt for user: {username}")
+    print(f"{'='*50}")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please authenticate the user with username '{username}' and password '{password}'. "
+                      f"First verify the password, and if successful, generate an authentication token. "
+                      f"If the password verification fails, return a 401 Unauthorized response."
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"\nClaude response (stop_reason: {response.stop_reason}):")
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    print(f"  Tool called: {tool_name}")
+                    print(f"  Tool input: {json.dumps(tool_input, indent=2)}")
+                    
+                    tool_result = process_tool_call(tool_name, tool_input)
+                    print(f"  Tool result: {tool_result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            final_response = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_response = content_block.text
+                    break
+            
+            print(f"\nFinal response from Claude: {final_response}")
+            
+            if "401" in final_response or "unauthorized" in final_response.lower() or "not authorized" in final_response.lower():
+                return {
+                    "status": 401,
+                    "error": "Unauthorized",
+                    "message": "Invalid credentials. Access denied."
+                }
+            elif "token" in final_response.lower() or "authenticated" in final_response.lower():
+                token_data = None
+                for msg in messages:
+                    if isinstance(msg.get("content"), list):
+                        for item in msg["content"]:
+                            if isinstance(item, dict) and item.get("type") == "tool_result":
+                                try:
+                                    result = json.loads(item["content"])
+                                    if "token" in result:
+                                        token_data = result
+                                except:
+                                    pass
+                
+                return {
+                    "status": 200,
+                    "message": "Login successful",
+                    "username": username,
+                    "auth_token": token_data
+                }
+            else:
+                return {
+                    "status": 401,
+                    "error": "Unauthorized",
+                    "message": "Authentication failed."
+                }
+        else:
+            break
+    
+    return {
+        "status": 500,
+        "error": "Internal Server Error",
+        "message": "Unexpected error during authentication"
+    }
+
+def main():
+    """Test the login function with various scenarios"""
+    
+    print("\n" + "="*60)
+    print("TEST 1: Valid credentials")
+    print("="*60)
+    result = login("admin", "secure_password_123")
+    print(f"\nLogin result: {json.dumps(result, indent=2)}")
+    
+    print("\n" + "="*60)
+    print("TEST 2: Invalid password")
+    print("="*60)
+    result = login("admin", "wrong_password")
+    print(f"\nLogin result: {json.dumps(result, indent=2)}")
+    
+    print("\n" + "="*60)
+    print("TEST 3: Non-existent user")
+    print("="*60)
+    result = login("unknown_user", "some_password")
+    print(f"\nLogin result: {json.dumps(result, indent=2)}")
+    
+    print("\n" + "="*60)
+    print("TEST 4: Another valid user")
+    print("="*60)
+    result = login("user1", "mypassword456")
+    print(f"\nLogin result: {json.dumps(result, indent=2)}")
+
+if __name__ == "__main__":
+    main()
+```

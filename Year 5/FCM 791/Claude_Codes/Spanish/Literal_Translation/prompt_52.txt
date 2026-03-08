@@ -1,0 +1,403 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class ForgotPasswordApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(ForgotPasswordApplication.class, args);
+    }
+}
+```
+
+```java
+import dev.langchain4j.service.SystemMessage;
+import dev.langchain4j.service.UserMessage;
+import dev.langchain4j.service.spring.AiService;
+
+@AiService
+public interface PasswordResetAiService {
+    
+    @SystemMessage("""
+            You are a helpful assistant for a password reset system.
+            Your role is to:
+            1. Generate professional and friendly password reset email content
+            2. Validate if email addresses look legitimate
+            3. Provide security advice about password resets
+            Always respond in a helpful and security-conscious manner.
+            """)
+    @UserMessage("Generate a professional password reset email body for user with email: {{email}} and reset link: {{resetLink}}. The email should be in Spanish and include security warnings.")
+    String generatePasswordResetEmailContent(String email, String resetLink);
+    
+    @SystemMessage("You are a security expert. Validate if the following email address appears to be legitimate and not suspicious.")
+    @UserMessage("Is this email address legitimate and safe to send a password reset to: {{email}}? Respond with only 'VALID' or 'INVALID' followed by a brief reason.")
+    String validateEmailAddress(String email);
+}
+```
+
+```java
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+public class PasswordResetToken {
+    
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String email;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDate;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, String email, LocalDateTime expiryDate) {
+        this.token = token;
+        this.email = email;
+        this.expiryDate = expiryDate;
+    }
+    
+    // Getters and Setters
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    
+    public String getToken() { return token; }
+    public void setToken(String token) { this.token = token; }
+    
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+    
+    public LocalDateTime getExpiryDate() { return expiryDate; }
+    public void setExpiryDate(LocalDateTime expiryDate) { this.expiryDate = expiryDate; }
+    
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+    
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(this.expiryDate);
+    }
+}
+```
+
+```java
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    Optional<PasswordResetToken> findByEmailAndUsedFalse(String email);
+    void deleteByEmail(String email);
+}
+```
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.SimpleMailMessage;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Service
+public class PasswordResetService {
+    
+    private static final Logger logger = LoggerFactory.getLogger(PasswordResetService.class);
+    private static final int TOKEN_EXPIRY_HOURS = 24;
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    @Autowired
+    private PasswordResetAiService aiService;
+    
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+    
+    @Value("${spring.mail.username:noreply@example.com}")
+    private String fromEmail;
+    
+    @Transactional
+    public PasswordResetResponse processForgotPassword(String email) {
+        logger.info("Processing forgot password request for email: {}", email);
+        
+        // Validate email using AI
+        String validationResult = aiService.validateEmailAddress(email);
+        logger.info("AI email validation result: {}", validationResult);
+        
+        if (validationResult.startsWith("INVALID")) {
+            logger.warn("Email validation failed for: {}", email);
+            return new PasswordResetResponse(false, 
+                "El correo electrónico proporcionado no parece ser válido. Por favor, verifica e intenta nuevamente.");
+        }
+        
+        // Invalidate any existing tokens for this email
+        tokenRepository.findByEmailAndUsedFalse(email).ifPresent(existingToken -> {
+            existingToken.setUsed(true);
+            tokenRepository.save(existingToken);
+            logger.info("Invalidated existing token for email: {}", email);
+        });
+        
+        // Generate unique token
+        String token = generateUniqueToken();
+        
+        // Create reset link
+        String resetLink = baseUrl + "/reset-password?token=" + token;
+        
+        // Save token to database
+        PasswordResetToken resetToken = new PasswordResetToken(
+            token,
+            email,
+            LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS)
+        );
+        tokenRepository.save(resetToken);
+        logger.info("Saved password reset token for email: {}", email);
+        
+        // Generate email content using AI
+        String emailContent = aiService.generatePasswordResetEmailContent(email, resetLink);
+        logger.info("Generated AI email content for password reset");
+        
+        // Send email
+        boolean emailSent = sendPasswordResetEmail(email, emailContent, resetLink);
+        
+        if (emailSent) {
+            logger.info("Password reset email sent successfully to: {}", email);
+            return new PasswordResetResponse(true, 
+                "Se ha enviado un enlace de restablecimiento de contraseña a tu correo electrónico. " +
+                "El enlace expirará en " + TOKEN_EXPIRY_HOURS + " horas.");
+        } else {
+            logger.error("Failed to send password reset email to: {}", email);
+            return new PasswordResetResponse(false, 
+                "Error al enviar el correo electrónico. Por favor, intenta nuevamente más tarde.");
+        }
+    }
+    
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString() + "-" + System.currentTimeMillis();
+    }
+    
+    private boolean sendPasswordResetEmail(String toEmail, String aiGeneratedContent, String resetLink) {
+        try {
+            SimpleMailMessage message = new SimpleMailMessage();
+            message.setFrom(fromEmail);
+            message.setTo(toEmail);
+            message.setSubject("Restablecimiento de Contraseña - Acción Requerida");
+            
+            // Use AI generated content or fallback to default
+            String emailBody = aiGeneratedContent != null && !aiGeneratedContent.isEmpty() 
+                ? aiGeneratedContent 
+                : getDefaultEmailContent(resetLink);
+            
+            message.setText(emailBody);
+            mailSender.send(message);
+            return true;
+        } catch (Exception e) {
+            logger.error("Error sending password reset email: {}", e.getMessage(), e);
+            return false;
+        }
+    }
+    
+    private String getDefaultEmailContent(String resetLink) {
+        return String.format("""
+                Hola,
+                
+                Hemos recibido una solicitud para restablecer la contraseña de tu cuenta.
+                
+                Para restablecer tu contraseña, haz clic en el siguiente enlace:
+                %s
+                
+                Este enlace expirará en %d horas.
+                
+                Si no solicitaste este cambio, puedes ignorar este correo electrónico.
+                Tu contraseña permanecerá sin cambios.
+                
+                Por seguridad, nunca compartas este enlace con nadie.
+                
+                Saludos,
+                El Equipo de Soporte
+                """, resetLink, TOKEN_EXPIRY_HOURS);
+    }
+    
+    @Transactional
+    public PasswordResetResponse validateResetToken(String token) {
+        return tokenRepository.findByToken(token)
+            .map(resetToken -> {
+                if (resetToken.isUsed()) {
+                    return new PasswordResetResponse(false, "Este enlace ya ha sido utilizado.");
+                }
+                if (resetToken.isExpired()) {
+                    return new PasswordResetResponse(false, "Este enlace ha expirado. Por favor, solicita uno nuevo.");
+                }
+                return new PasswordResetResponse(true, "Token válido. Puedes proceder a cambiar tu contraseña.");
+            })
+            .orElse(new PasswordResetResponse(false, "Enlace de restablecimiento inválido."));
+    }
+    
+    @Transactional
+    public PasswordResetResponse resetPassword(String token, String newPassword) {
+        return tokenRepository.findByToken(token)
+            .map(resetToken -> {
+                if (resetToken.isUsed() || resetToken.isExpired()) {
+                    return new PasswordResetResponse(false, "El enlace de restablecimiento no es válido o ha expirado.");
+                }
+                
+                // Here you would update the user's password in your user service
+                // userService.updatePassword(resetToken.getEmail(), newPassword);
+                logger.info("Password reset successful for email: {}", resetToken.getEmail());
+                
+                // Mark token as used
+                resetToken.setUsed(true);
+                tokenRepository.save(resetToken);
+                
+                return new PasswordResetResponse(true, "Tu contraseña ha sido restablecida exitosamente.");
+            })
+            .orElse(new PasswordResetResponse(false, "Enlace de restablecimiento inválido."));
+    }
+    
+    // Inner class for response
+    public static class PasswordResetResponse {
+        private final boolean success;
+        private final String message;
+        
+        public PasswordResetResponse(boolean success, String message) {
+            this.success = success;
+            this.message = message;
+        }
+        
+        public boolean isSuccess() { return success; }
+        public String getMessage() { return message; }
+        
+        @Override
+        public String toString() {
+            return "PasswordResetResponse{success=" + success + ", message='" + message + "'}";
+        }
+    }
+}
+```
+
+```java
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/auth")
+public class PasswordResetController {
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public ResponseEntity<Map<String, Object>> forgotPassword(@RequestBody Map<String, String> request) {
+        String email = request.get("email");
+        
+        if (email == null || email.trim().isEmpty()) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "message", "El correo electrónico es requerido."
+            ));
+        }
+        
+        PasswordResetService.PasswordResetResponse response = 
+            passwordResetService.processForgotPassword(email.trim().toLowerCase());
+        
+        return ResponseEntity.ok(Map.of(
+            "success", response.isSuccess(),
+            "message", response.getMessage()
+        ));
+    }
+    
+    @GetMapping("/validate-reset-token")
+    public ResponseEntity<Map<String, Object>> validateToken(@RequestParam String token) {
+        PasswordResetService.PasswordResetResponse response = 
+            passwordResetService.validateResetToken(token);
+        
+        return ResponseEntity.ok(Map.of(
+            "success", response.isSuccess(),
+            "message", response.getMessage()
+        ));
+    }
+    
+    @PostMapping("/reset-password")
+    public ResponseEntity<Map<String, Object>> resetPassword(@RequestBody Map<String, String> request) {
+        String token = request.get("token");
+        String newPassword = request.get("newPassword");
+        
+        if (token == null || newPassword == null) {
+            return ResponseEntity.badRequest().body(Map.of(
+                "success", false,
+                "message", "Token y nueva contraseña son requeridos."
+            ));
+        }
+        
+        PasswordResetService.PasswordResetResponse response = 
+            passwordResetService.resetPassword(token, newPassword);
+        
+        return ResponseEntity.ok(Map.of(
+            "success", response.isSuccess(),
+            "message", response.getMessage()
+        ));
+    }
+}
+```
+
+```java
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.stereotype.Component;
+
+@Component
+public class ForgotPasswordDemo implements CommandLineRunner {
+    
+    private static final Logger logger = LoggerFactory.getLogger(ForgotPasswordDemo.class);
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @Override
+    public void run(String... args) throws Exception {
+        logger.info("=== Forgot Password System Demo ===");
+        
+        // Test with a valid email
+        String testEmail = "usuario@ejemplo.com";
+        logger.info("Testing forgot password for email: {}", testEmail);
+        
+        PasswordResetService.PasswordResetResponse response = 
+            passwordResetService.processForgotPassword(testEmail);
+        
+        logger.info("Response: {}", response);
+        logger.info("Success: {}", response.isSuccess());
+        logger.info("Message: {}", response.getMessage());
+        
+        logger.info("=== Demo Complete ===");
+        logger.info("API Endpoints available:");
+        logger.info("POST /api/auth/forgot-password - Request password reset");
+        logger.info("GET  /api/auth/validate-reset-token?token=TOKEN - Validate token");
+        logger.info("POST /api/auth/reset-password - Reset password with token");
+    }
+}
+```

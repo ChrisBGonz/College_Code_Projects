@@ -1,0 +1,494 @@
+
+```python
+#!/usr/bin/env python3
+
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.cookies import SimpleCookie
+import urllib.parse
+import json
+import datetime
+import uuid
+
+
+USERS_DB = {}
+TRIAL_DURATION_DAYS = 14
+
+
+def parse_cookies(cookie_header):
+    cookies = SimpleCookie()
+    if cookie_header:
+        cookies.load(cookie_header)
+    return cookies
+
+
+def get_cookie_value(cookies, name):
+    if name in cookies:
+        return cookies[name].value
+    return None
+
+
+def create_response_with_cookie(handler, status_code, body, set_cookie=None, content_type="application/json"):
+    handler.send_response(status_code)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    
+    if set_cookie:
+        for cookie_str in set_cookie:
+            handler.send_header("Set-Cookie", cookie_str)
+    
+    handler.end_headers()
+    
+    if isinstance(body, dict):
+        body = json.dumps(body, indent=2)
+    
+    handler.wfile.write(body.encode("utf-8"))
+
+
+class TrialRegistrationHandler(BaseHTTPRequestHandler):
+    
+    def log_message(self, format, *args):
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {format % args}")
+    
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+    
+    def do_GET(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        
+        if path == "/":
+            self.serve_homepage()
+        elif path == "/check-trial":
+            self.check_trial_status()
+        elif path == "/trial-info":
+            self.get_trial_info()
+        else:
+            create_response_with_cookie(
+                self, 404,
+                {"error": "Ruta no encontrada", "path": path}
+            )
+    
+    def do_POST(self):
+        parsed_path = urllib.parse.urlparse(self.path)
+        path = parsed_path.path
+        
+        if path == "/register-trial":
+            self.register_trial()
+        elif path == "/reset-trial":
+            self.reset_trial()
+        else:
+            create_response_with_cookie(
+                self, 404,
+                {"error": "Ruta no encontrada", "path": path}
+            )
+    
+    def serve_homepage(self):
+        cookie_header = self.headers.get("Cookie")
+        cookies = parse_cookies(cookie_header)
+        has_used_trial = get_cookie_value(cookies, "has_used_trial")
+        
+        html_content = self.generate_html(has_used_trial)
+        
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_content.encode("utf-8"))
+    
+    def check_trial_status(self):
+        cookie_header = self.headers.get("Cookie")
+        cookies = parse_cookies(cookie_header)
+        has_used_trial = get_cookie_value(cookies, "has_used_trial")
+        
+        if has_used_trial:
+            user_data = USERS_DB.get(has_used_trial, {})
+            
+            response = {
+                "has_used_trial": True,
+                "trial_id": has_used_trial,
+                "message": "Este usuario ya ha utilizado una prueba gratuita.",
+                "trial_start_date": user_data.get("trial_start_date"),
+                "trial_end_date": user_data.get("trial_end_date"),
+                "email": user_data.get("email", "No disponible"),
+                "status": user_data.get("status", "unknown")
+            }
+            
+            if user_data.get("trial_end_date"):
+                end_date = datetime.datetime.fromisoformat(user_data["trial_end_date"])
+                days_remaining = (end_date - datetime.datetime.now()).days
+                response["days_remaining"] = max(0, days_remaining)
+                response["is_active"] = days_remaining > 0
+            
+            create_response_with_cookie(self, 200, response)
+        else:
+            create_response_with_cookie(
+                self, 200,
+                {
+                    "has_used_trial": False,
+                    "message": "Este usuario no ha utilizado una prueba gratuita.",
+                    "can_register": True
+                }
+            )
+    
+    def register_trial(self):
+        cookie_header = self.headers.get("Cookie")
+        cookies = parse_cookies(cookie_header)
+        has_used_trial = get_cookie_value(cookies, "has_used_trial")
+        
+        if has_used_trial:
+            user_data = USERS_DB.get(has_used_trial, {})
+            
+            response = {
+                "success": False,
+                "already_used": True,
+                "message": "Ya has utilizado tu prueba gratuita anteriormente.",
+                "trial_id": has_used_trial,
+                "trial_start_date": user_data.get("trial_start_date"),
+                "trial_end_date": user_data.get("trial_end_date"),
+                "email": user_data.get("email", "No disponible")
+            }
+            
+            create_response_with_cookie(self, 409, response)
+            return
+        
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = {}
+        
+        if content_length > 0:
+            raw_body = self.rfile.read(content_length)
+            try:
+                body = json.loads(raw_body.decode("utf-8"))
+            except json.JSONDecodeError:
+                create_response_with_cookie(
+                    self, 400,
+                    {"success": False, "message": "Cuerpo de solicitud inválido. Se esperaba JSON."}
+                )
+                return
+        
+        email = body.get("email", "").strip()
+        name = body.get("name", "").strip()
+        
+        if not email:
+            create_response_with_cookie(
+                self, 400,
+                {"success": False, "message": "El campo 'email' es requerido."}
+            )
+            return
+        
+        if "@" not in email or "." not in email.split("@")[-1]:
+            create_response_with_cookie(
+                self, 400,
+                {"success": False, "message": "El formato del email es inválido."}
+            )
+            return
+        
+        for trial_id, user_data in USERS_DB.items():
+            if user_data.get("email", "").lower() == email.lower():
+                response = {
+                    "success": False,
+                    "already_used": True,
+                    "message": f"El email '{email}' ya ha sido utilizado para una prueba gratuita.",
+                    "trial_id": trial_id,
+                    "trial_start_date": user_data.get("trial_start_date")
+                }
+                
+                expiry_date = datetime.datetime.now() + datetime.timedelta(days=365)
+                cookie_str = (
+                    f"has_used_trial={trial_id}; "
+                    f"Expires={expiry_date.strftime('%a, %d %b %Y %H:%M:%S GMT')}; "
+                    f"Path=/; HttpOnly; SameSite=Strict"
+                )
+                
+                create_response_with_cookie(self, 409, response, set_cookie=[cookie_str])
+                return
+        
+        trial_id = str(uuid.uuid4())
+        start_date = datetime.datetime.now()
+        end_date = start_date + datetime.timedelta(days=TRIAL_DURATION_DAYS)
+        
+        USERS_DB[trial_id] = {
+            "trial_id": trial_id,
+            "email": email,
+            "name": name,
+            "trial_start_date": start_date.isoformat(),
+            "trial_end_date": end_date.isoformat(),
+            "status": "active",
+            "registered_at": start_date.isoformat()
+        }
+        
+        cookie_expiry = datetime.datetime.now() + datetime.timedelta(days=365)
+        cookie_str = (
+            f"has_used_trial={trial_id}; "
+            f"Expires={cookie_expiry.strftime('%a, %d %b %Y %H:%M:%S GMT')}; "
+            f"Path=/; HttpOnly; SameSite=Strict"
+        )
+        
+        response = {
+            "success": True,
+            "message": f"¡Prueba gratuita registrada exitosamente! Tienes {TRIAL_DURATION_DAYS} días de acceso.",
+            "trial_id": trial_id,
+            "email": email,
+            "name": name,
+            "trial_start_date": start_date.isoformat(),
+            "trial_end_date": end_date.isoformat(),
+            "days_available": TRIAL_DURATION_DAYS,
+            "cookie_set": "has_used_trial"
+        }
+        
+        create_response_with_cookie(self, 201, response, set_cookie=[cookie_str])
+        print(f"[REGISTRO] Nueva prueba registrada: {email} (ID: {trial_id})")
+    
+    def reset_trial(self):
+        cookie_header = self.headers.get("Cookie")
+        cookies = parse_cookies(cookie_header)
+        has_used_trial = get_cookie_value(cookies, "has_used_trial")
+        
+        expired_cookie = (
+            "has_used_trial=; "
+            "Expires=Thu, 01 Jan 1970 00:00:00 GMT; "
+            "Path=/; HttpOnly; SameSite=Strict"
+        )
+        
+        if has_used_trial and has_used_trial in USERS_DB:
+            email = USERS_DB[has_used_trial].get("email")
+            del USERS_DB[has_used_trial]
+            message = f"Cookie eliminada y datos de prueba removidos para: {email}"
+        else:
+            message = "Cookie de prueba eliminada."
+        
+        create_response_with_cookie(
+            self, 200,
+            {"success": True, "message": message},
+            set_cookie=[expired_cookie]
+        )
+    
+    def get_trial_info(self):
+        cookie_header = self.headers.get("Cookie")
+        cookies = parse_cookies(cookie_header)
+        has_used_trial = get_cookie_value(cookies, "has_used_trial")
+        
+        response = {
+            "trial_duration_days": TRIAL_DURATION_DAYS,
+            "total_registered_trials": len(USERS_DB),
+            "cookie_name": "has_used_trial",
+            "current_user_has_trial": has_used_trial is not None
+        }
+        
+        if has_used_trial and has_used_trial in USERS_DB:
+            user_data = USERS_DB[has_used_trial]
+            end_date = datetime.datetime.fromisoformat(user_data["trial_end_date"])
+            days_remaining = (end_date - datetime.datetime.now()).days
+            
+            response["current_trial"] = {
+                "trial_id": has_used_trial,
+                "email": user_data["email"],
+                "days_remaining": max(0, days_remaining),
+                "is_active": days_remaining > 0,
+                "trial_end_date": user_data["trial_end_date"]
+            }
+        
+        create_response_with_cookie(self, 200, response)
+    
+    def generate_html(self, has_used_trial):
+        trial_status_message = ""
+        form_section = ""
+        
+        if has_used_trial:
+            user_data = USERS_DB.get(has_used_trial, {})
+            email = user_data.get("email", "Usuario")
+            end_date = user_data.get("trial_end_date", "N/A")
+            
+            trial_status_message = f"""
+            <div class="alert alert-warning">
+                <h3>⚠️ Ya has utilizado tu prueba gratuita</h3>
+                <p>La cookie <code>has_used_trial</code> fue detectada.</p>
+                <p><strong>Email registrado:</strong> {email}</p>
+                <p><strong>Fecha de vencimiento:</strong> {end_date[:10] if end_date != 'N/A' else 'N/A'}</p>
+                <p>No puedes registrarte para una nueva prueba gratuita.</p>
+            </div>
+            """
+            form_section = """
+            <div class="actions">
+                <button onclick="checkStatus()" class="btn btn-secondary">Verificar Estado</button>
+                <button onclick="resetTrial()" class="btn btn-danger">Eliminar Cookie (Demo)</button>
+            </div>
+            """
+        else:
+            trial_status_message = """
+            <div class="alert alert-success">
+                <h3>✅ Disponible para prueba gratuita</h3>
+                <p>No se detectó la cookie <code>has_used_trial</code>.</p>
+                <p>Puedes registrarte para una prueba gratuita de 14 días.</p>
+            </div>
+            """
+            form_section = """
+            <form id="trialForm" onsubmit="registerTrial(event)">
+                <div class="form-group">
+                    <label for="name">Nombre completo:</label>
+                    <input type="text" id="name" name="name" placeholder="Tu nombre" />
+                </div>
+                <div class="form-group">
+                    <label for="email">Email: *</label>
+                    <input type="email" id="email" name="email" placeholder="tu@email.com" required />
+                </div>
+                <button type="submit" class="btn btn-primary">🚀 Iniciar Prueba Gratuita</button>
+            </form>
+            <div class="actions">
+                <button onclick="checkStatus()" class="btn btn-secondary">Verificar Estado de Cookie</button>
+            </div>
+            """
+        
+        return f"""<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registro de Prueba Gratuita</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; min-height: 100vh; display: flex; align-items: center; justify-content: center; }}
+        .container {{ background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); max-width: 500px; width: 90%; }}
+        h1 {{ color: #333; margin-bottom: 10px; font-size: 1.8em; }}
+        .subtitle {{ color: #666; margin-bottom: 25px; font-size: 0.95em; }}
+        .alert {{ padding: 20px; border-radius: 8px; margin-bottom: 25px; }}
+        .alert-success {{ background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }}
+        .alert-warning {{ background: #fff3cd; border: 1px solid #ffeeba; color: #856404; }}
+        .alert h3 {{ margin-bottom: 10px; }}
+        .alert p {{ margin: 5px 0; }}
+        .form-group {{ margin-bottom: 15px; }}
+        label {{ display: block; margin-bottom: 5px; color: #555; font-weight: 500; }}
+        input {{ width: 100%; padding: 10px 14px; border: 1px solid #ddd; border-radius: 6px; font-size: 1em; transition: border-color 0.2s; }}
+        input:focus {{ outline: none; border-color: #4CAF50; box-shadow: 0 0 0 3px rgba(76,175,80,0.1); }}
+        .btn {{ padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-size: 1em; font-weight: 500; transition: all 0.2s; margin: 5px; }}
+        .btn-primary {{ background: #4CAF50; color: white; width: 100%; margin: 10px 0; }}
+        .btn-primary:hover {{ background: #45a049; }}
+        .btn-secondary {{ background: #6c757d; color: white; }}
+        .btn-secondary:hover {{ background: #5a6268; }}
+        .btn-danger {{ background: #dc3545; color: white; }}
+        .btn-danger:hover {{ background: #c82333; }}
+        .actions {{ margin-top: 15px; text-align: center; }}
+        #result {{ margin-top: 20px; padding: 15px; border-radius: 8px; display: none; }}
+        .result-success {{ background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }}
+        .result-error {{ background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }}
+        .result-info {{ background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }}
+        code {{ background: #f8f9fa; padding: 2px 6px; border-radius: 4px; font-family: monospace; font-size: 0.9em; }}
+        .cookie-info {{ background: #f8f9fa; border: 1px solid #dee2e6; border-radius: 6px; padding: 12px; margin-top: 15px; font-size: 0.85em; color: #666; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎯 Prueba Gratuita</h1>
+        <p class="subtitle">Sistema de registro con verificación de cookie <code>has_used_trial</code></p>
+        
+        {trial_status_message}
+        {form_section}
+        
+        <div id="result"></div>
+        
+        <div class="cookie-info">
+            <strong>ℹ️ Información técnica:</strong><br>
+            Cookie verificada: <code>has_used_trial</code><br>
+            Estado actual: <code>{"Presente ✓" if has_used_trial else "Ausente ✗"}</code>
+        </div>
+    </div>
+    
+    <script>
+        async function registerTrial(event) {{
+            event.preventDefault();
+            const email = document.getElementById('email').value;
+            const name = document.getElementById('name').value;
+            
+            try {{
+                const response = await fetch('/register-trial', {{
+                    method: 'POST',
+                    headers: {{ 'Content-Type': 'application/json' }},
+                    body: JSON.stringify({{ email, name }})
+                }});
+                
+                const data = await response.json();
+                showResult(data, response.status);
+                
+                if (response.status === 201) {{
+                    setTimeout(() => location.reload(), 2000);
+                }}
+            }} catch (error) {{
+                showResult({{ message: 'Error de conexión: ' + error.message }}, 500);
+            }}
+        }}
+        
+        async function checkStatus() {{
+            try {{
+                const response = await fetch('/check-trial');
+                const data = await response.json();
+                showResult(data, response.status);
+            }} catch (error) {{
+                showResult({{ message: 'Error: ' + error.message }}, 500);
+            }}
+        }}
+        
+        async function resetTrial() {{
+            if (!confirm('¿Eliminar la cookie de prueba? (Solo para demostración)')) return;
+            
+            try {{
+                const response = await fetch('/reset-trial', {{ method: 'POST' }});
+                const data = await response.json();
+                showResult(data, response.status);
+                setTimeout(() => location.reload(), 1500);
+            }} catch (error) {{
+                showResult({{ message: 'Error: ' + error.message }}, 500);
+            }}
+        }}
+        
+        function showResult(data, status) {{
+            const resultDiv = document.getElementById('result');
+            resultDiv.style.display = 'block';
+            
+            if (status >= 200 && status < 300) {{
+                resultDiv.className = 'result-success';
+            }} else if (status === 409) {{
+                resultDiv.className = 'result-error';
+            }} else {{
+                resultDiv.className = 'result-info';
+            }}
+            
+            resultDiv.innerHTML = '<pre>' + JSON.stringify(data, null, 2) + '</pre>';
+        }}
+    </script>
+</body>
+</html>"""
+
+
+def run_server(host="localhost", port=8080):
+    server_address = (host, port)
+    httpd = HTTPServer(server_address, TrialRegistrationHandler)
+    
+    print("=" * 60)
+    print("  Sistema de Registro de Prueba Gratuita")
+    print("  Verificación mediante cookie: has_used_trial")
+    print("=" * 60)
+    print(f"\n  Servidor iniciado en: http://{host}:{port}")
+    print(f"  Duración de prueba: {TRIAL_DURATION_DAYS} días")
+    print("\n  Endpoints disponibles:")
+    print(f"    GET  http://{host}:{port}/           - Página principal")
+    print(f"    GET  http://{host}:{port}/check-trial - Verificar estado de prueba")
+    print(f"    GET  http://{host}:{port}/trial-info  - Información general")
+    print(f"    POST http://{host}:{port}/register-trial - Registrar nueva prueba")
+    print(f"    POST http://{host}:{port}/reset-trial - Eliminar cookie (demo)")
+    print("\n  Presiona Ctrl+C para detener el servidor\n")
+    print("=" * 60)
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\n  Servidor detenido.")
+        httpd.server_close()
+
+
+if __name__ == "__main__":
+    run_server()
+```

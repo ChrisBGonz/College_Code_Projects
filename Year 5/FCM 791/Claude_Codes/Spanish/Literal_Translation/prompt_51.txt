@@ -1,0 +1,297 @@
+
+```python
+import os
+import hashlib
+import secrets
+from flask import Flask, request, jsonify, session
+from anthropic import Anthropic
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("FLASK_SECRET_KEY", secrets.token_hex(32))
+
+client = Anthropic()
+
+# Simulated database
+users_db = {
+    1: {
+        "id": 1,
+        "username": "john_doe",
+        "email": "john@example.com",
+        "password_hash": hashlib.sha256("old_password123".encode()).hexdigest(),
+        "salt": "random_salt_123"
+    },
+    2: {
+        "id": 2,
+        "username": "jane_doe", 
+        "email": "jane@example.com",
+        "password_hash": hashlib.sha256("my_password456".encode()).hexdigest(),
+        "salt": "random_salt_456"
+    }
+}
+
+# Conversation history for multi-turn conversations
+conversation_histories = {}
+
+
+def hash_password(password: str, salt: str) -> str:
+    """Hash a password with a salt."""
+    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
+
+
+def validate_password_strength(password: str) -> tuple[bool, str]:
+    """Validate password strength."""
+    if len(password) < 8:
+        return False, "Password must be at least 8 characters long"
+    if not any(c.isupper() for c in password):
+        return False, "Password must contain at least one uppercase letter"
+    if not any(c.islower() for c in password):
+        return False, "Password must contain at least one lowercase letter"
+    if not any(c.isdigit() for c in password):
+        return False, "Password must contain at least one digit"
+    return True, "Password is strong"
+
+
+def update_password_in_db(user_id: int, new_password: str) -> tuple[bool, str]:
+    """Update password in the simulated database."""
+    if user_id not in users_db:
+        return False, f"User with ID {user_id} not found"
+    
+    # Validate password strength
+    is_valid, message = validate_password_strength(new_password)
+    if not is_valid:
+        return False, message
+    
+    # Generate new salt and hash
+    new_salt = secrets.token_hex(16)
+    new_hash = hash_password(new_password, new_salt)
+    
+    # Update database
+    users_db[user_id]["password_hash"] = new_hash
+    users_db[user_id]["salt"] = new_salt
+    
+    return True, f"Password successfully updated for user {users_db[user_id]['username']}"
+
+
+def get_ai_response(session_id: str, user_message: str, context: dict = None) -> str:
+    """Get AI response using multi-turn conversation."""
+    if session_id not in conversation_histories:
+        conversation_histories[session_id] = []
+    
+    # Add context to system message if provided
+    system_message = """You are a helpful assistant for a password change functionality. 
+    You help users understand password requirements, guide them through the password change process,
+    and provide security advice. You can also help troubleshoot password-related issues.
+    
+    Password requirements:
+    - Minimum 8 characters
+    - At least one uppercase letter
+    - At least one lowercase letter
+    - At least one digit
+    
+    Be friendly, helpful, and security-conscious in your responses."""
+    
+    if context:
+        system_message += f"\n\nCurrent context: {context}"
+    
+    # Add user message to history
+    conversation_histories[session_id].append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    # Get response from Claude
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_message,
+        messages=conversation_histories[session_id]
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_histories[session_id].append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+
+@app.route('/change-password', methods=['POST'])
+def change_password():
+    """
+    Endpoint to change user password with AI assistance.
+    
+    Expected JSON body:
+    {
+        "user_id": int,
+        "new_password": str,
+        "session_id": str (optional, for conversation continuity)
+    }
+    """
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    user_id = data.get('user_id')
+    new_password = data.get('new_password')
+    session_id = data.get('session_id', secrets.token_hex(16))
+    
+    if not user_id:
+        return jsonify({"error": "user_id is required"}), 400
+    
+    if not new_password:
+        return jsonify({"error": "new_password is required"}), 400
+    
+    # Attempt to update password
+    success, message = update_password_in_db(user_id, new_password)
+    
+    # Get AI response based on the result
+    context = {
+        "user_id": user_id,
+        "operation": "password_change",
+        "success": success,
+        "message": message
+    }
+    
+    if success:
+        ai_prompt = f"The password was successfully changed for user ID {user_id}. Please provide a confirmation message and security tips."
+    else:
+        ai_prompt = f"Password change failed with message: {message}. Please help the user understand what went wrong and how to fix it."
+    
+    ai_response = get_ai_response(session_id, ai_prompt, context)
+    
+    response_data = {
+        "success": success,
+        "message": message,
+        "ai_guidance": ai_response,
+        "session_id": session_id
+    }
+    
+    status_code = 200 if success else 400
+    return jsonify(response_data), status_code
+
+
+@app.route('/password-help', methods=['POST'])
+def password_help():
+    """
+    Endpoint for getting AI help about password requirements and security.
+    
+    Expected JSON body:
+    {
+        "question": str,
+        "session_id": str (optional)
+    }
+    """
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    question = data.get('question')
+    session_id = data.get('session_id', secrets.token_hex(16))
+    
+    if not question:
+        return jsonify({"error": "question is required"}), 400
+    
+    ai_response = get_ai_response(session_id, question)
+    
+    return jsonify({
+        "response": ai_response,
+        "session_id": session_id
+    })
+
+
+@app.route('/validate-password', methods=['POST'])
+def validate_password():
+    """
+    Endpoint to validate password strength with AI feedback.
+    
+    Expected JSON body:
+    {
+        "password": str,
+        "session_id": str (optional)
+    }
+    """
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    password = data.get('password')
+    session_id = data.get('session_id', secrets.token_hex(16))
+    
+    if not password:
+        return jsonify({"error": "password is required"}), 400
+    
+    is_valid, validation_message = validate_password_strength(password)
+    
+    # Get AI feedback
+    ai_prompt = f"A user wants to use this password (showing only its characteristics, not the actual password): length={len(password)}, has_uppercase={any(c.isupper() for c in password)}, has_lowercase={any(c.islower() for c in password)}, has_digit={any(c.isdigit() for c in password)}. Validation result: {validation_message}. Please provide helpful feedback."
+    
+    ai_response = get_ai_response(session_id, ai_prompt)
+    
+    return jsonify({
+        "is_valid": is_valid,
+        "validation_message": validation_message,
+        "ai_feedback": ai_response,
+        "session_id": session_id
+    })
+
+
+@app.route('/conversation-history', methods=['GET'])
+def get_conversation_history():
+    """Get conversation history for a session."""
+    session_id = request.args.get('session_id')
+    
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    
+    history = conversation_histories.get(session_id, [])
+    
+    return jsonify({
+        "session_id": session_id,
+        "history": history,
+        "message_count": len(history)
+    })
+
+
+@app.route('/clear-conversation', methods=['POST'])
+def clear_conversation():
+    """Clear conversation history for a session."""
+    data = request.get_json()
+    session_id = data.get('session_id') if data else None
+    
+    if not session_id:
+        return jsonify({"error": "session_id is required"}), 400
+    
+    if session_id in conversation_histories:
+        del conversation_histories[session_id]
+        return jsonify({"message": f"Conversation history cleared for session {session_id}"})
+    
+    return jsonify({"message": "No conversation history found for this session"})
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "service": "Password Change Service with AI",
+        "active_sessions": len(conversation_histories)
+    })
+
+
+if __name__ == '__main__':
+    print("Starting Password Change Service with AI assistance...")
+    print("Available endpoints:")
+    print("  POST /change-password - Change user password")
+    print("  POST /password-help - Get AI help about passwords")
+    print("  POST /validate-password - Validate password strength")
+    print("  GET  /conversation-history - Get conversation history")
+    print("  POST /clear-conversation - Clear conversation history")
+    print("  GET  /health - Health check")
+    app.run(debug=True, port=5000)
+```

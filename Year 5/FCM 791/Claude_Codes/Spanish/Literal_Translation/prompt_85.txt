@@ -1,0 +1,505 @@
+<?php
+
+/**
+ * Admin Access Alert System
+ * Sends email and/or Slack notification when unauthorized access to /admin is attempted
+ */
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+$config = [
+    // Email settings
+    'email' => [
+        'enabled'        => true,
+        'to'             => 'admin@yourdomain.com',
+        'from'           => 'security@yourdomain.com',
+        'from_name'      => 'Security Alert System',
+        'subject'        => '🚨 Unauthorized Admin Access Attempt Detected',
+    ],
+
+    // Slack settings
+    'slack' => [
+        'enabled'        => true,
+        'webhook_url'    => 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK',
+        'channel'        => '#security-alerts',
+        'username'       => 'SecurityBot',
+        'icon_emoji'     => ':warning:',
+    ],
+
+    // Log settings
+    'log' => [
+        'enabled'        => true,
+        'file'           => __DIR__ . '/logs/unauthorized_access.log',
+    ],
+
+    // Rate limiting (prevent alert flooding)
+    'rate_limit' => [
+        'enabled'        => true,
+        'max_alerts'     => 3,       // Max alerts per IP
+        'time_window'    => 300,     // Time window in seconds (5 minutes)
+        'cache_file'     => __DIR__ . '/logs/rate_limit_cache.json',
+    ],
+
+    // Whitelist IPs (these IPs will NOT trigger alerts)
+    'whitelist_ips'      => [
+        '127.0.0.1',
+        '::1',
+        // Add trusted IPs here
+    ],
+];
+
+// ============================================================
+// HELPER FUNCTIONS
+// ============================================================
+
+/**
+ * Get the real client IP address
+ */
+function getClientIP(): string
+{
+    $headers = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            $ip  = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $_SERVER['REMOTE_ADDR'] ?? 'UNKNOWN';
+}
+
+/**
+ * Get geolocation info for an IP (using free ip-api.com)
+ */
+function getGeoLocation(string $ip): array
+{
+    $default = ['country' => 'Unknown', 'city' => 'Unknown', 'isp' => 'Unknown'];
+
+    if (in_array($ip, ['127.0.0.1', '::1', 'UNKNOWN'])) {
+        return array_merge($default, ['country' => 'Localhost']);
+    }
+
+    $url      = "http://ip-api.com/json/{$ip}?fields=status,country,city,isp,query";
+    $context  = stream_context_create(['http' => ['timeout' => 3]]);
+    $response = @file_get_contents($url, false, $context);
+
+    if ($response) {
+        $data = json_decode($response, true);
+        if ($data && $data['status'] === 'success') {
+            return [
+                'country' => $data['country'] ?? 'Unknown',
+                'city'    => $data['city']    ?? 'Unknown',
+                'isp'     => $data['isp']     ?? 'Unknown',
+            ];
+        }
+    }
+
+    return $default;
+}
+
+/**
+ * Check if the IP is rate-limited
+ */
+function isRateLimited(string $ip, array $config): bool
+{
+    if (!$config['rate_limit']['enabled']) {
+        return false;
+    }
+
+    $cacheFile = $config['rate_limit']['cache_file'];
+    $cache     = [];
+
+    if (file_exists($cacheFile)) {
+        $content = file_get_contents($cacheFile);
+        $cache   = json_decode($content, true) ?? [];
+    }
+
+    $now        = time();
+    $timeWindow = $config['rate_limit']['time_window'];
+    $maxAlerts  = $config['rate_limit']['max_alerts'];
+
+    // Clean expired entries
+    foreach ($cache as $cachedIp => $timestamps) {
+        $cache[$cachedIp] = array_filter($timestamps, fn($t) => ($now - $t) < $timeWindow);
+        if (empty($cache[$cachedIp])) {
+            unset($cache[$cachedIp]);
+        }
+    }
+
+    // Check current IP
+    $ipAttempts = $cache[$ip] ?? [];
+
+    if (count($ipAttempts) >= $maxAlerts) {
+        // Save cleaned cache and return rate limited
+        file_put_contents($cacheFile, json_encode($cache), LOCK_EX);
+        return true;
+    }
+
+    // Add current attempt
+    $cache[$ip]   = array_values($ipAttempts);
+    $cache[$ip][] = $now;
+
+    // Ensure log directory exists
+    $logDir = dirname($cacheFile);
+    if (!is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
+
+    file_put_contents($cacheFile, json_encode($cache), LOCK_EX);
+    return false;
+}
+
+/**
+ * Write to log file
+ */
+function writeLog(string $message, array $config): void
+{
+    if (!$config['log']['enabled']) {
+        return;
+    }
+
+    $logFile = $config['log']['file'];
+    $logDir  = dirname($logFile);
+
+    if (!is_dir($logDir)) {
+        mkdir($logDir, 0755, true);
+    }
+
+    $timestamp  = date('Y-m-d H:i:s');
+    $logMessage = "[{$timestamp}] {$message}" . PHP_EOL;
+
+    file_put_contents($logFile, $logMessage, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Send email alert
+ */
+function sendEmailAlert(array $alertData, array $config): bool
+{
+    if (!$config['email']['enabled']) {
+        return false;
+    }
+
+    $to      = $config['email']['to'];
+    $subject = $config['email']['subject'];
+    $from    = $config['email']['from'];
+    $name    = $config['email']['from_name'];
+
+    $body = buildEmailBody($alertData);
+
+    $headers  = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: {$name} <{$from}>\r\n";
+    $headers .= "Reply-To: {$from}\r\n";
+    $headers .= "X-Mailer: PHP/" . phpversion() . "\r\n";
+    $headers .= "X-Priority: 1\r\n";
+
+    $result = mail($to, $subject, $body, $headers);
+
+    return $result;
+}
+
+/**
+ * Build HTML email body
+ */
+function buildEmailBody(array $data): string
+{
+    $timestamp   = htmlspecialchars($data['timestamp']);
+    $ip          = htmlspecialchars($data['ip']);
+    $url         = htmlspecialchars($data['url']);
+    $method      = htmlspecialchars($data['method']);
+    $userAgent   = htmlspecialchars($data['user_agent']);
+    $referer     = htmlspecialchars($data['referer'] ?: 'N/A');
+    $country     = htmlspecialchars($data['geo']['country']);
+    $city        = htmlspecialchars($data['geo']['city']);
+    $isp         = htmlspecialchars($data['geo']['isp']);
+    $sessionUser = htmlspecialchars($data['session_user'] ?: 'Not logged in');
+
+    return <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 20px; }
+        .container { max-width: 600px; margin: 0 auto; background: #fff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .header { background: #c0392b; color: #fff; padding: 20px 30px; }
+        .header h1 { margin: 0; font-size: 22px; }
+        .header p { margin: 5px 0 0; opacity: 0.85; font-size: 14px; }
+        .body { padding: 30px; }
+        .alert-box { background: #fdf3f2; border-left: 4px solid #c0392b; padding: 15px 20px; border-radius: 4px; margin-bottom: 25px; }
+        .alert-box p { margin: 0; color: #922b21; font-weight: bold; }
+        table { width: 100%; border-collapse: collapse; }
+        th { text-align: left; background: #f8f9fa; padding: 10px 15px; font-size: 12px; text-transform: uppercase; color: #666; border-bottom: 2px solid #dee2e6; }
+        td { padding: 12px 15px; border-bottom: 1px solid #dee2e6; font-size: 14px; color: #333; }
+        td:first-child { font-weight: bold; color: #555; width: 35%; }
+        .footer { background: #f8f9fa; padding: 15px 30px; text-align: center; font-size: 12px; color: #999; }
+        .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: bold; background: #c0392b; color: #fff; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚨 Unauthorized Admin Access Attempt</h1>
+            <p>Security Alert — Immediate Attention Required</p>
+        </div>
+        <div class="body">
+            <div class="alert-box">
+                <p>⚠️ An unauthorized user attempted to access the admin panel. Please review the details below.</p>
+            </div>
+            <table>
+                <tr><th colspan="2">Incident Details</th></tr>
+                <tr><td>Timestamp</td><td>{$timestamp}</td></tr>
+                <tr><td>IP Address</td><td><strong>{$ip}</strong></td></tr>
+                <tr><td>Requested URL</td><td>{$url}</td></tr>
+                <tr><td>HTTP Method</td><td><span class="badge">{$method}</span></td></tr>
+                <tr><td>User Agent</td><td style="word-break:break-all;">{$userAgent}</td></tr>
+                <tr><td>Referer</td><td>{$referer}</td></tr>
+                <tr><td>Session User</td><td>{$sessionUser}</td></tr>
+                <tr><th colspan="2">Geolocation</th></tr>
+                <tr><td>Country</td><td>{$country}</td></tr>
+                <tr><td>City</td><td>{$city}</td></tr>
+                <tr><td>ISP</td><td>{$isp}</td></tr>
+            </table>
+        </div>
+        <div class="footer">
+            This is an automated security alert. Do not reply to this email.<br>
+            Generated on {$timestamp}
+        </div>
+    </div>
+</body>
+</html>
+HTML;
+}
+
+/**
+ * Send Slack notification
+ */
+function sendSlackAlert(array $alertData, array $config): bool
+{
+    if (!$config['slack']['enabled'] || empty($config['slack']['webhook_url'])) {
+        return false;
+    }
+
+    $webhookUrl = $config['slack']['webhook_url'];
+
+    $payload = [
+        'channel'    => $config['slack']['channel'],
+        'username'   => $config['slack']['username'],
+        'icon_emoji' => $config['slack']['icon_emoji'],
+        'text'       => '🚨 *Unauthorized Admin Access Attempt Detected!*',
+        'attachments' => [
+            [
+                'color'  => 'danger',
+                'title'  => 'Security Alert — Unauthorized /admin Access',
+                'fields' => [
+                    ['title' => 'Timestamp',    'value' => $alertData['timestamp'],                    'short' => true],
+                    ['title' => 'IP Address',   'value' => "`{$alertData['ip']}`",                    'short' => true],
+                    ['title' => 'URL',          'value' => $alertData['url'],                          'short' => false],
+                    ['title' => 'Method',       'value' => $alertData['method'],                       'short' => true],
+                    ['title' => 'Session User', 'value' => $alertData['session_user'] ?: 'Not logged in', 'short' => true],
+                    ['title' => 'Country',      'value' => $alertData['geo']['country'],               'short' => true],
+                    ['title' => 'City',         'value' => $alertData['geo']['city'],                  'short' => true],
+                    ['title' => 'ISP',          'value' => $alertData['geo']['isp'],                   'short' => false],
+                    ['title' => 'User Agent',   'value' => $alertData['user_agent'],                   'short' => false],
+                ],
+                'footer'      => 'Security Alert System',
+                'footer_icon' => 'https://platform.slack-edge.com/img/default_application_icon.png',
+                'ts'          => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    $ch = curl_init($webhookUrl);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 5,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return ($httpCode === 200 && $response === 'ok');
+}
+
+/**
+ * Collect all alert data
+ */
+function collectAlertData(): array
+{
+    $ip = getClientIP();
+
+    return [
+        'timestamp'    => date('Y-m-d H:i:s T'),
+        'ip'           => $ip,
+        'url'          => (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? 'https' : 'http')
+                          . '://' . ($_SERVER['HTTP_HOST'] ?? 'unknown')
+                          . ($_SERVER['REQUEST_URI'] ?? '/admin'),
+        'method'       => $_SERVER['REQUEST_METHOD'] ?? 'GET',
+        'user_agent'   => $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown',
+        'referer'      => $_SERVER['HTTP_REFERER'] ?? '',
+        'session_user' => $_SESSION['username'] ?? ($_SESSION['user_id'] ?? null),
+        'geo'          => getGeoLocation($ip),
+    ];
+}
+
+// ============================================================
+// MAIN FUNCTION: Trigger Admin Alert
+// ============================================================
+
+/**
+ * Main function to trigger the unauthorized access alert
+ */
+function triggerAdminAlert(array $config): void
+{
+    // Start session if not already started
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    $ip = getClientIP();
+
+    // Skip if IP is whitelisted
+    if (in_array($ip, $config['whitelist_ips'])) {
+        return;
+    }
+
+    // Check rate limiting
+    if (isRateLimited($ip, $config)) {
+        writeLog("RATE LIMITED: IP {$ip} exceeded alert threshold. Skipping notifications.", $config);
+        return;
+    }
+
+    // Collect alert data
+    $alertData = collectAlertData();
+
+    // Log the attempt
+    $logMessage = sprintf(
+        'UNAUTHORIZED ACCESS | IP: %s | URL: %s | Method: %s | User: %s | Country: %s | UA: %s',
+        $alertData['ip'],
+        $alertData['url'],
+        $alertData['method'],
+        $alertData['session_user'] ?: 'N/A',
+        $alertData['geo']['country'],
+        substr($alertData['user_agent'], 0, 100)
+    );
+    writeLog($logMessage, $config);
+
+    // Send email alert
+    $emailSent = sendEmailAlert($alertData, $config);
+    writeLog('Email alert ' . ($emailSent ? 'sent successfully' : 'FAILED to send'), $config);
+
+    // Send Slack alert
+    $slackSent = sendSlackAlert($alertData, $config);
+    writeLog('Slack alert ' . ($slackSent ? 'sent successfully' : 'FAILED to send'), $config);
+}
+
+// ============================================================
+// ADMIN ACCESS GUARD
+// ============================================================
+
+/**
+ * Check if the current user has admin access
+ * Modify this function to match your authentication system
+ */
+function userHasAdminAccess(): bool
+{
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+
+    // Example checks — adapt to your own auth system:
+    // return isset($_SESSION['role']) && $_SESSION['role'] === 'admin';
+    // return isset($_SESSION['is_admin']) && $_SESSION['is_admin'] === true;
+    // return isset($_SESSION['permissions']) && in_array('admin', $_SESSION['permissions']);
+
+    return isset($_SESSION['is_admin']) && $_SESSION['is_admin'] === true;
+}
+
+/**
+ * Guard function to protect admin routes
+ */
+function guardAdminAccess(array $config, bool $redirectOnFail = true, string $redirectUrl = '/'): void
+{
+    if (!userHasAdminAccess()) {
+        // Trigger the alert
+        triggerAdminAlert($config);
+
+        if ($redirectOnFail) {
+            http_response_code(403);
+            header("Location: {$redirectUrl}");
+            exit;
+        }
+
+        http_response_code(403);
+        echo json_encode(['error' => 'Forbidden', 'message' => 'Access denied.']);
+        exit;
+    }
+}
+
+// ============================================================
+// USAGE EXAMPLE
+// ============================================================
+
+// Option 1: Use the guard function at the top of your admin page
+// guardAdminAccess($config, true, '/login');
+
+// Option 2: Manually trigger the alert and handle the response yourself
+// if (!userHasAdminAccess()) {
+//     triggerAdminAlert($config);
+//     http_response_code(403);
+//     die('Access Denied');
+// }
+
+// Option 3: Middleware-style usage in a router
+// $requestUri = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
+// if (strpos($requestUri, '/admin') === 0) {
+//     guardAdminAccess($config, true, '/login');
+// }
+
+// ============================================================
+// DEMO / TEST (Remove in production)
+// ============================================================
+
+if (php_sapi_name() === 'cli' || (isset($_GET['test']) && $_GET['test'] === 'true')) {
+    echo "=== Admin Alert System Test ===" . PHP_EOL;
+    echo "Simulating unauthorized access attempt..." . PHP_EOL;
+
+    // Simulate a non-admin session
+    if (session_status() === PHP_SESSION_NONE) {
+        session_start();
+    }
+    $_SESSION['is_admin'] = false;
+
+    // Simulate request data
+    $_SERVER['REQUEST_URI']    = '/admin/dashboard';
+    $_SERVER['REQUEST_METHOD'] = 'GET';
+    $_SERVER['HTTP_HOST']      = 'example.com';
+    $_SERVER['HTTP_USER_AGENT'] = 'Mozilla/5.0 (Test Browser)';
+    $_SERVER['REMOTE_ADDR']    = '203.0.113.42'; // Example IP
+
+    triggerAdminAlert($config);
+
+    echo "Alert triggered!" . PHP_EOL;
+    echo "Check your email, Slack, and log file at: " . $config['log']['file'] . PHP_EOL;
+}

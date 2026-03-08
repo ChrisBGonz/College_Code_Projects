@@ -1,0 +1,391 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = {};
+const votes = {}; // { pollId: { ip: optionIndex } }
+
+// Conversation history for multi-turn conversations
+const conversationHistory = [];
+
+// System prompt for the voting assistant
+const systemPrompt = `You are a voting system assistant. You help users create polls, vote on them, and view results.
+
+You have access to the following operations:
+1. CREATE_POLL: Create a new poll with options
+2. LIST_POLLS: List all available polls
+3. VOTE: Cast a vote on a poll
+4. VIEW_RESULTS: View the results of a poll
+5. DELETE_POLL: Delete a poll
+
+When a user wants to perform an action, respond with a JSON command in this format:
+{
+  "action": "ACTION_NAME",
+  "data": { ... relevant data ... }
+}
+
+For CREATE_POLL:
+{
+  "action": "CREATE_POLL",
+  "data": {
+    "title": "Poll title",
+    "options": ["Option 1", "Option 2", "Option 3"]
+  }
+}
+
+For LIST_POLLS:
+{
+  "action": "LIST_POLLS",
+  "data": {}
+}
+
+For VOTE:
+{
+  "action": "VOTE",
+  "data": {
+    "pollId": "poll_id",
+    "optionIndex": 0
+  }
+}
+
+For VIEW_RESULTS:
+{
+  "action": "VIEW_RESULTS",
+  "data": {
+    "pollId": "poll_id"
+  }
+}
+
+For DELETE_POLL:
+{
+  "action": "DELETE_POLL",
+  "data": {
+    "pollId": "poll_id"
+  }
+}
+
+Always respond with a JSON command when the user wants to perform an action. If the user is just chatting or asking questions, respond normally without a JSON command.
+
+After receiving the result of an action, provide a friendly and informative response to the user.`;
+
+// Generate a unique poll ID
+function generatePollId() {
+  return "poll_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+}
+
+// Execute voting system actions
+function executeAction(action, data, userIp) {
+  switch (action) {
+    case "CREATE_POLL": {
+      const pollId = generatePollId();
+      polls[pollId] = {
+        id: pollId,
+        title: data.title,
+        options: data.options,
+        votes: new Array(data.options.length).fill(0),
+        createdAt: new Date().toISOString(),
+      };
+      votes[pollId] = {};
+      return {
+        success: true,
+        message: `Poll created successfully with ID: ${pollId}`,
+        poll: polls[pollId],
+      };
+    }
+
+    case "LIST_POLLS": {
+      const pollList = Object.values(polls).map((poll) => ({
+        id: poll.id,
+        title: poll.title,
+        options: poll.options,
+        totalVotes: poll.votes.reduce((a, b) => a + b, 0),
+        createdAt: poll.createdAt,
+      }));
+      return {
+        success: true,
+        polls: pollList,
+        count: pollList.length,
+      };
+    }
+
+    case "VOTE": {
+      const { pollId, optionIndex } = data;
+
+      if (!polls[pollId]) {
+        return { success: false, error: "Poll not found" };
+      }
+
+      if (optionIndex < 0 || optionIndex >= polls[pollId].options.length) {
+        return { success: false, error: "Invalid option index" };
+      }
+
+      if (votes[pollId][userIp]) {
+        return {
+          success: false,
+          error: "You have already voted in this poll",
+          previousVote: votes[pollId][userIp],
+        };
+      }
+
+      polls[pollId].votes[optionIndex]++;
+      votes[pollId][userIp] = optionIndex;
+
+      return {
+        success: true,
+        message: `Vote cast successfully for option: ${polls[pollId].options[optionIndex]}`,
+        poll: polls[pollId],
+      };
+    }
+
+    case "VIEW_RESULTS": {
+      const { pollId } = data;
+
+      if (!polls[pollId]) {
+        return { success: false, error: "Poll not found" };
+      }
+
+      const poll = polls[pollId];
+      const totalVotes = poll.votes.reduce((a, b) => a + b, 0);
+      const results = poll.options.map((option, index) => ({
+        option,
+        votes: poll.votes[index],
+        percentage:
+          totalVotes > 0
+            ? ((poll.votes[index] / totalVotes) * 100).toFixed(1)
+            : "0.0",
+      }));
+
+      return {
+        success: true,
+        poll: {
+          id: poll.id,
+          title: poll.title,
+          results,
+          totalVotes,
+          userHasVoted: votes[pollId][userIp] !== undefined,
+          userVote:
+            votes[pollId][userIp] !== undefined
+              ? poll.options[votes[pollId][userIp]]
+              : null,
+        },
+      };
+    }
+
+    case "DELETE_POLL": {
+      const { pollId } = data;
+
+      if (!polls[pollId]) {
+        return { success: false, error: "Poll not found" };
+      }
+
+      const deletedPoll = polls[pollId];
+      delete polls[pollId];
+      delete votes[pollId];
+
+      return {
+        success: true,
+        message: `Poll "${deletedPoll.title}" deleted successfully`,
+      };
+    }
+
+    default:
+      return { success: false, error: "Unknown action" };
+  }
+}
+
+// Parse JSON command from assistant response
+function parseCommand(response) {
+  try {
+    // Try to find JSON in the response
+    const jsonMatch = response.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      const parsed = JSON.parse(jsonMatch[0]);
+      if (parsed.action && parsed.data !== undefined) {
+        return parsed;
+      }
+    }
+  } catch (e) {
+    // Not a JSON command
+  }
+  return null;
+}
+
+// Main chat function with streaming
+async function chat(userMessage, userIp) {
+  // Add user message to history
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  let fullResponse = "";
+
+  try {
+    // Stream the response
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      system: systemPrompt,
+      messages: conversationHistory,
+    });
+
+    process.stdout.write("\nAssistant: ");
+
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        process.stdout.write(chunk.delta.text);
+        fullResponse += chunk.delta.text;
+      }
+    }
+
+    console.log("\n");
+
+    // Check if the response contains a command
+    const command = parseCommand(fullResponse);
+
+    if (command) {
+      // Execute the action
+      const result = executeAction(command.action, command.data, userIp);
+
+      // Add assistant's command response to history
+      conversationHistory.push({
+        role: "assistant",
+        content: fullResponse,
+      });
+
+      // Add the action result as a user message for context
+      const resultMessage = `Action result: ${JSON.stringify(result, null, 2)}`;
+      conversationHistory.push({
+        role: "user",
+        content: resultMessage,
+      });
+
+      // Get a follow-up response explaining the result
+      const followUpStream = await client.messages.stream({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        system: systemPrompt,
+        messages: conversationHistory,
+      });
+
+      let followUpResponse = "";
+      process.stdout.write("Assistant: ");
+
+      for await (const chunk of followUpStream) {
+        if (
+          chunk.type === "content_block_delta" &&
+          chunk.delta.type === "text_delta"
+        ) {
+          process.stdout.write(chunk.delta.text);
+          followUpResponse += chunk.delta.text;
+        }
+      }
+
+      console.log("\n");
+
+      // Add follow-up response to history
+      conversationHistory.push({
+        role: "assistant",
+        content: followUpResponse,
+      });
+    } else {
+      // Add regular response to history
+      conversationHistory.push({
+        role: "assistant",
+        content: fullResponse,
+      });
+    }
+  } catch (error) {
+    console.error("Error:", error.message);
+    throw error;
+  }
+}
+
+// Simulate different user IPs for testing
+function getSimulatedIp(userId) {
+  const ips = {
+    1: "192.168.1.1",
+    2: "192.168.1.2",
+    3: "10.0.0.1",
+    4: "172.16.0.1",
+  };
+  return ips[userId] || "127.0.0.1";
+}
+
+// Main function
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("=== Voting System with Claude AI ===");
+  console.log("You can create polls, vote, and view results.");
+  console.log(
+    "Type 'exit' to quit, 'switch user <1-4>' to simulate different users.\n"
+  );
+
+  let currentUserId = 1;
+  let currentIp = getSimulatedIp(currentUserId);
+
+  console.log(`Current user: User ${currentUserId} (IP: ${currentIp})\n`);
+
+  // Initial greeting
+  await chat(
+    "Hello! I want to use the voting system. Can you help me get started?",
+    currentIp
+  );
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye!");
+        rl.close();
+        return;
+      }
+
+      // Handle user switching
+      if (userInput.toLowerCase().startsWith("switch user ")) {
+        const userId = parseInt(userInput.split(" ")[2]);
+        if (userId >= 1 && userId <= 4) {
+          currentUserId = userId;
+          currentIp = getSimulatedIp(currentUserId);
+          console.log(
+            `\nSwitched to User ${currentUserId} (IP: ${currentIp})\n`
+          );
+        } else {
+          console.log("Invalid user ID. Use 1-4.\n");
+        }
+        askQuestion();
+        return;
+      }
+
+      try {
+        await chat(userInput, currentIp);
+      } catch (error) {
+        console.error("Error processing request:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main().catch(console.error);
+```

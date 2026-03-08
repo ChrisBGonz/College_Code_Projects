@@ -1,0 +1,214 @@
+
+```python
+from flask import Flask, request, jsonify, session
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from anthropic import Anthropic
+import os
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+client = Anthropic()
+
+# Database model
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password_hash = db.Column(db.String(120), nullable=False)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+# Conversation history for multi-turn chat
+conversation_history = []
+
+def chat_with_claude(user_message):
+    """Send a message to Claude and get a response using multi-turn conversation."""
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="""You are a helpful assistant for a login system. You help users with:
+        1. Understanding how to register and login
+        2. Troubleshooting login issues
+        3. Security best practices
+        4. General questions about the authentication system
+        
+        Be concise, helpful, and security-conscious in your responses.""",
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user."""
+    data = request.get_json()
+    
+    if not data or 'username' not in data or 'password' not in data:
+        return jsonify({'error': 'Username and password are required'}), 400
+    
+    username = data['username']
+    password = data['password']
+    
+    # Check if user already exists
+    if User.query.filter_by(username=username).first():
+        return jsonify({'error': 'Username already exists'}), 409
+    
+    # Create new user
+    user = User(username=username)
+    user.set_password(password)
+    db.session.add(user)
+    db.session.commit()
+    
+    return jsonify({'message': f'User {username} registered successfully'}), 201
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Login route that verifies username and password against the database."""
+    data = request.get_json()
+    
+    if not data or 'username' not in data or 'password' not in data:
+        return jsonify({'error': 'Username and password are required'}), 400
+    
+    username = data['username']
+    password = data['password']
+    
+    # Find user in database
+    user = User.query.filter_by(username=username).first()
+    
+    if user and user.check_password(password):
+        # Store user in session
+        session['user_id'] = user.id
+        session['username'] = user.username
+        
+        # Get AI assistance message for successful login
+        ai_message = chat_with_claude(f"User '{username}' has successfully logged in. Provide a brief welcome message and security tip.")
+        
+        return jsonify({
+            'message': 'Login successful',
+            'username': username,
+            'ai_assistant': ai_message
+        }), 200
+    else:
+        # Get AI assistance for failed login
+        ai_message = chat_with_claude("A user failed to login. Provide helpful advice about what they can do if they forgot their password or are having trouble logging in.")
+        
+        return jsonify({
+            'error': 'Invalid username or password',
+            'ai_assistant': ai_message
+        }), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout the current user."""
+    username = session.get('username', 'User')
+    session.clear()
+    
+    # Get AI farewell message
+    ai_message = chat_with_claude(f"User '{username}' has logged out. Provide a brief farewell message and security reminder.")
+    
+    return jsonify({
+        'message': 'Logged out successfully',
+        'ai_assistant': ai_message
+    }), 200
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    """Chat with Claude AI assistant about login/security topics."""
+    if 'user_id' not in session:
+        return jsonify({'error': 'You must be logged in to use the chat'}), 401
+    
+    data = request.get_json()
+    
+    if not data or 'message' not in data:
+        return jsonify({'error': 'Message is required'}), 400
+    
+    user_message = data['message']
+    ai_response = chat_with_claude(user_message)
+    
+    return jsonify({
+        'user_message': user_message,
+        'ai_response': ai_response
+    }), 200
+
+@app.route('/profile', methods=['GET'])
+def profile():
+    """Get current user profile (requires login)."""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Authentication required'}), 401
+    
+    user = User.query.get(session['user_id'])
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+    
+    return jsonify({
+        'id': user.id,
+        'username': user.username
+    }), 200
+
+@app.route('/reset-conversation', methods=['POST'])
+def reset_conversation():
+    """Reset the AI conversation history."""
+    global conversation_history
+    conversation_history = []
+    return jsonify({'message': 'Conversation history reset'}), 200
+
+def create_sample_users():
+    """Create sample users for testing."""
+    sample_users = [
+        {'username': 'admin', 'password': 'admin123'},
+        {'username': 'user1', 'password': 'password1'},
+        {'username': 'testuser', 'password': 'test123'}
+    ]
+    
+    for user_data in sample_users:
+        if not User.query.filter_by(username=user_data['username']).first():
+            user = User(username=user_data['username'])
+            user.set_password(user_data['password'])
+            db.session.add(user)
+    
+    db.session.commit()
+    print("Sample users created successfully")
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+        create_sample_users()
+        print("\n=== Flask Login System with Claude AI ===")
+        print("\nSample users created:")
+        print("  - Username: admin, Password: admin123")
+        print("  - Username: user1, Password: password1")
+        print("  - Username: testuser, Password: test123")
+        print("\nAvailable endpoints:")
+        print("  POST /register - Register a new user")
+        print("  POST /login - Login with username and password")
+        print("  POST /logout - Logout current user")
+        print("  GET /profile - Get current user profile")
+        print("  POST /chat - Chat with AI assistant (requires login)")
+        print("  POST /reset-conversation - Reset AI conversation history")
+        print("\nExample login request:")
+        print('  curl -X POST http://localhost:5000/login \\')
+        print('    -H "Content-Type: application/json" \\')
+        print('    -d \'{"username": "admin", "password": "admin123"}\'')
+        print("\nStarting server...")
+    
+    app.run(debug=True, port=5000)
+```

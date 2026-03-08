@@ -1,0 +1,262 @@
+
+```python
+import anthropic
+import json
+import uuid
+from datetime import datetime
+
+client = anthropic.Anthropic()
+PAYMENT_GATEWAY_URL = "https://payment-gateway.example.com/pay"
+payments_db = {}
+
+def create_payment_session(amount: float, currency: str, description: str, success_url: str, cancel_url: str) -> dict:
+    """Create a payment session with the third-party gateway."""
+    payment_id = str(uuid.uuid4())
+    
+    payment_session = {
+        "payment_id": payment_id,
+        "amount": amount,
+        "currency": currency,
+        "description": description,
+        "success_url": success_url,
+        "cancel_url": cancel_url,
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "gateway_url": f"{PAYMENT_GATEWAY_URL}?session_id={payment_id}&amount={amount}&currency={currency}"
+    }
+    
+    payments_db[payment_id] = payment_session
+    
+    return {
+        "payment_id": payment_id,
+        "redirect_url": payment_session["gateway_url"],
+        "status": "pending",
+        "message": f"Payment session created. Redirect user to: {payment_session['gateway_url']}"
+    }
+
+def verify_payment(payment_id: str) -> dict:
+    """Verify the status of a payment."""
+    if payment_id not in payments_db:
+        return {
+            "success": False,
+            "error": f"Payment ID {payment_id} not found"
+        }
+    
+    payment = payments_db[payment_id]
+    
+    import random
+    if random.random() > 0.3:
+        payment["status"] = "completed"
+        payment["completed_at"] = datetime.now().isoformat()
+        payment["transaction_id"] = f"TXN-{uuid.uuid4().hex[:8].upper()}"
+    else:
+        payment["status"] = "failed"
+        payment["error"] = "Payment declined by bank"
+    
+    return {
+        "payment_id": payment_id,
+        "status": payment["status"],
+        "transaction_id": payment.get("transaction_id"),
+        "amount": payment["amount"],
+        "currency": payment["currency"],
+        "success_url": payment["success_url"] if payment["status"] == "completed" else None,
+        "cancel_url": payment["cancel_url"] if payment["status"] == "failed" else None,
+        "message": f"Payment {payment['status']}. " + 
+                   (f"Redirect to success URL: {payment['success_url']}" if payment["status"] == "completed" 
+                    else f"Redirect to cancel URL: {payment['cancel_url']}")
+    }
+
+def get_payment_details(payment_id: str) -> dict:
+    """Get details of a specific payment."""
+    if payment_id not in payments_db:
+        return {
+            "success": False,
+            "error": f"Payment ID {payment_id} not found"
+        }
+    
+    return {
+        "success": True,
+        "payment": payments_db[payment_id]
+    }
+
+tools = [
+    {
+        "name": "create_payment_session",
+        "description": "Create a new payment session with the third-party payment gateway. Returns a redirect URL to send the user to for payment processing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {
+                    "type": "number",
+                    "description": "The payment amount in the specified currency"
+                },
+                "currency": {
+                    "type": "string",
+                    "description": "The currency code (e.g., USD, EUR, GBP)"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Description of what is being paid for"
+                },
+                "success_url": {
+                    "type": "string",
+                    "description": "URL to redirect the user to after successful payment"
+                },
+                "cancel_url": {
+                    "type": "string",
+                    "description": "URL to redirect the user to if payment is cancelled or fails"
+                }
+            },
+            "required": ["amount", "currency", "description", "success_url", "cancel_url"]
+        }
+    },
+    {
+        "name": "verify_payment",
+        "description": "Verify the status of a payment after the user returns from the payment gateway. Returns the payment status and appropriate redirect URL.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "payment_id": {
+                    "type": "string",
+                    "description": "The unique payment ID to verify"
+                }
+            },
+            "required": ["payment_id"]
+        }
+    },
+    {
+        "name": "get_payment_details",
+        "description": "Get detailed information about a specific payment",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "payment_id": {
+                    "type": "string",
+                    "description": "The unique payment ID"
+                }
+            },
+            "required": ["payment_id"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process a tool call and return the result as a string."""
+    if tool_name == "create_payment_session":
+        result = create_payment_session(
+            amount=tool_input["amount"],
+            currency=tool_input["currency"],
+            description=tool_input["description"],
+            success_url=tool_input["success_url"],
+            cancel_url=tool_input["cancel_url"]
+        )
+    elif tool_name == "verify_payment":
+        result = verify_payment(payment_id=tool_input["payment_id"])
+    elif tool_name == "get_payment_details":
+        result = get_payment_details(payment_id=tool_input["payment_id"])
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return json.dumps(result)
+
+def run_payment_agent(user_request: str):
+    """Run the payment agent with the given user request."""
+    print(f"\n{'='*60}")
+    print(f"User Request: {user_request}")
+    print(f"{'='*60}\n")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": user_request
+        }
+    ]
+    
+    system_prompt = """You are a payment processing assistant that helps integrate third-party payment gateways. 
+    When a user wants to make a payment, you should:
+    1. Create a payment session using the provided success_url and cancel_url
+    2. Provide the redirect URL to the user
+    3. After payment, verify the payment status
+    4. Redirect the user to the appropriate URL based on payment success or failure
+    
+    Always be clear about the payment amounts, currencies, and redirect URLs."""
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=system_prompt,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"Assistant Response (stop_reason: {response.stop_reason}):")
+        
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    print(f"\nFinal Response: {block.text}")
+            break
+        
+        if response.stop_reason == "tool_use":
+            messages.append({
+                "role": "assistant",
+                "content": response.content
+            })
+            
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nTool Call: {block.name}")
+                    print(f"Input: {json.dumps(block.input, indent=2)}")
+                    
+                    result = process_tool_call(block.name, block.input)
+                    print(f"Result: {result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+        else:
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+
+def main():
+    """Main function to demonstrate the payment gateway integration."""
+    
+    print("Payment Gateway Integration Demo")
+    print("="*60)
+    
+    run_payment_agent(
+        "I want to purchase a premium subscription for $99.99 USD. "
+        "Please process the payment and redirect me to https://myapp.com/payment/success "
+        "if successful, or https://myapp.com/payment/cancel if it fails."
+    )
+    
+    print("\n" + "="*60)
+    print("Testing payment verification...")
+    
+    if payments_db:
+        payment_id = list(payments_db.keys())[0]
+        run_payment_agent(
+            f"Please verify the payment with ID {payment_id} and let me know the result."
+        )
+    
+    print("\n" + "="*60)
+    print("Testing multiple payments...")
+    
+    run_payment_agent(
+        "I need to process two payments: "
+        "1. $25.00 EUR for a book purchase with success URL https://bookstore.com/success and cancel URL https://bookstore.com/cancel "
+        "2. $150.00 GBP for a course enrollment with success URL https://courses.com/enrolled and cancel URL https://courses.com/payment-failed"
+    )
+
+if __name__ == "__main__":
+    main()
+```

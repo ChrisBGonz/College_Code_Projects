@@ -1,0 +1,366 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Log file rotation script using Claude AI for intelligent log analysis and management.
+This script rotates log files every 24 hours to prevent disk from filling up.
+"""
+
+import os
+import sys
+import time
+import gzip
+import shutil
+import logging
+import argparse
+from datetime import datetime, timedelta
+from pathlib import Path
+import anthropic
+
+# Configure basic logging for the script itself
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def get_file_size_mb(file_path: str) -> float:
+    """Get file size in megabytes."""
+    return os.path.getsize(file_path) / (1024 * 1024)
+
+
+def compress_log_file(source_path: str, dest_path: str) -> bool:
+    """Compress a log file using gzip."""
+    try:
+        with open(source_path, 'rb') as f_in:
+            with gzip.open(dest_path, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        return True
+    except Exception as e:
+        logger.error(f"Error compressing {source_path}: {e}")
+        return False
+
+
+def rotate_log_file(log_path: str, backup_dir: str, max_backups: int = 7) -> dict:
+    """
+    Rotate a single log file.
+    
+    Returns a dict with rotation details.
+    """
+    result = {
+        'file': log_path,
+        'rotated': False,
+        'compressed': False,
+        'deleted_old': False,
+        'error': None,
+        'original_size_mb': 0,
+        'compressed_size_mb': 0
+    }
+    
+    if not os.path.exists(log_path):
+        result['error'] = f"File not found: {log_path}"
+        return result
+    
+    original_size = get_file_size_mb(log_path)
+    result['original_size_mb'] = round(original_size, 2)
+    
+    # Create backup directory if it doesn't exist
+    os.makedirs(backup_dir, exist_ok=True)
+    
+    # Generate backup filename with timestamp
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    log_filename = os.path.basename(log_path)
+    backup_filename = f"{log_filename}.{timestamp}.gz"
+    backup_path = os.path.join(backup_dir, backup_filename)
+    
+    # Compress and move the log file
+    if compress_log_file(log_path, backup_path):
+        result['compressed'] = True
+        compressed_size = get_file_size_mb(backup_path)
+        result['compressed_size_mb'] = round(compressed_size, 2)
+        
+        # Clear the original log file (truncate)
+        with open(log_path, 'w') as f:
+            f.write(f"# Log rotated at {datetime.now().isoformat()}\n")
+        
+        result['rotated'] = True
+        logger.info(f"Rotated {log_path} -> {backup_path}")
+        logger.info(f"Size: {original_size:.2f}MB -> {compressed_size:.2f}MB (compressed)")
+    else:
+        result['error'] = "Failed to compress log file"
+        return result
+    
+    # Clean up old backups
+    backup_files = sorted([
+        f for f in os.listdir(backup_dir) 
+        if f.startswith(log_filename) and f.endswith('.gz')
+    ])
+    
+    if len(backup_files) > max_backups:
+        files_to_delete = backup_files[:-max_backups]
+        for old_file in files_to_delete:
+            old_path = os.path.join(backup_dir, old_file)
+            os.remove(old_path)
+            logger.info(f"Deleted old backup: {old_path}")
+        result['deleted_old'] = len(files_to_delete)
+    
+    return result
+
+
+def analyze_logs_with_claude(log_files: list, rotation_results: list) -> str:
+    """
+    Use Claude AI to analyze log rotation results and provide recommendations.
+    Uses streaming for real-time output.
+    """
+    client = anthropic.Anthropic()
+    
+    # Prepare summary for Claude
+    summary = "Log Rotation Summary:\n\n"
+    for result in rotation_results:
+        summary += f"File: {result['file']}\n"
+        summary += f"  - Rotated: {result['rotated']}\n"
+        summary += f"  - Original size: {result['original_size_mb']} MB\n"
+        summary += f"  - Compressed size: {result['compressed_size_mb']} MB\n"
+        if result.get('deleted_old'):
+            summary += f"  - Deleted {result['deleted_old']} old backups\n"
+        if result.get('error'):
+            summary += f"  - Error: {result['error']}\n"
+        summary += "\n"
+    
+    prompt = f"""You are a system administrator assistant analyzing log rotation results.
+
+{summary}
+
+Please provide:
+1. A brief analysis of the log rotation operation
+2. Any concerns or issues you notice
+3. Recommendations for log management best practices
+4. Estimated disk space savings
+
+Keep your response concise and practical."""
+
+    print("\n" + "="*60)
+    print("Claude AI Analysis of Log Rotation:")
+    print("="*60)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {"role": "user", "content": prompt}
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "="*60)
+    
+    return full_response
+
+
+def check_disk_usage(path: str) -> dict:
+    """Check disk usage for a given path."""
+    stat = shutil.disk_usage(path)
+    return {
+        'total_gb': round(stat.total / (1024**3), 2),
+        'used_gb': round(stat.used / (1024**3), 2),
+        'free_gb': round(stat.free / (1024**3), 2),
+        'usage_percent': round((stat.used / stat.total) * 100, 1)
+    }
+
+
+def run_rotation_cycle(log_files: list, backup_dir: str, max_backups: int = 7) -> list:
+    """Run a complete rotation cycle for all specified log files."""
+    results = []
+    
+    logger.info(f"Starting log rotation cycle at {datetime.now().isoformat()}")
+    logger.info(f"Processing {len(log_files)} log file(s)")
+    
+    for log_file in log_files:
+        result = rotate_log_file(log_file, backup_dir, max_backups)
+        results.append(result)
+    
+    return results
+
+
+def create_sample_log_files(log_dir: str) -> list:
+    """Create sample log files for demonstration."""
+    os.makedirs(log_dir, exist_ok=True)
+    
+    log_files = []
+    sample_logs = ['app.log', 'error.log', 'access.log']
+    
+    for log_name in sample_logs:
+        log_path = os.path.join(log_dir, log_name)
+        
+        # Create sample log content
+        with open(log_path, 'w') as f:
+            f.write(f"# Sample log file: {log_name}\n")
+            f.write(f"# Created: {datetime.now().isoformat()}\n\n")
+            
+            # Write some sample log entries
+            for i in range(100):
+                timestamp = datetime.now() - timedelta(hours=i)
+                f.write(f"{timestamp.isoformat()} INFO Sample log entry {i}\n")
+                f.write(f"{timestamp.isoformat()} DEBUG Processing request {i}\n")
+                if i % 10 == 0:
+                    f.write(f"{timestamp.isoformat()} WARNING High memory usage detected\n")
+        
+        log_files.append(log_path)
+        logger.info(f"Created sample log file: {log_path}")
+    
+    return log_files
+
+
+def continuous_rotation(log_files: list, backup_dir: str, interval_hours: int = 24, 
+                        max_backups: int = 7, use_ai_analysis: bool = True):
+    """
+    Run continuous log rotation at specified intervals.
+    
+    Args:
+        log_files: List of log file paths to rotate
+        backup_dir: Directory to store backup files
+        interval_hours: Hours between rotations (default: 24)
+        max_backups: Maximum number of backups to keep per log file
+        use_ai_analysis: Whether to use Claude AI for analysis
+    """
+    logger.info(f"Starting continuous log rotation service")
+    logger.info(f"Rotation interval: {interval_hours} hours")
+    logger.info(f"Monitoring {len(log_files)} log file(s)")
+    
+    while True:
+        try:
+            # Check disk usage before rotation
+            disk_info = check_disk_usage(backup_dir)
+            logger.info(f"Disk usage: {disk_info['usage_percent']}% "
+                       f"({disk_info['used_gb']}GB used of {disk_info['total_gb']}GB)")
+            
+            # Run rotation
+            results = run_rotation_cycle(log_files, backup_dir, max_backups)
+            
+            # Analyze with Claude if enabled
+            if use_ai_analysis:
+                analyze_logs_with_claude(log_files, results)
+            
+            # Check disk usage after rotation
+            disk_info_after = check_disk_usage(backup_dir)
+            logger.info(f"Disk usage after rotation: {disk_info_after['usage_percent']}% "
+                       f"({disk_info_after['used_gb']}GB used of {disk_info_after['total_gb']}GB)")
+            
+            # Calculate next rotation time
+            next_rotation = datetime.now() + timedelta(hours=interval_hours)
+            logger.info(f"Next rotation scheduled at: {next_rotation.isoformat()}")
+            
+            # Sleep until next rotation
+            time.sleep(interval_hours * 3600)
+            
+        except KeyboardInterrupt:
+            logger.info("Log rotation service stopped by user")
+            break
+        except Exception as e:
+            logger.error(f"Error during rotation cycle: {e}")
+            # Wait a bit before retrying
+            time.sleep(60)
+
+
+def main():
+    """Main function to run the log rotation script."""
+    parser = argparse.ArgumentParser(description='Log file rotation script with AI analysis')
+    parser.add_argument('--log-dir', default='/tmp/sample_logs', 
+                       help='Directory containing log files')
+    parser.add_argument('--backup-dir', default='/tmp/log_backups',
+                       help='Directory for backup files')
+    parser.add_argument('--interval', type=int, default=24,
+                       help='Rotation interval in hours (default: 24)')
+    parser.add_argument('--max-backups', type=int, default=7,
+                       help='Maximum backups per log file (default: 7)')
+    parser.add_argument('--no-ai', action='store_true',
+                       help='Disable Claude AI analysis')
+    parser.add_argument('--demo', action='store_true',
+                       help='Run in demo mode (create sample logs and rotate once)')
+    parser.add_argument('--log-files', nargs='+',
+                       help='Specific log files to rotate')
+    
+    args = parser.parse_args()
+    
+    # Determine log files to process
+    if args.log_files:
+        log_files = args.log_files
+    elif args.demo:
+        # Create sample log files for demonstration
+        logger.info("Running in demo mode - creating sample log files")
+        log_files = create_sample_log_files(args.log_dir)
+    else:
+        # Look for log files in the specified directory
+        log_dir = Path(args.log_dir)
+        if log_dir.exists():
+            log_files = [str(f) for f in log_dir.glob('*.log')]
+        else:
+            logger.warning(f"Log directory {args.log_dir} not found")
+            logger.info("Creating sample log files for demonstration...")
+            log_files = create_sample_log_files(args.log_dir)
+    
+    if not log_files:
+        logger.error("No log files found to rotate")
+        sys.exit(1)
+    
+    logger.info(f"Found {len(log_files)} log file(s) to manage")
+    
+    if args.demo:
+        # Run single rotation cycle in demo mode
+        logger.info("Demo mode: Running single rotation cycle")
+        
+        # Show initial disk usage
+        disk_info = check_disk_usage(args.backup_dir if os.path.exists(args.backup_dir) else '/tmp')
+        logger.info(f"Initial disk usage: {disk_info['usage_percent']}% "
+                   f"({disk_info['used_gb']}GB used of {disk_info['total_gb']}GB)")
+        
+        # Run rotation
+        results = run_rotation_cycle(log_files, args.backup_dir, args.max_backups)
+        
+        # Display results
+        print("\nRotation Results:")
+        print("-" * 40)
+        for result in results:
+            print(f"\nFile: {result['file']}")
+            print(f"  Status: {'✓ Rotated' if result['rotated'] else '✗ Failed'}")
+            if result['rotated']:
+                print(f"  Original size: {result['original_size_mb']} MB")
+                print(f"  Compressed size: {result['compressed_size_mb']} MB")
+                if result['original_size_mb'] > 0:
+                    savings = ((result['original_size_mb'] - result['compressed_size_mb']) / 
+                              result['original_size_mb'] * 100)
+                    print(f"  Space saved: {savings:.1f}%")
+            if result.get('error'):
+                print(f"  Error: {result['error']}")
+        
+        # Analyze with Claude AI
+        if not args.no_ai:
+            analyze_logs_with_claude(log_files, results)
+        
+        # Show final disk usage
+        disk_info_after = check_disk_usage(args.backup_dir)
+        logger.info(f"Final disk usage: {disk_info_after['usage_percent']}% "
+                   f"({disk_info_after['used_gb']}GB used of {disk_info_after['total_gb']}GB)")
+        
+        logger.info("Demo completed successfully!")
+        
+    else:
+        # Run continuous rotation
+        logger.info(f"Starting continuous rotation with {args.interval}h interval")
+        continuous_rotation(
+            log_files=log_files,
+            backup_dir=args.backup_dir,
+            interval_hours=args.interval,
+            max_backups=args.max_backups,
+            use_ai_analysis=not args.no_ai
+        )
+
+
+if __name__ == "__main__":
+    main()
+```

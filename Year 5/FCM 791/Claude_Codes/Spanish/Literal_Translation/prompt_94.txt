@@ -1,0 +1,260 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = new Map();
+
+// Helper function to get or create conversation history
+function getConversationHistory(sessionId) {
+  if (!conversationHistory.has(sessionId)) {
+    conversationHistory.set(sessionId, []);
+  }
+  return conversationHistory.get(sessionId);
+}
+
+// Main chat endpoint with streaming
+app.post("/chat", async (req, res) => {
+  const { message, sessionId = "default" } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Set headers for streaming
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const history = getConversationHistory(sessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  let fullResponse = "";
+
+  try {
+    // Create streaming message with conversation history
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: history,
+    });
+
+    // Stream the response
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        const text = chunk.delta.text;
+        fullResponse += text;
+
+        // Send chunk to client
+        res.write(`data: ${JSON.stringify({ text, type: "chunk" })}\n\n`);
+      }
+    }
+
+    // Add assistant response to history
+    history.push({
+      role: "assistant",
+      content: fullResponse,
+    });
+
+    // Send completion signal
+    res.write(
+      `data: ${JSON.stringify({ type: "done", fullResponse })}\n\n`
+    );
+    res.end();
+  } catch (error) {
+    // Send error to client via SSE
+    res.write(
+      `data: ${JSON.stringify({ type: "error", error: error.message })}\n\n`
+    );
+    res.end();
+  }
+});
+
+// Endpoint to get conversation history
+app.get("/history/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const history = getConversationHistory(sessionId);
+  res.json({ sessionId, history });
+});
+
+// Endpoint to clear conversation history
+app.delete("/history/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  conversationHistory.delete(sessionId);
+  res.json({ message: `History cleared for session ${sessionId}` });
+});
+
+// Test endpoint to trigger various errors
+app.get("/test-error/:type", (req, res) => {
+  const { type } = req.params;
+
+  switch (type) {
+    case "sync":
+      // Synchronous error
+      throw new Error("Synchronous error for testing");
+
+    case "async":
+      // Async error without proper handling
+      Promise.reject(new Error("Unhandled promise rejection"));
+      res.json({ message: "Async error triggered" });
+      break;
+
+    case "type":
+      // TypeError
+      const obj = null;
+      obj.property; // This will throw TypeError
+      break;
+
+    case "custom":
+      // Custom error with status code
+      const customError = new Error("Custom application error");
+      customError.statusCode = 422;
+      customError.details = { field: "email", message: "Invalid format" };
+      throw customError;
+
+    default:
+      res.json({ message: "Unknown error type" });
+  }
+});
+
+// 404 handler - must be before error handlers
+app.use((req, res, next) => {
+  const error = new Error(`Route not found: ${req.originalUrl}`);
+  error.statusCode = 404;
+  next(error);
+});
+
+// Global error handler - must have 4 parameters
+app.use(async (err, req, res, next) => {
+  console.error("Error caught by global handler:", err);
+
+  // Determine status code
+  const statusCode = err.statusCode || err.status || 500;
+
+  // Prepare error details
+  const errorDetails = {
+    error: {
+      message: err.message || "Internal Server Error",
+      type: err.constructor.name,
+      statusCode,
+      timestamp: new Date().toISOString(),
+      path: req.originalUrl,
+      method: req.method,
+    },
+  };
+
+  // Add additional details if available
+  if (err.details) {
+    errorDetails.error.details = err.details;
+  }
+
+  // Add stack trace in development
+  if (process.env.NODE_ENV !== "production") {
+    errorDetails.error.stack = err.stack;
+  }
+
+  // Try to get AI analysis of the error
+  try {
+    const errorAnalysis = await analyzeErrorWithAI(err, req);
+    errorDetails.error.aiAnalysis = errorAnalysis;
+  } catch (aiError) {
+    console.error("Failed to get AI error analysis:", aiError.message);
+  }
+
+  // Send error response
+  res.status(statusCode).json(errorDetails);
+});
+
+// Function to analyze errors using Claude AI
+async function analyzeErrorWithAI(error, req) {
+  const errorContext = {
+    errorType: error.constructor.name,
+    message: error.message,
+    stack: error.stack,
+    requestPath: req.originalUrl,
+    requestMethod: req.method,
+    requestBody: req.body,
+    requestHeaders: {
+      "content-type": req.headers["content-type"],
+      "user-agent": req.headers["user-agent"],
+    },
+  };
+
+  const prompt = `Analyze this Node.js Express error and provide:
+1. A brief explanation of what went wrong
+2. Possible causes
+3. Suggested fixes
+4. Prevention strategies
+
+Error Context:
+${JSON.stringify(errorContext, null, 2)}
+
+Provide a concise, developer-friendly analysis in JSON format with keys: explanation, causes, fixes, prevention`;
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 500,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  try {
+    // Try to parse as JSON
+    const analysisText = response.content[0].text;
+    // Extract JSON if wrapped in markdown code blocks
+    const jsonMatch = analysisText.match(/```json\n?([\s\S]*?)\n?```/);
+    if (jsonMatch) {
+      return JSON.parse(jsonMatch[1]);
+    }
+    return JSON.parse(analysisText);
+  } catch {
+    // Return as plain text if not valid JSON
+    return { analysis: response.content[0].text };
+  }
+}
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+  // In production, you might want to gracefully shutdown
+  // process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`
+Available endpoints:
+  POST /chat - Chat with Claude AI (streaming)
+  GET  /history/:sessionId - Get conversation history
+  DELETE /history/:sessionId - Clear conversation history
+  GET  /test-error/:type - Test error handling (sync, async, type, custom)
+  `);
+});
+
+module.exports = app;
+```

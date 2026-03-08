@@ -1,0 +1,382 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const http = require("http");
+const url = require("url");
+
+const client = new Anthropic();
+
+// Simulated user database
+const usersDatabase = {
+  1: {
+    id: 1,
+    name: "John Doe",
+    email: "john.doe@example.com",
+    age: 30,
+    location: "New York, USA",
+    occupation: "Software Engineer",
+    joinDate: "2020-01-15",
+    preferences: {
+      language: "English",
+      theme: "dark",
+      notifications: true,
+    },
+    stats: {
+      postsCount: 45,
+      followersCount: 230,
+      followingCount: 180,
+    },
+  },
+  2: {
+    id: 2,
+    name: "Jane Smith",
+    email: "jane.smith@example.com",
+    age: 25,
+    location: "London, UK",
+    occupation: "Data Scientist",
+    joinDate: "2021-03-22",
+    preferences: {
+      language: "English",
+      theme: "light",
+      notifications: false,
+    },
+    stats: {
+      postsCount: 12,
+      followersCount: 89,
+      followingCount: 95,
+    },
+  },
+  3: {
+    id: 3,
+    name: "Carlos García",
+    email: "carlos.garcia@example.com",
+    age: 35,
+    location: "Madrid, Spain",
+    occupation: "Product Manager",
+    joinDate: "2019-07-10",
+    preferences: {
+      language: "Spanish",
+      theme: "dark",
+      notifications: true,
+    },
+    stats: {
+      postsCount: 78,
+      followersCount: 512,
+      followingCount: 340,
+    },
+  },
+};
+
+// Tool definition for getting user profile data
+const tools = [
+  {
+    name: "get_user_profile",
+    description:
+      "Retrieves the complete profile data for a user based on their user ID",
+    input_schema: {
+      type: "object",
+      properties: {
+        user_id: {
+          type: "number",
+          description: "The unique identifier of the user",
+        },
+      },
+      required: ["user_id"],
+    },
+  },
+  {
+    name: "format_profile_for_download",
+    description:
+      "Formats the user profile data for download, adding metadata and timestamps",
+    input_schema: {
+      type: "object",
+      properties: {
+        user_data: {
+          type: "object",
+          description: "The user profile data to format",
+        },
+        include_metadata: {
+          type: "boolean",
+          description: "Whether to include download metadata",
+        },
+      },
+      required: ["user_data"],
+    },
+  },
+];
+
+// Tool execution functions
+function getUserProfile(userId) {
+  const user = usersDatabase[userId];
+  if (!user) {
+    return { error: `User with ID ${userId} not found`, found: false };
+  }
+  return { ...user, found: true };
+}
+
+function formatProfileForDownload(userData, includeMetadata = true) {
+  const formattedData = {
+    ...userData,
+  };
+
+  if (includeMetadata) {
+    formattedData.downloadMetadata = {
+      downloadedAt: new Date().toISOString(),
+      version: "1.0",
+      format: "JSON",
+      dataRetentionPolicy: "This data is provided for personal use only",
+    };
+  }
+
+  return formattedData;
+}
+
+// Process tool calls from Claude
+function processToolCall(toolName, toolInput) {
+  if (toolName === "get_user_profile") {
+    return getUserProfile(toolInput.user_id);
+  } else if (toolName === "format_profile_for_download") {
+    return formatProfileForDownload(
+      toolInput.user_data,
+      toolInput.include_metadata
+    );
+  }
+  return { error: "Unknown tool" };
+}
+
+// Main function to handle profile download request using Claude
+async function handleProfileDownload(userId) {
+  console.log(`Processing profile download request for user ID: ${userId}`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `I need to download the profile data for user with ID ${userId}. Please retrieve their profile information and format it properly for download as a JSON file.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  // Agentic loop - continue until Claude stops using tools
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlocks = response.content.filter(
+      (block) => block.type === "tool_use"
+    );
+    const toolResults = [];
+
+    for (const toolUse of toolUseBlocks) {
+      console.log(`Executing tool: ${toolUse.name}`);
+      const result = processToolCall(toolUse.name, toolUse.input);
+      console.log(`Tool result:`, JSON.stringify(result, null, 2));
+
+      toolResults.push({
+        type: "tool_result",
+        tool_use_id: toolUse.id,
+        content: JSON.stringify(result),
+      });
+    }
+
+    // Continue the conversation with tool results
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  // Extract the final response
+  const textContent = response.content.find((block) => block.type === "text");
+
+  // Try to extract JSON data from the conversation
+  let profileData = null;
+
+  // Look for formatted profile data in tool results
+  for (const message of messages) {
+    if (Array.isArray(message.content)) {
+      for (const content of message.content) {
+        if (content.type === "tool_result") {
+          try {
+            const result = JSON.parse(content.content);
+            if (result.downloadMetadata || (result.id && result.email)) {
+              profileData = result;
+            }
+          } catch (e) {
+            // Continue looking
+          }
+        }
+      }
+    }
+  }
+
+  return {
+    success: profileData !== null,
+    data: profileData,
+    message: textContent ? textContent.text : "Profile data processed",
+  };
+}
+
+// HTTP Server
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+  const query = parsedUrl.query;
+
+  // CORS headers
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // Profile download endpoint
+  if (pathname === "/api/profile/download" && req.method === "GET") {
+    const userId = query.user_id;
+
+    if (!userId) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "Missing required parameter: user_id",
+          usage: "/api/profile/download?user_id=<number>",
+        })
+      );
+      return;
+    }
+
+    const userIdNum = parseInt(userId, 10);
+
+    if (isNaN(userIdNum) || userIdNum <= 0) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "Invalid user_id: must be a positive integer",
+        })
+      );
+      return;
+    }
+
+    try {
+      console.log(`\n${"=".repeat(50)}`);
+      console.log(`Received download request for user ID: ${userIdNum}`);
+      console.log(`${"=".repeat(50)}\n`);
+
+      const result = await handleProfileDownload(userIdNum);
+
+      if (!result.success || !result.data) {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: `User with ID ${userIdNum} not found`,
+            message: result.message,
+          })
+        );
+        return;
+      }
+
+      // Set headers for file download
+      const filename = `profile_user_${userIdNum}_${Date.now()}.json`;
+      res.setHeader("Content-Type", "application/json");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${filename}"`
+      );
+      res.setHeader("X-Download-Filename", filename);
+
+      res.writeHead(200);
+      res.end(JSON.stringify(result.data, null, 2));
+
+      console.log(`\nSuccessfully sent profile data for user ${userIdNum}`);
+    } catch (error) {
+      console.error("Error processing request:", error);
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: "Internal server error",
+          message: error.message,
+        })
+      );
+    }
+  }
+  // Health check endpoint
+  else if (pathname === "/health" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        availableUsers: Object.keys(usersDatabase).map(Number),
+      })
+    );
+  }
+  // API documentation endpoint
+  else if (pathname === "/" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        name: "Profile Download API",
+        version: "1.0.0",
+        endpoints: {
+          "GET /api/profile/download": {
+            description: "Download user profile data as JSON",
+            parameters: {
+              user_id: "Required. The user ID (positive integer)",
+            },
+            example: "/api/profile/download?user_id=1",
+          },
+          "GET /health": {
+            description: "Health check endpoint",
+          },
+        },
+        availableUsers: Object.keys(usersDatabase).map(Number),
+      })
+    );
+  } else {
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(
+      JSON.stringify({
+        error: "Endpoint not found",
+        availableEndpoints: ["/", "/health", "/api/profile/download"],
+      })
+    );
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`\n${"=".repeat(60)}`);
+  console.log(`Profile Download API Server running on port ${PORT}`);
+  console.log(`${"=".repeat(60)}`);
+  console.log(`\nAvailable endpoints:`);
+  console.log(`  GET http://localhost:${PORT}/`);
+  console.log(`  GET http://localhost:${PORT}/health`);
+  console.log(
+    `  GET http://localhost:${PORT}/api/profile/download?user_id=<id>`
+  );
+  console.log(`\nAvailable user IDs: ${Object.keys(usersDatabase).join(", ")}`);
+  console.log(`\nExample: http://localhost:${PORT}/api/profile/download?user_id=1`);
+  console.log(`${"=".repeat(60)}\n`);
+});
+
+module.exports = server;
+```

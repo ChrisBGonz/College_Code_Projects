@@ -1,0 +1,243 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeErrorWithClaude(errorInfo) {
+  // Add the error analysis request to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this production error and provide insights:
+    
+Error Type: ${errorInfo.type}
+Error Message: ${errorInfo.message}
+Stack Trace: ${errorInfo.stack || "Not available"}
+Timestamp: ${errorInfo.timestamp}
+Environment: ${errorInfo.environment}
+Request Path: ${errorInfo.requestPath || "Not available"}
+HTTP Method: ${errorInfo.method || "Not available"}
+Status Code: ${errorInfo.statusCode || "Not available"}
+
+Please provide:
+1. Error severity assessment
+2. Possible root causes
+3. Recommended immediate actions
+4. Prevention strategies`,
+  });
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: `You are an expert system error analyzer for production environments. 
+    Your role is to analyze errors, provide insights, and suggest solutions.
+    Always be concise but thorough in your analysis.
+    Format your responses clearly with numbered points.`,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to conversation history
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+async function logProductionError(error, req = null, additionalContext = {}) {
+  const timestamp = new Date().toISOString();
+  const environment = process.env.NODE_ENV || "production";
+
+  // Prepare error information
+  const errorInfo = {
+    type: error.name || "Error",
+    message: error.message,
+    stack: error.stack,
+    timestamp,
+    environment,
+    requestPath: req ? req.path : null,
+    method: req ? req.method : null,
+    statusCode: additionalContext.statusCode || null,
+    ...additionalContext,
+  };
+
+  // Log basic error information immediately
+  console.log("=".repeat(60));
+  console.log(`[PRODUCTION ERROR] ${timestamp}`);
+  console.log(`Type: ${errorInfo.type}`);
+  console.log(`Message: ${errorInfo.message}`);
+  if (req) {
+    console.log(`Request: ${errorInfo.method} ${errorInfo.requestPath}`);
+  }
+  console.log("=".repeat(60));
+
+  // Use Claude to analyze the error
+  console.log("\n[CLAUDE ANALYSIS] Analyzing error with AI...\n");
+
+  const analysis = await analyzeErrorWithClaude(errorInfo);
+
+  console.log("[CLAUDE ANALYSIS RESULT]");
+  console.log("-".repeat(40));
+  console.log(analysis);
+  console.log("-".repeat(40));
+
+  // Ask follow-up question for critical errors
+  if (
+    error.name === "DatabaseError" ||
+    error.name === "SecurityError" ||
+    (additionalContext.statusCode && additionalContext.statusCode >= 500)
+  ) {
+    conversationHistory.push({
+      role: "user",
+      content:
+        "Given this is a critical error, what are the immediate steps to minimize system downtime and user impact?",
+    });
+
+    const criticalResponse = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system: `You are an expert system error analyzer for production environments. 
+      Your role is to analyze errors, provide insights, and suggest solutions.
+      Always be concise but thorough in your analysis.
+      Format your responses clearly with numbered points.`,
+      messages: conversationHistory,
+    });
+
+    const criticalAnalysis = criticalResponse.content[0].text;
+
+    conversationHistory.push({
+      role: "assistant",
+      content: criticalAnalysis,
+    });
+
+    console.log("\n[CRITICAL ERROR - IMMEDIATE ACTIONS]");
+    console.log("-".repeat(40));
+    console.log(criticalAnalysis);
+    console.log("-".repeat(40));
+  }
+
+  console.log("\n");
+
+  return {
+    errorInfo,
+    analysis,
+    timestamp,
+  };
+}
+
+// Express error handling middleware
+async function errorHandler(err, req, res, next) {
+  const statusCode = err.statusCode || err.status || 500;
+
+  // Log the error with Claude analysis
+  await logProductionError(err, req, { statusCode });
+
+  // Send appropriate response to client
+  res.status(statusCode).json({
+    error: {
+      message:
+        process.env.NODE_ENV === "production"
+          ? "An internal server error occurred"
+          : err.message,
+      timestamp: new Date().toISOString(),
+      requestId: req.headers["x-request-id"] || "unknown",
+    },
+  });
+}
+
+// Example routes to demonstrate error logging
+app.get("/test-error", (req, res, next) => {
+  const error = new Error("Test database connection failed");
+  error.name = "DatabaseError";
+  error.statusCode = 500;
+  next(error);
+});
+
+app.get("/test-auth-error", (req, res, next) => {
+  const error = new Error("Unauthorized access attempt detected");
+  error.name = "SecurityError";
+  error.statusCode = 401;
+  next(error);
+});
+
+app.get("/test-validation-error", (req, res, next) => {
+  const error = new Error("Invalid input parameters");
+  error.name = "ValidationError";
+  error.statusCode = 400;
+  next(error);
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
+
+// Register error handler middleware
+app.use(errorHandler);
+
+// Demonstration function
+async function demonstrateErrorLogging() {
+  console.log("Starting Production Error Logger with Claude AI Analysis\n");
+  console.log(
+    "This system uses Claude to analyze production errors and provide insights.\n"
+  );
+
+  // Simulate different types of errors
+  const errors = [
+    {
+      error: Object.assign(new Error("Connection timeout after 30 seconds"), {
+        name: "DatabaseError",
+        statusCode: 503,
+      }),
+      context: { database: "PostgreSQL", host: "db.example.com" },
+    },
+    {
+      error: Object.assign(
+        new Error("Memory usage exceeded 90% threshold"),
+        { name: "SystemError", statusCode: 500 }
+      ),
+      context: { memoryUsage: "92%", availableMemory: "512MB" },
+    },
+    {
+      error: Object.assign(
+        new Error("API rate limit exceeded for external service"),
+        { name: "ExternalServiceError", statusCode: 429 }
+      ),
+      context: { service: "PaymentGateway", requestsPerMinute: 1000 },
+    },
+  ];
+
+  for (const { error, context } of errors) {
+    await logProductionError(error, null, context);
+    // Small delay between errors for readability
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  console.log("\nError logging demonstration complete.");
+  console.log(
+    `Total conversation turns with Claude: ${conversationHistory.length}`
+  );
+}
+
+// Start the server and run demonstration
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, async () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "production"}\n`);
+
+  // Run demonstration
+  await demonstrateErrorLogging();
+});
+
+module.exports = { logProductionError, errorHandler };
+```

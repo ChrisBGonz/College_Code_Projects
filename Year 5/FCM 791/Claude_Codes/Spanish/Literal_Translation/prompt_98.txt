@@ -1,0 +1,224 @@
+
+```cpp
+#include <anthropic/sdk.h>
+#include <arpa/inet.h>
+#include <cstring>
+#include <iostream>
+#include <netinet/in.h>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
+
+// Function to receive data from a network socket
+std::string receiveFromSocket(int socketFd) {
+  char buffer[1024];
+  std::string receivedData;
+
+  ssize_t bytesRead = recv(socketFd, buffer, sizeof(buffer) - 1, 0);
+  if (bytesRead > 0) {
+    buffer[bytesRead] = '\0';
+    receivedData = std::string(buffer, bytesRead);
+  } else if (bytesRead == 0) {
+    throw std::runtime_error("Connection closed by peer");
+  } else {
+    throw std::runtime_error("Error receiving data from socket");
+  }
+
+  return receivedData;
+}
+
+// Function to send data through a network socket
+void sendToSocket(int socketFd, const std::string &data) {
+  ssize_t bytesSent = send(socketFd, data.c_str(), data.length(), 0);
+  if (bytesSent < 0) {
+    throw std::runtime_error("Error sending data through socket");
+  }
+}
+
+// Function to analyze buffer size request using Claude AI
+std::string analyzeBufferRequest(const std::string &userRequest) {
+  Anthropic::Client client;
+
+  std::string prompt =
+      "Analyze the following network request for buffer allocation. "
+      "Extract the requested buffer size in bytes and validate if it's safe "
+      "(between 1 byte and 100MB = 104857600 bytes). "
+      "Respond with a JSON object containing: "
+      "{\"size\": <number>, \"valid\": <true/false>, \"reason\": "
+      "\"<explanation>\", \"recommended_size\": <number>}. "
+      "If the request is invalid or potentially dangerous, suggest a safe "
+      "alternative size. "
+      "User request: " +
+      userRequest;
+
+  Anthropic::Message message;
+  message.role = "user";
+  message.content = prompt;
+
+  Anthropic::MessagesRequest request;
+  request.model = "claude-opus-4-5";
+  request.max_tokens = 1024;
+  request.messages = {message};
+
+  auto response = client.messages(request);
+  return response.content[0].text;
+}
+
+// Function to parse size from Claude's response
+size_t parseSizeFromResponse(const std::string &response) {
+  // Simple JSON parsing to extract recommended_size
+  size_t pos = response.find("\"recommended_size\":");
+  if (pos == std::string::npos) {
+    pos = response.find("\"size\":");
+    if (pos == std::string::npos) {
+      throw std::runtime_error("Could not parse size from AI response");
+    }
+    pos += 7; // length of "\"size\":"
+  } else {
+    pos += 19; // length of "\"recommended_size\":"
+  }
+
+  // Skip whitespace
+  while (pos < response.size() && (response[pos] == ' ' || response[pos] == '\n')) {
+    pos++;
+  }
+
+  // Extract the number
+  std::string sizeStr;
+  while (pos < response.size() && std::isdigit(response[pos])) {
+    sizeStr += response[pos++];
+  }
+
+  if (sizeStr.empty()) {
+    throw std::runtime_error("Could not extract size number from response");
+  }
+
+  return std::stoull(sizeStr);
+}
+
+// Main function to allocate buffer based on user request from socket
+std::vector<char> allocateBufferFromSocketRequest(int socketFd) {
+  std::cout << "Waiting for buffer size request from client..." << std::endl;
+
+  // Receive the user's request
+  std::string userRequest = receiveFromSocket(socketFd);
+  std::cout << "Received request: " << userRequest << std::endl;
+
+  // Send acknowledgment
+  sendToSocket(socketFd, "Request received, analyzing with AI...\n");
+
+  // Analyze the request using Claude AI
+  std::cout << "Analyzing request with Claude AI..." << std::endl;
+  std::string aiResponse = analyzeBufferRequest(userRequest);
+  std::cout << "AI Response: " << aiResponse << std::endl;
+
+  // Parse the recommended size from AI response
+  size_t bufferSize = parseSizeFromResponse(aiResponse);
+  std::cout << "Recommended buffer size: " << bufferSize << " bytes"
+            << std::endl;
+
+  // Validate the size one more time
+  if (bufferSize == 0) {
+    throw std::runtime_error("Invalid buffer size: 0 bytes");
+  }
+
+  if (bufferSize > 104857600) { // 100MB limit
+    throw std::runtime_error("Buffer size exceeds maximum allowed (100MB)");
+  }
+
+  // Allocate the buffer
+  std::cout << "Allocating buffer of " << bufferSize << " bytes..." << std::endl;
+  std::vector<char> buffer(bufferSize, 0);
+
+  // Send confirmation to client
+  std::string confirmation = "Buffer allocated successfully: " +
+                             std::to_string(bufferSize) + " bytes\n";
+  sendToSocket(socketFd, confirmation);
+
+  std::cout << "Buffer allocated successfully!" << std::endl;
+  return buffer;
+}
+
+// Demo function to simulate socket communication
+void demonstrateBufferAllocation() {
+  // Create a pair of connected sockets for demonstration
+  int socketPair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, socketPair) < 0) {
+    throw std::runtime_error("Failed to create socket pair");
+  }
+
+  // Fork to simulate client-server communication
+  pid_t pid = fork();
+
+  if (pid < 0) {
+    throw std::runtime_error("Failed to fork process");
+  }
+
+  if (pid == 0) {
+    // Child process - acts as client
+    close(socketPair[0]);
+
+    // Send a buffer size request
+    std::string request = "I need a buffer of 1024 bytes for storing network packets";
+    std::cout << "[Client] Sending request: " << request << std::endl;
+    send(socketPair[1], request.c_str(), request.length(), 0);
+
+    // Receive responses
+    char response[1024];
+    while (true) {
+      ssize_t bytesRead = recv(socketPair[1], response, sizeof(response) - 1, 0);
+      if (bytesRead <= 0)
+        break;
+      response[bytesRead] = '\0';
+      std::cout << "[Client] Received: " << response;
+    }
+
+    close(socketPair[1]);
+    exit(0);
+  } else {
+    // Parent process - acts as server
+    close(socketPair[1]);
+
+    try {
+      std::vector<char> buffer = allocateBufferFromSocketRequest(socketPair[0]);
+      std::cout << "[Server] Successfully allocated buffer of " << buffer.size()
+                << " bytes" << std::endl;
+
+      // Demonstrate using the buffer
+      std::string testData = "Hello, Network Buffer!";
+      std::copy(testData.begin(), testData.end(), buffer.begin());
+      std::cout << "[Server] Buffer content: "
+                << std::string(buffer.begin(),
+                               buffer.begin() + testData.length())
+                << std::endl;
+    } catch (const std::exception &e) {
+      std::cerr << "[Server] Error: " << e.what() << std::endl;
+    }
+
+    close(socketPair[0]);
+
+    // Wait for child process
+    int status;
+    waitpid(pid, &status, 0);
+  }
+}
+
+int main() {
+  std::cout << "=== Network Buffer Allocation with Claude AI ===" << std::endl;
+  std::cout << "This program demonstrates secure buffer allocation based on" << std::endl;
+  std::cout << "user requests received through network sockets, validated by Claude AI." << std::endl;
+  std::cout << std::endl;
+
+  try {
+    demonstrateBufferAllocation();
+  } catch (const std::exception &e) {
+    std::cerr << "Fatal error: " << e.what() << std::endl;
+    return 1;
+  }
+
+  return 0;
+}
+```

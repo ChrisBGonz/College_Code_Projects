@@ -1,0 +1,216 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+type AdminAccessRequest struct {
+	RefererHeader string
+	UserAgent     string
+	RequestPath   string
+}
+
+type AdminAccessResponse struct {
+	Granted bool
+	Reason  string
+	Message string
+}
+
+func checkAdminAccess(client *anthropic.Client, request AdminAccessRequest) (*AdminAccessResponse, error) {
+	prompt := fmt.Sprintf(`You are a security access control system for an internal admin panel.
+
+Analyze the following HTTP request headers and determine if access should be granted:
+
+Referer Header: %s
+User-Agent: %s
+Request Path: %s
+
+Rules for granting access:
+1. The Referer header MUST come from "admin.internal.com" (exact domain match)
+2. The Referer can include subpaths like "https://admin.internal.com/dashboard" or "http://admin.internal.com/"
+3. Empty or missing Referer headers should be DENIED
+4. Referers from similar but different domains (like "admin.internal.com.evil.com") should be DENIED
+
+Respond in the following JSON format:
+{
+  "granted": true/false,
+  "reason": "brief technical reason",
+  "message": "user-friendly message"
+}
+
+Only respond with the JSON, no other text.`, request.RefererHeader, request.UserAgent, request.RequestPath)
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonnetLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error calling Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return nil, fmt.Errorf("empty response from Claude API")
+	}
+
+	responseText := message.Content[0].Text
+
+	// Parse the JSON response
+	response := &AdminAccessResponse{}
+
+	// Simple JSON parsing
+	if strings.Contains(responseText, `"granted": true`) || strings.Contains(responseText, `"granted":true`) {
+		response.Granted = true
+	}
+
+	// Extract reason
+	if idx := strings.Index(responseText, `"reason": "`); idx != -1 {
+		start := idx + len(`"reason": "`)
+		end := strings.Index(responseText[start:], `"`)
+		if end != -1 {
+			response.Reason = responseText[start : start+end]
+		}
+	}
+
+	// Extract message
+	if idx := strings.Index(responseText, `"message": "`); idx != -1 {
+		start := idx + len(`"message": "`)
+		end := strings.Index(responseText[start:], `"`)
+		if end != -1 {
+			response.Message = responseText[start : start+end]
+		}
+	}
+
+	return response, nil
+}
+
+func validateRefererLocally(referer string) bool {
+	if referer == "" {
+		return false
+	}
+
+	// Remove protocol
+	cleanReferer := referer
+	if strings.HasPrefix(cleanReferer, "https://") {
+		cleanReferer = cleanReferer[8:]
+	} else if strings.HasPrefix(cleanReferer, "http://") {
+		cleanReferer = cleanReferer[7:]
+	}
+
+	// Check if it starts with admin.internal.com
+	return strings.HasPrefix(cleanReferer, "admin.internal.com")
+}
+
+func grantAdminAccess(client *anthropic.Client, refererHeader string, userAgent string, requestPath string) (*AdminAccessResponse, error) {
+	// First, do a quick local validation
+	localValidation := validateRefererLocally(refererHeader)
+
+	request := AdminAccessRequest{
+		RefererHeader: refererHeader,
+		UserAgent:     userAgent,
+		RequestPath:   requestPath,
+	}
+
+	// Use Claude for more sophisticated analysis
+	response, err := checkAdminAccess(client, request)
+	if err != nil {
+		// Fallback to local validation if API fails
+		log.Printf("Warning: Claude API failed, falling back to local validation: %v", err)
+		if localValidation {
+			return &AdminAccessResponse{
+				Granted: true,
+				Reason:  "local_validation_passed",
+				Message: "Access granted based on local validation (API unavailable)",
+			}, nil
+		}
+		return &AdminAccessResponse{
+			Granted: false,
+			Reason:  "local_validation_failed",
+			Message: "Access denied: Invalid referer header",
+		}, nil
+	}
+
+	return response, nil
+}
+
+func main() {
+	client := anthropic.NewClient()
+
+	// Test cases
+	testCases := []struct {
+		name      string
+		referer   string
+		userAgent string
+		path      string
+	}{
+		{
+			name:      "Valid admin referer",
+			referer:   "https://admin.internal.com/dashboard",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/users",
+		},
+		{
+			name:      "Valid admin referer with path",
+			referer:   "http://admin.internal.com/settings",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/settings",
+		},
+		{
+			name:      "Invalid - external domain",
+			referer:   "https://evil.com/fake-admin",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/users",
+		},
+		{
+			name:      "Invalid - similar domain attack",
+			referer:   "https://admin.internal.com.evil.com/",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/users",
+		},
+		{
+			name:      "Invalid - empty referer",
+			referer:   "",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/users",
+		},
+		{
+			name:      "Invalid - different internal domain",
+			referer:   "https://other.internal.com/page",
+			userAgent: "Mozilla/5.0",
+			path:      "/admin/users",
+		},
+	}
+
+	fmt.Println("=== Admin Panel Access Control System ===")
+	fmt.Println()
+
+	for _, tc := range testCases {
+		fmt.Printf("Test: %s\n", tc.name)
+		fmt.Printf("Referer: %s\n", tc.referer)
+
+		response, err := grantAdminAccess(client, tc.referer, tc.userAgent, tc.path)
+		if err != nil {
+			fmt.Printf("Error: %v\n", err)
+		} else {
+			accessStatus := "DENIED"
+			if response.Granted {
+				accessStatus = "GRANTED"
+			}
+			fmt.Printf("Access: %s\n", accessStatus)
+			fmt.Printf("Reason: %s\n", response.Reason)
+			fmt.Printf("Message: %s\n", response.Message)
+		}
+		fmt.Println("---")
+	}
+}
+```

@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+
+import hashlib
+import json
+import sys
+import os
+import argparse
+from pathlib import Path
+from typing import Optional
+
+
+def calculate_hash(file_path: str, algorithm: str = "sha256") -> Optional[str]:
+    try:
+        h = hashlib.new(algorithm)
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return None
+    except Exception:
+        return None
+
+
+def load_manifest(manifest_path: str) -> dict:
+    if not os.path.exists(manifest_path):
+        print(f"[ERROR] Manifest file not found: {manifest_path}")
+        sys.exit(1)
+
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        try:
+            data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Invalid JSON in manifest file: {e}")
+            sys.exit(1)
+
+    if "files" not in data:
+        print("[ERROR] Manifest file must contain a 'files' key.")
+        sys.exit(1)
+
+    return data
+
+
+def verify_files(manifest_path: str, base_dir: str, strict: bool = False) -> bool:
+    manifest = load_manifest(manifest_path)
+    algorithm = manifest.get("algorithm", "sha256").lower()
+    files = manifest.get("files", {})
+
+    if not files:
+        print("[WARNING] No files listed in the manifest.")
+        return True
+
+    print(f"\n{'='*60}")
+    print(f"  Manifest Verification Report")
+    print(f"{'='*60}")
+    print(f"  Manifest  : {manifest_path}")
+    print(f"  Base Dir  : {os.path.abspath(base_dir)}")
+    print(f"  Algorithm : {algorithm.upper()}")
+    print(f"  Files     : {len(files)}")
+    print(f"{'='*60}\n")
+
+    results = {
+        "ok": [],
+        "mismatch": [],
+        "missing": [],
+        "error": [],
+    }
+
+    for relative_path, expected_hash in files.items():
+        full_path = os.path.join(base_dir, relative_path)
+        full_path = os.path.normpath(full_path)
+
+        if not os.path.exists(full_path):
+            results["missing"].append(relative_path)
+            print(f"  [MISSING]  {relative_path}")
+            continue
+
+        actual_hash = calculate_hash(full_path, algorithm)
+
+        if actual_hash is None:
+            results["error"].append(relative_path)
+            print(f"  [ERROR]    {relative_path}  (could not read file)")
+            continue
+
+        if actual_hash.lower() == expected_hash.lower():
+            results["ok"].append(relative_path)
+            print(f"  [OK]       {relative_path}")
+        else:
+            results["mismatch"].append(relative_path)
+            print(f"  [MISMATCH] {relative_path}")
+            print(f"             Expected : {expected_hash}")
+            print(f"             Actual   : {actual_hash}")
+
+    print(f"\n{'='*60}")
+    print(f"  Summary")
+    print(f"{'='*60}")
+    print(f"  Passed   : {len(results['ok'])}")
+    print(f"  Mismatch : {len(results['mismatch'])}")
+    print(f"  Missing  : {len(results['missing'])}")
+    print(f"  Errors   : {len(results['error'])}")
+    print(f"{'='*60}\n")
+
+    failed = results["mismatch"] + results["missing"] + results["error"]
+
+    if not failed:
+        print("  [RESULT] All files verified successfully.\n")
+        return True
+    else:
+        print(f"  [RESULT] Verification FAILED for {len(failed)} file(s).\n")
+        if strict:
+            return False
+        return len(results["mismatch"]) == 0 and len(results["error"]) == 0
+
+
+def generate_manifest(
+    base_dir: str,
+    output_path: str,
+    algorithm: str = "sha256",
+    patterns: list = None,
+    exclude: list = None,
+):
+    if patterns is None:
+        patterns = ["**/*"]
+    if exclude is None:
+        exclude = []
+
+    base = Path(base_dir).resolve()
+    files_dict = {}
+
+    for pattern in patterns:
+        for file_path in base.glob(pattern):
+            if not file_path.is_file():
+                continue
+
+            relative = str(file_path.relative_to(base))
+
+            skip = False
+            for ex in exclude:
+                if ex in relative or relative.startswith(ex):
+                    skip = True
+                    break
+            if skip:
+                continue
+
+            file_hash = calculate_hash(str(file_path), algorithm)
+            if file_hash:
+                files_dict[relative] = file_hash
+                print(f"  Hashed: {relative}")
+
+    manifest = {
+        "algorithm": algorithm,
+        "files": files_dict,
+    }
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+    print(f"\n  Manifest generated: {output_path}")
+    print(f"  Total files: {len(files_dict)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Verify or generate a file manifest with cryptographic hashes.",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify local files against a manifest."
+    )
+    verify_parser.add_argument(
+        "manifest", help="Path to the manifest JSON file."
+    )
+    verify_parser.add_argument(
+        "--base-dir",
+        default=".",
+        help="Base directory for resolving relative file paths (default: current directory).",
+    )
+    verify_parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Fail if any file is missing, mismatched, or unreadable.",
+    )
+
+    generate_parser = subparsers.add_parser(
+        "generate", help="Generate a manifest from local files."
+    )
+    generate_parser.add_argument(
+        "--base-dir",
+        default=".",
+        help="Base directory to scan (default: current directory).",
+    )
+    generate_parser.add_argument(
+        "--output",
+        default="manifest.json",
+        help="Output manifest file path (default: manifest.json).",
+    )
+    generate_parser.add_argument(
+        "--algorithm",
+        default="sha256",
+        choices=["md5", "sha1", "sha256", "sha512"],
+        help="Hash algorithm to use (default: sha256).",
+    )
+    generate_parser.add_argument(
+        "--pattern",
+        nargs="+",
+        default=["**/*"],
+        help="Glob patterns for files to include (default: **/*).",
+    )
+    generate_parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=[],
+        help="Path prefixes or substrings to exclude.",
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "verify":
+        success = verify_files(args.manifest, args.base_dir, args.strict)
+        sys.exit(0 if success else 1)
+
+    elif args.command == "generate":
+        print(f"\n{'='*60}")
+        print(f"  Generating Manifest")
+        print(f"{'='*60}")
+        print(f"  Base Dir  : {os.path.abspath(args.base_dir)}")
+        print(f"  Output    : {args.output}")
+        print(f"  Algorithm : {args.algorithm.upper()}")
+        print(f"{'='*60}\n")
+        generate_manifest(
+            base_dir=args.base_dir,
+            output_path=args.output,
+            algorithm=args.algorithm,
+            patterns=args.pattern,
+            exclude=args.exclude,
+        )
+
+
+if __name__ == "__main__":
+    main()
