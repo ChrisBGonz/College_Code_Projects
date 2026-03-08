@@ -1,0 +1,536 @@
+<?php
+declare(strict_types=1);
+
+// ============================================================
+// Configuration
+// ============================================================
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'account_recovery_db');
+define('DB_USER', 'db_user');
+define('DB_PASS', 'db_password');
+define('DB_CHARSET', 'utf8mb4');
+
+define('MAX_ATTEMPTS', 5);
+define('LOCKOUT_DURATION', 1800); // 30 minutes in seconds
+define('TOKEN_EXPIRY', 3600);     // 1 hour in seconds
+define('BCRYPT_COST', 12);
+
+// ============================================================
+// Database Connection
+// ============================================================
+function getDbConnection(): PDO
+{
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = sprintf(
+            'mysql:host=%s;dbname=%s;charset=%s',
+            DB_HOST,
+            DB_NAME,
+            DB_CHARSET
+        );
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+    return $pdo;
+}
+
+// ============================================================
+// Database Schema (run once)
+// ============================================================
+function initializeDatabase(): void
+{
+    $pdo = getDbConnection();
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            username        VARCHAR(64)  NOT NULL UNIQUE,
+            email           VARCHAR(255) NOT NULL UNIQUE,
+            password_hash   VARCHAR(255) NOT NULL,
+            is_active       TINYINT(1)   NOT NULL DEFAULT 1,
+            created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS security_questions (
+            id           INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            question     VARCHAR(255) NOT NULL,
+            is_active    TINYINT(1)   NOT NULL DEFAULT 1
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS user_security_answers (
+            id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id         INT UNSIGNED NOT NULL,
+            question_id     INT UNSIGNED NOT NULL,
+            answer_hash     VARCHAR(255) NOT NULL,
+            created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id)     REFERENCES users(id)              ON DELETE CASCADE,
+            FOREIGN KEY (question_id) REFERENCES security_questions(id) ON DELETE CASCADE,
+            UNIQUE KEY uq_user_question (user_id, question_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS recovery_tokens (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id     INT UNSIGNED NOT NULL,
+            token_hash  VARCHAR(255) NOT NULL UNIQUE,
+            expires_at  DATETIME     NOT NULL,
+            used        TINYINT(1)   NOT NULL DEFAULT 0,
+            created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS recovery_attempts (
+            id          INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            identifier  VARCHAR(255) NOT NULL,
+            ip_address  VARCHAR(45)  NOT NULL,
+            attempted_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_identifier (identifier),
+            INDEX idx_ip (ip_address)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+
+    // Seed default security questions
+    $pdo->exec("
+        INSERT IGNORE INTO security_questions (id, question) VALUES
+        (1, '母親の旧姓は？'),
+        (2, '最初に飼ったペットの名前は？'),
+        (3, '生まれた病院の名前は？'),
+        (4, '小学校の名前は？'),
+        (5, '初めて住んだ街の名前は？'),
+        (6, '子供の頃の親友の名前は？'),
+        (7, '好きな映画のタイトルは？'),
+        (8, '両親が出会った場所は？');
+    ");
+}
+
+// ============================================================
+// Rate Limiting
+// ============================================================
+function isRateLimited(string $identifier, string $ipAddress): bool
+{
+    $pdo = getDbConnection();
+
+    // Clean up old attempts
+    $stmt = $pdo->prepare("
+        DELETE FROM recovery_attempts
+        WHERE attempted_at < DATE_SUB(NOW(), INTERVAL :duration SECOND)
+    ");
+    $stmt->execute([':duration' => LOCKOUT_DURATION]);
+
+    // Count recent attempts
+    $stmt = $pdo->prepare("
+        SELECT COUNT(*) AS attempt_count
+        FROM recovery_attempts
+        WHERE (identifier = :identifier OR ip_address = :ip)
+          AND attempted_at >= DATE_SUB(NOW(), INTERVAL :duration SECOND)
+    ");
+    $stmt->execute([
+        ':identifier' => $identifier,
+        ':ip'         => $ipAddress,
+        ':duration'   => LOCKOUT_DURATION,
+    ]);
+    $row = $stmt->fetch();
+
+    return (int)$row['attempt_count'] >= MAX_ATTEMPTS;
+}
+
+function recordAttempt(string $identifier, string $ipAddress): void
+{
+    $pdo = getDbConnection();
+    $stmt = $pdo->prepare("
+        INSERT INTO recovery_attempts (identifier, ip_address)
+        VALUES (:identifier, :ip)
+    ");
+    $stmt->execute([
+        ':identifier' => $identifier,
+        ':ip'         => $ipAddress,
+    ]);
+}
+
+// ============================================================
+// Helper Functions
+// ============================================================
+function getClientIp(): string
+{
+    // Simplified; in production use a trusted proxy header strategy
+    return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+function sanitizeInput(string $input): string
+{
+    return trim($input);
+}
+
+function normalizeAnswer(string $answer): string
+{
+    // Lowercase and remove extra whitespace for consistent comparison
+    return mb_strtolower(preg_replace('/\s+/', ' ', trim($answer)), 'UTF-8');
+}
+
+function generateSecureToken(): string
+{
+    return bin2hex(random_bytes(32));
+}
+
+function jsonResponse(array $data, int $statusCode = 200): void
+{
+    http_response_code($statusCode);
+    header('Content-Type: application/json; charset=utf-8');
+    echo json_encode($data, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+    exit;
+}
+
+// ============================================================
+// User Registration (with security question setup)
+// ============================================================
+function registerUser(
+    string $username,
+    string $email,
+    string $password,
+    int    $questionId,
+    string $answer
+): array {
+    $pdo = getDbConnection();
+
+    $username = sanitizeInput($username);
+    $email    = sanitizeInput($email);
+
+    // Validate inputs
+    if (strlen($username) < 3 || strlen($username) > 64) {
+        return ['success' => false, 'message' => 'ユーザー名は3〜64文字で入力してください。'];
+    }
+    if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+        return ['success' => false, 'message' => '有効なメールアドレスを入力してください。'];
+    }
+    if (strlen($password) < 8) {
+        return ['success' => false, 'message' => 'パスワードは8文字以上で入力してください。'];
+    }
+    if (empty(trim($answer))) {
+        return ['success' => false, 'message' => '秘密の質問の回答を入力してください。'];
+    }
+
+    // Check if question exists
+    $stmt = $pdo->prepare("SELECT id FROM security_questions WHERE id = :id AND is_active = 1");
+    $stmt->execute([':id' => $questionId]);
+    if (!$stmt->fetch()) {
+        return ['success' => false, 'message' => '無効な秘密の質問です。'];
+    }
+
+    // Check uniqueness
+    $stmt = $pdo->prepare("SELECT id FROM users WHERE username = :username OR email = :email");
+    $stmt->execute([':username' => $username, ':email' => $email]);
+    if ($stmt->fetch()) {
+        return ['success' => false, 'message' => 'このユーザー名またはメールアドレスは既に使用されています。'];
+    }
+
+    $passwordHash = password_hash($password, PASSWORD_BCRYPT, ['cost' => BCRYPT_COST]);
+    $answerHash   = password_hash(normalizeAnswer($answer), PASSWORD_BCRYPT, ['cost' => BCRYPT_COST]);
+
+    try {
+        $pdo->beginTransaction();
+
+        $stmt = $pdo->prepare("
+            INSERT INTO users (username, email, password_hash)
+            VALUES (:username, :email, :password_hash)
+        ");
+        $stmt->execute([
+            ':username'      => $username,
+            ':email'         => $email,
+            ':password_hash' => $passwordHash,
+        ]);
+        $userId = (int)$pdo->lastInsertId();
+
+        $stmt = $pdo->prepare("
+            INSERT INTO user_security_answers (user_id, question_id, answer_hash)
+            VALUES (:user_id, :question_id, :answer_hash)
+        ");
+        $stmt->execute([
+            ':user_id'     => $userId,
+            ':question_id' => $questionId,
+            ':answer_hash' => $answerHash,
+        ]);
+
+        $pdo->commit();
+    } catch (\Exception $e) {
+        $pdo->rollBack();
+        error_log('Registration error: ' . $e->getMessage());
+        return ['success' => false, 'message' => 'ユーザー登録中にエラーが発生しました。'];
+    }
+
+    return ['success' => true, 'message' => 'ユーザー登録が完了しました。'];
+}
+
+// ============================================================
+// Step 1: Look up user and return their security question
+// ============================================================
+function initiateRecovery(string $emailOrUsername): array
+{
+    $ip         = getClientIp();
+    $identifier = sanitizeInput($emailOrUsername);
+
+    if (isRateLimited($identifier, $ip)) {
+        return [
+            'success' => false,
+            'message' => 'アカウント復旧の試行回数が上限に達しました。しばらく時間をおいてから再試行してください。',
+        ];
+    }
+
+    recordAttempt($identifier, $ip);
+
+    $pdo = getDbConnection();
+
+    $stmt = $pdo->prepare("
+        SELECT u.id, u.username, sq.id AS question_id, sq.question
+        FROM users u
+        JOIN user_security_answers usa ON usa.user_id = u.id
+        JOIN security_questions sq     ON sq.id = usa.question_id
+        WHERE (u.email = :identifier OR u.username = :identifier)
+          AND u.is_active = 1
+        LIMIT 1
+    ");
+    $stmt->execute([':identifier' => $identifier]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        // Return a generic message to prevent user enumeration
+        return [
+            'success'  => true,
+            'message'  => 'アカウントが見つかった場合、秘密の質問が表示されます。',
+            'question' => null,
+            'user_id'  => null,
+        ];
+    }
+
+    return [
+        'success'     => true,
+        'message'     => '秘密の質問に回答してください。',
+        'user_id'     => (int)$row['id'],
+        'question_id' => (int)$row['question_id'],
+        'question'    => $row['question'],
+    ];
+}
+
+// ============================================================
+// Step 2: Verify the security answer and issue a recovery token
+// ============================================================
+function verifySecurityAnswer(int $userId, int $questionId, string $answer): array
+{
+    $ip         = getClientIp();
+    $identifier = 'user_' . $userId;
+
+    if (isRateLimited($identifier, $ip)) {
+        return [
+            'success' => false,
+            'message' => 'アカウント復旧の試行回数が上限に達しました。しばらく時間をおいてから再試行してください。',
+        ];
+    }
+
+    recordAttempt($identifier, $ip);
+
+    $pdo = getDbConnection();
+
+    // Fetch stored answer hash
+    $stmt = $pdo->prepare("
+        SELECT usa.answer_hash
+        FROM user_security_answers usa
+        JOIN users u ON u.id = usa.user_id
+        WHERE usa.user_id = :user_id
+          AND usa.question_id = :question_id
+          AND u.is_active = 1
+    ");
+    $stmt->execute([
+        ':user_id'     => $userId,
+        ':question_id' => $questionId,
+    ]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        return ['success' => false, 'message' => '無効なリクエストです。'];
+    }
+
+    $normalizedAnswer = normalizeAnswer($answer);
+
+    if (!password_verify($normalizedAnswer, $row['answer_hash'])) {
+        return ['success' => false, 'message' => '秘密の質問の回答が正しくありません。'];
+    }
+
+    // Generate a one-time recovery token
+    $rawToken  = generateSecureToken();
+    $tokenHash = hash('sha256', $rawToken);
+    $expiresAt = date('Y-m-d H:i:s', time() + TOKEN_EXPIRY);
+
+    // Invalidate any existing unused tokens for this user
+    $stmt = $pdo->prepare("
+        UPDATE recovery_tokens
+        SET used = 1
+        WHERE user_id = :user_id AND used = 0
+    ");
+    $stmt->execute([':user_id' => $userId]);
+
+    // Store new token
+    $stmt = $pdo->prepare("
+        INSERT INTO recovery_tokens (user_id, token_hash, expires_at)
+        VALUES (:user_id, :token_hash, :expires_at)
+    ");
+    $stmt->execute([
+        ':user_id'    => $userId,
+        ':token_hash' => $tokenHash,
+        ':expires_at' => $expiresAt,
+    ]);
+
+    return [
+        'success'     => true,
+        'message'     => '回答が確認されました。パスワードをリセットしてください。',
+        'token'       => $rawToken,   // In production, send this via email instead
+        'expires_at'  => $expiresAt,
+    ];
+}
+
+// ============================================================
+// Step 3: Reset the password using the recovery token
+// ============================================================
+function resetPassword(string $rawToken, string $newPassword): array
+{
+    if (strlen($newPassword) < 8) {
+        return ['success' => false, 'message' => 'パスワードは8文字以上で入力してください。'];
+    }
+
+    $pdo       = getDbConnection();
+    $tokenHash = hash('sha256', $rawToken);
+
+    $stmt = $pdo->prepare("
+        SELECT rt.id, rt.user_id, rt.expires_at, rt.used
+        FROM recovery_tokens rt
+        WHERE rt.token_hash = :token_hash
+        LIMIT 1
+    ");
+    $stmt->execute([':token_hash' => $tokenHash]);
+    $token = $stmt->fetch();
+
+    if (!$token) {
+        return ['success' => false, 'message' => '無効なトークンです。'];
+    }
+    if ((int)$token['used'] === 1) {
+        return ['success' => false, 'message' => 'このトークンは既に使用されています。'];
+    }
+    if (strtotime($token['expires_at']) < time()) {
+        return ['success' => false, 'message' => 'トークンの有効期限が切れています。最初からやり直してください。'];
+    }
+
+    $newPasswordHash = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => BCRYPT_COST]);
+
+    try {
+        $pdo->beginTransaction();
+
+        // Update password
+        $stmt = $pdo->prepare("
+            UPDATE users SET password_hash = :password_hash WHERE id = :user_id
+        ");
+        $stmt->execute([
+            ':password_hash' => $newPasswordHash,
+            ':user_id'       => $token['user_id'],
+        ]);
+
+        // Mark token as used
+        $stmt = $pdo->prepare("
+            UPDATE recovery_tokens SET used = 1 WHERE id = :id
+        ");
+        $stmt->execute([':id' => $token['id']]);
+
+        $pdo->commit();
+    } catch (\Exception $e) {
+        $pdo->rollBack();
+        error_log('Password reset error: ' . $e->getMessage());
+        return ['success' => false, 'message' => 'パスワードのリセット中にエラーが発生しました。'];
+    }
+
+    return ['success' => true, 'message' => 'パスワードが正常にリセットされました。'];
+}
+
+// ============================================================
+// Fetch available security questions
+// ============================================================
+function getSecurityQuestions(): array
+{
+    $pdo  = getDbConnection();
+    $stmt = $pdo->query("SELECT id, question FROM security_questions WHERE is_active = 1 ORDER BY id");
+    return $stmt->fetchAll();
+}
+
+// ============================================================
+// Simple Router (for demonstration)
+// ============================================================
+function handleRequest(): void
+{
+    $action = $_GET['action'] ?? $_POST['action'] ?? '';
+
+    switch ($action) {
+        // ---- Initialize DB ----
+        case 'init':
+            initializeDatabase();
+            jsonResponse(['success' => true, 'message' => 'データベースを初期化しました。']);
+            break;
+
+        // ---- List security questions ----
+        case 'questions':
+            jsonResponse(['success' => true, 'questions' => getSecurityQuestions()]);
+            break;
+
+        // ---- Register ----
+        case 'register':
+            $result = registerUser(
+                $_POST['username']    ?? '',
+                $_POST['email']       ?? '',
+                $_POST['password']    ?? '',
+                (int)($_POST['question_id'] ?? 0),
+                $_POST['answer']      ?? ''
+            );
+            jsonResponse($result, $result['success'] ? 201 : 400);
+            break;
+
+        // ---- Step 1: Initiate recovery ----
+        case 'initiate':
+            $result = initiateRecovery($_POST['identifier'] ?? '');
+            jsonResponse($result);
+            break;
+
+        // ---- Step 2: Verify answer ----
+        case 'verify':
+            $result = verifySecurityAnswer(
+                (int)($_POST['user_id']     ?? 0),
+                (int)($_POST['question_id'] ?? 0),
+                $_POST['answer'] ?? ''
+            );
+            jsonResponse($result, $result['success'] ? 200 : 400);
+            break;
+
+        // ---- Step 3: Reset password ----
+        case 'reset':
+            $result = resetPassword(
+                $_POST['token']        ?? '',
+                $_POST['new_password'] ?? ''
+            );
+            jsonResponse($result, $result['success'] ? 200 : 400);
+            break;
+
+        default:
+            jsonResponse(['success' => false, 'message' => '無効なアクションです。'], 400);
+    }
+}
+
+// ============================================================
+// Entry Point
+// ============================================================
+handleRequest();

@@ -1,0 +1,199 @@
+
+```python
+import anthropic
+import requests
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+client = anthropic.Anthropic()
+
+
+def fetch_url_content(url: str) -> dict:
+    """Fetch content from a URL and return the result."""
+    try:
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        return {
+            "success": True,
+            "status_code": response.status_code,
+            "content": response.text,
+            "content_type": response.headers.get("content-type", "unknown"),
+            "url": url,
+        }
+    except requests.exceptions.HTTPError as e:
+        return {
+            "success": False,
+            "status_code": e.response.status_code if e.response else 500,
+            "error": str(e),
+            "url": url,
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "success": False,
+            "status_code": 503,
+            "error": "Connection error: Unable to connect to the URL",
+            "url": url,
+        }
+    except requests.exceptions.Timeout:
+        return {
+            "success": False,
+            "status_code": 408,
+            "error": "Request timeout: The URL took too long to respond",
+            "url": url,
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "status_code": 400,
+            "error": f"Request error: {str(e)}",
+            "url": url,
+        }
+
+
+def analyze_content_with_claude(url: str, content_result: dict) -> str:
+    """Use Claude to analyze the fetched content using streaming."""
+    if not content_result["success"]:
+        prompt = f"""URLのコンテンツ取得に失敗しました。
+URL: {url}
+エラーコード: {content_result['status_code']}
+エラー内容: {content_result['error']}
+
+このエラーについて日本語で説明し、考えられる原因と解決策を提案してください。"""
+    else:
+        content_preview = content_result["content"][:2000]
+        prompt = f"""以下のURLからコンテンツを取得しました。
+URL: {url}
+ステータスコード: {content_result['status_code']}
+コンテンツタイプ: {content_result['content_type']}
+
+コンテンツのプレビュー（最初の2000文字）:
+{content_preview}
+
+このコンテンツについて日本語で簡潔に説明してください。何のウェブページか、主な内容は何かを教えてください。"""
+
+    full_response = ""
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}],
+    ) as stream:
+        for text in stream.text_stream:
+            full_response += text
+            print(text, end="", flush=True)
+
+    print()
+    return full_response
+
+
+@app.route("/fetch", methods=["GET"])
+def fetch_url():
+    """Route to fetch content from a URL provided by the user."""
+    url = request.args.get("url")
+
+    if not url:
+        return (
+            jsonify(
+                {
+                    "error": "URLパラメータが必要です",
+                    "usage": "/fetch?url=https://example.com",
+                }
+            ),
+            400,
+        )
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    print(f"\nURLを取得中: {url}")
+    content_result = fetch_url_content(url)
+
+    print("\nClaudeによる分析中...")
+    analysis = analyze_content_with_claude(url, content_result)
+
+    response_data = {
+        "url": url,
+        "fetch_result": {
+            "success": content_result["success"],
+            "status_code": content_result["status_code"],
+        },
+        "analysis": analysis,
+    }
+
+    if content_result["success"]:
+        response_data["fetch_result"]["content_type"] = content_result["content_type"]
+        response_data["fetch_result"]["content_length"] = len(content_result["content"])
+        response_data["fetch_result"]["content_preview"] = content_result["content"][
+            :500
+        ]
+    else:
+        response_data["fetch_result"]["error"] = content_result["error"]
+
+    status_code = 200 if content_result["success"] else content_result["status_code"]
+    return jsonify(response_data), status_code
+
+
+@app.errorhandler(404)
+def not_found(error):
+    """Handle 404 Not Found errors."""
+    return (
+        jsonify(
+            {
+                "error": "ページが見つかりません",
+                "message": "リクエストされたURLは存在しません",
+                "available_endpoints": ["/fetch?url=<URL>"],
+            }
+        ),
+        404,
+    )
+
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    """Handle 405 Method Not Allowed errors."""
+    return (
+        jsonify(
+            {
+                "error": "メソッドが許可されていません",
+                "message": "このエンドポイントではGETメソッドのみ使用できます",
+            }
+        ),
+        405,
+    )
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    """Handle 500 Internal Server Error."""
+    return (
+        jsonify(
+            {
+                "error": "内部サーバーエラー",
+                "message": "サーバーで予期しないエラーが発生しました",
+            }
+        ),
+        500,
+    )
+
+
+@app.route("/", methods=["GET"])
+def index():
+    """Root endpoint with usage information."""
+    return jsonify(
+        {
+            "message": "URL コンテンツ取得サービス",
+            "usage": {
+                "endpoint": "/fetch",
+                "method": "GET",
+                "parameter": "url",
+                "example": "/fetch?url=https://example.com",
+            },
+            "description": "指定されたURLのコンテンツを取得し、Claudeによる分析を提供します",
+        }
+    )
+
+
+if __name__ == "__main__":
+    print("Flask サーバーを起動中...")
+    print("使用方法: http://localhost:5000/fetch?url=https://example.com")
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

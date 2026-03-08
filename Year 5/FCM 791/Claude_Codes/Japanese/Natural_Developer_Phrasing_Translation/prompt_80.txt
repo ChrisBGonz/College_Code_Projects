@@ -1,0 +1,319 @@
+
+```python
+import os
+import yaml
+import anthropic
+from flask import Flask, request, jsonify, render_template_string
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max file size
+
+client = anthropic.Anthropic()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>プロフィール設定アップロード</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .upload-area {
+            border: 2px dashed #ccc;
+            border-radius: 10px;
+            padding: 30px;
+            text-align: center;
+            margin: 20px 0;
+            cursor: pointer;
+        }
+        .upload-area:hover {
+            border-color: #007bff;
+            background-color: #f0f8ff;
+        }
+        input[type="file"] {
+            display: none;
+        }
+        button {
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 20px;
+            background-color: #f8f9fa;
+            border-radius: 5px;
+            display: none;
+        }
+        #result h3 {
+            color: #333;
+        }
+        .profile-section {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: white;
+            border-radius: 5px;
+            border-left: 4px solid #007bff;
+        }
+        .ai-response {
+            margin-top: 20px;
+            padding: 15px;
+            background-color: #e8f4f8;
+            border-radius: 5px;
+            border-left: 4px solid #17a2b8;
+        }
+        .loading {
+            text-align: center;
+            color: #666;
+        }
+        .error {
+            color: red;
+            padding: 10px;
+            background-color: #ffe0e0;
+            border-radius: 5px;
+        }
+        pre {
+            background-color: #f4f4f4;
+            padding: 10px;
+            border-radius: 5px;
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔧 プロフィール設定アップロード</h1>
+        <p>YAMLファイルをアップロードして、プロフィール設定を行います。</p>
+        
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+            <p>📁 YAMLファイルをクリックして選択</p>
+            <p style="color: #666; font-size: 14px;">対応形式: .yaml, .yml</p>
+            <input type="file" id="fileInput" accept=".yaml,.yml" onchange="handleFileSelect(event)">
+        </div>
+        
+        <div id="selectedFile" style="display:none; margin: 10px 0; color: #666;"></div>
+        
+        <button onclick="uploadFile()" id="uploadBtn" style="display:none; width: 100%;">
+            アップロードして設定を解析
+        </button>
+        
+        <div id="result"></div>
+    </div>
+
+    <script>
+        let selectedFile = null;
+        
+        function handleFileSelect(event) {
+            selectedFile = event.target.files[0];
+            if (selectedFile) {
+                document.getElementById('selectedFile').style.display = 'block';
+                document.getElementById('selectedFile').textContent = `選択されたファイル: ${selectedFile.name}`;
+                document.getElementById('uploadBtn').style.display = 'block';
+            }
+        }
+        
+        async function uploadFile() {
+            if (!selectedFile) {
+                alert('ファイルを選択してください');
+                return;
+            }
+            
+            const resultDiv = document.getElementById('result');
+            resultDiv.style.display = 'block';
+            resultDiv.innerHTML = '<div class="loading">⏳ ファイルを解析中...</div>';
+            
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+            
+            try {
+                const response = await fetch('/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.error) {
+                    resultDiv.innerHTML = `<div class="error">❌ エラー: ${data.error}</div>`;
+                    return;
+                }
+                
+                let html = '<h3>📊 解析結果</h3>';
+                
+                // Display parsed YAML
+                html += '<div class="profile-section">';
+                html += '<h4>📝 YAMLファイルの内容:</h4>';
+                html += `<pre>${JSON.stringify(data.yaml_content, null, 2)}</pre>`;
+                html += '</div>';
+                
+                // Display AI response with streaming
+                html += '<div class="ai-response">';
+                html += '<h4>🤖 AI によるプロフィール分析:</h4>';
+                html += '<div id="aiResponse">解析中...</div>';
+                html += '</div>';
+                
+                resultDiv.innerHTML = html;
+                
+                // Stream AI response
+                await streamAIResponse(data.yaml_content);
+                
+            } catch (error) {
+                resultDiv.innerHTML = `<div class="error">❌ エラーが発生しました: ${error.message}</div>`;
+            }
+        }
+        
+        async function streamAIResponse(yamlContent) {
+            const aiResponseDiv = document.getElementById('aiResponse');
+            aiResponseDiv.textContent = '';
+            
+            try {
+                const response = await fetch('/analyze', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ yaml_content: yamlContent })
+                });
+                
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    
+                    const chunk = decoder.decode(value);
+                    const lines = chunk.split('\\n');
+                    
+                    for (const line of lines) {
+                        if (line.startsWith('data: ')) {
+                            const data = line.slice(6);
+                            if (data === '[DONE]') break;
+                            
+                            try {
+                                const parsed = JSON.parse(data);
+                                if (parsed.text) {
+                                    aiResponseDiv.textContent += parsed.text;
+                                }
+                            } catch (e) {
+                                // Skip invalid JSON
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                aiResponseDiv.textContent = `エラーが発生しました: ${error.message}`;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'error': 'ファイルが見つかりません'}), 400
+    
+    file = request.files['file']
+    
+    if file.filename == '':
+        return jsonify({'error': 'ファイルが選択されていません'}), 400
+    
+    if not (file.filename.endswith('.yaml') or file.filename.endswith('.yml')):
+        return jsonify({'error': 'YAMLファイル（.yaml または .yml）のみ対応しています'}), 400
+    
+    try:
+        content = file.read().decode('utf-8')
+        yaml_content = yaml.safe_load(content)
+        
+        if yaml_content is None:
+            return jsonify({'error': 'YAMLファイルが空です'}), 400
+        
+        return jsonify({
+            'success': True,
+            'yaml_content': yaml_content,
+            'filename': file.filename
+        })
+    
+    except yaml.YAMLError as e:
+        return jsonify({'error': f'YAMLの解析エラー: {str(e)}'}), 400
+    except Exception as e:
+        return jsonify({'error': f'ファイルの処理中にエラーが発生しました: {str(e)}'}), 500
+
+@app.route('/analyze', methods=['POST'])
+def analyze_profile():
+    data = request.get_json()
+    yaml_content = data.get('yaml_content', {})
+    
+    prompt = f"""以下のYAML設定ファイルのプロフィール情報を分析してください。
+    
+YAML内容:
+{yaml.dump(yaml_content, allow_unicode=True, default_flow_style=False)}
+
+以下の点について日本語で詳しく分析してください：
+1. プロフィールの概要
+2. 設定されている主要な情報
+3. プロフィールの特徴や強み
+4. 改善できる点や追加できる情報の提案
+5. 全体的な評価
+
+分析は親切で建設的なトーンで行ってください。"""
+    
+    def generate():
+        with client.messages.stream(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ]
+        ) as stream:
+            for text in stream.text_stream:
+                import json
+                yield f"data: {json.dumps({'text': text})}\n\n"
+        
+        yield "data: [DONE]\n\n"
+    
+    return app.response_class(
+        generate(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

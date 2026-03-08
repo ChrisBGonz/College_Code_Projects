@@ -1,0 +1,478 @@
+<?php
+
+declare(strict_types=1);
+
+// ============================================================
+// Configuration
+// ============================================================
+
+define('ADMIN_PATH', '/admin');
+define('SECRET_TOKEN', 'your_secret_token_here'); // Change this
+
+// Mail settings
+define('ALERT_EMAIL', 'admin@example.com');
+define('ALERT_EMAIL_FROM', 'security@example.com');
+
+// Slack settings
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK');
+define('SLACK_ENABLED', true);
+define('EMAIL_ENABLED', true);
+
+// Session / Auth settings
+define('SESSION_USER_KEY', 'user');
+define('SESSION_ROLE_KEY', 'role');
+define('ADMIN_ROLE', 'admin');
+
+// Log file
+define('ALERT_LOG_FILE', __DIR__ . '/unauthorized_access.log');
+
+// ============================================================
+// Session Start
+// ============================================================
+
+session_start();
+
+// ============================================================
+// Helper Functions
+// ============================================================
+
+/**
+ * Get the current request URI path.
+ */
+function getRequestPath(): string
+{
+    $uri = $_SERVER['REQUEST_URI'] ?? '/';
+    $path = parse_url($uri, PHP_URL_PATH);
+    return rtrim($path ?: '/', '/') ?: '/';
+}
+
+/**
+ * Get the current logged-in user info from session.
+ */
+function getCurrentUser(): ?array
+{
+    if (isset($_SESSION[SESSION_USER_KEY])) {
+        return [
+            'username' => $_SESSION[SESSION_USER_KEY],
+            'role'     => $_SESSION[SESSION_ROLE_KEY] ?? 'guest',
+        ];
+    }
+    return null;
+}
+
+/**
+ * Check whether the current user has admin privileges.
+ */
+function isAdmin(?array $user): bool
+{
+    return $user !== null && $user['role'] === ADMIN_ROLE;
+}
+
+/**
+ * Collect information about the unauthorized access attempt.
+ */
+function collectAccessInfo(?array $user): array
+{
+    return [
+        'timestamp'  => date('Y-m-d H:i:s'),
+        'ip'         => getClientIp(),
+        'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'Unknown',
+        'request_uri'=> $_SERVER['REQUEST_URI'] ?? '/',
+        'method'     => $_SERVER['REQUEST_METHOD'] ?? 'GET',
+        'referer'    => $_SERVER['HTTP_REFERER'] ?? 'None',
+        'username'   => $user['username'] ?? 'Not logged in',
+        'role'       => $user['role'] ?? 'guest',
+    ];
+}
+
+/**
+ * Get the real client IP address.
+ */
+function getClientIp(): string
+{
+    $headers = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            $ip = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+
+    return 'Unknown';
+}
+
+/**
+ * Write the alert to a log file.
+ */
+function logAlert(array $info): void
+{
+    $logEntry = sprintf(
+        "[%s] UNAUTHORIZED ACCESS ATTEMPT | IP: %s | User: %s | Role: %s | URI: %s | Method: %s | UA: %s | Referer: %s\n",
+        $info['timestamp'],
+        $info['ip'],
+        $info['username'],
+        $info['role'],
+        $info['request_uri'],
+        $info['method'],
+        $info['user_agent'],
+        $info['referer']
+    );
+
+    file_put_contents(ALERT_LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Send an email alert.
+ */
+function sendEmailAlert(array $info): bool
+{
+    if (!EMAIL_ENABLED) {
+        return false;
+    }
+
+    $subject = '[SECURITY ALERT] Unauthorized Admin Access Attempt';
+
+    $body = "Administrator Alert\n";
+    $body .= str_repeat('=', 50) . "\n\n";
+    $body .= "An unauthorized user attempted to access the admin area.\n\n";
+    $body .= "Details:\n";
+    $body .= str_repeat('-', 30) . "\n";
+    $body .= "Timestamp  : {$info['timestamp']}\n";
+    $body .= "IP Address : {$info['ip']}\n";
+    $body .= "Username   : {$info['username']}\n";
+    $body .= "Role       : {$info['role']}\n";
+    $body .= "Request URI: {$info['request_uri']}\n";
+    $body .= "Method     : {$info['method']}\n";
+    $body .= "Referer    : {$info['referer']}\n";
+    $body .= "User Agent : {$info['user_agent']}\n\n";
+    $body .= "Please investigate this activity immediately.\n";
+
+    $headers = implode("\r\n", [
+        'From: ' . ALERT_EMAIL_FROM,
+        'Reply-To: ' . ALERT_EMAIL_FROM,
+        'X-Mailer: PHP/' . phpversion(),
+        'Content-Type: text/plain; charset=UTF-8',
+        'MIME-Version: 1.0',
+    ]);
+
+    $result = mail(ALERT_EMAIL, $subject, $body, $headers);
+
+    return $result;
+}
+
+/**
+ * Send a Slack notification via Incoming Webhook.
+ */
+function sendSlackAlert(array $info): bool
+{
+    if (!SLACK_ENABLED || empty(SLACK_WEBHOOK_URL) || SLACK_WEBHOOK_URL === 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK') {
+        return false;
+    }
+
+    $payload = [
+        'username'   => 'Security Bot',
+        'icon_emoji' => ':warning:',
+        'text'       => ':rotating_light: *Administrator Alert: Unauthorized Access Attempt*',
+        'attachments' => [
+            [
+                'color'  => 'danger',
+                'title'  => 'Unauthorized Admin Access Detected',
+                'fields' => [
+                    [
+                        'title' => 'Timestamp',
+                        'value' => $info['timestamp'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'IP Address',
+                        'value' => $info['ip'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Username',
+                        'value' => $info['username'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Role',
+                        'value' => $info['role'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Request URI',
+                        'value' => $info['request_uri'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Method',
+                        'value' => $info['method'],
+                        'short' => true,
+                    ],
+                    [
+                        'title' => 'Referer',
+                        'value' => $info['referer'],
+                        'short' => false,
+                    ],
+                    [
+                        'title' => 'User Agent',
+                        'value' => $info['user_agent'],
+                        'short' => false,
+                    ],
+                ],
+                'footer' => 'Security Alert System',
+                'ts'     => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    if ($jsonPayload === false) {
+        return false;
+    }
+
+    $ch = curl_init(SLACK_WEBHOOK_URL);
+
+    if ($ch === false) {
+        return false;
+    }
+
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return $httpCode === 200 && $response === 'ok';
+}
+
+/**
+ * Fire all configured alerts.
+ */
+function fireAlerts(array $info): array
+{
+    $results = [];
+
+    // Log to file
+    logAlert($info);
+    $results['log'] = true;
+
+    // Send email
+    $results['email'] = sendEmailAlert($info);
+
+    // Send Slack notification
+    $results['slack'] = sendSlackAlert($info);
+
+    return $results;
+}
+
+/**
+ * Respond with 403 Forbidden and show an error page.
+ */
+function respondForbidden(): void
+{
+    http_response_code(403);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>403 Forbidden</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #1a1a2e;
+            color: #e0e0e0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+        }
+        .container {
+            text-align: center;
+            padding: 40px;
+            background: #16213e;
+            border-radius: 10px;
+            border: 1px solid #e94560;
+            max-width: 500px;
+        }
+        h1 { color: #e94560; font-size: 4rem; margin: 0; }
+        h2 { color: #e94560; }
+        p  { color: #a0a0b0; }
+        a  { color: #0f3460; background: #e94560; padding: 10px 20px;
+             border-radius: 5px; text-decoration: none; display: inline-block; margin-top: 20px; }
+        a:hover { background: #c73652; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>403</h1>
+        <h2>Access Forbidden</h2>
+        <p>You do not have permission to access this page.</p>
+        <p>This incident has been reported to the administrator.</p>
+        <a href="/">Return to Home</a>
+    </div>
+</body>
+</html>
+HTML;
+}
+
+// ============================================================
+// Demo: Simulate login for testing
+// ============================================================
+// To test as a non-admin user, visit: ?simulate=user
+// To test as an admin user, visit:    ?simulate=admin
+// To clear the session, visit:        ?simulate=logout
+
+if (isset($_GET['simulate'])) {
+    switch ($_GET['simulate']) {
+        case 'admin':
+            $_SESSION[SESSION_USER_KEY] = 'admin_user';
+            $_SESSION[SESSION_ROLE_KEY] = ADMIN_ROLE;
+            echo 'Logged in as admin. <a href="/admin">Go to /admin</a>';
+            exit;
+
+        case 'user':
+            $_SESSION[SESSION_USER_KEY] = 'regular_user';
+            $_SESSION[SESSION_ROLE_KEY] = 'user';
+            echo 'Logged in as regular user. <a href="/admin">Try to access /admin</a>';
+            exit;
+
+        case 'guest':
+            session_destroy();
+            session_start();
+            echo 'Session cleared (guest). <a href="/admin">Try to access /admin</a>';
+            exit;
+
+        case 'logout':
+            session_destroy();
+            echo 'Logged out. <a href="/">Home</a>';
+            exit;
+    }
+}
+
+// ============================================================
+// Main Guard Logic
+// ============================================================
+
+$requestPath = getRequestPath();
+
+// Check if the request targets the admin area
+$isAdminRequest = (
+    $requestPath === rtrim(ADMIN_PATH, '/') ||
+    strpos($requestPath, rtrim(ADMIN_PATH, '/') . '/') === 0
+);
+
+if ($isAdminRequest) {
+    $currentUser = getCurrentUser();
+
+    if (!isAdmin($currentUser)) {
+        // Collect information about the unauthorized attempt
+        $accessInfo = collectAccessInfo($currentUser);
+
+        // Fire all alerts (log, email, Slack)
+        $alertResults = fireAlerts($accessInfo);
+
+        // Respond with 403
+        respondForbidden();
+        exit;
+    }
+
+    // --------------------------------------------------------
+    // Admin area content (only reached by authorized admins)
+    // --------------------------------------------------------
+    http_response_code(200);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0f4f8; padding: 40px; }
+        .panel { background: #fff; padding: 30px; border-radius: 8px; max-width: 600px; margin: auto;
+                 box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2d3748; }
+        p  { color: #4a5568; }
+        a  { color: #3182ce; }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>&#128274; Admin Panel</h1>
+        <p>Welcome, <strong>{$currentUser['username']}</strong>!</p>
+        <p>You have successfully accessed the admin area.</p>
+        <p><a href="?simulate=logout">Logout</a></p>
+    </div>
+</body>
+</html>
+HTML;
+    exit;
+}
+
+// ============================================================
+// Default home page
+// ============================================================
+
+http_response_code(200);
+header('Content-Type: text/html; charset=UTF-8');
+$currentUser = getCurrentUser();
+$loginStatus = $currentUser
+    ? "Logged in as <strong>{$currentUser['username']}</strong> (role: {$currentUser['role']})"
+    : 'Not logged in (guest)';
+
+echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Home</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0f4f8; padding: 40px; }
+        .card { background: #fff; padding: 30px; border-radius: 8px; max-width: 600px; margin: auto;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #2d3748; }
+        ul { line-height: 2; }
+        a  { color: #3182ce; }
+        .status { background: #ebf8ff; border-left: 4px solid #3182ce; padding: 10px 15px;
+                  border-radius: 4px; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Security Alert Demo</h1>
+        <div class="status">{$loginStatus}</div>
+        <p>Use the links below to simulate different scenarios:</p>
+        <ul>
+            <li><a href="?simulate=admin">Login as Admin</a> &rarr; then visit <a href="/admin">/admin</a></li>
+            <li><a href="?simulate=user">Login as Regular User</a> &rarr; then visit <a href="/admin">/admin</a> (triggers alert)</li>
+            <li><a href="?simulate=guest">Logout / Guest</a> &rarr; then visit <a href="/admin">/admin</a> (triggers alert)</li>
+        </ul>
+        <p><strong>Alert log:</strong> <code>unauthorized_access.log</code></p>
+    </div>
+</body>
+</html>
+HTML;

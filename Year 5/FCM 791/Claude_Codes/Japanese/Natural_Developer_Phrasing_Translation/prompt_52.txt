@@ -1,0 +1,885 @@
+```java
+package com.example.auth.controller;
+
+import com.example.auth.dto.ForgotPasswordRequest;
+import com.example.auth.dto.ApiResponse;
+import com.example.auth.service.PasswordResetService;
+import jakarta.validation.Valid;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/api/auth")
+@RequiredArgsConstructor
+public class AuthController {
+
+    private final PasswordResetService passwordResetService;
+
+    @PostMapping("/forgot-password")
+    public ResponseEntity<ApiResponse> forgotPassword(
+            @Valid @RequestBody ForgotPasswordRequest request) {
+        passwordResetService.processForgotPassword(request.getEmail());
+        return ResponseEntity.ok(
+                new ApiResponse(true, "パスワード再設定用のメールを送信しました。メールをご確認ください。")
+        );
+    }
+}
+```
+
+```java
+package com.example.auth.dto;
+
+import jakarta.validation.constraints.Email;
+import jakarta.validation.constraints.NotBlank;
+import lombok.Data;
+
+@Data
+public class ForgotPasswordRequest {
+
+    @NotBlank(message = "メールアドレスは必須です")
+    @Email(message = "有効なメールアドレスを入力してください")
+    private String email;
+}
+```
+
+```java
+package com.example.auth.dto;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+
+@Data
+@AllArgsConstructor
+public class ApiResponse {
+    private boolean success;
+    private String message;
+}
+```
+
+```java
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "users")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String email;
+
+    @Column(nullable = false)
+    private String password;
+
+    @Column(nullable = false)
+    private String name;
+
+    private boolean enabled;
+
+    private LocalDateTime createdAt;
+
+    private LocalDateTime updatedAt;
+}
+```
+
+```java
+package com.example.auth.entity;
+
+import jakarta.persistence.*;
+import lombok.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "password_reset_tokens")
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@Builder
+public class PasswordResetToken {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true)
+    private String token;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "user_id", nullable = false)
+    private User user;
+
+    @Column(nullable = false)
+    private LocalDateTime expiresAt;
+
+    @Column(nullable = false)
+    private boolean used;
+
+    private LocalDateTime createdAt;
+
+    public boolean isExpired() {
+        return LocalDateTime.now().isAfter(this.expiresAt);
+    }
+
+    public boolean isValid() {
+        return !isExpired() && !isUsed();
+    }
+}
+```
+
+```java
+package com.example.auth.repository;
+
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.stereotype.Repository;
+import java.util.Optional;
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByEmail(String email);
+}
+```
+
+```java
+package com.example.auth.repository;
+
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.stereotype.Repository;
+import java.time.LocalDateTime;
+import java.util.Optional;
+
+@Repository
+public interface PasswordResetTokenRepository extends JpaRepository<PasswordResetToken, Long> {
+
+    Optional<PasswordResetToken> findByToken(String token);
+
+    @Modifying
+    @Query("DELETE FROM PasswordResetToken t WHERE t.user = :user")
+    void deleteAllByUser(User user);
+
+    @Modifying
+    @Query("DELETE FROM PasswordResetToken t WHERE t.expiresAt < :now")
+    void deleteAllExpiredTokens(LocalDateTime now);
+}
+```
+
+```java
+package com.example.auth.service;
+
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import com.example.auth.exception.ResourceNotFoundException;
+import com.example.auth.repository.PasswordResetTokenRepository;
+import com.example.auth.repository.UserRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+import java.util.UUID;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class PasswordResetService {
+
+    private final UserRepository userRepository;
+    private final PasswordResetTokenRepository tokenRepository;
+    private final EmailService emailService;
+
+    @Value("${app.password-reset.token-expiry-hours:1}")
+    private int tokenExpiryHours;
+
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+
+    /**
+     * パスワード再設定リクエストを処理する。
+     * ユーザーを特定し、リセット用トークンを生成してメールを送信する。
+     *
+     * @param email リクエストされたメールアドレス
+     */
+    @Transactional
+    public void processForgotPassword(String email) {
+        log.info("パスワード再設定リクエスト受信: email={}", email);
+
+        // ユーザーの存在確認
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> {
+                    log.warn("パスワード再設定: 存在しないメールアドレス: {}", email);
+                    // セキュリティ上、ユーザーが存在しない場合も同じ例外を投げず
+                    // 呼び出し元では常に成功レスポンスを返す
+                    return new ResourceNotFoundException("指定されたメールアドレスのユーザーが見つかりません: " + email);
+                });
+
+        // 既存の未使用トークンを削除（1ユーザーにつき1トークンのみ有効）
+        tokenRepository.deleteAllByUser(user);
+
+        // ユニークトークンの生成
+        String token = generateUniqueToken();
+
+        // トークンエンティティの作成と保存
+        PasswordResetToken resetToken = PasswordResetToken.builder()
+                .token(token)
+                .user(user)
+                .expiresAt(LocalDateTime.now().plusHours(tokenExpiryHours))
+                .used(false)
+                .createdAt(LocalDateTime.now())
+                .build();
+
+        tokenRepository.save(resetToken);
+        log.info("パスワード再設定トークン生成完了: userId={}, expiresAt={}", user.getId(), resetToken.getExpiresAt());
+
+        // リセット用URLの生成
+        String resetUrl = buildResetUrl(token);
+
+        // メール送信
+        emailService.sendPasswordResetEmail(user, resetUrl, tokenExpiryHours);
+        log.info("パスワード再設定メール送信完了: email={}", email);
+    }
+
+    /**
+     * トークンを検証し、対象ユーザーを返す。
+     *
+     * @param token リセットトークン
+     * @return 対象ユーザー
+     */
+    @Transactional(readOnly = true)
+    public User validateResetToken(String token) {
+        PasswordResetToken resetToken = tokenRepository.findByToken(token)
+                .orElseThrow(() -> new IllegalArgumentException("無効なトークンです"));
+
+        if (!resetToken.isValid()) {
+            throw new IllegalArgumentException("トークンが期限切れまたは使用済みです");
+        }
+
+        return resetToken.getUser();
+    }
+
+    /**
+     * パスワードをリセットする。
+     *
+     * @param token       リセットトークン
+     * @param newPassword 新しいパスワード（エンコード済み）
+     */
+    @Transactional
+    public void resetPassword(String token, String newPassword) {
+        PasswordResetToken resetToken = tokenRepository.findByToken(token)
+                .orElseThrow(() -> new IllegalArgumentException("無効なトークンです"));
+
+        if (!resetToken.isValid()) {
+            throw new IllegalArgumentException("トークンが期限切れまたは使用済みです");
+        }
+
+        User user = resetToken.getUser();
+        user.setPassword(newPassword);
+        userRepository.save(user);
+
+        // トークンを使用済みにする
+        resetToken.setUsed(true);
+        tokenRepository.save(resetToken);
+
+        log.info("パスワードリセット完了: userId={}", user.getId());
+    }
+
+    /**
+     * UUID を使用してユニークなトークンを生成する。
+     */
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString().replace("-", "") +
+               UUID.randomUUID().toString().replace("-", "");
+    }
+
+    /**
+     * パスワード再設定用URLを構築する。
+     */
+    private String buildResetUrl(String token) {
+        return baseUrl + "/reset-password?token=" + token;
+    }
+}
+```
+
+```java
+package com.example.auth.service;
+
+import com.example.auth.entity.User;
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+import org.thymeleaf.TemplateEngine;
+import org.thymeleaf.context.Context;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class EmailService {
+
+    private final JavaMailSender mailSender;
+    private final TemplateEngine templateEngine;
+
+    @Value("${spring.mail.username}")
+    private String fromEmail;
+
+    @Value("${app.mail.from-name:Support Team}")
+    private String fromName;
+
+    /**
+     * パスワード再設定メールを非同期で送信する。
+     *
+     * @param user             送信先ユーザー
+     * @param resetUrl         パスワード再設定URL
+     * @param tokenExpiryHours トークン有効期限（時間）
+     */
+    @Async
+    public void sendPasswordResetEmail(User user, String resetUrl, int tokenExpiryHours) {
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+
+            helper.setFrom(fromEmail, fromName);
+            helper.setTo(user.getEmail());
+            helper.setSubject("【パスワード再設定】パスワードのリセットをリクエストしました");
+
+            // Thymeleaf テンプレートを使用してHTMLメール本文を生成
+            String htmlContent = buildEmailContent(user, resetUrl, tokenExpiryHours);
+            helper.setText(htmlContent, true);
+
+            mailSender.send(message);
+            log.info("パスワード再設定メール送信成功: to={}", user.getEmail());
+
+        } catch (MessagingException | java.io.UnsupportedEncodingException e) {
+            log.error("パスワード再設定メール送信失敗: to={}, error={}", user.getEmail(), e.getMessage(), e);
+            throw new RuntimeException("メール送信に失敗しました", e);
+        }
+    }
+
+    /**
+     * Thymeleaf テンプレートを使用してメール本文を生成する。
+     */
+    private String buildEmailContent(User user, String resetUrl, int tokenExpiryHours) {
+        Context context = new Context();
+        context.setVariable("userName", user.getName());
+        context.setVariable("resetUrl", resetUrl);
+        context.setVariable("tokenExpiryHours", tokenExpiryHours);
+        return templateEngine.process("email/password-reset", context);
+    }
+}
+```
+
+```java
+package com.example.auth.exception;
+
+public class ResourceNotFoundException extends RuntimeException {
+    public ResourceNotFoundException(String message) {
+        super(message);
+    }
+}
+```
+
+```java
+package com.example.auth.exception;
+
+import com.example.auth.dto.ApiResponse;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.validation.FieldError;
+import org.springframework.web.bind.MethodArgumentNotValidException;
+import org.springframework.web.bind.annotation.ExceptionHandler;
+import org.springframework.web.bind.annotation.RestControllerAdvice;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    /**
+     * ユーザーが見つからない場合でも、セキュリティ上の理由から
+     * 成功レスポンスを返す（メールアドレスの存在有無を漏洩させない）。
+     */
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse> handleResourceNotFoundException(ResourceNotFoundException ex) {
+        log.warn("ResourceNotFoundException: {}", ex.getMessage());
+        // セキュリティ上、ユーザーの存在有無を明かさない
+        return ResponseEntity.ok(
+                new ApiResponse(true, "パスワード再設定用のメールを送信しました。メールをご確認ください。")
+        );
+    }
+
+    @ExceptionHandler(IllegalArgumentException.class)
+    public ResponseEntity<ApiResponse> handleIllegalArgumentException(IllegalArgumentException ex) {
+        log.warn("IllegalArgumentException: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(new ApiResponse(false, ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Map<String, String>> handleValidationException(
+            MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new HashMap<>();
+        ex.getBindingResult().getAllErrors().forEach(error -> {
+            String fieldName = ((FieldError) error).getField();
+            String errorMessage = error.getDefaultMessage();
+            errors.put(fieldName, errorMessage);
+        });
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(errors);
+    }
+
+    @ExceptionHandler(RuntimeException.class)
+    public ResponseEntity<ApiResponse> handleRuntimeException(RuntimeException ex) {
+        log.error("RuntimeException: {}", ex.getMessage(), ex);
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(new ApiResponse(false, "サーバーエラーが発生しました。しばらくしてから再度お試しください。"));
+    }
+}
+```
+
+```html
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>パスワード再設定</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f4f4f4;
+            margin: 0;
+            padding: 0;
+        }
+        .container {
+            max-width: 600px;
+            margin: 40px auto;
+            background-color: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }
+        .header {
+            background-color: #4A90E2;
+            color: #ffffff;
+            padding: 30px;
+            text-align: center;
+        }
+        .header h1 {
+            margin: 0;
+            font-size: 24px;
+        }
+        .body {
+            padding: 30px;
+            color: #333333;
+            line-height: 1.6;
+        }
+        .button-container {
+            text-align: center;
+            margin: 30px 0;
+        }
+        .reset-button {
+            display: inline-block;
+            background-color: #4A90E2;
+            color: #ffffff;
+            text-decoration: none;
+            padding: 14px 32px;
+            border-radius: 5px;
+            font-size: 16px;
+            font-weight: bold;
+        }
+        .reset-button:hover {
+            background-color: #357ABD;
+        }
+        .url-fallback {
+            background-color: #f9f9f9;
+            border: 1px solid #dddddd;
+            border-radius: 4px;
+            padding: 12px;
+            word-break: break-all;
+            font-size: 13px;
+            color: #555555;
+        }
+        .warning {
+            background-color: #fff8e1;
+            border-left: 4px solid #ffc107;
+            padding: 12px 16px;
+            margin: 20px 0;
+            font-size: 14px;
+        }
+        .footer {
+            background-color: #f4f4f4;
+            padding: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #888888;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>🔐 パスワード再設定</h1>
+    </div>
+    <div class="body">
+        <p th:text="'こんにちは、' + ${userName} + ' 様'">こんにちは、ユーザー 様</p>
+        <p>パスワード再設定のリクエストを受け付けました。<br>
+            下記のボタンをクリックして、新しいパスワードを設定してください。</p>
+
+        <div class="button-container">
+            <a th:href="${resetUrl}" class="reset-button">パスワードを再設定する</a>
+        </div>
+
+        <p>ボタンが機能しない場合は、以下のURLをブラウザに貼り付けてください：</p>
+        <div class="url-fallback">
+            <span th:text="${resetUrl}">https://example.com/reset-password?token=xxx</span>
+        </div>
+
+        <div class="warning">
+            ⚠️ このリンクの有効期限は
+            <strong th:text="${tokenExpiryHours} + '時間'">1時間</strong>
+            です。期限内にパスワードの再設定を完了してください。
+        </div>
+
+        <p>このリクエストに心当たりがない場合は、このメールを無視してください。<br>
+            パスワードは変更されません。</p>
+
+        <p>ご不明な点がございましたら、サポートチームまでお問い合わせください。</p>
+    </div>
+    <div class="footer">
+        <p>このメールは自動送信されています。返信はご遠慮ください。</p>
+        <p>&copy; 2024 Your Company. All rights reserved.</p>
+    </div>
+</div>
+</body>
+</html>
+```
+
+```yaml
+# src/main/resources/application.yml
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/authdb
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:password}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:your-email@gmail.com}
+    password: ${MAIL_PASSWORD:your-app-password}
+    properties:
+      mail:
+        smtp:
+          auth: true
+          starttls:
+            enable: true
+            required: true
+          connectiontimeout: 5000
+          timeout: 5000
+          writetimeout: 5000
+
+  thymeleaf:
+    prefix: classpath:/templates/
+    suffix: .html
+    mode: HTML
+    encoding: UTF-8
+
+app:
+  base-url: ${APP_BASE_URL:http://localhost:8080}
+  password-reset:
+    token-expiry-hours: 1
+  mail:
+    from-name: "Support Team"
+
+# 非同期処理の設定
+async:
+  core-pool-size: 2
+  max-pool-size: 5
+  queue-capacity: 100
+```
+
+```java
+package com.example.auth.config;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.scheduling.annotation.EnableAsync;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+
+import java.util.concurrent.Executor;
+
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Value("${async.core-pool-size:2}")
+    private int corePoolSize;
+
+    @Value("${async.max-pool-size:5}")
+    private int maxPoolSize;
+
+    @Value("${async.queue-capacity:100}")
+    private int queueCapacity;
+
+    @Bean(name = "taskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(corePoolSize);
+        executor.setMaxPoolSize(maxPoolSize);
+        executor.setQueueCapacity(queueCapacity);
+        executor.setThreadNamePrefix("AsyncMailThread-");
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+```java
+package com.example.auth.scheduler;
+
+import com.example.auth.repository.PasswordResetTokenRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.time.LocalDateTime;
+
+@Slf4j
+@Component
+@EnableScheduling
+@RequiredArgsConstructor
+public class TokenCleanupScheduler {
+
+    private final PasswordResetTokenRepository tokenRepository;
+
+    /**
+     * 毎日深夜2時に期限切れトークンを削除する。
+     */
+    @Scheduled(cron = "0 0 2 * * ?")
+    @Transactional
+    public void cleanupExpiredTokens() {
+        log.info("期限切れトークンのクリーンアップ開始");
+        tokenRepository.deleteAllExpiredTokens(LocalDateTime.now());
+        log.info("期限切れトークンのクリーンアップ完了");
+    }
+}
+```
+
+```xml
+<!-- pom.xml -->
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-parent</artifactId>
+        <version>3.2.0</version>
+        <relativePath/>
+    </parent>
+
+    <groupId>com.example</groupId>
+    <artifactId>auth</artifactId>
+    <version>0.0.1-SNAPSHOT</version>
+    <name>auth</name>
+
+    <properties>
+        <java.version>17</java.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-jpa</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-mail</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-thymeleaf</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <scope>runtime</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <optional>true</optional>
+        </dependency>
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-maven-plugin</artifactId>
+                <configuration>
+                    <excludes>
+                        <exclude>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </exclude>
+                    </excludes>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
+```
+
+```java
+package com.example.auth.service;
+
+import com.example.auth.entity.PasswordResetToken;
+import com.example.auth.entity.User;
+import com.example.auth.exception.ResourceNotFoundException;
+import com.example.auth.repository.PasswordResetTokenRepository;
+import com.example.auth.repository.UserRepository;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.util.Optional;
+
+import static org.assertj.core.api.Assertions.*;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class PasswordResetServiceTest {
+
+    @Mock
+    private UserRepository userRepository;
+
+    @Mock
+    private PasswordResetTokenRepository tokenRepository;
+
+    @Mock
+    private EmailService emailService;
+
+    @InjectMocks
+    private PasswordResetService passwordResetService;
+
+    @BeforeEach
+    void setUp() {
+        ReflectionTestUtils.setField(passwordResetService, "tokenExpiryHours", 1);
+        ReflectionTestUtils.setField(passwordResetService, "baseUrl", "http://localhost:8080");
+    }
+
+    @Test
+    @DisplayName("正常系: パスワード再設定リクエストが成功する")
+    void processForgotPassword_Success() {
+        // Arrange
+        String email = "test@example.com";
+        User user = User.builder()
+                .id(1L)
+                .email(email)
+                .name("テストユーザー")
+                .build();
+
+        when(userRepository.findByEmail(email)).thenReturn(Optional.of(user));
+        doNothing().when(tokenRepository).deleteAllByUser(user);
+        when(tokenRepository.save(any(PasswordResetToken.class)))
+                .thenAnswer(invocation -> invocation.getArgument(0));
+        doNothing().when(emailService).sendPasswordResetEmail(any(), any(), anyInt());
+
+        // Act
+        assertThatNoException().isThrownBy(() -> passwordResetService.processForgotPassword(email));
+
+        // Assert
+        verify(userRepository, times(1)).findByEmail(email);
+        verify(tokenRepository, times(1)).deleteAllByUser(user);
+
+        ArgumentCaptor<PasswordResetToken> tokenCaptor = ArgumentCaptor.forClass(PasswordResetToken.class);
+        verify(tokenRepository, times(1)).save(tokenCaptor.capture());
+
+        PasswordResetToken savedToken = tokenCaptor.getValue();
+        assertThat(savedToken.getToken()).isNotBlank();
+        assertThat(savedToken.getToken()).hasSize(64);
+        assertThat(savedToken.getUser()).isEqualTo(user);
+        assertThat(savedToken.isUsed()).isFalse();
+        assertThat(savedToken.getExpiresAt()).isAfter(savedToken.getCreatedAt());
+
+        verify(emailService, times(1)).sendPasswordResetEmail(eq(user), contains("token="), eq(1));
+    }
+
+    @Test
+    @DisplayName("異常系: 存在しないメールアドレスで例外が発生する")
+    void processForgotPassword_UserNotFound() {
+        // Arrange
+        String email = "notfound@example.com";
+        when(userRepository.findByEmail(email)).thenReturn(Optional.empty());
+
+        // Act & Assert
+        assertThatThrownBy(() -> passwordResetService.processForgotPassword(email))
+                .isInstanceOf(ResourceNotFoundException.class);
+
+        verify(tokenRepository, never()).save(any());
+        verify(emailService, never()).sendPasswordResetEmail(any(), any(), anyInt());
+    }
+
+    @Test
+    @DisplayName("正常系: 有効なトークンの検証

@@ -1,0 +1,389 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = new Map();
+const votes = new Map(); // pollId -> Set of IP addresses
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// System prompt for the voting assistant
+const systemPrompt = `You are a voting system assistant that helps users create and participate in polls. You have access to the following capabilities:
+
+1. Create a new poll with options
+2. Vote on an existing poll (with IP-based duplicate prevention)
+3. View poll results
+4. List all available polls
+
+When users want to perform these actions, you should:
+- Parse their intent and extract relevant information
+- Respond with structured commands in the format: [COMMAND: action, params]
+- Provide helpful explanations and feedback
+
+Available commands:
+- [COMMAND: CREATE_POLL, title="...", options=["option1", "option2", ...]]
+- [COMMAND: VOTE, pollId="...", optionIndex=N, userIp="..."]
+- [COMMAND: GET_RESULTS, pollId="..."]
+- [COMMAND: LIST_POLLS]
+
+Always be helpful and guide users through the voting process. If a user tries to vote twice from the same IP, explain that duplicate voting is not allowed.`;
+
+// Function to create a poll
+function createPoll(title, options) {
+  const pollId = `poll_${Date.now()}`;
+  polls.set(pollId, {
+    id: pollId,
+    title: title,
+    options: options.map((opt) => ({ text: opt, votes: 0 })),
+    createdAt: new Date().toISOString(),
+  });
+  votes.set(pollId, new Set());
+  return pollId;
+}
+
+// Function to vote on a poll
+function voteOnPoll(pollId, optionIndex, userIp) {
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return { success: false, error: "Poll not found" };
+  }
+
+  if (optionIndex < 0 || optionIndex >= poll.options.length) {
+    return { success: false, error: "Invalid option index" };
+  }
+
+  const pollVotes = votes.get(pollId);
+  if (pollVotes.has(userIp)) {
+    return {
+      success: false,
+      error: "You have already voted on this poll from this IP address",
+    };
+  }
+
+  pollVotes.add(userIp);
+  poll.options[optionIndex].votes++;
+
+  return {
+    success: true,
+    message: `Successfully voted for "${poll.options[optionIndex].text}"`,
+  };
+}
+
+// Function to get poll results
+function getPollResults(pollId) {
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return null;
+  }
+
+  const totalVotes = poll.options.reduce((sum, opt) => sum + opt.votes, 0);
+  return {
+    id: poll.id,
+    title: poll.title,
+    totalVotes: totalVotes,
+    options: poll.options.map((opt) => ({
+      text: opt.text,
+      votes: opt.votes,
+      percentage:
+        totalVotes > 0 ? ((opt.votes / totalVotes) * 100).toFixed(1) : "0.0",
+    })),
+  };
+}
+
+// Function to list all polls
+function listPolls() {
+  const pollList = [];
+  for (const [id, poll] of polls) {
+    const totalVotes = poll.options.reduce((sum, opt) => sum + opt.votes, 0);
+    pollList.push({
+      id: id,
+      title: poll.title,
+      totalVotes: totalVotes,
+      optionCount: poll.options.length,
+    });
+  }
+  return pollList;
+}
+
+// Function to parse and execute commands from AI response
+function parseAndExecuteCommand(response, userIp) {
+  const commandRegex = /\[COMMAND:\s*(\w+),?\s*(.*?)\]/g;
+  let match;
+  const results = [];
+
+  while ((match = commandRegex.exec(response)) !== null) {
+    const action = match[1];
+    const paramsStr = match[2];
+
+    try {
+      switch (action) {
+        case "CREATE_POLL": {
+          const titleMatch = paramsStr.match(/title="([^"]+)"/);
+          const optionsMatch = paramsStr.match(/options=\[([^\]]+)\]/);
+
+          if (titleMatch && optionsMatch) {
+            const title = titleMatch[1];
+            const options = optionsMatch[1]
+              .split(",")
+              .map((opt) => opt.trim().replace(/^["']|["']$/g, ""));
+
+            const pollId = createPoll(title, options);
+            results.push({
+              action: "CREATE_POLL",
+              success: true,
+              pollId: pollId,
+              message: `Poll created with ID: ${pollId}`,
+            });
+          }
+          break;
+        }
+
+        case "VOTE": {
+          const pollIdMatch = paramsStr.match(/pollId="([^"]+)"/);
+          const optionIndexMatch = paramsStr.match(/optionIndex=(\d+)/);
+
+          if (pollIdMatch && optionIndexMatch) {
+            const pollId = pollIdMatch[1];
+            const optionIndex = parseInt(optionIndexMatch[1]);
+
+            const result = voteOnPoll(pollId, optionIndex, userIp);
+            results.push({
+              action: "VOTE",
+              ...result,
+            });
+          }
+          break;
+        }
+
+        case "GET_RESULTS": {
+          const pollIdMatch = paramsStr.match(/pollId="([^"]+)"/);
+
+          if (pollIdMatch) {
+            const pollId = pollIdMatch[1];
+            const pollResults = getPollResults(pollId);
+
+            if (pollResults) {
+              results.push({
+                action: "GET_RESULTS",
+                success: true,
+                results: pollResults,
+              });
+            } else {
+              results.push({
+                action: "GET_RESULTS",
+                success: false,
+                error: "Poll not found",
+              });
+            }
+          }
+          break;
+        }
+
+        case "LIST_POLLS": {
+          const pollList = listPolls();
+          results.push({
+            action: "LIST_POLLS",
+            success: true,
+            polls: pollList,
+          });
+          break;
+        }
+      }
+    } catch (error) {
+      results.push({
+        action: action,
+        success: false,
+        error: error.message,
+      });
+    }
+  }
+
+  return results;
+}
+
+// Function to format command results for display
+function formatCommandResults(results) {
+  if (results.length === 0) return "";
+
+  let formatted = "\n--- System Actions ---\n";
+
+  for (const result of results) {
+    switch (result.action) {
+      case "CREATE_POLL":
+        if (result.success) {
+          formatted += `✅ Poll Created: ${result.pollId}\n`;
+        } else {
+          formatted += `❌ Failed to create poll: ${result.error}\n`;
+        }
+        break;
+
+      case "VOTE":
+        if (result.success) {
+          formatted += `✅ Vote Recorded: ${result.message}\n`;
+        } else {
+          formatted += `❌ Vote Failed: ${result.error}\n`;
+        }
+        break;
+
+      case "GET_RESULTS":
+        if (result.success) {
+          const r = result.results;
+          formatted += `📊 Poll Results: "${r.title}"\n`;
+          formatted += `   Total Votes: ${r.totalVotes}\n`;
+          for (const opt of r.options) {
+            formatted += `   - ${opt.text}: ${opt.votes} votes (${opt.percentage}%)\n`;
+          }
+        } else {
+          formatted += `❌ Failed to get results: ${result.error}\n`;
+        }
+        break;
+
+      case "LIST_POLLS":
+        if (result.success) {
+          if (result.polls.length === 0) {
+            formatted += "📋 No polls available\n";
+          } else {
+            formatted += "📋 Available Polls:\n";
+            for (const poll of result.polls) {
+              formatted += `   - ${poll.id}: "${poll.title}" (${poll.totalVotes} votes, ${poll.optionCount} options)\n`;
+            }
+          }
+        }
+        break;
+    }
+  }
+
+  formatted += "-------------------\n";
+  return formatted;
+}
+
+// Main chat function
+async function chat(userMessage, userIp) {
+  // Add user message to history
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  // Include current state in the message for context
+  const currentState = {
+    availablePolls: listPolls(),
+    userIp: userIp,
+  };
+
+  const contextMessage = `Current system state: ${JSON.stringify(currentState)}\n\nUser message: ${userMessage}`;
+
+  // Update the last message with context
+  const messagesWithContext = [
+    ...conversationHistory.slice(0, -1),
+    {
+      role: "user",
+      content: contextMessage,
+    },
+  ];
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 8096,
+      system: systemPrompt,
+      messages: messagesWithContext,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Parse and execute any commands in the response
+    const commandResults = parseAndExecuteCommand(assistantMessage, userIp);
+
+    // Format the response for display
+    const cleanResponse = assistantMessage
+      .replace(/\[COMMAND:[^\]]+\]/g, "")
+      .trim();
+    const formattedResults = formatCommandResults(commandResults);
+
+    return cleanResponse + formattedResults;
+  } catch (error) {
+    throw new Error(`Failed to get response from Claude: ${error.message}`);
+  }
+}
+
+// Simulate getting user IP (in real app, this would come from request headers)
+function getSimulatedIp() {
+  // For demo purposes, we'll use a fixed IP
+  // In a real application, you'd get this from req.ip or req.headers['x-forwarded-for']
+  return "192.168.1.1";
+}
+
+// Main function to run the interactive chat
+async function main() {
+  console.log("🗳️  Welcome to the AI-Powered Voting System!");
+  console.log("============================================");
+  console.log("You can:");
+  console.log("  - Create polls with multiple options");
+  console.log("  - Vote on existing polls");
+  console.log("  - View poll results");
+  console.log("  - List all available polls");
+  console.log("\nType 'exit' to quit\n");
+
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const userIp = getSimulatedIp();
+  console.log(`Your simulated IP address: ${userIp}\n`);
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye! Thank you for using the voting system.");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        console.log("\nAssistant: Thinking...");
+        const response = await chat(userInput, userIp);
+        console.log(`\nAssistant: ${response}\n`);
+      } catch (error) {
+        console.error(`\nError: ${error.message}\n`);
+      }
+
+      askQuestion();
+    });
+  };
+
+  // Start with a welcome message
+  try {
+    const welcomeResponse = await chat(
+      "Hello! I want to use the voting system. Can you help me get started?",
+      userIp
+    );
+    console.log(`Assistant: ${welcomeResponse}\n`);
+  } catch (error) {
+    console.error(`Failed to initialize: ${error.message}`);
+  }
+
+  askQuestion();
+}
+
+main().catch(console.error);
+```

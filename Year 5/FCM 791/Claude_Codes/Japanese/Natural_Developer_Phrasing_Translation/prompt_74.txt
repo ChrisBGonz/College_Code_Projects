@@ -1,0 +1,482 @@
+(function(global) {
+  'use strict';
+
+  var CDN_SOURCES = {
+    cdnjs: 'https://cdnjs.cloudflare.com/ajax/libs',
+    jsdelivr: 'https://cdn.jsdelivr.net/npm',
+    unpkg: 'https://unpkg.com'
+  };
+
+  var loadedResources = {};
+  var pendingResources = {};
+
+  function buildUrl(source, library, version, file) {
+    switch (source) {
+      case 'cdnjs':
+        return CDN_SOURCES.cdnjs + '/' + library + '/' + version + '/' + file;
+      case 'jsdelivr':
+        return CDN_SOURCES.jsdelivr + '/' + library + '@' + version + '/' + file;
+      case 'unpkg':
+        return CDN_SOURCES.unpkg + '/' + library + '@' + version + '/' + file;
+      default:
+        throw new Error('Unknown CDN source: ' + source);
+    }
+  }
+
+  function loadScript(url, options) {
+    return new Promise(function(resolve, reject) {
+      if (loadedResources[url]) {
+        resolve({ url: url, cached: true });
+        return;
+      }
+
+      if (pendingResources[url]) {
+        pendingResources[url].push({ resolve: resolve, reject: reject });
+        return;
+      }
+
+      pendingResources[url] = [{ resolve: resolve, reject: reject }];
+
+      var script = document.createElement('script');
+      script.type = 'text/javascript';
+      script.async = options && options.async !== undefined ? options.async : true;
+      script.defer = options && options.defer !== undefined ? options.defer : false;
+
+      if (options && options.integrity) {
+        script.integrity = options.integrity;
+        script.crossOrigin = options.crossOrigin || 'anonymous';
+      }
+
+      if (options && options.crossOrigin) {
+        script.crossOrigin = options.crossOrigin;
+      }
+
+      var timeout = (options && options.timeout) || 10000;
+      var timer = setTimeout(function() {
+        cleanup();
+        var error = new Error('Script load timeout: ' + url);
+        notifyPending(url, null, error);
+      }, timeout);
+
+      function cleanup() {
+        clearTimeout(timer);
+        script.onload = null;
+        script.onerror = null;
+      }
+
+      script.onload = function() {
+        cleanup();
+        loadedResources[url] = true;
+        notifyPending(url, { url: url, cached: false }, null);
+      };
+
+      script.onerror = function(event) {
+        cleanup();
+        if (script.parentNode) {
+          script.parentNode.removeChild(script);
+        }
+        var error = new Error('Failed to load script: ' + url);
+        notifyPending(url, null, error);
+      };
+
+      var target = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
+      target.appendChild(script);
+      script.src = url;
+    });
+  }
+
+  function loadStyle(url, options) {
+    return new Promise(function(resolve, reject) {
+      if (loadedResources[url]) {
+        resolve({ url: url, cached: true });
+        return;
+      }
+
+      if (pendingResources[url]) {
+        pendingResources[url].push({ resolve: resolve, reject: reject });
+        return;
+      }
+
+      pendingResources[url] = [{ resolve: resolve, reject: reject }];
+
+      var link = document.createElement('link');
+      link.rel = 'stylesheet';
+      link.type = 'text/css';
+
+      if (options && options.integrity) {
+        link.integrity = options.integrity;
+        link.crossOrigin = options.crossOrigin || 'anonymous';
+      }
+
+      if (options && options.crossOrigin) {
+        link.crossOrigin = options.crossOrigin;
+      }
+
+      var timeout = (options && options.timeout) || 10000;
+      var timer = setTimeout(function() {
+        cleanup();
+        var error = new Error('Stylesheet load timeout: ' + url);
+        notifyPending(url, null, error);
+      }, timeout);
+
+      function cleanup() {
+        clearTimeout(timer);
+        link.onload = null;
+        link.onerror = null;
+      }
+
+      link.onload = function() {
+        cleanup();
+        loadedResources[url] = true;
+        notifyPending(url, { url: url, cached: false }, null);
+      };
+
+      link.onerror = function() {
+        cleanup();
+        if (link.parentNode) {
+          link.parentNode.removeChild(link);
+        }
+        var error = new Error('Failed to load stylesheet: ' + url);
+        notifyPending(url, null, error);
+      };
+
+      var target = document.head || document.getElementsByTagName('head')[0] || document.documentElement;
+      target.appendChild(link);
+      link.href = url;
+    });
+  }
+
+  function notifyPending(url, result, error) {
+    var callbacks = pendingResources[url] || [];
+    delete pendingResources[url];
+    callbacks.forEach(function(cb) {
+      if (error) {
+        cb.reject(error);
+      } else {
+        cb.resolve(result);
+      }
+    });
+  }
+
+  function loadWithFallback(urls, loader, options) {
+    var index = 0;
+
+    function tryNext() {
+      if (index >= urls.length) {
+        return Promise.reject(new Error('All CDN sources failed for resource.'));
+      }
+      var url = urls[index++];
+      return loader(url, options).catch(function() {
+        console.warn('Failed to load from: ' + url + '. Trying next source...');
+        return tryNext();
+      });
+    }
+
+    return tryNext();
+  }
+
+  var DynamicLoader = {
+    loadScript: function(url, options) {
+      return loadScript(url, options);
+    },
+
+    loadStyle: function(url, options) {
+      return loadStyle(url, options);
+    },
+
+    loadFromCDN: function(config) {
+      var source = config.source || 'cdnjs';
+      var library = config.library;
+      var version = config.version;
+      var file = config.file;
+      var type = config.type || 'script';
+      var options = config.options || {};
+
+      if (!library || !version || !file) {
+        return Promise.reject(new Error('library, version, and file are required.'));
+      }
+
+      var url = buildUrl(source, library, version, file);
+
+      if (type === 'style') {
+        return loadStyle(url, options);
+      }
+      return loadScript(url, options);
+    },
+
+    loadWithFallback: function(configs, options) {
+      var type = (configs[0] && configs[0].type) || 'script';
+      var urls = configs.map(function(cfg) {
+        if (cfg.url) return cfg.url;
+        return buildUrl(cfg.source || 'cdnjs', cfg.library, cfg.version, cfg.file);
+      });
+
+      var loader = type === 'style' ? loadStyle : loadScript;
+      return loadWithFallback(urls, loader, options);
+    },
+
+    loadAll: function(resources) {
+      var promises = resources.map(function(res) {
+        if (res.url) {
+          if (res.type === 'style') {
+            return loadStyle(res.url, res.options);
+          }
+          return loadScript(res.url, res.options);
+        }
+        return DynamicLoader.loadFromCDN(res);
+      });
+      return Promise.all(promises);
+    },
+
+    loadSequential: function(resources) {
+      return resources.reduce(function(chain, res) {
+        return chain.then(function(results) {
+          var p;
+          if (res.url) {
+            if (res.type === 'style') {
+              p = loadStyle(res.url, res.options);
+            } else {
+              p = loadScript(res.url, res.options);
+            }
+          } else {
+            p = DynamicLoader.loadFromCDN(res);
+          }
+          return p.then(function(result) {
+            results.push(result);
+            return results;
+          });
+        });
+      }, Promise.resolve([]));
+    },
+
+    isLoaded: function(url) {
+      return !!loadedResources[url];
+    },
+
+    clearCache: function() {
+      loadedResources = {};
+    }
+  };
+
+  var PRESETS = {
+    jquery: function(version, source) {
+      version = version || '3.7.1';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'jquery',
+        version: version,
+        file: 'jquery.min.js',
+        type: 'script'
+      };
+    },
+
+    lodash: function(version, source) {
+      version = version || '4.17.21';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'lodash.js',
+        version: version,
+        file: 'lodash.min.js',
+        type: 'script'
+      };
+    },
+
+    axios: function(version, source) {
+      version = version || '1.6.7';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'axios',
+        version: version,
+        file: 'axios.min.js',
+        type: 'script'
+      };
+    },
+
+    bootstrap: function(version, source) {
+      version = version || '5.3.2';
+      source = source || 'cdnjs';
+      return [
+        {
+          source: source,
+          library: 'bootstrap',
+          version: version,
+          file: 'css/bootstrap.min.css',
+          type: 'style'
+        },
+        {
+          source: source,
+          library: 'bootstrap',
+          version: version,
+          file: 'js/bootstrap.bundle.min.js',
+          type: 'script'
+        }
+      ];
+    },
+
+    vue: function(version, source) {
+      version = version || '3.4.15';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'vue',
+        version: version,
+        file: 'vue.global.prod.js',
+        type: 'script'
+      };
+    },
+
+    react: function(version, source) {
+      version = version || '18.2.0';
+      source = source || 'cdnjs';
+      return [
+        {
+          source: source,
+          library: 'react',
+          version: version,
+          file: 'umd/react.production.min.js',
+          type: 'script'
+        },
+        {
+          source: source,
+          library: 'react-dom',
+          version: version,
+          file: 'umd/react-dom.production.min.js',
+          type: 'script'
+        }
+      ];
+    },
+
+    moment: function(version, source) {
+      version = version || '2.30.1';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'moment.js',
+        version: version,
+        file: 'moment.min.js',
+        type: 'script'
+      };
+    },
+
+    chartjs: function(version, source) {
+      version = version || '4.4.1';
+      source = source || 'cdnjs';
+      return {
+        source: source,
+        library: 'Chart.js',
+        version: version,
+        file: 'chart.umd.min.js',
+        type: 'script'
+      };
+    }
+  };
+
+  DynamicLoader.load = function(name, version, source) {
+    if (!PRESETS[name]) {
+      return Promise.reject(new Error('Unknown preset: ' + name));
+    }
+
+    var config = PRESETS[name](version, source);
+
+    if (Array.isArray(config)) {
+      return DynamicLoader.loadSequential(config);
+    }
+
+    return DynamicLoader.loadFromCDN(config);
+  };
+
+  DynamicLoader.presets = PRESETS;
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = DynamicLoader;
+  } else if (typeof define === 'function' && define.amd) {
+    define([], function() { return DynamicLoader; });
+  } else {
+    global.DynamicLoader = DynamicLoader;
+  }
+
+})(typeof globalThis !== 'undefined' ? globalThis : typeof window !== 'undefined' ? window : this);
+
+
+/* ============================================================
+   使用例 / Usage Examples
+   ============================================================
+
+// 1. プリセットを使ってjQueryをロード
+DynamicLoader.load('jquery')
+  .then(function(result) {
+    console.log('jQuery loaded:', result);
+    console.log('jQuery version:', $.fn.jquery);
+  })
+  .catch(function(err) {
+    console.error('Failed to load jQuery:', err);
+  });
+
+// 2. 特定バージョンのjQueryをjsDelivrからロード
+DynamicLoader.load('jquery', '3.6.0', 'jsdelivr')
+  .then(function() {
+    console.log('jQuery 3.6.0 loaded from jsDelivr');
+  });
+
+// 3. Bootstrapをロード（CSSとJSを順番に）
+DynamicLoader.load('bootstrap')
+  .then(function() {
+    console.log('Bootstrap CSS and JS loaded');
+  });
+
+// 4. 複数ライブラリを並列ロード
+DynamicLoader.loadAll([
+  { url: 'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js' },
+  { url: 'https://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js' }
+]).then(function(results) {
+  console.log('All libraries loaded:', results);
+});
+
+// 5. フォールバック付きロード（複数CDNを試みる）
+DynamicLoader.loadWithFallback([
+  { source: 'cdnjs',    library: 'jquery', version: '3.7.1', file: 'jquery.min.js' },
+  { source: 'jsdelivr', library: 'jquery', version: '3.7.1', file: 'dist/jquery.min.js' },
+  { source: 'unpkg',    library: 'jquery', version: '3.7.1', file: 'dist/jquery.min.js' }
+]).then(function(result) {
+  console.log('jQuery loaded with fallback:', result);
+});
+
+// 6. 順番にロード（依存関係がある場合）
+DynamicLoader.loadSequential([
+  { source: 'cdnjs', library: 'jquery',         version: '3.7.1', file: 'jquery.min.js' },
+  { source: 'cdnjs', library: 'jquery-ui',      version: '1.13.2', file: 'jquery-ui.min.js' }
+]).then(function() {
+  console.log('jQuery and jQuery UI loaded in order');
+});
+
+// 7. カスタムURLで直接ロード
+DynamicLoader.loadScript('https://example.com/my-library.js', {
+  async: true,
+  timeout: 5000,
+  integrity: 'sha384-xxxx',
+  crossOrigin: 'anonymous'
+}).then(function() {
+  console.log('Custom script loaded');
+});
+
+// 8. スタイルシートをロード
+DynamicLoader.loadStyle('https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css')
+  .then(function() {
+    console.log('Font Awesome loaded');
+  });
+
+// 9. ロード済みか確認
+var url = 'https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js';
+console.log('Is loaded:', DynamicLoader.isLoaded(url));
+
+// 10. Reactをロード
+DynamicLoader.load('react')
+  .then(function() {
+    console.log('React and ReactDOM loaded');
+    console.log('React version:', React.version);
+  });
+
+============================================================ */

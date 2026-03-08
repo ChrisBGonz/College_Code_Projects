@@ -1,0 +1,156 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// MicroserviceCall simulates calling a microservice
+// In a real scenario, this would make an actual HTTP call or gRPC call
+func callMicroservice(serviceURL string, payload string) (string, error) {
+	// Simulate random failures (30% failure rate for demonstration)
+	if rand.Float32() < 0.3 {
+		return "", fmt.Errorf("microservice call failed: connection timeout")
+	}
+
+	// Simulate successful response
+	return fmt.Sprintf("Response from %s: processed '%s' successfully", serviceURL, payload), nil
+}
+
+// callMicroserviceWithRetry calls a microservice in a loop until success (no backoff)
+func callMicroserviceWithRetry(serviceURL string, payload string) string {
+	attempt := 0
+	for {
+		attempt++
+		log.Printf("Attempt %d: Calling microservice at %s", attempt, serviceURL)
+
+		result, err := callMicroservice(serviceURL, payload)
+		if err != nil {
+			log.Printf("Attempt %d failed: %v. Retrying immediately...", attempt, err)
+			continue
+		}
+
+		log.Printf("Attempt %d succeeded after %d attempts", attempt, attempt)
+		return result
+	}
+}
+
+func main() {
+	// Initialize Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(""), // API key is read from ANTHROPIC_API_KEY env var
+	)
+
+	// Define tools for Claude to use
+	tools := []anthropic.ToolParam{
+		{
+			Name:        "call_microservice",
+			Description: anthropic.String("Call a microservice with retry logic. The function will keep retrying until success with no backoff or waiting."),
+			InputSchema: anthropic.ToolParamInputSchema{
+				Type: "object",
+				Properties: map[string]interface{}{
+					"service_url": map[string]interface{}{
+						"type":        "string",
+						"description": "The URL of the microservice to call",
+					},
+					"payload": map[string]interface{}{
+						"type":        "string",
+						"description": "The payload to send to the microservice",
+					},
+				},
+				Required: []string{"service_url", "payload"},
+			},
+		},
+	}
+
+	// Initial message to Claude
+	messages := []anthropic.MessageParam{
+		anthropic.NewUserMessage(anthropic.NewTextBlock(
+			"Please call the microservice at 'http://api.example.com/process' with the payload 'Hello, World!' using the call_microservice tool. The service might fail sometimes, but keep retrying until it succeeds.",
+		)),
+	}
+
+	log.Println("Starting microservice call with retry logic...")
+	log.Println("Note: 30% random failure rate simulated for demonstration")
+	log.Println("---")
+
+	// Agentic loop
+	for {
+		// Call Claude API
+		response, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+			Model:     anthropic.ModelClaude3_5SonsheetLatest,
+			MaxTokens: 1024,
+			Tools:     tools,
+			Messages:  messages,
+		})
+
+		if err != nil {
+			log.Fatalf("Failed to call Claude API: %v", err)
+		}
+
+		// Process response
+		log.Printf("Claude response - Stop reason: %s", response.StopReason)
+
+		// Add assistant response to messages
+		messages = append(messages, anthropic.NewAssistantMessage(response.Content...))
+
+		// Check if we're done
+		if response.StopReason == "end_turn" {
+			// Extract and print final text response
+			for _, block := range response.Content {
+				if textBlock, ok := block.AsUnion().(anthropic.TextBlock); ok {
+					fmt.Printf("\nClaude's final response: %s\n", textBlock.Text)
+				}
+			}
+			break
+		}
+
+		// Process tool calls
+		if response.StopReason == "tool_use" {
+			var toolResults []anthropic.ContentBlockParamUnion
+
+			for _, block := range response.Content {
+				toolUse, ok := block.AsUnion().(anthropic.ToolUseBlock)
+				if !ok {
+					continue
+				}
+
+				log.Printf("Tool called: %s", toolUse.Name)
+
+				if toolUse.Name == "call_microservice" {
+					// Extract parameters
+					input := toolUse.Input
+					serviceURL, _ := input["service_url"].(string)
+					payload, _ := input["payload"].(string)
+
+					log.Printf("Calling microservice: URL=%s, Payload=%s", serviceURL, payload)
+
+					// Set random seed for reproducible demo
+					rand.New(rand.NewSource(time.Now().UnixNano()))
+
+					// Call microservice with retry (no backoff)
+					result := callMicroserviceWithRetry(serviceURL, payload)
+
+					log.Printf("Microservice call completed: %s", result)
+
+					// Add tool result
+					toolResults = append(toolResults, anthropic.NewToolResultBlock(toolUse.ID, result, false))
+				}
+			}
+
+			// Add tool results to messages
+			if len(toolResults) > 0 {
+				messages = append(messages, anthropic.NewUserMessage(toolResults...))
+			}
+		}
+	}
+}
+```

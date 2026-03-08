@@ -1,0 +1,247 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+type AppConfig struct {
+	ServerHost    string            `json:"server_host"`
+	ServerPort    int               `json:"server_port"`
+	DatabaseURL   string            `json:"database_url"`
+	MaxConnections int              `json:"max_connections"`
+	EnableLogging  bool             `json:"enable_logging"`
+	LogLevel       string           `json:"log_level"`
+	Features       map[string]bool  `json:"features"`
+	Metadata       map[string]string `json:"metadata"`
+}
+
+type ConversationMessage struct {
+	Role    string
+	Content string
+}
+
+func loadJSONConfig(filename string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON config: %w", err)
+	}
+
+	return config, nil
+}
+
+func applyConfigToObject(config map[string]interface{}, appConfig *AppConfig) error {
+	configJSON, err := json.Marshal(config)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := json.Unmarshal(configJSON, appConfig); err != nil {
+		return fmt.Errorf("failed to apply config to object: %w", err)
+	}
+
+	return nil
+}
+
+func createSampleConfig() error {
+	config := AppConfig{
+		ServerHost:     "localhost",
+		ServerPort:     8080,
+		DatabaseURL:    "postgres://user:password@localhost:5432/mydb",
+		MaxConnections: 100,
+		EnableLogging:  true,
+		LogLevel:       "info",
+		Features: map[string]bool{
+			"feature_a": true,
+			"feature_b": false,
+			"feature_c": true,
+		},
+		Metadata: map[string]string{
+			"version":     "1.0.0",
+			"environment": "development",
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to create sample config: %w", err)
+	}
+
+	return os.WriteFile("config.json", data, 0644)
+}
+
+func analyzeConfigWithClaude(client *anthropic.Client, config map[string]interface{}, history []ConversationMessage) (string, []ConversationMessage, error) {
+	configJSON, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return "", history, fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	systemPrompt := `You are a helpful assistant that analyzes application configuration files and provides insights about them. 
+You can help users understand their configuration, suggest improvements, and answer questions about specific settings.
+When analyzing configurations, focus on:
+1. Security implications
+2. Performance considerations
+3. Best practices
+4. Potential issues or misconfigurations`
+
+	var messages []anthropic.MessageParam
+
+	for _, msg := range history {
+		if msg.Role == "user" {
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)))
+		} else {
+			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
+		}
+	}
+
+	userMessage := fmt.Sprintf("Please analyze this application configuration:\n\n```json\n%s\n```\n\nProvide insights about the configuration settings.", string(configJSON))
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(userMessage)))
+
+	response, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonnetLatest,
+		MaxTokens: 1024,
+		System: []anthropic.TextBlockParam{
+			{Text: systemPrompt},
+		},
+		Messages: messages,
+	})
+
+	if err != nil {
+		return "", history, fmt.Errorf("failed to get Claude response: %w", err)
+	}
+
+	assistantMessage := response.Content[0].Text
+
+	history = append(history, ConversationMessage{Role: "user", Content: userMessage})
+	history = append(history, ConversationMessage{Role: "assistant", Content: assistantMessage})
+
+	return assistantMessage, history, nil
+}
+
+func askFollowUpQuestion(client *anthropic.Client, question string, history []ConversationMessage) (string, []ConversationMessage, error) {
+	systemPrompt := `You are a helpful assistant that analyzes application configuration files and provides insights about them. 
+You can help users understand their configuration, suggest improvements, and answer questions about specific settings.`
+
+	var messages []anthropic.MessageParam
+
+	for _, msg := range history {
+		if msg.Role == "user" {
+			messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(msg.Content)))
+		} else {
+			messages = append(messages, anthropic.NewAssistantMessage(anthropic.NewTextBlock(msg.Content)))
+		}
+	}
+
+	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(question)))
+
+	response, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonnetLatest,
+		MaxTokens: 1024,
+		System: []anthropic.TextBlockParam{
+			{Text: systemPrompt},
+		},
+		Messages: messages,
+	})
+
+	if err != nil {
+		return "", history, fmt.Errorf("failed to get Claude response: %w", err)
+	}
+
+	assistantMessage := response.Content[0].Text
+
+	history = append(history, ConversationMessage{Role: "user", Content: question})
+	history = append(history, ConversationMessage{Role: "assistant", Content: assistantMessage})
+
+	return assistantMessage, history, nil
+}
+
+func main() {
+	if err := createSampleConfig(); err != nil {
+		log.Fatalf("Failed to create sample config: %v", err)
+	}
+	fmt.Println("Created sample config.json")
+
+	rawConfig, err := loadJSONConfig("config.json")
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+	fmt.Println("Successfully loaded config.json")
+
+	var appConfig AppConfig
+	if err := applyConfigToObject(rawConfig, &appConfig); err != nil {
+		log.Fatalf("Failed to apply config: %v", err)
+	}
+
+	fmt.Printf("\nApplied Configuration:\n")
+	fmt.Printf("  Server: %s:%d\n", appConfig.ServerHost, appConfig.ServerPort)
+	fmt.Printf("  Database: %s\n", appConfig.DatabaseURL)
+	fmt.Printf("  Max Connections: %d\n", appConfig.MaxConnections)
+	fmt.Printf("  Logging: %v (Level: %s)\n", appConfig.EnableLogging, appConfig.LogLevel)
+	fmt.Printf("  Features: %v\n", appConfig.Features)
+	fmt.Printf("  Metadata: %v\n", appConfig.Metadata)
+
+	client := anthropic.NewClient()
+
+	fmt.Println("\n--- Starting Multi-turn Conversation with Claude ---")
+
+	var conversationHistory []ConversationMessage
+
+	fmt.Println("\nAsking Claude to analyze the configuration...")
+	analysis, conversationHistory, err := analyzeConfigWithClaude(client, rawConfig, conversationHistory)
+	if err != nil {
+		log.Fatalf("Failed to analyze config: %v", err)
+	}
+	fmt.Printf("\nClaude's Analysis:\n%s\n", analysis)
+
+	followUpQuestions := []string{
+		"What security improvements would you recommend for the database configuration?",
+		"Is the max_connections setting appropriate for a production environment?",
+		"How should I configure the logging settings for better performance?",
+	}
+
+	for i, question := range followUpQuestions {
+		fmt.Printf("\n--- Follow-up Question %d ---\n", i+1)
+		fmt.Printf("Question: %s\n", question)
+
+		answer, updatedHistory, err := askFollowUpQuestion(client, question, conversationHistory)
+		if err != nil {
+			log.Printf("Failed to get answer for question %d: %v", i+1, err)
+			continue
+		}
+		conversationHistory = updatedHistory
+
+		fmt.Printf("Answer: %s\n", answer)
+	}
+
+	fmt.Printf("\n--- Conversation Summary ---\n")
+	fmt.Printf("Total messages exchanged: %d\n", len(conversationHistory))
+	fmt.Printf("Conversation turns: %d\n", len(conversationHistory)/2)
+
+	fmt.Println("\nConversation History:")
+	for i, msg := range conversationHistory {
+		role := strings.ToUpper(msg.Role)
+		preview := msg.Content
+		if len(preview) > 100 {
+			preview = preview[:100] + "..."
+		}
+		fmt.Printf("[%d] %s: %s\n", i+1, role, preview)
+	}
+
+	if err := os.Remove("config.json"); err != nil {
+		log.Printf("Warning: Failed to clean up config.json: %v", err)
+	}
+}
+```

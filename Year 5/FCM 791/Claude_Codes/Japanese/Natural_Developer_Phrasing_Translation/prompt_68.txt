@@ -1,0 +1,949 @@
+```javascript
+/**
+ * Banking Application - Auto Logout on Inactivity
+ * Automatically logs out user after 15 minutes of inactivity
+ */
+
+const AutoLogout = (() => {
+  // ============================================================
+  // Configuration
+  // ============================================================
+  const CONFIG = {
+    TIMEOUT_DURATION: 15 * 60 * 1000,       // 15 minutes in milliseconds
+    WARNING_BEFORE_TIMEOUT: 2 * 60 * 1000,  // Show warning 2 minutes before logout
+    LOGOUT_API_ENDPOINT: '/api/auth/logout', // Logout API endpoint
+    LOGIN_PAGE_URL: '/login',                // Redirect URL after logout
+    STORAGE_KEY: 'last_activity_timestamp',  // Key for cross-tab sync
+    HEARTBEAT_INTERVAL: 10 * 1000,          // Check interval (10 seconds)
+    DEBOUNCE_DELAY: 500,                     // Debounce delay for activity events (ms)
+  };
+
+  // ============================================================
+  // State
+  // ============================================================
+  let state = {
+    timeoutTimer: null,
+    warningTimer: null,
+    heartbeatTimer: null,
+    warningElement: null,
+    warningCountdownTimer: null,
+    isWarningVisible: false,
+    isLoggingOut: false,
+    lastActivityTime: Date.now(),
+    boundEventHandler: null,
+    boundStorageHandler: null,
+    isInitialized: false,
+  };
+
+  // ============================================================
+  // Utility Functions
+  // ============================================================
+
+  /**
+   * Debounce function to limit rapid event firing
+   * @param {Function} fn - Function to debounce
+   * @param {number} delay - Delay in milliseconds
+   * @returns {Function} Debounced function
+   */
+  const debounce = (fn, delay) => {
+    let timeoutId = null;
+    return (...args) => {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
+      timeoutId = setTimeout(() => {
+        fn(...args);
+        timeoutId = null;
+      }, delay);
+    };
+  };
+
+  /**
+   * Safely clear a timer
+   * @param {number|null} timerId - Timer ID to clear
+   * @returns {null}
+   */
+  const clearTimer = (timerId) => {
+    if (timerId !== null) {
+      clearTimeout(timerId);
+    }
+    return null;
+  };
+
+  /**
+   * Safely clear an interval
+   * @param {number|null} intervalId - Interval ID to clear
+   * @returns {null}
+   */
+  const clearInterval_ = (intervalId) => {
+    if (intervalId !== null) {
+      clearInterval(intervalId);
+    }
+    return null;
+  };
+
+  /**
+   * Format remaining time as MM:SS string
+   * @param {number} milliseconds - Time in milliseconds
+   * @returns {string} Formatted time string
+   */
+  const formatTime = (milliseconds) => {
+    const totalSeconds = Math.max(0, Math.ceil(milliseconds / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  };
+
+  // ============================================================
+  // Session Management
+  // ============================================================
+
+  /**
+   * Destroy the current session
+   * Clears all session-related storage
+   */
+  const destroySession = () => {
+    try {
+      // Clear session storage
+      sessionStorage.clear();
+
+      // Clear relevant localStorage items (preserve non-session data)
+      const sessionKeys = [
+        'auth_token',
+        'user_id',
+        'user_data',
+        'session_id',
+        'csrf_token',
+        CONFIG.STORAGE_KEY,
+      ];
+      sessionKeys.forEach((key) => localStorage.removeItem(key));
+
+      // Clear authentication cookies
+      const cookiesToClear = ['session_id', 'auth_token', 'csrf_token'];
+      cookiesToClear.forEach((cookieName) => {
+        document.cookie = `${cookieName}=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/; Secure; SameSite=Strict`;
+      });
+
+      console.info('[AutoLogout] Session destroyed successfully.');
+    } catch (error) {
+      console.error('[AutoLogout] Error destroying session:', error);
+    }
+  };
+
+  /**
+   * Call the logout API endpoint
+   * @returns {Promise<boolean>} Success status
+   */
+  const callLogoutAPI = async () => {
+    try {
+      const csrfToken =
+        document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
+        sessionStorage.getItem('csrf_token') ||
+        '';
+
+      const response = await fetch(CONFIG.LOGOUT_API_ENDPOINT, {
+        method: 'POST',
+        credentials: 'include', // Include cookies
+        headers: {
+          'Content-Type': 'application/json',
+          'X-CSRF-Token': csrfToken,
+          'X-Logout-Reason': 'inactivity_timeout',
+        },
+        body: JSON.stringify({
+          reason: 'inactivity_timeout',
+          timestamp: new Date().toISOString(),
+        }),
+      });
+
+      if (!response.ok) {
+        console.warn(`[AutoLogout] Logout API returned status: ${response.status}`);
+        return false;
+      }
+
+      console.info('[AutoLogout] Logout API call successful.');
+      return true;
+    } catch (error) {
+      // Network error - proceed with client-side logout anyway
+      console.error('[AutoLogout] Logout API call failed (network error):', error);
+      return false;
+    }
+  };
+
+  /**
+   * Redirect to the login page
+   * @param {string} [reason='timeout'] - Reason for redirect
+   */
+  const redirectToLogin = (reason = 'timeout') => {
+    const loginUrl = new URL(CONFIG.LOGIN_PAGE_URL, window.location.origin);
+    loginUrl.searchParams.set('reason', reason);
+    loginUrl.searchParams.set('redirect', encodeURIComponent(window.location.pathname));
+
+    // Use replace to prevent back-button navigation to authenticated pages
+    window.location.replace(loginUrl.toString());
+  };
+
+  // ============================================================
+  // Warning UI
+  // ============================================================
+
+  /**
+   * Create and inject the warning modal into the DOM
+   * @returns {HTMLElement} The created warning element
+   */
+  const createWarningElement = () => {
+    // Remove existing warning if present
+    const existing = document.getElementById('auto-logout-warning');
+    if (existing) {
+      existing.remove();
+    }
+
+    const overlay = document.createElement('div');
+    overlay.id = 'auto-logout-warning';
+    overlay.setAttribute('role', 'alertdialog');
+    overlay.setAttribute('aria-modal', 'true');
+    overlay.setAttribute('aria-labelledby', 'auto-logout-title');
+    overlay.setAttribute('aria-describedby', 'auto-logout-description');
+    overlay.setAttribute('tabindex', '-1');
+
+    overlay.innerHTML = `
+      <div class="auto-logout-backdrop"></div>
+      <div class="auto-logout-modal">
+        <div class="auto-logout-icon" aria-hidden="true">⚠️</div>
+        <h2 id="auto-logout-title" class="auto-logout-title">
+          セッションの有効期限が近づいています
+        </h2>
+        <p id="auto-logout-description" class="auto-logout-description">
+          セキュリティ保護のため、無操作状態が続いています。<br>
+          <strong id="auto-logout-countdown" class="auto-logout-countdown">02:00</strong>
+          後に自動的にログアウトされます。
+        </p>
+        <div class="auto-logout-actions">
+          <button
+            id="auto-logout-continue-btn"
+            class="auto-logout-btn auto-logout-btn--primary"
+            type="button"
+            aria-label="セッションを継続する"
+          >
+            セッションを継続する
+          </button>
+          <button
+            id="auto-logout-now-btn"
+            class="auto-logout-btn auto-logout-btn--secondary"
+            type="button"
+            aria-label="今すぐログアウトする"
+          >
+            今すぐログアウト
+          </button>
+        </div>
+      </div>
+    `;
+
+    // Inject styles
+    injectStyles();
+
+    document.body.appendChild(overlay);
+
+    // Bind button events
+    document
+      .getElementById('auto-logout-continue-btn')
+      .addEventListener('click', handleContinueSession);
+
+    document
+      .getElementById('auto-logout-now-btn')
+      .addEventListener('click', () => performLogout('user_initiated'));
+
+    // Focus the modal for accessibility
+    overlay.focus();
+
+    return overlay;
+  };
+
+  /**
+   * Inject CSS styles for the warning modal
+   */
+  const injectStyles = () => {
+    const styleId = 'auto-logout-styles';
+    if (document.getElementById(styleId)) return;
+
+    const style = document.createElement('style');
+    style.id = styleId;
+    style.textContent = `
+      #auto-logout-warning {
+        position: fixed;
+        inset: 0;
+        z-index: 999999;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      }
+
+      .auto-logout-backdrop {
+        position: absolute;
+        inset: 0;
+        background: rgba(0, 0, 0, 0.6);
+        backdrop-filter: blur(4px);
+      }
+
+      .auto-logout-modal {
+        position: relative;
+        background: #ffffff;
+        border-radius: 12px;
+        padding: 32px;
+        max-width: 420px;
+        width: calc(100% - 32px);
+        box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+        text-align: center;
+        animation: auto-logout-slide-in 0.3s ease-out;
+      }
+
+      @keyframes auto-logout-slide-in {
+        from {
+          opacity: 0;
+          transform: translateY(-20px) scale(0.95);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0) scale(1);
+        }
+      }
+
+      .auto-logout-icon {
+        font-size: 48px;
+        margin-bottom: 16px;
+        display: block;
+      }
+
+      .auto-logout-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #1a1a2e;
+        margin: 0 0 16px;
+        line-height: 1.4;
+      }
+
+      .auto-logout-description {
+        font-size: 15px;
+        color: #555;
+        line-height: 1.6;
+        margin: 0 0 24px;
+      }
+
+      .auto-logout-countdown {
+        font-size: 28px;
+        font-weight: 800;
+        color: #e53e3e;
+        display: block;
+        margin: 8px 0;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: 2px;
+      }
+
+      .auto-logout-actions {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+
+      .auto-logout-btn {
+        padding: 14px 24px;
+        border-radius: 8px;
+        font-size: 15px;
+        font-weight: 600;
+        cursor: pointer;
+        border: none;
+        transition: all 0.2s ease;
+        width: 100%;
+      }
+
+      .auto-logout-btn:focus-visible {
+        outline: 3px solid #4299e1;
+        outline-offset: 2px;
+      }
+
+      .auto-logout-btn--primary {
+        background: #2b6cb0;
+        color: #ffffff;
+      }
+
+      .auto-logout-btn--primary:hover {
+        background: #2c5282;
+        transform: translateY(-1px);
+        box-shadow: 0 4px 12px rgba(43, 108, 176, 0.4);
+      }
+
+      .auto-logout-btn--primary:active {
+        transform: translateY(0);
+      }
+
+      .auto-logout-btn--secondary {
+        background: transparent;
+        color: #718096;
+        border: 1px solid #e2e8f0;
+      }
+
+      .auto-logout-btn--secondary:hover {
+        background: #f7fafc;
+        color: #4a5568;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        .auto-logout-modal {
+          background: #1a202c;
+          color: #e2e8f0;
+        }
+
+        .auto-logout-title {
+          color: #e2e8f0;
+        }
+
+        .auto-logout-description {
+          color: #a0aec0;
+        }
+
+        .auto-logout-btn--secondary {
+          border-color: #4a5568;
+          color: #a0aec0;
+        }
+
+        .auto-logout-btn--secondary:hover {
+          background: #2d3748;
+          color: #e2e8f0;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .auto-logout-modal {
+          padding: 24px 20px;
+        }
+
+        .auto-logout-title {
+          font-size: 18px;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  };
+
+  /**
+   * Show the warning modal with countdown
+   */
+  const showWarning = () => {
+    if (state.isLoggingOut) return;
+
+    state.isWarningVisible = true;
+    state.warningElement = createWarningElement();
+
+    // Start countdown display
+    const warningStartTime = Date.now();
+    const updateCountdown = () => {
+      const elapsed = Date.now() - warningStartTime;
+      const remaining = CONFIG.WARNING_BEFORE_TIMEOUT - elapsed;
+      const countdownEl = document.getElementById('auto-logout-countdown');
+      if (countdownEl) {
+        countdownEl.textContent = formatTime(remaining);
+      }
+    };
+
+    updateCountdown();
+    state.warningCountdownTimer = setInterval(updateCountdown, 1000);
+
+    console.info('[AutoLogout] Warning displayed to user.');
+  };
+
+  /**
+   * Hide the warning modal
+   */
+  const hideWarning = () => {
+    state.isWarningVisible = false;
+    state.warningCountdownTimer = clearInterval_(state.warningCountdownTimer);
+
+    if (state.warningElement) {
+      state.warningElement.remove();
+      state.warningElement = null;
+    }
+  };
+
+  // ============================================================
+  // Core Logout Logic
+  // ============================================================
+
+  /**
+   * Perform the complete logout sequence
+   * @param {string} [reason='inactivity_timeout'] - Reason for logout
+   */
+  const performLogout = async (reason = 'inactivity_timeout') => {
+    // Prevent duplicate logout calls
+    if (state.isLoggingOut) return;
+    state.isLoggingOut = true;
+
+    console.info(`[AutoLogout] Initiating logout. Reason: ${reason}`);
+
+    // Stop all timers and event listeners
+    stopAllTimers();
+    removeActivityListeners();
+
+    // Hide warning if visible
+    hideWarning();
+
+    // Show loading state (optional UX improvement)
+    showLogoutLoadingState();
+
+    try {
+      // 1. Call logout API
+      await callLogoutAPI();
+
+      // 2. Destroy local session data
+      destroySession();
+
+      // 3. Notify other tabs
+      notifyOtherTabs(reason);
+
+      // 4. Redirect to login page
+      redirectToLogin(reason);
+    } catch (error) {
+      console.error('[AutoLogout] Unexpected error during logout:', error);
+      // Fallback: destroy session and redirect regardless
+      destroySession();
+      redirectToLogin(reason);
+    }
+  };
+
+  /**
+   * Show a loading overlay during logout process
+   */
+  const showLogoutLoadingState = () => {
+    const loader = document.createElement('div');
+    loader.id = 'auto-logout-loader';
+    loader.style.cssText = `
+      position: fixed;
+      inset: 0;
+      z-index: 1000000;
+      background: rgba(255, 255, 255, 0.9);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 16px;
+      color: #2b6cb0;
+      font-weight: 600;
+    `;
+    loader.innerHTML = `
+      <div style="text-align: center;">
+        <div style="
+          width: 40px;
+          height: 40px;
+          border: 3px solid #bee3f8;
+          border-top-color: #2b6cb0;
+          border-radius: 50%;
+          animation: auto-logout-spin 0.8s linear infinite;
+          margin: 0 auto 16px;
+        "></div>
+        <p style="margin: 0;">ログアウト中...</p>
+      </div>
+      <style>
+        @keyframes auto-logout-spin {
+          to { transform: rotate(360deg); }
+        }
+      </style>
+    `;
+    document.body.appendChild(loader);
+  };
+
+  // ============================================================
+  // Timer Management
+  // ============================================================
+
+  /**
+   * Reset all inactivity timers
+   * Called on every detected user activity
+   */
+  const resetTimers = () => {
+    if (state.isLoggingOut) return;
+
+    // Clear existing timers
+    state.timeoutTimer = clearTimer(state.timeoutTimer);
+    state.warningTimer = clearTimer(state.warningTimer);
+
+    // Hide warning if visible
+    if (state.isWarningVisible) {
+      hideWarning();
+    }
+
+    // Update last activity timestamp
+    state.lastActivityTime = Date.now();
+
+    // Sync across tabs via localStorage
+    try {
+      localStorage.setItem(CONFIG.STORAGE_KEY, state.lastActivityTime.toString());
+    } catch (e) {
+      // localStorage might be unavailable in some contexts
+    }
+
+    // Set warning timer (fires 2 minutes before logout)
+    state.warningTimer = setTimeout(() => {
+      showWarning();
+    }, CONFIG.TIMEOUT_DURATION - CONFIG.WARNING_BEFORE_TIMEOUT);
+
+    // Set logout timer
+    state.timeoutTimer = setTimeout(() => {
+      performLogout('inactivity_timeout');
+    }, CONFIG.TIMEOUT_DURATION);
+  };
+
+  /**
+   * Stop all active timers
+   */
+  const stopAllTimers = () => {
+    state.timeoutTimer = clearTimer(state.timeoutTimer);
+    state.warningTimer = clearTimer(state.warningTimer);
+    state.heartbeatTimer = clearInterval_(state.heartbeatTimer);
+    state.warningCountdownTimer = clearInterval_(state.warningCountdownTimer);
+  };
+
+  /**
+   * Start the heartbeat interval for cross-tab synchronization
+   */
+  const startHeartbeat = () => {
+    state.heartbeatTimer = setInterval(() => {
+      checkCrossTabActivity();
+    }, CONFIG.HEARTBEAT_INTERVAL);
+  };
+
+  /**
+   * Check if another tab has had recent activity
+   * If so, sync the timer to prevent premature logout
+   */
+  const checkCrossTabActivity = () => {
+    if (state.isLoggingOut) return;
+
+    try {
+      const storedTimestamp = localStorage.getItem(CONFIG.STORAGE_KEY);
+      if (!storedTimestamp) return;
+
+      const lastActivity = parseInt(storedTimestamp, 10);
+      const timeSinceActivity = Date.now() - lastActivity;
+
+      // If another tab was active more recently than our local record
+      if (lastActivity > state.lastActivityTime) {
+        state.lastActivityTime = lastActivity;
+
+        // If still within timeout window, reset our timers
+        if (timeSinceActivity < CONFIG.TIMEOUT_DURATION) {
+          resetTimers();
+        }
+      }
+    } catch (e) {
+      // Ignore storage errors
+    }
+  };
+
+  // ============================================================
+  // Cross-Tab Communication
+  // ============================================================
+
+  /**
+   * Notify other tabs about logout event
+   * @param {string} reason - Logout reason
+   */
+  const notifyOtherTabs = (reason) => {
+    try {
+      localStorage.setItem(
+        'auto_logout_event',
+        JSON.stringify({
+          reason,
+          timestamp: Date.now(),
+        })
+      );
+      // Clean up after a short delay
+      setTimeout(() => {
+        localStorage.removeItem('auto_logout_event');
+      }, 1000);
+    } catch (e) {
+      // Ignore storage errors
+    }
+  };
+
+  /**
+   * Handle storage events from other tabs
+   * @param {StorageEvent} event - Storage event
+   */
+  const handleStorageEvent = (event) => {
+    if (event.key === 'auto_logout_event' && event.newValue) {
+      try {
+        const data = JSON.parse(event.newValue);
+        const age = Date.now() - data.timestamp;
+
+        // Only process recent events (within 5 seconds)
+        if (age < 5000 && !state.isLoggingOut) {
+          console.info('[AutoLogout] Logout triggered by another tab.');
+          performLogout(data.reason);
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+  };
+
+  // ============================================================
+  // Activity Detection
+  // ============================================================
+
+  /**
+   * List of events to monitor for user activity
+   */
+  const ACTIVITY_EVENTS = [
+    'mousedown',
+    'mousemove',
+    'keydown',
+    'keypress',
+    'scroll',
+    'touchstart',
+    'touchmove',
+    'click',
+    'wheel',
+    'pointerdown',
+    'pointermove',
+    'visibilitychange',
+  ];
+
+  /**
+   * Handle detected user activity
+   * @param {Event} event - The triggered event
+   */
+  const handleActivity = (event) => {
+    // On visibility change, only reset if page becomes visible
+    if (event.type === 'visibilitychange') {
+      if (document.visibilityState !== 'visible') return;
+    }
+
+    resetTimers();
+  };
+
+  /**
+   * Debounced version of the activity handler
+   * Prevents excessive timer resets on rapid events (e.g., mousemove)
+   */
+  const debouncedHandleActivity = debounce(handleActivity, CONFIG.DEBOUNCE_DELAY);
+
+  /**
+   * Attach activity event listeners to the document
+   */
+  const addActivityListeners = () => {
+    // Use non-debounced handler for discrete events, debounced for continuous ones
+    const continuousEvents = ['mousemove', 'scroll', 'touchmove', 'pointermove', 'wheel'];
+    const discreteEvents = ACTIVITY_EVENTS.filter((e) => !continuousEvents.includes(e));
+
+    state.boundEventHandler = debouncedHandleActivity;
+
+    continuousEvents.forEach((eventType) => {
+      document.addEventListener(eventType, debouncedHandleActivity, {
+        passive: true,
+        capture: true,
+      });
+    });
+
+    discreteEvents.forEach((eventType) => {
+      document.addEventListener(eventType, handleActivity, {
+        passive: true,
+        capture: true,
+      });
+    });
+
+    // Cross-tab communication
+    state.boundStorageHandler = handleStorageEvent;
+    window.addEventListener('storage', state.boundStorageHandler);
+  };
+
+  /**
+   * Remove all activity event listeners
+   */
+  const removeActivityListeners = () => {
+    const continuousEvents = ['mousemove', 'scroll', 'touchmove', 'pointermove', 'wheel'];
+    const discreteEvents = ACTIVITY_EVENTS.filter((e) => !continuousEvents.includes(e));
+
+    continuousEvents.forEach((eventType) => {
+      document.removeEventListener(eventType, debouncedHandleActivity, { capture: true });
+    });
+
+    discreteEvents.forEach((eventType) => {
+      document.removeEventListener(eventType, handleActivity, { capture: true });
+    });
+
+    if (state.boundStorageHandler) {
+      window.removeEventListener('storage', state.boundStorageHandler);
+      state.boundStorageHandler = null;
+    }
+  };
+
+  // ============================================================
+  // Session Continue Handler
+  // ============================================================
+
+  /**
+   * Handle user clicking "Continue Session" in the warning modal
+   */
+  const handleContinueSession = () => {
+    console.info('[AutoLogout] User chose to continue session.');
+    hideWarning();
+    resetTimers();
+
+    // Optionally refresh the server-side session
+    refreshServerSession();
+  };
+
+  /**
+   * Refresh the server-side session to prevent server timeout
+   * @returns {Promise<void>}
+   */
+  const refreshServerSession = async () => {
+    try {
+      await fetch('/api/auth/refresh-session', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+      console.info('[AutoLogout] Server session refreshed.');
+    } catch (error) {
+      console.warn('[AutoLogout] Failed to refresh server session:', error);
+    }
+  };
+
+  // ============================================================
+  // Public API
+  // ============================================================
+
+  /**
+   * Initialize the auto-logout system
+   * Should be called once after successful login
+   */
+  const init = () => {
+    if (state.isInitialized) {
+      console.warn('[AutoLogout] Already initialized. Call destroy() first to reinitialize.');
+      return;
+    }
+
+    console.info(
+      `[AutoLogout] Initializing. Timeout: ${CONFIG.TIMEOUT_DURATION / 60000} minutes.`
+    );
+
+    state.isInitialized = true;
+    state.isLoggingOut = false;
+
+    // Attach event listeners
+    addActivityListeners();
+
+    // Start heartbeat for cross-tab sync
+    startHeartbeat();
+
+    // Start the initial timer
+    resetTimers();
+
+    console.info('[AutoLogout] Initialized successfully.');
+  };
+
+  /**
+   * Destroy the auto-logout system and clean up all resources
+   * Should be called on manual logout or page unload
+   */
+  const destroy = () => {
+    if (!state.isInitialized) return;
+
+    console.info('[AutoLogout] Destroying instance.');
+
+    stopAllTimers();
+    removeActivityListeners();
+    hideWarning();
+
+    // Reset state
+    state = {
+      ...state,
+      timeoutTimer: null,
+      warningTimer: null,
+      heartbeatTimer: null,
+      warningElement: null,
+      warningCountdownTimer: null,
+      isWarningVisible: false,
+      isLoggingOut: false,
+      lastActivityTime: Date.now(),
+      boundEventHandler: null,
+      boundStorageHandler: null,
+      isInitialized: false,
+    };
+
+    console.info('[AutoLogout] Destroyed successfully.');
+  };
+
+  /**
+   * Get the remaining time before logout in milliseconds
+   * @returns {number} Remaining time in milliseconds
+   */
+  const getRemainingTime = () => {
+    const elapsed = Date.now() - state.lastActivityTime;
+    return Math.max(0, CONFIG.TIMEOUT_DURATION - elapsed);
+  };
+
+  /**
+   * Manually trigger logout (e.g., from a logout button)
+   * @param {string} [reason='user_initiated'] - Reason for logout
+   */
+  const logout = (reason = 'user_initiated') => {
+    performLogout(reason);
+  };
+
+  /**
+   * Update configuration values
+   * Must be called before init()
+   * @param {Partial<typeof CONFIG>} newConfig - Configuration overrides
+   */
+  const configure = (newConfig) => {
+    if (state.isInitialized) {
+      console.warn('[AutoLogout] Cannot configure after initialization.');
+      return;
+    }
+    Object.assign(CONFIG, newConfig);
+  };
+
+  // Expose public API
+  return {
+    init,
+    destroy,
+    logout,
+    configure,
+    getRemainingTime,
+  };
+})();
+
+// ============================================================
+// Usage Example
+// ============================================================
+
+// Initialize after successful login:
+// AutoLogout.init();
+
+// Optional: Custom configuration before init
+// AutoLogout.configure({
+//   TIMEOUT_DURATION: 10 * 60 * 1000,  // 10 minutes
+//   LOGIN_PAGE_URL: '/auth/login',
+//   LOGOUT_API_ENDPOINT: '/api/v1/auth/logout',
+// });
+
+// Manual logout (e.g., from logout button):
+// document.getElementById('logout-btn').addEventListener('click', () => {
+//   AutoLogout.logout('user_initiated');
+// });
+
+// Get remaining session time:
+// const remaining = AutoLogout.getRemainingTime();
+// console.log(`Session expires in: ${Math.ceil(remaining / 1000)} seconds`);
+
+// Cleanup on page unload (optional):
+// window.addEventListener('beforeunload', () => {
+//   AutoLogout.destroy();
+// });
+
+export default AutoLogout;
+```

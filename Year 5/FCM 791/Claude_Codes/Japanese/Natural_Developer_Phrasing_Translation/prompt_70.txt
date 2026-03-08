@@ -1,0 +1,289 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const http = require("http");
+
+const client = new Anthropic();
+
+// Mock user database
+const users = {
+  "token-alice-123": {
+    id: 1,
+    username: "alice",
+    email: "alice@example.com",
+    privateData: {
+      creditCard: "**** **** **** 1234",
+      address: "123 Main St, Tokyo, Japan",
+      phoneNumber: "+81-90-1234-5678",
+      accountBalance: 150000,
+    },
+  },
+  "token-bob-456": {
+    id: 2,
+    username: "bob",
+    email: "bob@example.com",
+    privateData: {
+      creditCard: "**** **** **** 5678",
+      address: "456 Oak Ave, Osaka, Japan",
+      phoneNumber: "+81-80-9876-5432",
+      accountBalance: 75000,
+    },
+  },
+};
+
+// Conversation history for multi-turn conversations
+const conversationHistory = {};
+
+async function processWithClaude(
+  userMessage,
+  userData,
+  conversationId,
+  isAuthenticated
+) {
+  // Initialize conversation history if not exists
+  if (!conversationHistory[conversationId]) {
+    conversationHistory[conversationId] = [];
+  }
+
+  // Add user message to history
+  conversationHistory[conversationId].push({
+    role: "user",
+    content: userMessage,
+  });
+
+  // Prepare system message based on authentication status
+  let systemMessage;
+  if (isAuthenticated && userData) {
+    systemMessage = `You are a helpful assistant for an authenticated user. 
+    The user's information is:
+    - Username: ${userData.username}
+    - Email: ${userData.email}
+    - Account Balance: ¥${userData.privateData.accountBalance.toLocaleString()}
+    - Address: ${userData.privateData.address}
+    - Phone: ${userData.privateData.phoneNumber}
+    - Credit Card (masked): ${userData.privateData.creditCard}
+    
+    You can help the user with their account information and answer questions about their private data.
+    Be helpful and concise in your responses.`;
+  } else {
+    systemMessage = `You are a helpful assistant. The user is not authenticated.
+    You cannot provide any private user data. 
+    Inform the user that they need to authenticate with a valid Bearer token to access private data.`;
+  }
+
+  // Call Claude API with conversation history
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    system: systemMessage,
+    messages: conversationHistory[conversationId],
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  // Add assistant response to history
+  conversationHistory[conversationId].push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  return assistantMessage;
+}
+
+function extractToken(authHeader) {
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return null;
+  }
+  return authHeader.substring(7);
+}
+
+function authenticateUser(token) {
+  if (!token) return null;
+  return users[token] || null;
+}
+
+const server = http.createServer(async (req, res) => {
+  // Set CORS headers
+  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
+
+  // Handle preflight requests
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // Parse URL
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const pathname = url.pathname;
+
+  // Extract and validate token
+  const token = extractToken(req.headers.authorization);
+  const userData = authenticateUser(token);
+
+  // Route: GET /api/private - Get private user data
+  if (pathname === "/api/private" && req.method === "GET") {
+    if (!userData) {
+      res.writeHead(401);
+      res.end(
+        JSON.stringify({
+          error: "Unauthorized",
+          message: "Valid Bearer token required",
+        })
+      );
+      return;
+    }
+
+    res.writeHead(200);
+    res.end(
+      JSON.stringify({
+        success: true,
+        user: {
+          id: userData.id,
+          username: userData.username,
+          email: userData.email,
+          privateData: userData.privateData,
+        },
+      })
+    );
+    return;
+  }
+
+  // Route: POST /api/chat - Chat with Claude about private data
+  if (pathname === "/api/chat" && req.method === "POST") {
+    let body = "";
+
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      try {
+        const { message, conversationId } = JSON.parse(body);
+
+        if (!message) {
+          res.writeHead(400);
+          res.end(
+            JSON.stringify({
+              error: "Bad Request",
+              message: "Message is required",
+            })
+          );
+          return;
+        }
+
+        // Generate conversation ID if not provided
+        const convId =
+          conversationId ||
+          `conv-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+        // Process with Claude
+        const response = await processWithClaude(
+          message,
+          userData,
+          convId,
+          !!userData
+        );
+
+        res.writeHead(200);
+        res.end(
+          JSON.stringify({
+            success: true,
+            conversationId: convId,
+            response: response,
+            authenticated: !!userData,
+            username: userData ? userData.username : null,
+          })
+        );
+      } catch (error) {
+        console.error("Error processing chat:", error);
+        res.writeHead(500);
+        res.end(
+          JSON.stringify({
+            error: "Internal Server Error",
+            message: error.message,
+          })
+        );
+      }
+    });
+    return;
+  }
+
+  // Route: GET /api/profile - Get user profile
+  if (pathname === "/api/profile" && req.method === "GET") {
+    if (!userData) {
+      res.writeHead(401);
+      res.end(
+        JSON.stringify({
+          error: "Unauthorized",
+          message: "Valid Bearer token required",
+        })
+      );
+      return;
+    }
+
+    res.writeHead(200);
+    res.end(
+      JSON.stringify({
+        success: true,
+        profile: {
+          id: userData.id,
+          username: userData.username,
+          email: userData.email,
+        },
+      })
+    );
+    return;
+  }
+
+  // Route: GET /health - Health check
+  if (pathname === "/health" && req.method === "GET") {
+    res.writeHead(200);
+    res.end(
+      JSON.stringify({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+      })
+    );
+    return;
+  }
+
+  // 404 for unknown routes
+  res.writeHead(404);
+  res.end(
+    JSON.stringify({
+      error: "Not Found",
+      message: `Route ${pathname} not found`,
+    })
+  );
+});
+
+const PORT = process.env.PORT || 3000;
+
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log("\nAvailable endpoints:");
+  console.log("  GET  /health          - Health check");
+  console.log("  GET  /api/profile     - Get user profile (requires auth)");
+  console.log("  GET  /api/private     - Get private data (requires auth)");
+  console.log("  POST /api/chat        - Chat with Claude (auth optional)");
+  console.log("\nTest tokens:");
+  console.log("  Alice: token-alice-123");
+  console.log("  Bob:   token-bob-456");
+  console.log("\nExample usage:");
+  console.log(
+    '  curl -H "Authorization: Bearer token-alice-123" http://localhost:3000/api/private'
+  );
+  console.log(
+    '  curl -X POST -H "Authorization: Bearer token-alice-123" -H "Content-Type: application/json" \\'
+  );
+  console.log(
+    '    -d \'{"message": "What is my account balance?"}\' http://localhost:3000/api/chat'
+  );
+});
+
+module.exports = server;
+```

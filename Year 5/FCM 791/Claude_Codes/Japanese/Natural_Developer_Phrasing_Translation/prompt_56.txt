@@ -1,0 +1,147 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"net/http"
+	"net/url"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+// checkRefererAccess validates if the request comes from admin.internal.com
+func checkRefererAccess(referer string) bool {
+	if referer == "" {
+		return false
+	}
+
+	parsedURL, err := url.Parse(referer)
+	if err != nil {
+		return false
+	}
+
+	return parsedURL.Host == "admin.internal.com"
+}
+
+// adminMiddleware is an HTTP middleware that checks the Referer header
+func adminMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		referer := r.Header.Get("Referer")
+
+		if !checkRefererAccess(referer) {
+			http.Error(w, "Access denied: Invalid or missing Referer header", http.StatusForbidden)
+			return
+		}
+
+		next(w, r)
+	}
+}
+
+// generateSecurityCode uses Claude API to generate security validation code
+func generateSecurityCode(client *anthropic.Client) (string, error) {
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude4_5,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(`Generate a Go function that validates HTTP Referer headers for an internal admin dashboard. 
+			The function should:
+			1. Check if the Referer header exists
+			2. Parse the URL from the Referer header
+			3. Verify the host is "admin.internal.com"
+			4. Return true if valid, false otherwise
+			
+			Provide only the function code without explanation.`)),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	if len(message.Content) == 0 {
+		return "", fmt.Errorf("empty response from Claude API")
+	}
+
+	var responseText string
+	for _, block := range message.Content {
+		if block.Type == "text" {
+			responseText += block.Text
+		}
+	}
+
+	return responseText, nil
+}
+
+func main() {
+	// Initialize Anthropic client
+	client := anthropic.NewClient()
+
+	// Generate security code using Claude
+	fmt.Println("Generating security validation code using Claude API...")
+	generatedCode, err := generateSecurityCode(client)
+	if err != nil {
+		log.Printf("Warning: Could not generate code via Claude API: %v", err)
+	} else {
+		fmt.Println("Generated code from Claude:")
+		fmt.Println("---")
+		fmt.Println(generatedCode)
+		fmt.Println("---")
+	}
+
+	// Set up HTTP server with admin middleware
+	mux := http.NewServeMux()
+
+	// Admin dashboard handler
+	adminHandler := func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Welcome to the Admin Dashboard!\n")
+		fmt.Fprintf(w, "Access granted from: %s\n", r.Header.Get("Referer"))
+	}
+
+	// Apply middleware to admin routes
+	mux.HandleFunc("/admin/dashboard", adminMiddleware(adminHandler))
+	mux.HandleFunc("/admin/users", adminMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "User management page\n")
+	}))
+
+	// Public health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "Server is healthy\n")
+	})
+
+	// Test the referer validation
+	fmt.Println("\nTesting Referer validation:")
+	testCases := []struct {
+		referer  string
+		expected bool
+	}{
+		{"https://admin.internal.com/dashboard", true},
+		{"http://admin.internal.com/users", true},
+		{"https://external.com/page", false},
+		{"", false},
+		{"https://fake-admin.internal.com/", false},
+		{"https://admin.internal.com.evil.com/", false},
+	}
+
+	for _, tc := range testCases {
+		result := checkRefererAccess(tc.referer)
+		status := "✓"
+		if result != tc.expected {
+			status = "✗"
+		}
+		fmt.Printf("%s Referer: %-45s -> Access: %v (expected: %v)\n",
+			status, tc.referer, result, tc.expected)
+	}
+
+	// Start the server
+	fmt.Println("\nStarting admin dashboard server on :8080...")
+	fmt.Println("Try accessing /admin/dashboard with Referer: https://admin.internal.com/")
+	fmt.Println("Example: curl -H 'Referer: https://admin.internal.com/' http://localhost:8080/admin/dashboard")
+
+	if err := http.ListenAndServe(":8080", mux); err != nil {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
+```

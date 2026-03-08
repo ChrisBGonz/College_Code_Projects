@@ -1,0 +1,160 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+const client = new Anthropic();
+
+app.use(express.json());
+
+// Route that demonstrates streaming with Claude
+app.post("/chat", async (req, res) => {
+  const { message } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  try {
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: message,
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (error) {
+    // This will be caught by the error handler below
+    throw error;
+  }
+});
+
+// Route that intentionally throws an error for testing
+app.get("/test-error", (req, res) => {
+  throw new Error("This is a test error");
+});
+
+// Route that throws an async error for testing
+app.get("/test-async-error", async (req, res) => {
+  await Promise.reject(new Error("This is an async test error"));
+});
+
+// Async error wrapper middleware
+const asyncHandler = (fn) => (req, res, next) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// Route using async handler wrapper
+app.get(
+  "/test-wrapped-error",
+  asyncHandler(async (req, res) => {
+    throw new Error("This is a wrapped async error");
+  })
+);
+
+// 404 handler - must be before error handler
+app.use((req, res, next) => {
+  const error = new Error(`Not Found: ${req.originalUrl}`);
+  error.status = 404;
+  next(error);
+});
+
+// Global error handler middleware - catches all unhandled exceptions
+// Must have 4 parameters (err, req, res, next) to be recognized as error handler
+app.use((err, req, res, next) => {
+  console.error("Unhandled Exception:", {
+    message: err.message,
+    stack: err.stack,
+    status: err.status || 500,
+    timestamp: new Date().toISOString(),
+    path: req.path,
+    method: req.method,
+  });
+
+  const statusCode = err.status || err.statusCode || 500;
+
+  // Check if response has already started (e.g., during streaming)
+  if (res.headersSent) {
+    // For SSE streams, send error event before closing
+    if (res.getHeader("Content-Type") === "text/event-stream") {
+      res.write(
+        `data: ${JSON.stringify({
+          error: {
+            message: err.message,
+            status: statusCode,
+          },
+        })}\n\n`
+      );
+    }
+    return res.end();
+  }
+
+  // Send error response to client
+  res.status(statusCode).json({
+    error: {
+      message: err.message || "Internal Server Error",
+      status: statusCode,
+      timestamp: new Date().toISOString(),
+      path: req.path,
+      // Only include stack trace in development
+      ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+    },
+  });
+});
+
+// Handle uncaught exceptions at process level
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", {
+    message: error.message,
+    stack: error.stack,
+    timestamp: new Date().toISOString(),
+  });
+  // In production, you might want to gracefully shutdown
+  // process.exit(1);
+});
+
+// Handle unhandled promise rejections at process level
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection:", {
+    reason: reason,
+    promise: promise,
+    timestamp: new Date().toISOString(),
+  });
+  // In production, you might want to gracefully shutdown
+  // process.exit(1);
+});
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Test endpoints:`);
+  console.log(`  POST /chat - Chat with Claude (streaming)`);
+  console.log(`  GET /test-error - Test synchronous error`);
+  console.log(`  GET /test-async-error - Test async error`);
+  console.log(`  GET /test-wrapped-error - Test wrapped async error`);
+  console.log(`  GET /nonexistent - Test 404 error`);
+});
+
+module.exports = app;
+```

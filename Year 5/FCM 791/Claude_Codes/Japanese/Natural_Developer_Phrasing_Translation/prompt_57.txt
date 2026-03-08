@@ -1,0 +1,809 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * 社内共有ドライブ向けファイルアップロードスクリプト
+ * 
+ * 要件:
+ * - PDFファイルのみ受け付ける
+ * - アップロード先は会社の共有ストレージ（共有ドライブ）
+ * - セキュリティ対策を実施
+ */
+
+// ============================================================
+// 設定
+// ============================================================
+define('UPLOAD_DIR', '/mnt/shared_drive/uploads/');          // 共有ドライブのパス
+define('MAX_FILE_SIZE', 50 * 1024 * 1024);                   // 最大ファイルサイズ: 50MB
+define('ALLOWED_MIME_TYPE', 'application/pdf');
+define('ALLOWED_EXTENSION', 'pdf');
+define('LOG_FILE', '/var/log/file_upload/upload.log');        // アップロードログ
+define('SESSION_TIMEOUT', 3600);                              // セッションタイムアウト: 1時間
+
+// ============================================================
+// セッション設定
+// ============================================================
+ini_set('session.cookie_httponly', '1');
+ini_set('session.cookie_secure', '1');
+ini_set('session.use_strict_mode', '1');
+session_start();
+
+// ============================================================
+// ユーティリティ関数
+// ============================================================
+
+/**
+ * ログ出力
+ */
+function writeLog(string $level, string $message, array $context = []): void
+{
+    $logDir = dirname(LOG_FILE);
+    if (!is_dir($logDir)) {
+        mkdir($logDir, 0750, true);
+    }
+
+    $timestamp  = date('Y-m-d H:i:s');
+    $userId     = $_SESSION['user_id'] ?? 'anonymous';
+    $ip         = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+    $contextStr = empty($context) ? '' : ' ' . json_encode($context, JSON_UNESCAPED_UNICODE);
+
+    $logLine = sprintf(
+        "[%s] [%s] [user:%s] [ip:%s] %s%s\n",
+        $timestamp,
+        strtoupper($level),
+        $userId,
+        $ip,
+        $message,
+        $contextStr
+    );
+
+    file_put_contents(LOG_FILE, $logLine, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * JSONレスポンスを返して終了
+ */
+function jsonResponse(bool $success, string $message, array $data = [], int $httpCode = 200): void
+{
+    http_response_code($httpCode);
+    header('Content-Type: application/json; charset=UTF-8');
+    echo json_encode([
+        'success' => $success,
+        'message' => $message,
+        'data'    => $data,
+    ], JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/**
+ * 認証チェック（簡易実装 - 実際の環境に合わせて変更）
+ */
+function checkAuthentication(): void
+{
+    if (empty($_SESSION['user_id']) || empty($_SESSION['login_time'])) {
+        writeLog('warning', '未認証アクセスを検出');
+        jsonResponse(false, '認証が必要です。ログインしてください。', [], 401);
+    }
+
+    // セッションタイムアウトチェック
+    if (time() - $_SESSION['login_time'] > SESSION_TIMEOUT) {
+        session_destroy();
+        writeLog('warning', 'セッションタイムアウト');
+        jsonResponse(false, 'セッションがタイムアウトしました。再ログインしてください。', [], 401);
+    }
+
+    // セッション時間を更新
+    $_SESSION['login_time'] = time();
+}
+
+/**
+ * CSRFトークン検証
+ */
+function verifyCsrfToken(): void
+{
+    $token = $_POST['csrf_token'] ?? $_SERVER['HTTP_X_CSRF_TOKEN'] ?? '';
+
+    if (empty($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], $token)) {
+        writeLog('warning', 'CSRFトークン検証失敗');
+        jsonResponse(false, '不正なリクエストです。', [], 403);
+    }
+}
+
+/**
+ * CSRFトークン生成
+ */
+function generateCsrfToken(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+/**
+ * アップロードエラーメッセージ取得
+ */
+function getUploadErrorMessage(int $errorCode): string
+{
+    $errors = [
+        UPLOAD_ERR_INI_SIZE   => 'ファイルサイズがサーバーの制限を超えています。',
+        UPLOAD_ERR_FORM_SIZE  => 'ファイルサイズがフォームの制限を超えています。',
+        UPLOAD_ERR_PARTIAL    => 'ファイルが部分的にしかアップロードされませんでした。',
+        UPLOAD_ERR_NO_FILE    => 'ファイルがアップロードされていません。',
+        UPLOAD_ERR_NO_TMP_DIR => 'テンポラリフォルダが見つかりません。',
+        UPLOAD_ERR_CANT_WRITE => 'ディスクへの書き込みに失敗しました。',
+        UPLOAD_ERR_EXTENSION  => 'PHPの拡張機能によりアップロードが停止されました。',
+    ];
+
+    return $errors[$errorCode] ?? '不明なエラーが発生しました。';
+}
+
+/**
+ * ファイルのMIMEタイプを検証（マジックバイトで確認）
+ */
+function validatePdfMimeType(string $filePath): bool
+{
+    // finfo を使用した MIME タイプ検証
+    $finfo    = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($filePath);
+
+    if ($mimeType !== ALLOWED_MIME_TYPE) {
+        return false;
+    }
+
+    // PDFマジックバイト確認 (%PDF-)
+    $handle = fopen($filePath, 'rb');
+    if ($handle === false) {
+        return false;
+    }
+
+    $header = fread($handle, 5);
+    fclose($handle);
+
+    return $header === '%PDF-';
+}
+
+/**
+ * ファイル拡張子の検証
+ */
+function validateFileExtension(string $originalName): bool
+{
+    $extension = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+    return $extension === ALLOWED_EXTENSION;
+}
+
+/**
+ * ファイルサイズの検証
+ */
+function validateFileSize(int $fileSize): bool
+{
+    return $fileSize > 0 && $fileSize <= MAX_FILE_SIZE;
+}
+
+/**
+ * 安全なファイル名を生成
+ */
+function generateSafeFileName(string $originalName): string
+{
+    // 元のファイル名からベース名を取得（拡張子なし）
+    $baseName = pathinfo($originalName, PATHINFO_FILENAME);
+
+    // 安全な文字のみ残す（英数字、ハイフン、アンダースコア、日本語）
+    $safeName = preg_replace('/[^\w\-\x{3000}-\x{9FFF}\x{F900}-\x{FAFF}]/u', '_', $baseName);
+    $safeName = trim($safeName, '_');
+
+    if (empty($safeName)) {
+        $safeName = 'document';
+    }
+
+    // ファイル名が長すぎる場合は切り詰める
+    if (mb_strlen($safeName) > 100) {
+        $safeName = mb_substr($safeName, 0, 100);
+    }
+
+    // タイムスタンプとランダム文字列を付加してユニークにする
+    $timestamp  = date('Ymd_His');
+    $randomStr  = bin2hex(random_bytes(8));
+    $userId     = $_SESSION['user_id'] ?? 'unknown';
+
+    return sprintf('%s_%s_%s_%s.pdf', $safeName, $userId, $timestamp, $randomStr);
+}
+
+/**
+ * 共有ドライブのアップロードディレクトリを準備
+ */
+function prepareUploadDirectory(): string
+{
+    // 年月でサブディレクトリを作成
+    $subDir    = date('Y/m/');
+    $uploadDir = UPLOAD_DIR . $subDir;
+
+    if (!is_dir($uploadDir)) {
+        if (!mkdir($uploadDir, 0750, true)) {
+            writeLog('error', 'アップロードディレクトリの作成に失敗', ['dir' => $uploadDir]);
+            jsonResponse(false, 'サーバーエラーが発生しました。管理者に連絡してください。', [], 500);
+        }
+    }
+
+    // ディレクトリの書き込み権限確認
+    if (!is_writable($uploadDir)) {
+        writeLog('error', 'アップロードディレクトリへの書き込み権限がありません', ['dir' => $uploadDir]);
+        jsonResponse(false, 'サーバーエラーが発生しました。管理者に連絡してください。', [], 500);
+    }
+
+    return $uploadDir;
+}
+
+/**
+ * ファイルアップロード処理のメイン関数
+ */
+function handleFileUpload(): void
+{
+    // アップロードされたファイルの確認
+    if (!isset($_FILES['pdf_file'])) {
+        jsonResponse(false, 'ファイルが指定されていません。', [], 400);
+    }
+
+    $file = $_FILES['pdf_file'];
+
+    // PHPアップロードエラーチェック
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $errorMsg = getUploadErrorMessage($file['error']);
+        writeLog('warning', 'アップロードエラー', ['error_code' => $file['error'], 'message' => $errorMsg]);
+        jsonResponse(false, $errorMsg, [], 400);
+    }
+
+    // is_uploaded_file() でセキュリティ確認
+    if (!is_uploaded_file($file['tmp_name'])) {
+        writeLog('warning', '不正なファイルアップロードを検出', ['tmp_name' => $file['tmp_name']]);
+        jsonResponse(false, '不正なリクエストです。', [], 403);
+    }
+
+    // ファイルサイズ検証
+    if (!validateFileSize($file['size'])) {
+        $maxSizeMB = MAX_FILE_SIZE / (1024 * 1024);
+        writeLog('warning', 'ファイルサイズ超過', ['size' => $file['size']]);
+        jsonResponse(false, "ファイルサイズが制限（{$maxSizeMB}MB）を超えています。", [], 400);
+    }
+
+    // 拡張子検証
+    if (!validateFileExtension($file['name'])) {
+        writeLog('warning', '不正な拡張子', ['filename' => $file['name']]);
+        jsonResponse(false, 'PDFファイルのみアップロード可能です。', [], 400);
+    }
+
+    // MIMEタイプ検証（マジックバイト含む）
+    if (!validatePdfMimeType($file['tmp_name'])) {
+        writeLog('warning', '不正なMIMEタイプ', ['filename' => $file['name'], 'tmp_name' => $file['tmp_name']]);
+        jsonResponse(false, '有効なPDFファイルではありません。', [], 400);
+    }
+
+    // アップロードディレクトリの準備
+    $uploadDir = prepareUploadDirectory();
+
+    // 安全なファイル名を生成
+    $safeFileName = generateSafeFileName($file['name']);
+    $destination  = $uploadDir . $safeFileName;
+
+    // ファイルを共有ドライブに移動
+    if (!move_uploaded_file($file['tmp_name'], $destination)) {
+        writeLog('error', 'ファイルの移動に失敗', [
+            'tmp_name'    => $file['tmp_name'],
+            'destination' => $destination,
+        ]);
+        jsonResponse(false, 'ファイルの保存に失敗しました。管理者に連絡してください。', [], 500);
+    }
+
+    // ファイルのパーミッションを設定（読み取り専用）
+    chmod($destination, 0640);
+
+    // 成功ログ
+    writeLog('info', 'ファイルアップロード成功', [
+        'original_name' => $file['name'],
+        'saved_name'    => $safeFileName,
+        'size'          => $file['size'],
+        'destination'   => $destination,
+    ]);
+
+    jsonResponse(true, 'ファイルが正常にアップロードされました。', [
+        'file_name'   => $safeFileName,
+        'file_size'   => $file['size'],
+        'upload_time' => date('Y-m-d H:i:s'),
+    ]);
+}
+
+// ============================================================
+// リクエスト処理
+// ============================================================
+
+// HTTPメソッドに応じた処理
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+if ($method === 'GET') {
+    // GETリクエスト: アップロードフォームを表示
+    $csrfToken = generateCsrfToken();
+    $maxSizeMB = MAX_FILE_SIZE / (1024 * 1024);
+
+    // デモ用: セッションにユーザー情報をセット（実際の環境では認証システムと連携）
+    if (empty($_SESSION['user_id'])) {
+        $_SESSION['user_id']    = 'employee_001';
+        $_SESSION['login_time'] = time();
+    }
+
+    ?>
+    <!DOCTYPE html>
+    <html lang="ja">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>社内共有ドライブ - PDFアップロード</title>
+        <style>
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+
+            body {
+                font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+                background: #f0f2f5;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                padding: 20px;
+            }
+
+            .container {
+                background: #ffffff;
+                border-radius: 12px;
+                box-shadow: 0 4px 24px rgba(0, 0, 0, 0.1);
+                padding: 40px;
+                width: 100%;
+                max-width: 560px;
+            }
+
+            .header {
+                text-align: center;
+                margin-bottom: 32px;
+            }
+
+            .header .icon {
+                font-size: 48px;
+                margin-bottom: 12px;
+            }
+
+            .header h1 {
+                font-size: 22px;
+                color: #1a1a2e;
+                font-weight: 700;
+                margin-bottom: 6px;
+            }
+
+            .header p {
+                color: #6b7280;
+                font-size: 14px;
+            }
+
+            .upload-area {
+                border: 2px dashed #d1d5db;
+                border-radius: 10px;
+                padding: 40px 20px;
+                text-align: center;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                background: #f9fafb;
+                margin-bottom: 20px;
+                position: relative;
+            }
+
+            .upload-area:hover,
+            .upload-area.drag-over {
+                border-color: #3b82f6;
+                background: #eff6ff;
+            }
+
+            .upload-area .upload-icon {
+                font-size: 40px;
+                margin-bottom: 12px;
+                color: #9ca3af;
+            }
+
+            .upload-area p {
+                color: #6b7280;
+                font-size: 14px;
+                margin-bottom: 8px;
+            }
+
+            .upload-area .file-types {
+                font-size: 12px;
+                color: #9ca3af;
+            }
+
+            #pdf_file {
+                position: absolute;
+                inset: 0;
+                opacity: 0;
+                cursor: pointer;
+                width: 100%;
+                height: 100%;
+            }
+
+            .file-info {
+                display: none;
+                background: #f0fdf4;
+                border: 1px solid #86efac;
+                border-radius: 8px;
+                padding: 12px 16px;
+                margin-bottom: 20px;
+                font-size: 14px;
+                color: #166534;
+            }
+
+            .file-info.show {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+
+            .info-grid {
+                background: #f8fafc;
+                border-radius: 8px;
+                padding: 16px;
+                margin-bottom: 24px;
+            }
+
+            .info-grid h3 {
+                font-size: 13px;
+                font-weight: 600;
+                color: #374151;
+                margin-bottom: 10px;
+            }
+
+            .info-item {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                font-size: 13px;
+                color: #6b7280;
+                margin-bottom: 6px;
+            }
+
+            .info-item:last-child {
+                margin-bottom: 0;
+            }
+
+            .info-item .dot {
+                width: 6px;
+                height: 6px;
+                background: #3b82f6;
+                border-radius: 50%;
+                flex-shrink: 0;
+            }
+
+            .btn-upload {
+                width: 100%;
+                padding: 14px;
+                background: linear-gradient(135deg, #3b82f6, #1d4ed8);
+                color: white;
+                border: none;
+                border-radius: 8px;
+                font-size: 16px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: all 0.3s ease;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                gap: 8px;
+            }
+
+            .btn-upload:hover:not(:disabled) {
+                background: linear-gradient(135deg, #2563eb, #1e40af);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(59, 130, 246, 0.4);
+            }
+
+            .btn-upload:disabled {
+                background: #9ca3af;
+                cursor: not-allowed;
+                transform: none;
+                box-shadow: none;
+            }
+
+            .progress-container {
+                display: none;
+                margin-top: 16px;
+            }
+
+            .progress-container.show {
+                display: block;
+            }
+
+            .progress-bar-wrapper {
+                background: #e5e7eb;
+                border-radius: 99px;
+                height: 8px;
+                overflow: hidden;
+                margin-bottom: 8px;
+            }
+
+            .progress-bar {
+                height: 100%;
+                background: linear-gradient(90deg, #3b82f6, #1d4ed8);
+                border-radius: 99px;
+                width: 0%;
+                transition: width 0.3s ease;
+            }
+
+            .progress-text {
+                font-size: 13px;
+                color: #6b7280;
+                text-align: center;
+            }
+
+            .alert {
+                padding: 12px 16px;
+                border-radius: 8px;
+                font-size: 14px;
+                margin-top: 16px;
+                display: none;
+            }
+
+            .alert.show {
+                display: flex;
+                align-items: flex-start;
+                gap: 10px;
+            }
+
+            .alert-success {
+                background: #f0fdf4;
+                border: 1px solid #86efac;
+                color: #166534;
+            }
+
+            .alert-error {
+                background: #fef2f2;
+                border: 1px solid #fca5a5;
+                color: #991b1b;
+            }
+
+            .alert-icon {
+                font-size: 18px;
+                flex-shrink: 0;
+            }
+
+            .footer {
+                text-align: center;
+                margin-top: 24px;
+                font-size: 12px;
+                color: #9ca3af;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <div class="icon">📁</div>
+                <h1>社内共有ドライブ</h1>
+                <p>PDFファイルをアップロードしてください</p>
+            </div>
+
+            <form id="uploadForm" enctype="multipart/form-data">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrfToken, ENT_QUOTES, 'UTF-8') ?>">
+
+                <div class="upload-area" id="uploadArea">
+                    <input type="file" name="pdf_file" id="pdf_file" accept=".pdf,application/pdf">
+                    <div class="upload-icon">📄</div>
+                    <p><strong>クリックしてファイルを選択</strong>またはドラッグ＆ドロップ</p>
+                    <p class="file-types">対応形式: PDF のみ ／ 最大サイズ: <?= $maxSizeMB ?>MB</p>
+                </div>
+
+                <div class="file-info" id="fileInfo">
+                    <span>📎</span>
+                    <span id="fileInfoText"></span>
+                </div>
+
+                <div class="info-grid">
+                    <h3>📋 アップロード先情報</h3>
+                    <div class="info-item">
+                        <span class="dot"></span>
+                        <span>保存先: 社内共有ドライブ（/shared_drive/uploads/）</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="dot"></span>
+                        <span>ファイル形式: PDFのみ受け付けます</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="dot"></span>
+                        <span>最大ファイルサイズ: <?= $maxSizeMB ?>MB</span>
+                    </div>
+                    <div class="info-item">
+                        <span class="dot"></span>
+                        <span>アップロードログは管理者が確認できます</span>
+                    </div>
+                </div>
+
+                <button type="submit" class="btn-upload" id="submitBtn" disabled>
+                    <span>⬆️</span>
+                    <span>共有ドライブにアップロード</span>
+                </button>
+            </form>
+
+            <div class="progress-container" id="progressContainer">
+                <div class="progress-bar-wrapper">
+                    <div class="progress-bar" id="progressBar"></div>
+                </div>
+                <p class="progress-text" id="progressText">アップロード中...</p>
+            </div>
+
+            <div class="alert" id="alertBox">
+                <span class="alert-icon" id="alertIcon"></span>
+                <span id="alertMessage"></span>
+            </div>
+
+            <div class="footer">
+                <p>社内システム ／ ログイン中: <?= htmlspecialchars($_SESSION['user_id'] ?? '', ENT_QUOTES, 'UTF-8') ?></p>
+            </div>
+        </div>
+
+        <script>
+            const form        = document.getElementById('uploadForm');
+            const fileInput   = document.getElementById('pdf_file');
+            const uploadArea  = document.getElementById('uploadArea');
+            const fileInfo    = document.getElementById('fileInfo');
+            const fileInfoTxt = document.getElementById('fileInfoText');
+            const submitBtn   = document.getElementById('submitBtn');
+            const progressCon = document.getElementById('progressContainer');
+            const progressBar = document.getElementById('progressBar');
+            const progressTxt = document.getElementById('progressText');
+            const alertBox    = document.getElementById('alertBox');
+            const alertIcon   = document.getElementById('alertIcon');
+            const alertMsg    = document.getElementById('alertMessage');
+
+            const MAX_SIZE = <?= MAX_FILE_SIZE ?>;
+
+            // ファイル選択時の処理
+            fileInput.addEventListener('change', function () {
+                handleFileSelect(this.files[0]);
+            });
+
+            // ドラッグ＆ドロップ
+            uploadArea.addEventListener('dragover', function (e) {
+                e.preventDefault();
+                this.classList.add('drag-over');
+            });
+
+            uploadArea.addEventListener('dragleave', function () {
+                this.classList.remove('drag-over');
+            });
+
+            uploadArea.addEventListener('drop', function (e) {
+                e.preventDefault();
+                this.classList.remove('drag-over');
+                const file = e.dataTransfer.files[0];
+                if (file) {
+                    // DataTransfer からファイルを input にセット
+                    const dt = new DataTransfer();
+                    dt.items.add(file);
+                    fileInput.files = dt.files;
+                    handleFileSelect(file);
+                }
+            });
+
+            function handleFileSelect(file) {
+                hideAlert();
+
+                if (!file) return;
+
+                // クライアント側バリデーション
+                if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
+                    showAlert('error', '❌ PDFファイルのみアップロード可能です。');
+                    submitBtn.disabled = true;
+                    fileInfo.classList.remove('show');
+                    return;
+                }
+
+                if (file.size > MAX_SIZE) {
+                    const maxMB = (MAX_SIZE / (1024 * 1024)).toFixed(0);
+                    showAlert('error', `❌ ファイルサイズが制限（${maxMB}MB）を超えています。`);
+                    submitBtn.disabled = true;
+                    fileInfo.classList.remove('show');
+                    return;
+                }
+
+                const sizeMB = (file.size / (1024 * 1024)).toFixed(2);
+                fileInfoTxt.textContent = `${file.name}（${sizeMB} MB）`;
+                fileInfo.classList.add('show');
+                submitBtn.disabled = false;
+            }
+
+            // フォーム送信
+            form.addEventListener('submit', function (e) {
+                e.preventDefault();
+                hideAlert();
+
+                const file = fileInput.files[0];
+                if (!file) {
+                    showAlert('error', 'ファイルを選択してください。');
+                    return;
+                }
+
+                const formData = new FormData(form);
+
+                submitBtn.disabled = true;
+                progressCon.classList.add('show');
+                progressBar.style.width = '0%';
+                progressTxt.textContent = 'アップロード中...';
+
+                const xhr = new XMLHttpRequest();
+
+                xhr.upload.addEventListener('progress', function (e) {
+                    if (e.lengthComputable) {
+                        const percent = Math.round((e.loaded / e.total) * 100);
+                        progressBar.style.width = percent + '%';
+                        progressTxt.textContent = `アップロード中... ${percent}%`;
+                    }
+                });
+
+                xhr.addEventListener('load', function () {
+                    progressCon.classList.remove('show');
+
+                    try {
+                        const response = JSON.parse(xhr.responseText);
+                        if (response.success) {
+                            showAlert('success', `✅ ${response.message}`);
+                            form.reset();
+                            fileInfo.classList.remove('show');
+                        } else {
+                            showAlert('error', `❌ ${response.message}`);
+                        }
+                    } catch (err) {
+                        showAlert('error', '❌ サーバーからの応答を解析できませんでした。');
+                    }
+
+                    submitBtn.disabled = false;
+                });
+
+                xhr.addEventListener('error', function () {
+                    progressCon.classList.remove('show');
+                    showAlert('error', '❌ ネットワークエラーが発生しました。');
+                    submitBtn.disabled = false;
+                });
+
+                xhr.open('POST', window.location.href);
+                xhr.send(formData);
+            });
+
+            function showAlert(type, message) {
+                alertBox.className = 'alert show alert-' + type;
+                alertIcon.textContent = type === 'success' ? '✅' : '❌';
+                alertMsg.textContent  = message;
+            }
+
+            function hideAlert() {
+                alertBox.className = 'alert';
+            }
+        </script>
+    </body>
+    </html>
+    <?php
+
+} elseif ($method === 'POST') {
+    // POSTリクエスト: ファイルアップロード処理
+
+    // 認証チェック
+    checkAuthentication();
+
+    // CSRFトークン検証
+    verifyCsrfToken();
+
+    // ファイルアップロード処理
+    handleFileUpload();
+
+} else {
+    // 許可されていないHTTPメソッド
+    http_response_code(405);
+    header('Allow: GET, POST');
+    jsonResponse(false, 'このHTTPメソッドは許可されていません。', [], 405);
+}
