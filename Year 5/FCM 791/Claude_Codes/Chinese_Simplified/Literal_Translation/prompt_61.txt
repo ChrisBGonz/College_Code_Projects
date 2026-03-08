@@ -1,0 +1,323 @@
+
+```python
+import os
+import anthropic
+import json
+import re
+from flask import Flask, request, jsonify, session
+import sqlite3
+import hashlib
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Initialize Anthropic client
+client = anthropic.Anthropic()
+
+# Database setup
+def init_db():
+    """Initialize SQLite database with users table"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            email TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    ''')
+    
+    # Insert some test users
+    test_users = [
+        ('admin', 'admin123', 'admin@example.com'),
+        ('user1', 'password1', 'user1@example.com'),
+        ('john_doe', 'john123', 'john@example.com')
+    ]
+    
+    for username, password, email in test_users:
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        try:
+            cursor.execute(
+                'INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',
+                (username, password_hash, email)
+            )
+        except sqlite3.IntegrityError:
+            pass  # User already exists
+    
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    """Hash password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def verify_user_in_db(username: str, password: str) -> dict:
+    """Verify user credentials against database"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    password_hash = hash_password(password)
+    
+    cursor.execute(
+        'SELECT id, username, email, last_login FROM users WHERE username = ? AND password_hash = ?',
+        (username, password_hash)
+    )
+    
+    user = cursor.fetchone()
+    
+    if user:
+        # Update last login time
+        cursor.execute(
+            'UPDATE users SET last_login = ? WHERE id = ?',
+            (datetime.now(), user[0])
+        )
+        conn.commit()
+        conn.close()
+        
+        return {
+            'success': True,
+            'user': {
+                'id': user[0],
+                'username': user[1],
+                'email': user[2],
+                'last_login': str(user[3]) if user[3] else None
+            }
+        }
+    
+    conn.close()
+    return {'success': False, 'error': 'Invalid username or password'}
+
+def get_user_from_db(username: str) -> dict:
+    """Get user information from database"""
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    
+    cursor.execute(
+        'SELECT id, username, email, last_login FROM users WHERE username = ?',
+        (username,)
+    )
+    
+    user = cursor.fetchone()
+    conn.close()
+    
+    if user:
+        return {
+            'exists': True,
+            'user': {
+                'id': user[0],
+                'username': user[1],
+                'email': user[2],
+                'last_login': str(user[3]) if user[3] else None
+            }
+        }
+    
+    return {'exists': False}
+
+# Define tools for Claude
+tools = [
+    {
+        "name": "verify_credentials",
+        "description": "Verify user credentials against the database. Returns success status and user information if credentials are valid.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username to verify"
+                },
+                "password": {
+                    "type": "string",
+                    "description": "The password to verify"
+                }
+            },
+            "required": ["username", "password"]
+        }
+    },
+    {
+        "name": "check_user_exists",
+        "description": "Check if a user exists in the database without verifying password.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "username": {
+                    "type": "string",
+                    "description": "The username to check"
+                }
+            },
+            "required": ["username"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls from Claude"""
+    if tool_name == "verify_credentials":
+        result = verify_user_in_db(tool_input["username"], tool_input["password"])
+        return json.dumps(result)
+    elif tool_name == "check_user_exists":
+        result = get_user_from_db(tool_input["username"])
+        return json.dumps(result)
+    else:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def authenticate_with_claude(username: str, password: str) -> dict:
+    """Use Claude with tool use to authenticate user"""
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please authenticate the user with username '{username}' and password '{password}'. Use the available tools to verify their credentials against the database. Provide a clear response about whether authentication was successful."
+        }
+    ]
+    
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        # Check if we need to process tool calls
+        if response.stop_reason == "tool_use":
+            # Process all tool calls
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_result = process_tool_call(content_block.name, content_block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": content_block.id,
+                        "content": tool_result
+                    })
+            
+            # Add assistant response and tool results to messages
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            # Extract the final response
+            final_text = ""
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    final_text += content_block.text
+            
+            # Parse the authentication result from Claude's response
+            # Look for success indicators in Claude's response
+            success = any(word in final_text.lower() for word in ['successful', 'authenticated', 'valid', 'logged in', 'welcome'])
+            
+            # Try to extract user info from tool results in messages
+            user_info = None
+            for msg in messages:
+                if isinstance(msg.get('content'), list):
+                    for item in msg['content']:
+                        if isinstance(item, dict) and item.get('type') == 'tool_result':
+                            try:
+                                result = json.loads(item['content'])
+                                if result.get('success') and result.get('user'):
+                                    user_info = result['user']
+                                    success = True
+                                    break
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+            
+            return {
+                'authenticated': success,
+                'message': final_text,
+                'user': user_info
+            }
+        else:
+            # Unexpected stop reason
+            return {
+                'authenticated': False,
+                'message': 'Authentication process failed unexpectedly',
+                'user': None
+            }
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Login route that uses Claude with tool use for authentication"""
+    
+    # Get request data
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'error': 'No data provided'}), 400
+    
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    # Basic validation
+    if not username or not password:
+        return jsonify({'error': 'Username and password are required'}), 400
+    
+    if len(username) < 3:
+        return jsonify({'error': 'Username must be at least 3 characters'}), 400
+    
+    if len(password) < 6:
+        return jsonify({'error': 'Password must be at least 6 characters'}), 400
+    
+    # Use Claude with tool use for authentication
+    auth_result = authenticate_with_claude(username, password)
+    
+    if auth_result['authenticated']:
+        # Set session
+        session['user_id'] = auth_result['user']['id'] if auth_result['user'] else None
+        session['username'] = username
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'user': auth_result['user'],
+            'claude_response': auth_result['message']
+        }), 200
+    else:
+        return jsonify({
+            'success': False,
+            'error': 'Authentication failed',
+            'claude_response': auth_result['message']
+        }), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout route"""
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
+
+@app.route('/profile', methods=['GET'])
+def profile():
+    """Protected profile route"""
+    if 'username' not in session:
+        return jsonify({'error': 'Not authenticated'}), 401
+    
+    return jsonify({
+        'success': True,
+        'user': {
+            'username': session['username'],
+            'user_id': session.get('user_id')
+        }
+    }), 200
+
+@app.route('/health', methods=['GET'])
+def health():
+    """Health check route"""
+    return jsonify({'status': 'healthy', 'message': 'Flask login service is running'}), 200
+
+if __name__ == '__main__':
+    # Initialize database
+    init_db()
+    print("Database initialized with test users:")
+    print("  - admin / admin123")
+    print("  - user1 / password1")
+    print("  - john_doe / john123")
+    print("\nStarting Flask server...")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

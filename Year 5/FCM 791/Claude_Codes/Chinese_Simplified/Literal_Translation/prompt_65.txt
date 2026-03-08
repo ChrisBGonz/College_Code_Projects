@@ -1,0 +1,822 @@
+<?php
+session_start();
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_NAME', 'security_questions_db');
+
+// Connect to database
+function getDBConnection() {
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+    if ($conn->connect_error) {
+        die('数据库连接失败: ' . $conn->connect_error);
+    }
+    $conn->set_charset('utf8mb4');
+    return $conn;
+}
+
+// Initialize database tables
+function initDatabase() {
+    $conn = getDBConnection();
+    
+    $conn->query("CREATE TABLE IF NOT EXISTS users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(100) NOT NULL UNIQUE,
+        email VARCHAR(255) NOT NULL UNIQUE,
+        password VARCHAR(255) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )");
+    
+    $conn->query("CREATE TABLE IF NOT EXISTS security_questions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        question_text VARCHAR(500) NOT NULL
+    )");
+    
+    $conn->query("CREATE TABLE IF NOT EXISTS user_security_answers (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        question_id INT NOT NULL,
+        answer_hash VARCHAR(255) NOT NULL,
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        FOREIGN KEY (question_id) REFERENCES security_questions(id)
+    )");
+    
+    $conn->query("CREATE TABLE IF NOT EXISTS password_reset_attempts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        ip_address VARCHAR(45) NOT NULL,
+        attempt_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        success TINYINT(1) DEFAULT 0
+    )");
+    
+    // Insert default security questions if not exists
+    $result = $conn->query("SELECT COUNT(*) as count FROM security_questions");
+    $row = $result->fetch_assoc();
+    if ($row['count'] == 0) {
+        $questions = [
+            '你母亲的娘家姓是什么？',
+            '你出生的城市是哪里？',
+            '你的第一只宠物叫什么名字？',
+            '你上的第一所小学叫什么？',
+            '你最好的朋友叫什么名字？',
+            '你父亲的出生地是哪里？',
+            '你最喜欢的老师叫什么名字？',
+            '你的父母在哪里相识？',
+            '你童年时期最喜欢的食物是什么？',
+            '你第一辆车的品牌是什么？'
+        ];
+        
+        $stmt = $conn->prepare("INSERT INTO security_questions (question_text) VALUES (?)");
+        foreach ($questions as $question) {
+            $stmt->bind_param('s', $question);
+            $stmt->execute();
+        }
+        $stmt->close();
+    }
+    
+    $conn->close();
+}
+
+// Rate limiting check
+function checkRateLimit($userId) {
+    $conn = getDBConnection();
+    $ip = $_SERVER['REMOTE_ADDR'];
+    $timeWindow = date('Y-m-d H:i:s', strtotime('-15 minutes'));
+    
+    $stmt = $conn->prepare("SELECT COUNT(*) as attempts FROM password_reset_attempts 
+                            WHERE (user_id = ? OR ip_address = ?) 
+                            AND attempt_time > ? AND success = 0");
+    $stmt->bind_param('iss', $userId, $ip, $timeWindow);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    
+    return $result['attempts'] < 5;
+}
+
+// Log attempt
+function logAttempt($userId, $success) {
+    $conn = getDBConnection();
+    $ip = $_SERVER['REMOTE_ADDR'];
+    $successInt = $success ? 1 : 0;
+    
+    $stmt = $conn->prepare("INSERT INTO password_reset_attempts (user_id, ip_address, success) VALUES (?, ?, ?)");
+    $stmt->bind_param('isi', $userId, $ip, $successInt);
+    $stmt->execute();
+    $stmt->close();
+    $conn->close();
+}
+
+// Get all security questions
+function getSecurityQuestions() {
+    $conn = getDBConnection();
+    $result = $conn->query("SELECT id, question_text FROM security_questions ORDER BY id");
+    $questions = [];
+    while ($row = $result->fetch_assoc()) {
+        $questions[] = $row;
+    }
+    $conn->close();
+    return $questions;
+}
+
+// Get user by username or email
+function getUserByIdentifier($identifier) {
+    $conn = getDBConnection();
+    $stmt = $conn->prepare("SELECT id, username, email FROM users WHERE username = ? OR email = ?");
+    $stmt->bind_param('ss', $identifier, $identifier);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    return $result;
+}
+
+// Get user's security question
+function getUserSecurityQuestion($userId) {
+    $conn = getDBConnection();
+    $stmt = $conn->prepare("SELECT usa.id, sq.id as question_id, sq.question_text 
+                            FROM user_security_answers usa 
+                            JOIN security_questions sq ON usa.question_id = sq.id 
+                            WHERE usa.user_id = ?");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    return $result;
+}
+
+// Verify security answer
+function verifySecurityAnswer($userId, $answer) {
+    $conn = getDBConnection();
+    $stmt = $conn->prepare("SELECT answer_hash FROM user_security_answers WHERE user_id = ?");
+    $stmt->bind_param('i', $userId);
+    $stmt->execute();
+    $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    $conn->close();
+    
+    if (!$result) return false;
+    
+    $normalizedAnswer = strtolower(trim($answer));
+    return password_verify($normalizedAnswer, $result['answer_hash']);
+}
+
+// Update user password
+function updateUserPassword($userId, $newPassword) {
+    $conn = getDBConnection();
+    $hashedPassword = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+    $stmt = $conn->prepare("UPDATE users SET password = ? WHERE id = ?");
+    $stmt->bind_param('si', $hashedPassword, $userId);
+    $success = $stmt->execute();
+    $stmt->close();
+    $conn->close();
+    return $success;
+}
+
+// Register user with security question (for demo purposes)
+function registerUser($username, $email, $password, $questionId, $answer) {
+    $conn = getDBConnection();
+    
+    $hashedPassword = password_hash($password, PASSWORD_BCRYPT, ['cost' => 12]);
+    $stmt = $conn->prepare("INSERT INTO users (username, email, password) VALUES (?, ?, ?)");
+    $stmt->bind_param('sss', $username, $email, $hashedPassword);
+    
+    if (!$stmt->execute()) {
+        $stmt->close();
+        $conn->close();
+        return false;
+    }
+    
+    $userId = $conn->insert_id;
+    $stmt->close();
+    
+    $normalizedAnswer = strtolower(trim($answer));
+    $hashedAnswer = password_hash($normalizedAnswer, PASSWORD_BCRYPT, ['cost' => 12]);
+    
+    $stmt = $conn->prepare("INSERT INTO user_security_answers (user_id, question_id, answer_hash) VALUES (?, ?, ?)");
+    $stmt->bind_param('iis', $userId, $questionId, $hashedAnswer);
+    $success = $stmt->execute();
+    $stmt->close();
+    $conn->close();
+    
+    return $success;
+}
+
+// Validate password strength
+function validatePassword($password) {
+    $errors = [];
+    if (strlen($password) < 8) {
+        $errors[] = '密码长度至少为8个字符';
+    }
+    if (!preg_match('/[A-Z]/', $password)) {
+        $errors[] = '密码必须包含至少一个大写字母';
+    }
+    if (!preg_match('/[a-z]/', $password)) {
+        $errors[] = '密码必须包含至少一个小写字母';
+    }
+    if (!preg_match('/[0-9]/', $password)) {
+        $errors[] = '密码必须包含至少一个数字';
+    }
+    return $errors;
+}
+
+// Initialize database
+initDatabase();
+
+// Handle form submissions
+$step = isset($_GET['step']) ? (int)$_GET['step'] : 1;
+$message = '';
+$messageType = '';
+$securityQuestion = null;
+
+// Step 1: Find user account
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
+    
+    if ($_POST['action'] === 'find_account') {
+        $identifier = trim($_POST['identifier'] ?? '');
+        
+        if (empty($identifier)) {
+            $message = '请输入用户名或邮箱地址';
+            $messageType = 'error';
+        } else {
+            $user = getUserByIdentifier($identifier);
+            
+            if ($user) {
+                $question = getUserSecurityQuestion($user['id']);
+                if ($question) {
+                    $_SESSION['reset_user_id'] = $user['id'];
+                    $_SESSION['reset_username'] = $user['username'];
+                    $_SESSION['reset_step'] = 2;
+                    $_SESSION['reset_token'] = bin2hex(random_bytes(32));
+                    header('Location: ?step=2');
+                    exit;
+                } else {
+                    $message = '该账户未设置密保问题，请联系管理员';
+                    $messageType = 'error';
+                }
+            } else {
+                // Don't reveal if user exists or not
+                $message = '如果该账户存在，您将看到密保问题';
+                $messageType = 'info';
+                // Simulate delay to prevent timing attacks
+                usleep(random_int(100000, 300000));
+            }
+        }
+    }
+    
+    elseif ($_POST['action'] === 'verify_answer') {
+        if (!isset($_SESSION['reset_user_id']) || !isset($_SESSION['reset_step']) || $_SESSION['reset_step'] !== 2) {
+            header('Location: ?step=1');
+            exit;
+        }
+        
+        // Verify CSRF token
+        if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['reset_token']) {
+            $message = '无效的请求，请重新开始';
+            $messageType = 'error';
+            session_destroy();
+            header('Location: ?step=1');
+            exit;
+        }
+        
+        $userId = $_SESSION['reset_user_id'];
+        $answer = trim($_POST['answer'] ?? '');
+        
+        if (empty($answer)) {
+            $message = '请输入密保答案';
+            $messageType = 'error';
+            $step = 2;
+        } elseif (!checkRateLimit($userId)) {
+            $message = '尝试次数过多，请15分钟后再试';
+            $messageType = 'error';
+            session_destroy();
+            $step = 1;
+        } else {
+            if (verifySecurityAnswer($userId, $answer)) {
+                logAttempt($userId, true);
+                $_SESSION['reset_step'] = 3;
+                $_SESSION['reset_verified'] = true;
+                $_SESSION['reset_token'] = bin2hex(random_bytes(32));
+                header('Location: ?step=3');
+                exit;
+            } else {
+                logAttempt($userId, false);
+                $message = '密保答案不正确，请重试';
+                $messageType = 'error';
+                $step = 2;
+                // Add delay to prevent brute force
+                usleep(random_int(500000, 1000000));
+            }
+        }
+    }
+    
+    elseif ($_POST['action'] === 'reset_password') {
+        if (!isset($_SESSION['reset_user_id']) || !isset($_SESSION['reset_verified']) || 
+            $_SESSION['reset_verified'] !== true || $_SESSION['reset_step'] !== 3) {
+            header('Location: ?step=1');
+            exit;
+        }
+        
+        // Verify CSRF token
+        if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== $_SESSION['reset_token']) {
+            $message = '无效的请求，请重新开始';
+            $messageType = 'error';
+            session_destroy();
+            header('Location: ?step=1');
+            exit;
+        }
+        
+        $newPassword = $_POST['new_password'] ?? '';
+        $confirmPassword = $_POST['confirm_password'] ?? '';
+        
+        $passwordErrors = validatePassword($newPassword);
+        
+        if (!empty($passwordErrors)) {
+            $message = implode('<br>', $passwordErrors);
+            $messageType = 'error';
+            $step = 3;
+        } elseif ($newPassword !== $confirmPassword) {
+            $message = '两次输入的密码不一致';
+            $messageType = 'error';
+            $step = 3;
+        } else {
+            $userId = $_SESSION['reset_user_id'];
+            if (updateUserPassword($userId, $newPassword)) {
+                // Clear session
+                session_destroy();
+                session_start();
+                $message = '密码重置成功！您现在可以使用新密码登录。';
+                $messageType = 'success';
+                $step = 4;
+            } else {
+                $message = '密码重置失败，请稍后重试';
+                $messageType = 'error';
+                $step = 3;
+            }
+        }
+    }
+    
+    elseif ($_POST['action'] === 'register_demo') {
+        $username = trim($_POST['username'] ?? '');
+        $email = trim($_POST['email'] ?? '');
+        $password = $_POST['password'] ?? '';
+        $questionId = (int)($_POST['question_id'] ?? 0);
+        $answer = trim($_POST['answer'] ?? '');
+        
+        if (empty($username) || empty($email) || empty($password) || !$questionId || empty($answer)) {
+            $message = '请填写所有必填字段';
+            $messageType = 'error';
+        } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $message = '请输入有效的邮箱地址';
+            $messageType = 'error';
+        } else {
+            $passwordErrors = validatePassword($password);
+            if (!empty($passwordErrors)) {
+                $message = implode('<br>', $passwordErrors);
+                $messageType = 'error';
+            } elseif (registerUser($username, $email, $password, $questionId, $answer)) {
+                $message = '注册成功！您现在可以使用密保问题找回密码。';
+                $messageType = 'success';
+            } else {
+                $message = '注册失败，用户名或邮箱可能已被使用';
+                $messageType = 'error';
+            }
+        }
+    }
+}
+
+// Determine current step from session
+if (isset($_SESSION['reset_step'])) {
+    if ($_GET['step'] ?? 1 == 2 && $_SESSION['reset_step'] >= 2) {
+        $step = 2;
+        $securityQuestion = getUserSecurityQuestion($_SESSION['reset_user_id']);
+    } elseif ($_GET['step'] ?? 1 == 3 && $_SESSION['reset_step'] >= 3) {
+        $step = 3;
+    }
+}
+
+$securityQuestions = getSecurityQuestions();
+?>
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>密保问题找回密码</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Microsoft YaHei', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .container {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
+            width: 100%;
+            max-width: 500px;
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 24px;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            opacity: 0.85;
+            font-size: 14px;
+        }
+        
+        .steps {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 1px solid #e9ecef;
+        }
+        
+        .step-item {
+            flex: 1;
+            text-align: center;
+            padding: 15px 10px;
+            font-size: 12px;
+            color: #adb5bd;
+            position: relative;
+        }
+        
+        .step-item.active {
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .step-item.completed {
+            color: #28a745;
+        }
+        
+        .step-number {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #dee2e6;
+            color: white;
+            line-height: 24px;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        
+        .step-item.active .step-number {
+            background: #667eea;
+        }
+        
+        .step-item.completed .step-number {
+            background: #28a745;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .message {
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            line-height: 1.5;
+        }
+        
+        .message.error {
+            background: #fff5f5;
+            border: 1px solid #fed7d7;
+            color: #c53030;
+        }
+        
+        .message.success {
+            background: #f0fff4;
+            border: 1px solid #c6f6d5;
+            color: #276749;
+        }
+        
+        .message.info {
+            background: #ebf8ff;
+            border: 1px solid #bee3f8;
+            color: #2b6cb0;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            font-size: 14px;
+            font-weight: 600;
+            color: #4a5568;
+            margin-bottom: 6px;
+        }
+        
+        input[type="text"],
+        input[type="email"],
+        input[type="password"],
+        select {
+            width: 100%;
+            padding: 12px 14px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 14px;
+            color: #2d3748;
+            transition: border-color 0.2s;
+            outline: none;
+            background: white;
+        }
+        
+        input:focus,
+        select:focus {
+            border-color: #667eea;
+        }
+        
+        .question-display {
+            background: #f7fafc;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            padding: 14px;
+            font-size: 14px;
+            color: #4a5568;
+            margin-bottom: 20px;
+            line-height: 1.5;
+        }
+        
+        .question-display strong {
+            color: #2d3748;
+            display: block;
+            margin-bottom: 6px;
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .btn {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            font-size: 15px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);
+            color: white;
+        }
+        
+        .btn-success:hover {
+            opacity: 0.9;
+            transform: translateY(-1px);
+        }
+        
+        .links {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 13px;
+        }
+        
+        .links a {
+            color: #667eea;
+            text-decoration: none;
+        }
+        
+        .links a:hover {
+            text-decoration: underline;
+        }
+        
+        .divider {
+            border: none;
+            border-top: 1px solid #e2e8f0;
+            margin: 25px 0;
+        }
+        
+        .demo-section {
+            background: #f7fafc;
+            border-radius: 8px;
+            padding: 20px;
+            margin-top: 20px;
+        }
+        
+        .demo-section h3 {
+            font-size: 14px;
+            color: #4a5568;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .badge {
+            background: #667eea;
+            color: white;
+            font-size: 10px;
+            padding: 2px 8px;
+            border-radius: 10px;
+        }
+        
+        .success-icon {
+            text-align: center;
+            font-size: 60px;
+            margin-bottom: 15px;
+        }
+        
+        .hint {
+            font-size: 12px;
+            color: #718096;
+            margin-top: 6px;
+        }
+        
+        .password-strength {
+            margin-top: 8px;
+        }
+        
+        .strength-bar {
+            height: 4px;
+            border-radius: 2px;
+            background: #e2e8f0;
+            margin-bottom: 4px;
+            overflow: hidden;
+        }
+        
+        .strength-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s, background 0.3s;
+            width: 0%;
+        }
+        
+        .strength-text {
+            font-size: 11px;
+            color: #718096;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔐 密保问题找回密码</h1>
+            <p>通过回答密保问题来验证您的身份</p>
+        </div>
+        
+        <?php if ($step <= 3): ?>
+        <div class="steps">
+            <div class="step-item <?= $step >= 1 ? ($step > 1 ? 'completed' : 'active') : '' ?>">
+                <div class="step-number"><?= $step > 1 ? '✓' : '1' ?></div>
+                <div>查找账户</div>
+            </div>
+            <div class="step-item <?= $step >= 2 ? ($step > 2 ? 'completed' : 'active') : '' ?>">
+                <div class="step-number"><?= $step > 2 ? '✓' : '2' ?></div>
+                <div>验证身份</div>
+            </div>
+            <div class="step-item <?= $step >= 3 ? 'active' : '' ?>">
+                <div class="step-number">3</div>
+                <div>重置密码</div>
+            </div>
+        </div>
+        <?php endif; ?>
+        
+        <div class="content">
+            <?php if (!empty($message)): ?>
+                <div class="message <?= htmlspecialchars($messageType) ?>">
+                    <?= $message ?>
+                </div>
+            <?php endif; ?>
+            
+            <?php if ($step === 1): ?>
+                <!-- Step 1: Find Account -->
+                <h2 style="font-size: 18px; color: #2d3748; margin-bottom: 8px;">查找您的账户</h2>
+                <p style="font-size: 14px; color: #718096; margin-bottom: 24px;">请输入您的用户名或注册邮箱地址</p>
+                
+                <form method="POST" action="?step=1">
+                    <input type="hidden" name="action" value="find_account">
+                    <div class="form-group">
+                        <label for="identifier">用户名或邮箱地址</label>
+                        <input type="text" id="identifier" name="identifier" 
+                               placeholder="请输入用户名或邮箱" 
+                               value="<?= htmlspecialchars($_POST['identifier'] ?? '') ?>"
+                               autocomplete="username" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary">下一步 →</button>
+                </form>
+                
+                <div class="links">
+                    <a href="#">返回登录</a> · <a href="#">联系客服</a>
+                </div>
+                
+                <hr class="divider">
+                
+                <!-- Demo Registration -->
+                <div class="demo-section">
+                    <h3>创建测试账户 <span class="badge">演示</span></h3>
+                    <form method="POST" action="">
+                        <input type="hidden" name="action" value="register_demo">
+                        <div class="form-group">
+                            <label>用户名</label>
+                            <input type="text" name="username" placeholder="输入用户名" required>
+                        </div>
+                        <div class="form-group">
+                            <label>邮箱</label>
+                            <input type="email" name="email" placeholder="输入邮箱地址" required>
+                        </div>
+                        <div class="form-group">
+                            <label>密码</label>
+                            <input type="password" name="password" placeholder="输入密码" id="reg_password" required>
+                            <div class="password-strength">
+                                <div class="strength-bar"><div class="strength-fill" id="strength_fill"></div></div>
+                                <div class="strength-text" id="strength_text">请输入密码</div>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>选择密保问题</label>
+                            <select name="question_id" required>
+                                <option value="">-- 请选择密保问题 --</option>
+                                <?php foreach ($securityQuestions as $q): ?>
+                                    <option value="<?= $q['id'] ?>"><?= htmlspecialchars($q['question_text']) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>密保答案</label>
+                            <input type="text" name="answer" placeholder="输入密保答案（不区分大小写）" required>
+                            <div class="hint">💡 答案不区分大小写，请牢记您的答案</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary" style="background: linear-gradient(135deg, #48bb78 0%, #38a169 100%);">注册账户</button>
+                    </form>
+                </div>
+                
+            <?php elseif ($step === 2 && isset($_SESSION['reset_user_id'])): ?>
+                <!-- Step 2: Answer Security Question -->
+                <?php $securityQuestion = getUserSecurityQuestion($_SESSION['reset_user_id']); ?>
+                
+                <h2 style="font-size: 18px; color: #2d3748; margin-bottom: 8px;">验证您的身份</h2>
+                <p style="font-size: 14px; color: #718096; margin-bottom: 24px;">
+                    账户：<strong><?= htmlspecialchars($_SESSION['reset_username']) ?></strong>
+                </p>
+                
+                <?php if ($securityQuestion): ?>
+                    <div class="question-display">
+                        <strong>您的密保问题</strong>
+                        <?= htmlspecialchars($securityQuestion['question_text']) ?>
+                    </div>
+                    
+                    <form method="POST" action="?step=2">
+                        <input type="hidden" name="action" value="verify_answer">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['reset_token']) ?>">
+                        <div class="form-group">
+                            <label for="answer">您的答案</label>
+                            <input type="text" id="answer" name="answer" 
+                                   placeholder="请输入密保答案" 
+                                   autocomplete="off" required>
+                            <div class="hint">💡 答案不区分大小写</div>
+                        </div>
+                        <button type="submit" class="btn btn-primary">验证答案 →</button>
+                    </form>
+                    
+                    <div class="links">
+                        <a href="?step=1">← 返回上一步</a>
+                    </div>
+                <?php else: ?>
+                    <div class="message error">未找到密保问题，请联系管理员</div>
+                    <div class="links"><a href="?step=1">← 返回</a></div>
+                <?php endif; ?>
+                
+            <?

@@ -1,0 +1,268 @@
+
+```python
+import anthropic
+import subprocess
+import sys
+import time
+
+client = anthropic.Anthropic()
+
+def run_command(command: str) -> tuple[int, str, str]:
+    """Execute a shell command and return exit code, stdout, stderr."""
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stdout, stderr = process.communicate()
+    return process.returncode, stdout, stderr
+
+def stream_deployment_analysis(image_name: str, deployment_config: dict) -> str:
+    """Use Claude to analyze deployment and provide guidance with streaming."""
+    
+    deployment_info = f"""
+    Docker Image: {image_name}
+    Deployment Configuration:
+    - Container Name: {deployment_config.get('container_name', 'production-app')}
+    - Port Mapping: {deployment_config.get('port_mapping', '80:8080')}
+    - Environment: {deployment_config.get('environment', 'production')}
+    - Restart Policy: {deployment_config.get('restart_policy', 'always')}
+    - Memory Limit: {deployment_config.get('memory_limit', '512m')}
+    - CPU Limit: {deployment_config.get('cpu_limit', '1.0')}
+    """
+    
+    print("\n🤖 Claude AI is analyzing the deployment...")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""You are a DevOps expert helping with CI/CD pipeline deployment.
+                
+Analyze the following Docker deployment configuration and provide:
+1. Pre-deployment checklist
+2. Potential risks or issues
+3. Deployment steps validation
+4. Post-deployment verification steps
+5. Rollback strategy if needed
+
+{deployment_info}
+
+Please provide concise, actionable guidance for this production deployment."""
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    return full_response
+
+def pull_docker_image(image_name: str) -> bool:
+    """Pull Docker image from registry."""
+    print(f"\n📥 Pulling Docker image: {image_name}")
+    
+    exit_code, stdout, stderr = run_command(f"docker pull {image_name}")
+    
+    if exit_code == 0:
+        print(f"✅ Successfully pulled image: {image_name}")
+        if stdout:
+            print(stdout)
+        return True
+    else:
+        print(f"❌ Failed to pull image: {image_name}")
+        if stderr:
+            print(f"Error: {stderr}")
+        return False
+
+def stop_existing_container(container_name: str) -> bool:
+    """Stop and remove existing container if running."""
+    print(f"\n🛑 Checking for existing container: {container_name}")
+    
+    exit_code, stdout, _ = run_command(f"docker ps -q -f name={container_name}")
+    
+    if stdout.strip():
+        print(f"Found running container, stopping it...")
+        exit_code, _, stderr = run_command(f"docker stop {container_name}")
+        if exit_code != 0:
+            print(f"Warning: Could not stop container: {stderr}")
+        
+        exit_code, _, stderr = run_command(f"docker rm {container_name}")
+        if exit_code != 0:
+            print(f"Warning: Could not remove container: {stderr}")
+        else:
+            print(f"✅ Existing container stopped and removed")
+    else:
+        exit_code, stdout, _ = run_command(f"docker ps -aq -f name={container_name}")
+        if stdout.strip():
+            run_command(f"docker rm {container_name}")
+            print(f"✅ Removed stopped container")
+        else:
+            print(f"No existing container found")
+    
+    return True
+
+def deploy_container(image_name: str, config: dict) -> bool:
+    """Deploy Docker container with specified configuration."""
+    container_name = config.get('container_name', 'production-app')
+    port_mapping = config.get('port_mapping', '80:8080')
+    restart_policy = config.get('restart_policy', 'always')
+    memory_limit = config.get('memory_limit', '512m')
+    cpu_limit = config.get('cpu_limit', '1.0')
+    env_vars = config.get('env_vars', {})
+    
+    print(f"\n🚀 Deploying container: {container_name}")
+    
+    env_string = ""
+    for key, value in env_vars.items():
+        env_string += f" -e {key}={value}"
+    
+    deploy_command = (
+        f"docker run -d "
+        f"--name {container_name} "
+        f"-p {port_mapping} "
+        f"--restart {restart_policy} "
+        f"--memory {memory_limit} "
+        f"--cpus {cpu_limit} "
+        f"{env_string} "
+        f"{image_name}"
+    )
+    
+    print(f"Running command: {deploy_command}")
+    exit_code, stdout, stderr = run_command(deploy_command)
+    
+    if exit_code == 0:
+        container_id = stdout.strip()[:12]
+        print(f"✅ Container deployed successfully!")
+        print(f"Container ID: {container_id}")
+        return True
+    else:
+        print(f"❌ Deployment failed!")
+        print(f"Error: {stderr}")
+        return False
+
+def verify_deployment(container_name: str, health_check_url: str = None) -> bool:
+    """Verify the deployment is running correctly."""
+    print(f"\n🔍 Verifying deployment...")
+    
+    time.sleep(5)
+    
+    exit_code, stdout, _ = run_command(f"docker ps -f name={container_name} --format '{{{{.Status}}}}'")
+    
+    if exit_code == 0 and stdout.strip():
+        status = stdout.strip()
+        print(f"Container Status: {status}")
+        
+        if "Up" in status:
+            print(f"✅ Container is running!")
+            
+            exit_code, stdout, _ = run_command(f"docker logs --tail 20 {container_name}")
+            if stdout:
+                print("\n📋 Recent container logs:")
+                print(stdout)
+            
+            return True
+        else:
+            print(f"❌ Container is not in running state: {status}")
+            return False
+    else:
+        print(f"❌ Container not found or not running")
+        return False
+
+def generate_deployment_report(image_name: str, config: dict, success: bool, analysis: str) -> None:
+    """Generate a deployment report using Claude with streaming."""
+    
+    status = "SUCCESSFUL" if success else "FAILED"
+    
+    print(f"\n📊 Generating Deployment Report...")
+    print("=" * 60)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=512,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Generate a brief CI/CD deployment report for:
+
+Image: {image_name}
+Container: {config.get('container_name', 'production-app')}
+Status: {status}
+Environment: {config.get('environment', 'production')}
+Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+Previous Analysis Summary:
+{analysis[:500]}...
+
+Please provide a concise deployment report with:
+1. Deployment summary
+2. Key metrics
+3. Next steps or recommendations
+Keep it brief and professional."""
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n" + "=" * 60)
+
+def main():
+    """Main CI/CD pipeline execution."""
+    
+    print("🔄 CI/CD Pipeline Starting...")
+    print("=" * 60)
+    
+    IMAGE_NAME = "nginx:latest"
+    
+    DEPLOYMENT_CONFIG = {
+        "container_name": "production-nginx",
+        "port_mapping": "8080:80",
+        "environment": "production",
+        "restart_policy": "always",
+        "memory_limit": "256m",
+        "cpu_limit": "0.5",
+        "env_vars": {
+            "APP_ENV": "production",
+            "LOG_LEVEL": "info"
+        }
+    }
+    
+    analysis = stream_deployment_analysis(IMAGE_NAME, DEPLOYMENT_CONFIG)
+    
+    print("\n📋 Starting Deployment Pipeline...")
+    
+    if not pull_docker_image(IMAGE_NAME):
+        print("\n❌ Pipeline failed at image pull stage")
+        generate_deployment_report(IMAGE_NAME, DEPLOYMENT_CONFIG, False, analysis)
+        sys.exit(1)
+    
+    stop_existing_container(DEPLOYMENT_CONFIG["container_name"])
+    
+    if not deploy_container(IMAGE_NAME, DEPLOYMENT_CONFIG):
+        print("\n❌ Pipeline failed at deployment stage")
+        generate_deployment_report(IMAGE_NAME, DEPLOYMENT_CONFIG, False, analysis)
+        sys.exit(1)
+    
+    deployment_success = verify_deployment(DEPLOYMENT_CONFIG["container_name"])
+    
+    generate_deployment_report(IMAGE_NAME, DEPLOYMENT_CONFIG, deployment_success, analysis)
+    
+    if deployment_success:
+        print("\n✅ CI/CD Pipeline completed successfully!")
+        sys.exit(0)
+    else:
+        print("\n❌ CI/CD Pipeline failed!")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+```

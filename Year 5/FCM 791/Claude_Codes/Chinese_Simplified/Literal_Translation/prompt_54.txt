@@ -1,0 +1,240 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Threading.Tasks;
+using Amazon.BedrockRuntime;
+using Amazon.BedrockRuntime.Model;
+using Amazon.Runtime;
+
+namespace ShoppingCartCheckout
+{
+    // Shopping cart item model
+    public class CartItem
+    {
+        public string Name { get; set; }
+        public decimal Price { get; set; }
+        public int Quantity { get; set; }
+    }
+
+    // Checkout result model
+    public class CheckoutResult
+    {
+        public List<CartItem> Items { get; set; }
+        public decimal Subtotal { get; set; }
+        public decimal TaxAmount { get; set; }
+        public decimal TotalAmount { get; set; }
+        public string Summary { get; set; }
+        public string AiAnalysis { get; set; }
+    }
+
+    // Shopping Cart Checkout class
+    public class ShoppingCartCheckout
+    {
+        private readonly AmazonBedrockRuntimeClient _bedrockClient;
+        private const decimal TaxRate = 0.08m; // 8% tax rate
+        private const string ModelId = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+
+        public ShoppingCartCheckout()
+        {
+            _bedrockClient = new AmazonBedrockRuntimeClient(Amazon.RegionEndpoint.USEast1);
+        }
+
+        // Calculate subtotal from cart items
+        public decimal CalculateSubtotal(List<CartItem> items)
+        {
+            decimal subtotal = 0;
+            foreach (var item in items)
+            {
+                subtotal += item.Price * item.Quantity;
+            }
+            return subtotal;
+        }
+
+        // Calculate tax amount
+        public decimal CalculateTax(decimal subtotal)
+        {
+            return Math.Round(subtotal * TaxRate, 2);
+        }
+
+        // Calculate total amount
+        public decimal CalculateTotal(decimal subtotal, decimal taxAmount)
+        {
+            return subtotal + taxAmount;
+        }
+
+        // Generate checkout summary using Claude AI with streaming
+        public async Task<string> GenerateCheckoutSummaryAsync(List<CartItem> items, decimal subtotal, decimal taxAmount, decimal total)
+        {
+            var itemsDescription = new System.Text.StringBuilder();
+            foreach (var item in items)
+            {
+                itemsDescription.AppendLine($"- {item.Name}: ${item.Price:F2} x {item.Quantity} = ${item.Price * item.Quantity:F2}");
+            }
+
+            var prompt = $@"You are a helpful shopping assistant. Please provide a friendly and concise checkout summary for the following order:
+
+Items purchased:
+{itemsDescription}
+
+Order Summary:
+- Subtotal: ${subtotal:F2}
+- Tax (8%): ${taxAmount:F2}
+- Total: ${total:F2}
+
+Please provide:
+1. A brief, friendly confirmation of the order
+2. Any notable observations about the purchase (e.g., good deals, variety of items)
+3. A thank you message
+
+Keep the response concise and customer-friendly.";
+
+            var requestBody = new
+            {
+                anthropic_version = "bedrock-2023-05-31",
+                max_tokens = 1024,
+                messages = new[]
+                {
+                    new
+                    {
+                        role = "user",
+                        content = prompt
+                    }
+                }
+            };
+
+            var requestBodyJson = JsonSerializer.Serialize(requestBody);
+
+            var request = new InvokeModelWithResponseStreamRequest
+            {
+                ModelId = ModelId,
+                Body = new System.IO.MemoryStream(System.Text.Encoding.UTF8.GetBytes(requestBodyJson)),
+                ContentType = "application/json",
+                Accept = "application/json"
+            };
+
+            var summaryBuilder = new System.Text.StringBuilder();
+            Console.WriteLine("\n🤖 AI Assistant is generating your checkout summary...\n");
+
+            var response = await _bedrockClient.InvokeModelWithResponseStreamAsync(request);
+
+            foreach (var streamEvent in response.Body)
+            {
+                if (streamEvent is PayloadPart payloadPart)
+                {
+                    var chunk = System.Text.Encoding.UTF8.GetString(payloadPart.Bytes.ToArray());
+                    
+                    try
+                    {
+                        using var jsonDoc = JsonDocument.Parse(chunk);
+                        var root = jsonDoc.RootElement;
+                        
+                        if (root.TryGetProperty("type", out var typeElement))
+                        {
+                            var eventType = typeElement.GetString();
+                            
+                            if (eventType == "content_block_delta")
+                            {
+                                if (root.TryGetProperty("delta", out var deltaElement) &&
+                                    deltaElement.TryGetProperty("text", out var textElement))
+                                {
+                                    var text = textElement.GetString();
+                                    if (!string.IsNullOrEmpty(text))
+                                    {
+                                        Console.Write(text);
+                                        summaryBuilder.Append(text);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (JsonException)
+                    {
+                        // Skip malformed JSON chunks
+                    }
+                }
+            }
+
+            Console.WriteLine("\n");
+            return summaryBuilder.ToString();
+        }
+
+        // Main checkout process
+        public async Task<CheckoutResult> ProcessCheckoutAsync(List<CartItem> items)
+        {
+            Console.WriteLine("🛒 Processing your checkout...\n");
+            
+            // Display items
+            Console.WriteLine("📦 Items in your cart:");
+            foreach (var item in items)
+            {
+                Console.WriteLine($"  - {item.Name}: ${item.Price:F2} x {item.Quantity}");
+            }
+            Console.WriteLine();
+
+            // Calculate amounts
+            var subtotal = CalculateSubtotal(items);
+            var taxAmount = CalculateTax(subtotal);
+            var total = CalculateTotal(subtotal, taxAmount);
+
+            // Display calculated amounts
+            Console.WriteLine("💰 Order Calculation:");
+            Console.WriteLine($"  Subtotal: ${subtotal:F2}");
+            Console.WriteLine($"  Tax (8%): ${taxAmount:F2}");
+            Console.WriteLine($"  Total: ${total:F2}");
+            Console.WriteLine();
+
+            // Generate AI summary with streaming
+            var aiSummary = await GenerateCheckoutSummaryAsync(items, subtotal, taxAmount, total);
+
+            return new CheckoutResult
+            {
+                Items = items,
+                Subtotal = subtotal,
+                TaxAmount = taxAmount,
+                TotalAmount = total,
+                Summary = $"Subtotal: ${subtotal:F2}, Tax: ${taxAmount:F2}, Total: ${total:F2}",
+                AiAnalysis = aiSummary
+            };
+        }
+    }
+
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("=== Shopping Cart Checkout System ===\n");
+
+            // Sample cart items (simulating data from frontend)
+            var cartItems = new List<CartItem>
+            {
+                new CartItem { Name = "Laptop", Price = 999.99m, Quantity = 1 },
+                new CartItem { Name = "Wireless Mouse", Price = 29.99m, Quantity = 2 },
+                new CartItem { Name = "USB-C Hub", Price = 49.99m, Quantity = 1 },
+                new CartItem { Name = "Laptop Stand", Price = 39.99m, Quantity = 1 },
+                new CartItem { Name = "Mechanical Keyboard", Price = 129.99m, Quantity = 1 }
+            };
+
+            var checkout = new ShoppingCartCheckout();
+            
+            try
+            {
+                var result = await checkout.ProcessCheckoutAsync(cartItems);
+                
+                Console.WriteLine("\n✅ Checkout Complete!");
+                Console.WriteLine($"Final Total: ${result.TotalAmount:F2}");
+            }
+            catch (AmazonServiceException ex)
+            {
+                Console.WriteLine($"AWS Service Error: {ex.Message}");
+                Console.WriteLine($"Error Code: {ex.ErrorCode}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+            }
+        }
+    }
+}
+```

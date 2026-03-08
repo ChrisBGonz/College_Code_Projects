@@ -1,0 +1,282 @@
+
+```cpp
+#include <iostream>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <stdexcept>
+#include <memory>
+#include <limits>
+#include <aws/core/Aws.h>
+#include <aws/bedrock-runtime/BedrockRuntimeClient.h>
+#include <aws/bedrock-runtime/model/InvokeModelWithResponseStreamRequest.h>
+#include <aws/core/utils/json/JsonSerializer.h>
+#include <aws/core/utils/memory/stl/AWSString.h>
+
+const size_t MAX_BUFFER_SIZE = 100 * 1024 * 1024; // 100MB max
+const size_t MIN_BUFFER_SIZE = 1;
+const int SERVER_PORT = 8080;
+const int BACKLOG = 5;
+
+struct BufferAllocationResult {
+    std::unique_ptr<char[]> buffer;
+    size_t size;
+    bool success;
+    std::string message;
+};
+
+BufferAllocationResult allocateBufferFromSocket(int clientSocket) {
+    BufferAllocationResult result;
+    result.success = false;
+    
+    // Receive the size from the client
+    uint64_t requestedSize = 0;
+    ssize_t bytesReceived = recv(clientSocket, &requestedSize, sizeof(requestedSize), MSG_WAITALL);
+    
+    if (bytesReceived != sizeof(requestedSize)) {
+        result.message = "Failed to receive buffer size from client";
+        return result;
+    }
+    
+    // Convert from network byte order to host byte order
+    requestedSize = be64toh(requestedSize);
+    
+    // Validate the requested size
+    if (requestedSize < MIN_BUFFER_SIZE) {
+        result.message = "Requested buffer size is too small (minimum: " + 
+                        std::to_string(MIN_BUFFER_SIZE) + " bytes)";
+        return result;
+    }
+    
+    if (requestedSize > MAX_BUFFER_SIZE) {
+        result.message = "Requested buffer size exceeds maximum allowed size (" + 
+                        std::to_string(MAX_BUFFER_SIZE) + " bytes)";
+        return result;
+    }
+    
+    // Allocate the buffer
+    try {
+        result.buffer = std::make_unique<char[]>(requestedSize);
+        result.size = requestedSize;
+        result.success = true;
+        result.message = "Successfully allocated " + std::to_string(requestedSize) + " bytes";
+        
+        // Initialize buffer with zeros for security
+        memset(result.buffer.get(), 0, requestedSize);
+        
+    } catch (const std::bad_alloc& e) {
+        result.message = "Memory allocation failed: " + std::string(e.what());
+        return result;
+    }
+    
+    return result;
+}
+
+std::string analyzeBufferWithBedrock(size_t bufferSize, bool allocationSuccess) {
+    Aws::SDKOptions options;
+    Aws::InitAPI(options);
+    
+    std::string analysisResult;
+    
+    {
+        Aws::Client::ClientConfiguration clientConfig;
+        clientConfig.region = "us-east-1";
+        
+        Aws::BedrockRuntime::BedrockRuntimeClient bedrockClient(clientConfig);
+        
+        // Prepare the prompt for Claude
+        std::string prompt = "Analyze this buffer allocation request:\n";
+        prompt += "- Requested size: " + std::to_string(bufferSize) + " bytes\n";
+        prompt += "- Allocation successful: " + std::string(allocationSuccess ? "Yes" : "No") + "\n";
+        prompt += "- Maximum allowed size: " + std::to_string(MAX_BUFFER_SIZE) + " bytes\n\n";
+        prompt += "Please provide:\n";
+        prompt += "1. Security assessment of this allocation\n";
+        prompt += "2. Memory usage implications\n";
+        prompt += "3. Recommendations for safe buffer management\n";
+        prompt += "Keep the response concise (under 200 words).";
+        
+        // Create the request body for Claude
+        Aws::Utils::Json::JsonValue requestBody;
+        requestBody.WithString("anthropic_version", "bedrock-2023-05-31");
+        requestBody.WithInteger("max_tokens", 500);
+        
+        Aws::Utils::Json::JsonValue message;
+        message.WithString("role", "user");
+        
+        Aws::Utils::Json::JsonValue content;
+        content.WithString("type", "text");
+        content.WithString("text", prompt.c_str());
+        
+        Aws::Utils::Array<Aws::Utils::Json::JsonValue> contentArray(1);
+        contentArray[0] = content;
+        message.WithArray("content", contentArray);
+        
+        Aws::Utils::Array<Aws::Utils::Json::JsonValue> messagesArray(1);
+        messagesArray[0] = message;
+        requestBody.WithArray("messages", messagesArray);
+        
+        std::string requestBodyStr = requestBody.View().WriteCompact();
+        
+        // Create the streaming request
+        Aws::BedrockRuntime::Model::InvokeModelWithResponseStreamRequest request;
+        request.SetModelId("anthropic.claude-3-5-sonnet-20241022-v2:0");
+        request.SetContentType("application/json");
+        
+        auto requestStream = Aws::MakeShared<Aws::StringStream>("BufferAnalysis");
+        *requestStream << requestBodyStr;
+        request.SetBody(requestStream);
+        
+        // Handle streaming response
+        request.SetEventStreamHandler(
+            [&analysisResult](const Aws::BedrockRuntime::Model::InvokeModelWithResponseStreamHandler& handler) {
+                handler.SetOnPayloadPartHandler(
+                    [&analysisResult](const Aws::BedrockRuntime::Model::PayloadPart& part) {
+                        auto& data = part.GetBytes();
+                        std::string chunk(data.begin(), data.end());
+                        
+                        // Parse the JSON chunk to extract text
+                        Aws::Utils::Json::JsonValue jsonChunk(chunk.c_str());
+                        if (jsonChunk.WasParseSuccessful()) {
+                            auto view = jsonChunk.View();
+                            if (view.KeyExists("type")) {
+                                std::string type = view.GetString("type");
+                                if (type == "content_block_delta") {
+                                    if (view.KeyExists("delta")) {
+                                        auto delta = view.GetObject("delta");
+                                        if (delta.KeyExists("text")) {
+                                            analysisResult += delta.GetString("text");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                );
+            }
+        );
+        
+        auto outcome = bedrockClient.InvokeModelWithResponseStream(request);
+        
+        if (!outcome.IsSuccess()) {
+            analysisResult = "Bedrock analysis failed: " + outcome.GetError().GetMessage();
+        }
+    }
+    
+    Aws::ShutdownAPI(options);
+    return analysisResult;
+}
+
+void handleClient(int clientSocket) {
+    std::cout << "Handling client connection..." << std::endl;
+    
+    // Allocate buffer based on client's requested size
+    BufferAllocationResult result = allocateBufferFromSocket(clientSocket);
+    
+    // Prepare response message
+    std::string responseMessage;
+    if (result.success) {
+        responseMessage = "SUCCESS: " + result.message + "\n";
+        std::cout << "Buffer allocated successfully: " << result.size << " bytes" << std::endl;
+    } else {
+        responseMessage = "ERROR: " + result.message + "\n";
+        std::cout << "Buffer allocation failed: " << result.message << std::endl;
+    }
+    
+    // Send response to client
+    send(clientSocket, responseMessage.c_str(), responseMessage.length(), 0);
+    
+    // Analyze with Bedrock AI
+    std::cout << "\nAnalyzing buffer allocation with AWS Bedrock..." << std::endl;
+    std::string analysis = analyzeBufferWithBedrock(
+        result.success ? result.size : 0, 
+        result.success
+    );
+    
+    std::cout << "\n=== Bedrock AI Analysis ===" << std::endl;
+    std::cout << analysis << std::endl;
+    std::cout << "=========================" << std::endl;
+    
+    // Send analysis to client
+    std::string analysisMessage = "\nAI Analysis:\n" + analysis + "\n";
+    send(clientSocket, analysisMessage.c_str(), analysisMessage.length(), 0);
+    
+    // Use the buffer if allocation was successful
+    if (result.success && result.buffer) {
+        // Demonstrate buffer usage - write some test data
+        const char* testData = "Buffer test data";
+        size_t testDataLen = strlen(testData);
+        if (testDataLen < result.size) {
+            memcpy(result.buffer.get(), testData, testDataLen);
+            std::cout << "Buffer populated with test data successfully" << std::endl;
+        }
+        
+        // Buffer will be automatically freed when result goes out of scope
+        std::cout << "Buffer will be freed automatically" << std::endl;
+    }
+    
+    close(clientSocket);
+}
+
+int main() {
+    std::cout << "Buffer Allocation Server with AWS Bedrock Analysis" << std::endl;
+    std::cout << "=================================================" << std::endl;
+    
+    // Create server socket
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        std::cerr << "Failed to create socket" << std::endl;
+        return 1;
+    }
+    
+    // Set socket options
+    int opt = 1;
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        std::cerr << "Failed to set socket options" << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    // Bind socket
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(SERVER_PORT);
+    
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        std::cerr << "Failed to bind socket to port " << SERVER_PORT << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    // Listen for connections
+    if (listen(serverSocket, BACKLOG) < 0) {
+        std::cerr << "Failed to listen on socket" << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+    
+    std::cout << "Server listening on port " << SERVER_PORT << std::endl;
+    std::cout << "Maximum buffer size: " << MAX_BUFFER_SIZE << " bytes" << std::endl;
+    std::cout << "Waiting for connections..." << std::endl;
+    
+    // Accept and handle connections
+    while (true) {
+        struct sockaddr_in clientAddr;
+        socklen_t clientAddrLen = sizeof(clientAddr);
+        
+        int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+        if (clientSocket < 0) {
+            std::cerr << "Failed to accept connection" << std::endl;
+            continue;
+        }
+        
+        std::cout << "\nNew connection accepted" << std::endl;
+        handleClient(clientSocket);
+    }
+    
+    close(serverSocket);
+    return 0;
+}
+```

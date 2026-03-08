@@ -1,0 +1,263 @@
+
+```java
+import software.amazon.awssdk.services.bedrockruntime.BedrockRuntimeClient;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelRequest;
+import software.amazon.awssdk.services.bedrockruntime.model.InvokeModelResponse;
+import software.amazon.awssdk.core.SdkBytes;
+import software.amazon.awssdk.regions.Region;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.logging.Logger;
+import java.util.logging.Level;
+
+public class SQLExceptionHandler {
+    
+    private static final Logger logger = Logger.getLogger(SQLExceptionHandler.class.getName());
+    
+    // Custom exception class
+    public static class DatabaseException extends Exception {
+        private final String errorCode;
+        private final String sqlState;
+        
+        public DatabaseException(String message, String errorCode, String sqlState, Throwable cause) {
+            super(message, cause);
+            this.errorCode = errorCode;
+            this.sqlState = sqlState;
+        }
+        
+        public String getErrorCode() {
+            return errorCode;
+        }
+        
+        public String getSqlState() {
+            return sqlState;
+        }
+        
+        @Override
+        public String toString() {
+            return String.format("DatabaseException{message='%s', errorCode='%s', sqlState='%s'}", 
+                getMessage(), errorCode, sqlState);
+        }
+    }
+    
+    private BedrockRuntimeClient bedrockClient;
+    private ObjectMapper objectMapper;
+    
+    public SQLExceptionHandler() {
+        this.bedrockClient = BedrockRuntimeClient.builder()
+            .region(Region.US_EAST_1)
+            .build();
+        this.objectMapper = new ObjectMapper();
+    }
+    
+    /**
+     * Executes a database query with proper exception handling
+     * Catches SQLException, logs error message, and throws custom DatabaseException
+     */
+    public ResultSet executeQuery(Connection connection, String sql, Object... params) throws DatabaseException {
+        try {
+            PreparedStatement stmt = connection.prepareStatement(sql);
+            
+            // Set parameters if any
+            for (int i = 0; i < params.length; i++) {
+                stmt.setObject(i + 1, params[i]);
+            }
+            
+            return stmt.executeQuery();
+            
+        } catch (SQLException e) {
+            // Log the error message
+            String errorMessage = String.format(
+                "SQL Error occurred - Error Code: %d, SQL State: %s, Message: %s, Query: %s",
+                e.getErrorCode(),
+                e.getSQLState(),
+                e.getMessage(),
+                sql
+            );
+            
+            logger.log(Level.SEVERE, errorMessage, e);
+            
+            // Use Claude to generate a helpful error description
+            String aiDescription = generateErrorDescription(e, sql);
+            logger.info("AI Error Analysis: " + aiDescription);
+            
+            // Throw custom exception
+            throw new DatabaseException(
+                "Database query failed: " + e.getMessage() + "\nAI Analysis: " + aiDescription,
+                String.valueOf(e.getErrorCode()),
+                e.getSQLState(),
+                e
+            );
+        }
+    }
+    
+    /**
+     * Executes a database update with proper exception handling
+     */
+    public int executeUpdate(Connection connection, String sql, Object... params) throws DatabaseException {
+        try {
+            PreparedStatement stmt = connection.prepareStatement(sql);
+            
+            for (int i = 0; i < params.length; i++) {
+                stmt.setObject(i + 1, params[i]);
+            }
+            
+            return stmt.executeUpdate();
+            
+        } catch (SQLException e) {
+            String errorMessage = String.format(
+                "SQL Update Error - Error Code: %d, SQL State: %s, Message: %s, Query: %s",
+                e.getErrorCode(),
+                e.getSQLState(),
+                e.getMessage(),
+                sql
+            );
+            
+            logger.log(Level.SEVERE, errorMessage, e);
+            
+            String aiDescription = generateErrorDescription(e, sql);
+            logger.info("AI Error Analysis: " + aiDescription);
+            
+            throw new DatabaseException(
+                "Database update failed: " + e.getMessage() + "\nAI Analysis: " + aiDescription,
+                String.valueOf(e.getErrorCode()),
+                e.getSQLState(),
+                e
+            );
+        }
+    }
+    
+    /**
+     * Uses Claude to generate a helpful description of the SQL error
+     */
+    private String generateErrorDescription(SQLException e, String sql) {
+        try {
+            String prompt = String.format(
+                "Analyze this SQL error and provide a brief, helpful explanation in Chinese:\n" +
+                "SQL Query: %s\n" +
+                "Error Code: %d\n" +
+                "SQL State: %s\n" +
+                "Error Message: %s\n\n" +
+                "Please provide:\n" +
+                "1. What caused this error\n" +
+                "2. How to fix it\n" +
+                "Keep the response concise (2-3 sentences).",
+                sql,
+                e.getErrorCode(),
+                e.getSQLState(),
+                e.getMessage()
+            );
+            
+            ObjectNode requestBody = objectMapper.createObjectNode();
+            requestBody.put("anthropic_version", "bedrock-2023-05-31");
+            requestBody.put("max_tokens", 300);
+            
+            ObjectNode message = objectMapper.createObjectNode();
+            message.put("role", "user");
+            message.put("content", prompt);
+            
+            requestBody.set("messages", objectMapper.createArrayNode().add(message));
+            
+            String requestBodyJson = objectMapper.writeValueAsString(requestBody);
+            
+            InvokeModelRequest request = InvokeModelRequest.builder()
+                .modelId("anthropic.claude-3-5-sonnet-20241022-v2:0")
+                .contentType("application/json")
+                .accept("application/json")
+                .body(SdkBytes.fromUtf8String(requestBodyJson))
+                .build();
+            
+            InvokeModelResponse response = bedrockClient.invokeModel(request);
+            String responseBody = response.body().asUtf8String();
+            
+            JsonNode responseJson = objectMapper.readTree(responseBody);
+            return responseJson.path("content").get(0).path("text").asText();
+            
+        } catch (Exception ex) {
+            logger.log(Level.WARNING, "Failed to generate AI error description", ex);
+            return "Unable to generate AI analysis for this error.";
+        }
+    }
+    
+    /**
+     * Demonstrates the usage of the exception handling methods
+     */
+    public static void main(String[] args) {
+        SQLExceptionHandler handler = new SQLExceptionHandler();
+        
+        // Example 1: Demonstrate with an invalid SQL query
+        System.out.println("=== SQL Exception Handler Demo ===\n");
+        
+        try {
+            // Try to connect to a non-existent database to trigger SQLException
+            Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1",
+                "sa",
+                ""
+            );
+            
+            // Create a test table
+            try (PreparedStatement createStmt = connection.prepareStatement(
+                "CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, name VARCHAR(100), email VARCHAR(100))")) {
+                createStmt.execute();
+            }
+            
+            // Insert test data
+            handler.executeUpdate(connection, 
+                "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+                1, "张三", "zhangsan@example.com");
+            System.out.println("Successfully inserted user data");
+            
+            // Query test data
+            ResultSet rs = handler.executeQuery(connection, 
+                "SELECT * FROM users WHERE id = ?", 1);
+            
+            while (rs.next()) {
+                System.out.println("Found user: " + rs.getString("name") + 
+                    " (" + rs.getString("email") + ")");
+            }
+            
+            // Trigger a SQL error - duplicate primary key
+            System.out.println("\nAttempting to insert duplicate key (will cause error)...");
+            handler.executeUpdate(connection,
+                "INSERT INTO users (id, name, email) VALUES (?, ?, ?)",
+                1, "李四", "lisi@example.com");
+                
+        } catch (DatabaseException e) {
+            System.out.println("\nCaught DatabaseException:");
+            System.out.println("Message: " + e.getMessage());
+            System.out.println("Error Code: " + e.getErrorCode());
+            System.out.println("SQL State: " + e.getSqlState());
+        } catch (SQLException e) {
+            System.out.println("Connection error: " + e.getMessage());
+        }
+        
+        // Example 2: Invalid SQL syntax
+        System.out.println("\n=== Testing Invalid SQL Syntax ===");
+        try {
+            Connection connection = DriverManager.getConnection(
+                "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1",
+                "sa",
+                ""
+            );
+            
+            handler.executeQuery(connection, "SELECT * FORM invalid_table_xyz");
+            
+        } catch (DatabaseException e) {
+            System.out.println("\nCaught DatabaseException for invalid SQL:");
+            System.out.println("Error Code: " + e.getErrorCode());
+            System.out.println("SQL State: " + e.getSqlState());
+            System.out.println("Full Exception: " + e.toString());
+        } catch (SQLException e) {
+            System.out.println("Connection error: " + e.getMessage());
+        }
+    }
+}
+```

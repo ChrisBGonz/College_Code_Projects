@@ -1,0 +1,158 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/openai"
+)
+
+// MicroserviceCall simulates calling a microservice
+// In a real scenario, this would be an actual HTTP call or gRPC call
+func MicroserviceCall(ctx context.Context, llm llms.Model, serviceInput string) (string, error) {
+	// Simulate occasional failures with random chance
+	if rand.Float32() < 0.3 { // 30% chance of failure
+		return "", fmt.Errorf("microservice temporarily unavailable")
+	}
+
+	// Use LangChain to process the request
+	response, err := llms.GenerateFromSinglePrompt(ctx, llm,
+		fmt.Sprintf("Process this microservice request and provide a brief response: %s", serviceInput),
+		llms.WithTemperature(0.7),
+		llms.WithMaxTokens(200),
+	)
+	if err != nil {
+		return "", fmt.Errorf("LLM call failed: %w", err)
+	}
+
+	return response, nil
+}
+
+// CallMicroserviceWithRetry calls a microservice in a loop and retries immediately on failure
+func CallMicroserviceWithRetry(ctx context.Context, llm llms.Model, requests []string) []string {
+	results := make([]string, 0, len(requests))
+
+	for i, request := range requests {
+		log.Printf("Processing request %d/%d: %s", i+1, len(requests), request)
+
+		attempt := 1
+		for {
+			result, err := MicroserviceCall(ctx, llm, request)
+			if err != nil {
+				log.Printf("Attempt %d failed for request '%s': %v. Retrying immediately...", attempt, request, err)
+				attempt++
+				// Small sleep to avoid hammering the service
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
+
+			log.Printf("Request '%s' succeeded on attempt %d", request, attempt)
+			results = append(results, result)
+			break
+		}
+	}
+
+	return results
+}
+
+// CallMicroserviceWithRetryAndContext calls a microservice with retry but respects context cancellation
+func CallMicroserviceWithRetryAndContext(ctx context.Context, llm llms.Model, requests []string) ([]string, error) {
+	results := make([]string, 0, len(requests))
+
+	for i, request := range requests {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return results, fmt.Errorf("context cancelled after processing %d requests: %w", i, ctx.Err())
+		default:
+		}
+
+		log.Printf("Processing request %d/%d: %s", i+1, len(requests), request)
+
+		attempt := 1
+		for {
+			// Check context before each attempt
+			select {
+			case <-ctx.Done():
+				return results, fmt.Errorf("context cancelled during request '%s': %w", request, ctx.Err())
+			default:
+			}
+
+			result, err := MicroserviceCall(ctx, llm, request)
+			if err != nil {
+				log.Printf("Attempt %d failed for request '%s': %v. Retrying immediately...", attempt, request, err)
+				attempt++
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+
+			log.Printf("Request '%s' succeeded on attempt %d", request, attempt)
+			results = append(results, result)
+			break
+		}
+	}
+
+	return results, nil
+}
+
+func main() {
+	// Seed random for simulation
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+
+	// Initialize OpenAI LLM
+	llm, err := openai.New()
+	if err != nil {
+		log.Fatalf("Failed to initialize LLM: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// Define microservice requests to process
+	requests := []string{
+		"Calculate the sum of numbers 1 to 100",
+		"Convert temperature 98.6°F to Celsius",
+		"Find the capital of France",
+		"What is the square root of 144?",
+		"Translate 'Hello World' to Spanish",
+	}
+
+	fmt.Println("=== Starting Microservice Calls with Retry ===")
+	fmt.Printf("Processing %d requests...\n\n", len(requests))
+
+	// Call microservice with retry (no context timeout)
+	startTime := time.Now()
+	results := CallMicroserviceWithRetry(ctx, llm, requests)
+	elapsed := time.Since(startTime)
+
+	fmt.Printf("\n=== Results (completed in %v) ===\n", elapsed)
+	for i, result := range results {
+		fmt.Printf("\nRequest %d: %s\nResponse: %s\n", i+1, requests[i], result)
+	}
+
+	// Demonstrate context-aware retry with timeout
+	fmt.Println("\n=== Starting Context-Aware Microservice Calls ===")
+	ctxWithTimeout, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	contextRequests := []string{
+		"What is machine learning?",
+		"Explain REST API in one sentence",
+	}
+
+	contextResults, err := CallMicroserviceWithRetryAndContext(ctxWithTimeout, llm, contextRequests)
+	if err != nil {
+		log.Printf("Context-aware calls encountered error: %v", err)
+	}
+
+	fmt.Printf("\n=== Context-Aware Results ===\n")
+	for i, result := range contextResults {
+		fmt.Printf("\nRequest %d: %s\nResponse: %s\n", i+1, contextRequests[i], result)
+	}
+}
+```

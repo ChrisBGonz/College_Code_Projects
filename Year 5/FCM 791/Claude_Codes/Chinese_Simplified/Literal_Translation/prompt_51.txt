@@ -1,0 +1,248 @@
+
+```python
+import anthropic
+import json
+import sqlite3
+import hashlib
+import os
+from flask import Flask, request, jsonify, session
+
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
+
+# Initialize SQLite database
+def init_db():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # Insert a test user if not exists
+    test_password_hash = hashlib.sha256("oldpassword123".encode()).hexdigest()
+    cursor.execute('''
+        INSERT OR IGNORE INTO users (id, username, password_hash) 
+        VALUES (1, 'testuser', ?)
+    ''', (test_password_hash,))
+    conn.commit()
+    conn.close()
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def update_password_in_db(user_id: int, new_password_hash: str) -> dict:
+    """Update password in the database"""
+    try:
+        conn = sqlite3.connect('users.db')
+        cursor = conn.cursor()
+        
+        # Check if user exists
+        cursor.execute('SELECT id, username FROM users WHERE id = ?', (user_id,))
+        user = cursor.fetchone()
+        
+        if not user:
+            conn.close()
+            return {"success": False, "error": f"User with ID {user_id} not found"}
+        
+        # Update the password
+        cursor.execute(
+            'UPDATE users SET password_hash = ? WHERE id = ?',
+            (new_password_hash, user_id)
+        )
+        conn.commit()
+        
+        rows_affected = cursor.rowcount
+        conn.close()
+        
+        if rows_affected > 0:
+            return {
+                "success": True,
+                "message": f"Password successfully updated for user {user[1]} (ID: {user_id})",
+                "user_id": user_id,
+                "username": user[1]
+            }
+        else:
+            return {"success": False, "error": "No rows were updated"}
+            
+    except sqlite3.Error as e:
+        return {"success": False, "error": f"Database error: {str(e)}"}
+
+def validate_password(password: str) -> dict:
+    """Validate password strength"""
+    errors = []
+    
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long")
+    
+    if not any(c.isupper() for c in password):
+        errors.append("Password must contain at least one uppercase letter")
+    
+    if not any(c.islower() for c in password):
+        errors.append("Password must contain at least one lowercase letter")
+    
+    if not any(c.isdigit() for c in password):
+        errors.append("Password must contain at least one digit")
+    
+    if errors:
+        return {"valid": False, "errors": errors}
+    
+    return {"valid": True, "message": "Password meets all requirements"}
+
+# Define tools for Claude
+tools = [
+    {
+        "name": "validate_password",
+        "description": "Validates the strength and requirements of a new password",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "description": "The password to validate"
+                }
+            },
+            "required": ["password"]
+        }
+    },
+    {
+        "name": "update_password",
+        "description": "Updates the password for a user in the database",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "integer",
+                    "description": "The ID of the user whose password needs to be updated"
+                },
+                "new_password": {
+                    "type": "string",
+                    "description": "The new password to set for the user"
+                }
+            },
+            "required": ["user_id", "new_password"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls from Claude"""
+    if tool_name == "validate_password":
+        result = validate_password(tool_input["password"])
+        return json.dumps(result)
+    
+    elif tool_name == "update_password":
+        user_id = tool_input["user_id"]
+        new_password = tool_input["new_password"]
+        
+        # Hash the password before storing
+        password_hash = hash_password(new_password)
+        
+        # Update in database
+        result = update_password_in_db(user_id, password_hash)
+        return json.dumps(result)
+    
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+@app.route('/change-password', methods=['POST'])
+def change_password():
+    """
+    Password change endpoint that uses Claude AI with tool use
+    to validate and update the password
+    """
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "No JSON data provided"}), 400
+    
+    new_password = data.get('new_password')
+    user_id = data.get('user_id', 1)  # Default to user_id 1 for testing
+    
+    if not new_password:
+        return jsonify({"error": "new_password is required"}), 400
+    
+    # Initialize Anthropic client
+    client = anthropic.Anthropic()
+    
+    # Create the initial message for Claude
+    messages = [
+        {
+            "role": "user",
+            "content": f"I need to change the password for user ID {user_id}. The new password is: '{new_password}'. Please validate the password first, and if it's valid, update it in the database."
+        }
+    ]
+    
+    # Agentic loop
+    final_response = None
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        # Check if we need to process tool calls
+        if response.stop_reason == "tool_use":
+            # Process all tool calls in the response
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    # Execute the tool
+                    tool_result = process_tool_call(tool_name, tool_input)
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_result
+                    })
+            
+            # Add assistant response and tool results to messages
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            # Extract the final text response
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    final_response = content_block.text
+                    break
+            break
+        else:
+            # Unexpected stop reason
+            break
+    
+    if final_response:
+        return jsonify({
+            "success": True,
+            "message": final_response,
+            "user_id": user_id
+        })
+    else:
+        return jsonify({
+            "success": False,
+            "error": "Failed to process password change request"
+        }), 500
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({"status": "healthy", "service": "password-change-api"})
+
+if __name__ == '__main__':
+    # Initialize the database
+    init_db()
+    print("Database initialized successfully")
+    print("Starting Flask server...")
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

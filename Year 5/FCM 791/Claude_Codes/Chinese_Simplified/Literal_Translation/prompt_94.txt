@@ -1,0 +1,243 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+const client = new Anthropic();
+
+app.use(express.json());
+
+// Route that demonstrates normal operation
+app.get("/", (req, res) => {
+  res.json({
+    message: "Welcome to the Express Error Handler Demo",
+    routes: [
+      "GET / - This welcome message",
+      "GET /error - Triggers a synchronous error",
+      "GET /async-error - Triggers an async error",
+      "GET /analyze-error - Analyzes an error using Claude AI",
+      "POST /analyze-error - Analyzes a custom error using Claude AI",
+    ],
+  });
+});
+
+// Route that triggers a synchronous error
+app.get("/error", (req, res) => {
+  throw new Error("This is a synchronous error for demonstration");
+});
+
+// Route that triggers an async error
+app.get("/async-error", async (req, res, next) => {
+  try {
+    await Promise.reject(new Error("This is an async error for demonstration"));
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Route that analyzes an error using Claude AI with streaming
+app.get("/analyze-error", async (req, res, next) => {
+  try {
+    const sampleError = new Error("Database connection timeout after 30 seconds");
+    sampleError.code = "ETIMEDOUT";
+    sampleError.stack = `Error: Database connection timeout after 30 seconds
+    at DatabasePool.connect (/app/db/pool.js:45:12)
+    at async UserService.getUser (/app/services/user.js:23:5)
+    at async UserController.handleRequest (/app/controllers/user.js:15:3)`;
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `Analyze this Node.js error and provide a brief explanation and solution:
+          
+Error Message: ${sampleError.message}
+Error Code: ${sampleError.code}
+Stack Trace: ${sampleError.stack}
+
+Please provide:
+1. What caused this error
+2. How to fix it
+3. Prevention strategies`,
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Route that analyzes a custom error using Claude AI
+app.post("/analyze-error", async (req, res, next) => {
+  try {
+    const { errorMessage, errorCode, stackTrace } = req.body;
+
+    if (!errorMessage) {
+      throw new Error("errorMessage is required in request body");
+    }
+
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `Analyze this Node.js error and provide a brief explanation and solution:
+          
+Error Message: ${errorMessage}
+${errorCode ? `Error Code: ${errorCode}` : ""}
+${stackTrace ? `Stack Trace: ${stackTrace}` : ""}
+
+Please provide:
+1. What caused this error
+2. How to fix it
+3. Prevention strategies`,
+        },
+      ],
+    });
+
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        res.write(`data: ${JSON.stringify({ text: chunk.delta.text })}\n\n`);
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (error) {
+    next(error);
+  }
+});
+
+// 404 handler for undefined routes
+app.use((req, res, next) => {
+  const error = new Error(`Route not found: ${req.method} ${req.path}`);
+  error.status = 404;
+  next(error);
+});
+
+// Global error handler middleware - catches all unhandled exceptions
+app.use(async (err, req, res, next) => {
+  console.error("Error caught by global handler:", err);
+
+  const statusCode = err.status || err.statusCode || 500;
+  const errorInfo = {
+    message: err.message || "Internal Server Error",
+    code: err.code || "UNKNOWN_ERROR",
+    stack: process.env.NODE_ENV === "development" ? err.stack : undefined,
+  };
+
+  // Use Claude AI to analyze the error and provide insights
+  try {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Error-Status", statusCode);
+
+    // Send initial error info
+    res.write(
+      `data: ${JSON.stringify({
+        type: "error_info",
+        status: statusCode,
+        error: errorInfo,
+      })}\n\n`
+    );
+
+    // Stream AI analysis
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 512,
+      messages: [
+        {
+          role: "user",
+          content: `A Node.js Express application encountered an error. Provide a brief, user-friendly explanation:
+
+Error: ${err.message}
+Status Code: ${statusCode}
+${err.code ? `Error Code: ${err.code}` : ""}
+
+In 2-3 sentences, explain what happened and what the user can do.`,
+        },
+      ],
+    });
+
+    res.write(
+      `data: ${JSON.stringify({ type: "analysis_start", text: "\n\nAI Analysis: " })}\n\n`
+    );
+
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        res.write(
+          `data: ${JSON.stringify({ type: "analysis", text: chunk.delta.text })}\n\n`
+        );
+      }
+    }
+
+    res.write("data: [DONE]\n\n");
+    res.end();
+  } catch (aiError) {
+    console.error("Failed to get AI analysis:", aiError);
+
+    // Fallback to regular JSON response if AI fails
+    if (!res.headersSent) {
+      res.status(statusCode).json({
+        error: errorInfo,
+        message: "An error occurred. AI analysis unavailable.",
+      });
+    } else {
+      res.write(
+        `data: ${JSON.stringify({ type: "error", text: "AI analysis unavailable" })}\n\n`
+      );
+      res.write("data: [DONE]\n\n");
+      res.end();
+    }
+  }
+});
+
+// Handle uncaught exceptions at process level
+process.on("uncaughtException", (error) => {
+  console.error("Uncaught Exception:", error);
+  process.exit(1);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Visit http://localhost:${PORT} for available routes`);
+});
+
+module.exports = app;
+```

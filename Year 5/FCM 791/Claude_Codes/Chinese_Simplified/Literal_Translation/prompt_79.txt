@@ -1,0 +1,278 @@
+
+```python
+import anthropic
+import hashlib
+import json
+import os
+import tempfile
+from pathlib import Path
+
+client = anthropic.Anthropic()
+
+def calculate_file_hash(file_path: str, algorithm: str = "sha256") -> str:
+    """Calculate hash of a file."""
+    hash_func = hashlib.new(algorithm)
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_func.update(chunk)
+    return hash_func.hexdigest()
+
+def read_manifest_file(manifest_path: str) -> dict:
+    """Read and parse manifest file."""
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+def verify_files(manifest_data: dict, base_dir: str) -> dict:
+    """Verify files against manifest hashes."""
+    results = {
+        "verified": [],
+        "failed": [],
+        "missing": [],
+        "extra": []
+    }
+    
+    manifest_files = set(manifest_data.get("files", {}).keys())
+    
+    for file_path, expected_hash in manifest_data.get("files", {}).items():
+        full_path = os.path.join(base_dir, file_path)
+        
+        if not os.path.exists(full_path):
+            results["missing"].append(file_path)
+        else:
+            algorithm = manifest_data.get("algorithm", "sha256")
+            actual_hash = calculate_file_hash(full_path, algorithm)
+            
+            if actual_hash == expected_hash:
+                results["verified"].append(file_path)
+            else:
+                results["failed"].append({
+                    "file": file_path,
+                    "expected": expected_hash,
+                    "actual": actual_hash
+                })
+    
+    if os.path.exists(base_dir):
+        for root, dirs, files in os.walk(base_dir):
+            for file in files:
+                full_path = os.path.join(root, file)
+                rel_path = os.path.relpath(full_path, base_dir)
+                if rel_path not in manifest_files:
+                    results["extra"].append(rel_path)
+    
+    return results
+
+tools = [
+    {
+        "name": "read_manifest",
+        "description": "Read and parse a manifest file containing file hashes",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "manifest_path": {
+                    "type": "string",
+                    "description": "Path to the manifest file"
+                }
+            },
+            "required": ["manifest_path"]
+        }
+    },
+    {
+        "name": "verify_project_files",
+        "description": "Verify project files against hashes from manifest",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "manifest_data": {
+                    "type": "object",
+                    "description": "Manifest data containing file hashes"
+                },
+                "project_dir": {
+                    "type": "string",
+                    "description": "Path to the project directory to verify"
+                }
+            },
+            "required": ["manifest_data", "project_dir"]
+        }
+    },
+    {
+        "name": "calculate_hash",
+        "description": "Calculate hash of a specific file",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to the file"
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "Hash algorithm to use (sha256, md5, sha1)",
+                    "default": "sha256"
+                }
+            },
+            "required": ["file_path"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results."""
+    if tool_name == "read_manifest":
+        try:
+            manifest_data = read_manifest_file(tool_input["manifest_path"])
+            return json.dumps(manifest_data)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    elif tool_name == "verify_project_files":
+        try:
+            results = verify_files(
+                tool_input["manifest_data"],
+                tool_input["project_dir"]
+            )
+            return json.dumps(results)
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    elif tool_name == "calculate_hash":
+        try:
+            algorithm = tool_input.get("algorithm", "sha256")
+            hash_value = calculate_file_hash(tool_input["file_path"], algorithm)
+            return json.dumps({"hash": hash_value, "algorithm": algorithm})
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def create_test_environment():
+    """Create a test environment with sample files and manifest."""
+    test_dir = tempfile.mkdtemp()
+    
+    files = {
+        "main.py": "print('Hello, World!')\n",
+        "utils.py": "def helper():\n    return True\n",
+        "config.json": '{"version": "1.0", "debug": false}\n',
+        "README.md": "# Test Project\nThis is a test project.\n"
+    }
+    
+    for filename, content in files.items():
+        file_path = os.path.join(test_dir, filename)
+        with open(file_path, "w") as f:
+            f.write(content)
+    
+    manifest = {
+        "version": "1.0",
+        "algorithm": "sha256",
+        "files": {}
+    }
+    
+    for filename in files.keys():
+        file_path = os.path.join(test_dir, filename)
+        manifest["files"][filename] = calculate_file_hash(file_path)
+    
+    manifest_path = os.path.join(test_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    
+    modified_file = os.path.join(test_dir, "utils.py")
+    with open(modified_file, "w") as f:
+        f.write("def helper():\n    return False  # Modified!\n")
+    
+    extra_file = os.path.join(test_dir, "extra_file.txt")
+    with open(extra_file, "w") as f:
+        f.write("This file is not in the manifest.\n")
+    
+    return test_dir, manifest_path
+
+def run_verification_agent(manifest_path: str, project_dir: str):
+    """Run the verification agent using Claude."""
+    print(f"\n{'='*60}")
+    print("Starting File Verification Agent")
+    print(f"{'='*60}")
+    print(f"Manifest: {manifest_path}")
+    print(f"Project Directory: {project_dir}")
+    print(f"{'='*60}\n")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"""Please verify the project files in '{project_dir}' against the manifest file at '{manifest_path}'.
+
+Follow these steps:
+1. Read the manifest file to get the expected file hashes
+2. Verify all project files against the manifest hashes
+3. Report which files are verified, which have failed verification, which are missing, and which are extra files not in the manifest
+4. Provide a summary of the verification results
+
+Please be thorough and provide a clear report of the verification status."""
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"Response (stop_reason: {response.stop_reason}):")
+        
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    print("\nAgent Response:")
+                    print(block.text)
+            break
+        
+        if response.stop_reason == "tool_use":
+            messages.append({
+                "role": "assistant",
+                "content": response.content
+            })
+            
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nTool Call: {block.name}")
+                    print(f"Input: {json.dumps(block.input, indent=2)}")
+                    
+                    result = process_tool_call(block.name, block.input)
+                    result_data = json.loads(result)
+                    print(f"Result: {json.dumps(result_data, indent=2)}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+        else:
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+
+def main():
+    """Main function to demonstrate the file verification system."""
+    print("Creating test environment...")
+    test_dir, manifest_path = create_test_environment()
+    
+    print(f"Test directory created: {test_dir}")
+    print(f"Manifest file: {manifest_path}")
+    
+    print("\nTest environment contents:")
+    for item in Path(test_dir).iterdir():
+        print(f"  - {item.name}")
+    
+    run_verification_agent(manifest_path, test_dir)
+    
+    import shutil
+    shutil.rmtree(test_dir)
+    print(f"\nTest environment cleaned up: {test_dir}")
+
+if __name__ == "__main__":
+    main()
+```

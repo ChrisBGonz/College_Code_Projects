@@ -1,0 +1,322 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+
+// Circuit Breaker States
+const CircuitState = {
+  CLOSED: "CLOSED", // Normal operation - requests flow through
+  OPEN: "OPEN", // Circuit is open - requests are blocked
+  HALF_OPEN: "HALF_OPEN", // Testing if service has recovered
+};
+
+// Circuit Breaker Implementation
+class CircuitBreaker {
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold || 5;
+    this.successThreshold = options.successThreshold || 2;
+    this.timeout = options.timeout || 60000; // 60 seconds
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    this.name = options.name || "CircuitBreaker";
+  }
+
+  async execute(fn) {
+    if (this.state === CircuitState.OPEN) {
+      if (Date.now() - this.lastFailureTime >= this.timeout) {
+        console.log(
+          `[${this.name}] Circuit transitioning from OPEN to HALF_OPEN`
+        );
+        this.state = CircuitState.HALF_OPEN;
+      } else {
+        const remainingTime = Math.ceil(
+          (this.timeout - (Date.now() - this.lastFailureTime)) / 1000
+        );
+        throw new Error(
+          `Circuit breaker is OPEN. Service unavailable. Retry in ${remainingTime}s`
+        );
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure(error);
+      throw error;
+    }
+  }
+
+  onSuccess() {
+    this.failureCount = 0;
+
+    if (this.state === CircuitState.HALF_OPEN) {
+      this.successCount++;
+      console.log(
+        `[${this.name}] Success in HALF_OPEN state (${this.successCount}/${this.successThreshold})`
+      );
+
+      if (this.successCount >= this.successThreshold) {
+        console.log(
+          `[${this.name}] Circuit transitioning from HALF_OPEN to CLOSED`
+        );
+        this.state = CircuitState.CLOSED;
+        this.successCount = 0;
+      }
+    }
+  }
+
+  onFailure(error) {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+    console.log(
+      `[${this.name}] Failure recorded (${this.failureCount}/${this.failureThreshold}): ${error.message}`
+    );
+
+    if (
+      this.state === CircuitState.HALF_OPEN ||
+      this.failureCount >= this.failureThreshold
+    ) {
+      console.log(
+        `[${this.name}] Circuit transitioning to OPEN state due to failures`
+      );
+      this.state = CircuitState.OPEN;
+      this.successCount = 0;
+    }
+  }
+
+  getState() {
+    return {
+      state: this.state,
+      failureCount: this.failureCount,
+      successCount: this.successCount,
+      lastFailureTime: this.lastFailureTime,
+    };
+  }
+
+  reset() {
+    this.state = CircuitState.CLOSED;
+    this.failureCount = 0;
+    this.successCount = 0;
+    this.lastFailureTime = null;
+    console.log(`[${this.name}] Circuit breaker manually reset`);
+  }
+}
+
+// Anthropic API Client with Circuit Breaker
+class AnthropicClientWithCircuitBreaker {
+  constructor() {
+    this.client = new Anthropic();
+    this.circuitBreaker = new CircuitBreaker({
+      name: "AnthropicAPI",
+      failureThreshold: 3,
+      successThreshold: 2,
+      timeout: 30000, // 30 seconds for demo
+    });
+  }
+
+  async sendMessage(messages, options = {}) {
+    return this.circuitBreaker.execute(async () => {
+      console.log(
+        `[AnthropicClient] Sending request... Circuit state: ${this.circuitBreaker.state}`
+      );
+
+      const response = await this.client.messages.create({
+        model: options.model || "claude-opus-4-5",
+        max_tokens: options.max_tokens || 1024,
+        messages: messages,
+      });
+
+      return response;
+    });
+  }
+
+  getCircuitState() {
+    return this.circuitBreaker.getState();
+  }
+
+  resetCircuit() {
+    this.circuitBreaker.reset();
+  }
+}
+
+// Simulate a faulty API client for testing
+class FaultyAnthropicClient {
+  constructor(failureRate = 0.8) {
+    this.client = new Anthropic();
+    this.failureRate = failureRate;
+    this.circuitBreaker = new CircuitBreaker({
+      name: "FaultyAnthropicAPI",
+      failureThreshold: 3,
+      successThreshold: 2,
+      timeout: 10000, // 10 seconds for demo
+    });
+    this.requestCount = 0;
+  }
+
+  async sendMessage(messages, options = {}) {
+    return this.circuitBreaker.execute(async () => {
+      this.requestCount++;
+      console.log(
+        `[FaultyClient] Request #${this.requestCount} - Circuit state: ${this.circuitBreaker.state}`
+      );
+
+      // Simulate failures based on failure rate
+      if (Math.random() < this.failureRate) {
+        throw new Error("Simulated backend failure: Service temporarily unavailable");
+      }
+
+      const response = await this.client.messages.create({
+        model: options.model || "claude-opus-4-5",
+        max_tokens: options.max_tokens || 1024,
+        messages: messages,
+      });
+
+      return response;
+    });
+  }
+
+  getCircuitState() {
+    return this.circuitBreaker.getState();
+  }
+}
+
+// Demo function to showcase circuit breaker behavior
+async function demonstrateCircuitBreaker() {
+  console.log("=".repeat(60));
+  console.log("Circuit Breaker Pattern Demo");
+  console.log("=".repeat(60));
+
+  // Demo 1: Normal operation with real API
+  console.log("\n--- Demo 1: Normal Operation ---");
+  const normalClient = new AnthropicClientWithCircuitBreaker();
+
+  try {
+    const response = await normalClient.sendMessage([
+      {
+        role: "user",
+        content: "Say 'Hello, Circuit Breaker!' in exactly those words.",
+      },
+    ]);
+
+    console.log(
+      "Response:",
+      response.content[0].type === "text" ? response.content[0].text : "N/A"
+    );
+    console.log("Circuit State:", normalClient.getCircuitState());
+  } catch (error) {
+    console.error("Error:", error.message);
+  }
+
+  // Demo 2: Simulating failures to trigger circuit breaker
+  console.log("\n--- Demo 2: Simulating Failures ---");
+  const faultyClient = new FaultyAnthropicClient(1.0); // 100% failure rate
+
+  const testMessages = [
+    { role: "user", content: "Test message 1" },
+    { role: "user", content: "Test message 2" },
+    { role: "user", content: "Test message 3" },
+    { role: "user", content: "Test message 4" },
+    { role: "user", content: "Test message 5" },
+  ];
+
+  for (let i = 0; i < testMessages.length; i++) {
+    try {
+      await faultyClient.sendMessage([testMessages[i]]);
+      console.log(`Request ${i + 1}: Success`);
+    } catch (error) {
+      console.log(`Request ${i + 1}: Failed - ${error.message}`);
+    }
+
+    const state = faultyClient.getCircuitState();
+    console.log(`  Current State: ${state.state}, Failures: ${state.failureCount}`);
+
+    // Small delay between requests
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  // Demo 3: Circuit breaker blocking requests when OPEN
+  console.log("\n--- Demo 3: Circuit Breaker Blocking Requests ---");
+  console.log("Attempting requests with OPEN circuit...");
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      await faultyClient.sendMessage([{ role: "user", content: "Blocked request" }]);
+    } catch (error) {
+      console.log(`Blocked request ${i + 1}: ${error.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+
+  // Demo 4: Multi-turn conversation with circuit breaker
+  console.log("\n--- Demo 4: Multi-turn Conversation with Circuit Breaker ---");
+  const conversationClient = new AnthropicClientWithCircuitBreaker();
+  const conversationHistory = [];
+
+  const turns = [
+    "What is the capital of France?",
+    "What is the population of that city?",
+    "What is it famous for?",
+  ];
+
+  for (const userMessage of turns) {
+    conversationHistory.push({
+      role: "user",
+      content: userMessage,
+    });
+
+    try {
+      console.log(`\nUser: ${userMessage}`);
+      const response = await conversationClient.sendMessage(conversationHistory);
+
+      const assistantMessage =
+        response.content[0].type === "text" ? response.content[0].text : "";
+      console.log(`Assistant: ${assistantMessage.substring(0, 150)}...`);
+
+      conversationHistory.push({
+        role: "assistant",
+        content: assistantMessage,
+      });
+
+      console.log(`Circuit State: ${conversationClient.getCircuitState().state}`);
+    } catch (error) {
+      console.error(`Error in conversation: ${error.message}`);
+      console.log(`Circuit State: ${conversationClient.getCircuitState().state}`);
+      break;
+    }
+  }
+
+  // Demo 5: Recovery simulation
+  console.log("\n--- Demo 5: Circuit Recovery Simulation ---");
+  console.log("Waiting for circuit timeout to demonstrate HALF_OPEN state...");
+  console.log("(In production, this would wait for the full timeout period)");
+
+  const recoveryClient = new FaultyAnthropicClient(0.0); // 0% failure rate (service recovered)
+  recoveryClient.circuitBreaker.state = CircuitState.HALF_OPEN; // Manually set for demo
+  recoveryClient.circuitBreaker.lastFailureTime = Date.now() - 15000; // Simulate timeout passed
+
+  console.log("Simulating recovered service with HALF_OPEN circuit...");
+
+  for (let i = 0; i < 3; i++) {
+    try {
+      const response = await recoveryClient.sendMessage([
+        { role: "user", content: "Recovery test message" },
+      ]);
+      console.log(`Recovery request ${i + 1}: Success`);
+      console.log(`Circuit State: ${recoveryClient.getCircuitState().state}`);
+    } catch (error) {
+      console.log(`Recovery request ${i + 1}: Failed - ${error.message}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+
+  console.log("\n" + "=".repeat(60));
+  console.log("Circuit Breaker Demo Complete");
+  console.log("=".repeat(60));
+}
+
+// Run the demonstration
+demonstrateCircuitBreaker().catch(console.error);
+```

@@ -1,0 +1,448 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// AppConfig represents the configuration structure
+type AppConfig struct {
+	AppName     string                 `json:"app_name"`
+	Version     string                 `json:"version"`
+	Debug       bool                   `json:"debug"`
+	MaxRetries  int                    `json:"max_retries"`
+	Timeout     float64                `json:"timeout"`
+	Features    []string               `json:"features"`
+	Database    DatabaseConfig         `json:"database"`
+	Cache       CacheConfig            `json:"cache"`
+	CustomProps map[string]interface{} `json:"custom_props"`
+}
+
+// DatabaseConfig represents database configuration
+type DatabaseConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Name     string `json:"name"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	MaxConns int    `json:"max_connections"`
+}
+
+// CacheConfig represents cache configuration
+type CacheConfig struct {
+	Enabled bool   `json:"enabled"`
+	TTL     int    `json:"ttl"`
+	MaxSize int    `json:"max_size"`
+	Type    string `json:"type"`
+}
+
+// Application represents the main application object
+type Application struct {
+	Config      *AppConfig
+	initialized bool
+	properties  map[string]interface{}
+}
+
+// ReadConfigFile reads and parses a JSON configuration file
+func ReadConfigFile(filename string) (*AppConfig, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config AppConfig
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
+	}
+
+	return &config, nil
+}
+
+// SetObjectProperties dynamically sets properties on an object using reflection
+func SetObjectProperties(obj interface{}, properties map[string]interface{}) error {
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Ptr || objValue.IsNil() {
+		return fmt.Errorf("object must be a non-nil pointer")
+	}
+
+	objValue = objValue.Elem()
+	objType := objValue.Type()
+
+	for key, value := range properties {
+		// Try to find field by name (case-insensitive)
+		fieldFound := false
+		for i := 0; i < objType.NumField(); i++ {
+			field := objType.Field(i)
+			fieldName := field.Name
+
+			// Check JSON tag first
+			jsonTag := field.Tag.Get("json")
+			if jsonTag != "" {
+				tagName := strings.Split(jsonTag, ",")[0]
+				if tagName == key {
+					fieldFound = true
+					if err := setFieldValue(objValue.Field(i), value); err != nil {
+						return fmt.Errorf("failed to set field %s: %w", key, err)
+					}
+					break
+				}
+			}
+
+			// Check field name
+			if strings.EqualFold(fieldName, key) {
+				fieldFound = true
+				if err := setFieldValue(objValue.Field(i), value); err != nil {
+					return fmt.Errorf("failed to set field %s: %w", key, err)
+				}
+				break
+			}
+		}
+
+		if !fieldFound {
+			log.Printf("Warning: field '%s' not found in object", key)
+		}
+	}
+
+	return nil
+}
+
+// setFieldValue sets a field value using reflection
+func setFieldValue(field reflect.Value, value interface{}) error {
+	if !field.CanSet() {
+		return fmt.Errorf("field is not settable")
+	}
+
+	val := reflect.ValueOf(value)
+	if !val.IsValid() {
+		return nil
+	}
+
+	// Handle type conversion
+	if val.Type().ConvertibleTo(field.Type()) {
+		field.Set(val.Convert(field.Type()))
+		return nil
+	}
+
+	// Handle special cases
+	switch field.Kind() {
+	case reflect.String:
+		field.SetString(fmt.Sprintf("%v", value))
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := value.(type) {
+		case float64:
+			field.SetInt(int64(v))
+		case int:
+			field.SetInt(int64(v))
+		default:
+			return fmt.Errorf("cannot convert %T to int", value)
+		}
+	case reflect.Float32, reflect.Float64:
+		switch v := value.(type) {
+		case float64:
+			field.SetFloat(v)
+		case int:
+			field.SetFloat(float64(v))
+		default:
+			return fmt.Errorf("cannot convert %T to float", value)
+		}
+	case reflect.Bool:
+		if b, ok := value.(bool); ok {
+			field.SetBool(b)
+		} else {
+			return fmt.Errorf("cannot convert %T to bool", value)
+		}
+	default:
+		return fmt.Errorf("unsupported field type: %s", field.Kind())
+	}
+
+	return nil
+}
+
+// NewApplication creates a new application with configuration
+func NewApplication(config *AppConfig) *Application {
+	return &Application{
+		Config:      config,
+		initialized: false,
+		properties:  make(map[string]interface{}),
+	}
+}
+
+// Initialize initializes the application with the loaded configuration
+func (app *Application) Initialize() error {
+	if app.Config == nil {
+		return fmt.Errorf("configuration is nil")
+	}
+
+	// Set custom properties from config
+	if app.Config.CustomProps != nil {
+		for k, v := range app.Config.CustomProps {
+			app.properties[k] = v
+		}
+	}
+
+	app.initialized = true
+	log.Printf("Application '%s' v%s initialized successfully", app.Config.AppName, app.Config.Version)
+	return nil
+}
+
+// GetProperty retrieves a property value
+func (app *Application) GetProperty(key string) (interface{}, bool) {
+	val, ok := app.properties[key]
+	return val, ok
+}
+
+// SetProperty sets a property value
+func (app *Application) SetProperty(key string, value interface{}) {
+	app.properties[key] = value
+}
+
+// ConfigSummary returns a summary of the configuration
+func (app *Application) ConfigSummary() string {
+	if app.Config == nil {
+		return "No configuration loaded"
+	}
+
+	summary := fmt.Sprintf(`
+Application Configuration Summary:
+===================================
+App Name: %s
+Version: %s
+Debug Mode: %v
+Max Retries: %d
+Timeout: %.2f seconds
+Features: %v
+
+Database Configuration:
+  Host: %s
+  Port: %d
+  Database: %s
+  Max Connections: %d
+
+Cache Configuration:
+  Enabled: %v
+  TTL: %d seconds
+  Max Size: %d
+  Type: %s
+
+Custom Properties: %d properties loaded
+`,
+		app.Config.AppName,
+		app.Config.Version,
+		app.Config.Debug,
+		app.Config.MaxRetries,
+		app.Config.Timeout,
+		app.Config.Features,
+		app.Config.Database.Host,
+		app.Config.Database.Port,
+		app.Config.Database.Name,
+		app.Config.Database.MaxConns,
+		app.Config.Cache.Enabled,
+		app.Config.Cache.TTL,
+		app.Config.Cache.MaxSize,
+		app.Config.Cache.Type,
+		len(app.properties),
+	)
+
+	return summary
+}
+
+// createSampleConfig creates a sample configuration file for demonstration
+func createSampleConfig(filename string) error {
+	config := AppConfig{
+		AppName:    "MyGoApp",
+		Version:    "1.0.0",
+		Debug:      true,
+		MaxRetries: 3,
+		Timeout:    30.5,
+		Features:   []string{"auth", "logging", "metrics", "caching"},
+		Database: DatabaseConfig{
+			Host:     "localhost",
+			Port:     5432,
+			Name:     "myapp_db",
+			User:     "admin",
+			Password: "secret",
+			MaxConns: 10,
+		},
+		Cache: CacheConfig{
+			Enabled: true,
+			TTL:     3600,
+			MaxSize: 1000,
+			Type:    "redis",
+		},
+		CustomProps: map[string]interface{}{
+			"theme":        "dark",
+			"language":     "en",
+			"max_file_size": 10485760,
+			"allowed_ips":  []string{"192.168.1.0/24", "10.0.0.0/8"},
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	return os.WriteFile(filename, data, 0644)
+}
+
+func main() {
+	// Create Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(os.Getenv("ANTHROPIC_API_KEY")),
+	)
+
+	// Create sample config file
+	configFile := "app_config.json"
+	if err := createSampleConfig(configFile); err != nil {
+		log.Fatalf("Failed to create sample config: %v", err)
+	}
+	defer os.Remove(configFile)
+
+	fmt.Println("Starting Go Configuration Manager with Claude AI")
+	fmt.Println("================================================")
+
+	// Read the configuration file
+	config, err := ReadConfigFile(configFile)
+	if err != nil {
+		log.Fatalf("Failed to read config: %v", err)
+	}
+
+	// Create and initialize application
+	app := NewApplication(config)
+	if err := app.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize app: %v", err)
+	}
+
+	// Print initial configuration summary
+	fmt.Println(app.ConfigSummary())
+
+	// Start conversation with Claude about the configuration
+	conversationHistory := []anthropic.MessageParam{}
+
+	// Initial message to Claude
+	initialMessage := fmt.Sprintf(`I have a Go application with the following configuration:
+
+%s
+
+I need help with:
+1. Analyzing this configuration for potential issues
+2. Suggesting improvements
+3. Demonstrating how to dynamically modify properties
+
+Please start by analyzing the current configuration and suggest any improvements.`, app.ConfigSummary())
+
+	fmt.Println("\nStarting conversation with Claude AI...")
+	fmt.Println("User:", initialMessage[:100]+"...")
+
+	// Add user message to history
+	conversationHistory = append(conversationHistory, anthropic.NewUserMessage(
+		anthropic.NewTextBlock(initialMessage),
+	))
+
+	// Multi-turn conversation loop
+	for i := 0; i < 3; i++ {
+		// Send message to Claude
+		response, err := client.Messages.New(context.Background(), anthropic.MessageNewParams{
+			Model:     anthropic.ModelClaude3_5SonnetLatest,
+			MaxTokens: 1024,
+			Messages:  conversationHistory,
+		})
+
+		if err != nil {
+			log.Fatalf("Failed to get response from Claude: %v", err)
+		}
+
+		// Extract response text
+		var responseText string
+		for _, block := range response.Content {
+			if block.Type == "text" {
+				responseText = block.Text
+				break
+			}
+		}
+
+		fmt.Printf("\nClaude (Turn %d):\n%s\n", i+1, responseText)
+
+		// Add assistant response to history
+		conversationHistory = append(conversationHistory, anthropic.NewAssistantMessage(
+			anthropic.NewTextBlock(responseText),
+		))
+
+		// Prepare follow-up questions based on turn
+		var followUpMessage string
+		switch i {
+		case 0:
+			// Demonstrate dynamic property modification
+			newProps := map[string]interface{}{
+				"debug":       false,
+				"max_retries": 5,
+				"timeout":     60.0,
+			}
+
+			if err := SetObjectProperties(config, newProps); err != nil {
+				log.Printf("Warning: failed to set some properties: %v", err)
+			}
+
+			followUpMessage = fmt.Sprintf(`I've dynamically updated some configuration properties:
+- debug: false (was true)
+- max_retries: 5 (was 3)  
+- timeout: 60.0 (was 30.5)
+
+The updated configuration is:
+%s
+
+Can you explain the benefits of dynamic configuration management and how this pattern is useful in production systems?`, app.ConfigSummary())
+
+		case 1:
+			// Ask about best practices
+			followUpMessage = `Based on our discussion, can you provide a code example showing best practices for:
+1. Configuration validation
+2. Environment-specific overrides
+3. Secure handling of sensitive configuration values like passwords
+
+Please provide practical Go code examples.`
+
+		case 2:
+			// Final summary
+			followUpMessage = `Thank you for the insights! Can you provide a brief summary of:
+1. The key improvements we discussed
+2. The most important security considerations
+3. One final recommendation for production deployment
+
+Keep it concise.`
+		}
+
+		if i < 2 {
+			fmt.Printf("\nUser (Turn %d):\n%s\n", i+2, followUpMessage[:100]+"...")
+
+			// Add follow-up to conversation history
+			conversationHistory = append(conversationHistory, anthropic.NewUserMessage(
+				anthropic.NewTextBlock(followUpMessage),
+			))
+		}
+	}
+
+	// Demonstrate final state of the application
+	fmt.Println("\n\nFinal Application State:")
+	fmt.Println("========================")
+	fmt.Println(app.ConfigSummary())
+
+	// Show custom properties
+	fmt.Println("\nCustom Properties:")
+	for k, v := range app.properties {
+		fmt.Printf("  %s: %v\n", k, v)
+	}
+
+	fmt.Println("\nConfiguration management demonstration complete!")
+}
+```

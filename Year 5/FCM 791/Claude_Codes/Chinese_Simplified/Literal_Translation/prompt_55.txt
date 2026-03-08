@@ -1,0 +1,240 @@
+
+```python
+import anthropic
+import json
+from datetime import datetime, timedelta
+
+# Simulated cookie storage (in a real app, this would be in a browser/session)
+cookie_store = {}
+
+
+def get_cookie(name: str) -> str | None:
+    """Get a cookie value from the store."""
+    cookie = cookie_store.get(name)
+    if cookie:
+        # Check if cookie has expired
+        if cookie.get("expires") and datetime.now() > cookie["expires"]:
+            del cookie_store[name]
+            return None
+        return cookie.get("value")
+    return None
+
+
+def set_cookie(name: str, value: str, days: int = 365):
+    """Set a cookie in the store."""
+    cookie_store[name] = {
+        "value": value,
+        "expires": datetime.now() + timedelta(days=days),
+        "created": datetime.now().isoformat(),
+    }
+
+
+def check_trial_status_tool(user_id: str) -> dict:
+    """Tool to check if a user has already used their trial."""
+    has_used_trial = get_cookie("has_used_trial")
+
+    if has_used_trial:
+        trial_data = json.loads(has_used_trial)
+        return {
+            "has_used_trial": True,
+            "user_id": trial_data.get("user_id"),
+            "trial_start_date": trial_data.get("start_date"),
+            "message": "User has already used their free trial.",
+        }
+    else:
+        return {
+            "has_used_trial": False,
+            "user_id": user_id,
+            "message": "User is eligible for a free trial.",
+        }
+
+
+def register_trial_tool(user_id: str, email: str) -> dict:
+    """Tool to register a user for a free trial."""
+    # Check if already used trial
+    has_used_trial = get_cookie("has_used_trial")
+
+    if has_used_trial:
+        trial_data = json.loads(has_used_trial)
+        return {
+            "success": False,
+            "message": f"Trial already used. Started on {trial_data.get('start_date')}",
+            "user_id": user_id,
+        }
+
+    # Register the trial
+    trial_data = {
+        "user_id": user_id,
+        "email": email,
+        "start_date": datetime.now().isoformat(),
+        "end_date": (datetime.now() + timedelta(days=14)).isoformat(),
+    }
+
+    # Set the cookie to mark trial as used
+    set_cookie("has_used_trial", json.dumps(trial_data), days=365)
+
+    return {
+        "success": True,
+        "message": "Free trial successfully registered!",
+        "user_id": user_id,
+        "email": email,
+        "trial_start": trial_data["start_date"],
+        "trial_end": trial_data["end_date"],
+        "trial_duration": "14 days",
+    }
+
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results."""
+    if tool_name == "check_trial_status":
+        result = check_trial_status_tool(tool_input["user_id"])
+    elif tool_name == "register_trial":
+        result = register_trial_tool(tool_input["user_id"], tool_input["email"])
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+
+    return json.dumps(result)
+
+
+def handle_trial_registration(user_id: str, email: str):
+    """Main function to handle trial registration using Claude with tool use."""
+    client = anthropic.Anthropic()
+
+    # Define the tools
+    tools = [
+        {
+            "name": "check_trial_status",
+            "description": "Check if a user has already used their free trial by examining the has_used_trial cookie",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "The unique identifier for the user",
+                    }
+                },
+                "required": ["user_id"],
+            },
+        },
+        {
+            "name": "register_trial",
+            "description": "Register a user for a free trial. This will set the has_used_trial cookie to prevent future trial registrations.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "user_id": {
+                        "type": "string",
+                        "description": "The unique identifier for the user",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "The email address of the user",
+                    },
+                },
+                "required": ["user_id", "email"],
+            },
+        },
+    ]
+
+    # Initial message to Claude
+    messages = [
+        {
+            "role": "user",
+            "content": f"I want to register for a free trial. My user ID is '{user_id}' and my email is '{email}'. Please check if I'm eligible and register me if I haven't used a trial before.",
+        }
+    ]
+
+    print(f"\n{'='*60}")
+    print(f"Processing trial registration for User ID: {user_id}")
+    print(f"Email: {email}")
+    print(f"{'='*60}\n")
+
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
+
+        print(f"Claude's response (stop_reason: {response.stop_reason}):")
+
+        # Process the response
+        if response.stop_reason == "tool_use":
+            # Handle tool calls
+            tool_results = []
+
+            for content_block in response.content:
+                if content_block.type == "text":
+                    print(f"Text: {content_block.text}")
+                elif content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+
+                    print(f"\nTool call: {tool_name}")
+                    print(f"Input: {json.dumps(tool_input, indent=2)}")
+
+                    # Execute the tool
+                    result = process_tool_call(tool_name, tool_input)
+                    print(f"Result: {result}")
+
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use_id,
+                            "content": result,
+                        }
+                    )
+
+            # Add assistant response and tool results to messages
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+
+        elif response.stop_reason == "end_turn":
+            # Final response
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    print(f"\nFinal Response: {content_block.text}")
+            break
+        else:
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+
+    print(f"\n{'='*60}")
+    print(f"Current Cookie Store: {json.dumps(cookie_store, indent=2, default=str)}")
+    print(f"{'='*60}\n")
+
+
+def main():
+    """Main function to demonstrate the trial registration system."""
+    print("FREE TRIAL REGISTRATION SYSTEM")
+    print("================================\n")
+
+    # Test Case 1: First-time user
+    print("TEST CASE 1: First-time user registration")
+    handle_trial_registration("user123", "john.doe@example.com")
+
+    # Test Case 2: Same user trying to register again
+    print("\nTEST CASE 2: Same user trying to register again")
+    handle_trial_registration("user123", "john.doe@example.com")
+
+    # Test Case 3: Different user (but same browser/cookie store)
+    print("\nTEST CASE 3: Different user ID but same cookie store")
+    handle_trial_registration("user456", "jane.smith@example.com")
+
+    # Reset cookie store to simulate a new browser session
+    print("\n" + "=" * 60)
+    print("Resetting cookie store (simulating new browser session)")
+    print("=" * 60)
+    cookie_store.clear()
+
+    # Test Case 4: New session, new user
+    print("\nTEST CASE 4: New session, new user")
+    handle_trial_registration("user789", "bob.wilson@example.com")
+
+
+if __name__ == "__main__":
+    main()
+```
