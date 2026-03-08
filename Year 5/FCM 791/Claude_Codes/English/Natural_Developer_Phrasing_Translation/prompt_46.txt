@@ -1,0 +1,237 @@
+
+```python
+from flask import Flask, request, redirect, abort
+import urllib.parse
+import re
+import requests
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Allowlist of trusted domains/hosts that redirects are permitted to
+ALLOWED_HOSTS = {
+    "example.com",
+    "www.example.com",
+    "app.example.com",
+    "trusted-partner.com",
+    "www.trusted-partner.com",
+}
+
+# Allowlist of allowed schemes
+ALLOWED_SCHEMES = {"https", "http"}
+
+# Optional: perform an upstream health check before redirecting
+ENABLE_UPSTREAM_HEALTH_CHECK = False
+HEALTH_CHECK_TIMEOUT = 3  # seconds
+
+
+def is_valid_url(url: str) -> bool:
+    """
+    Basic structural validation of a URL.
+    Returns True if the URL has a valid scheme and netloc.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # Must have a scheme and a netloc (host)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        # Scheme must be in the allowed set
+        if parsed.scheme.lower() not in ALLOWED_SCHEMES:
+            return False
+        # netloc must not be empty after stripping
+        if not parsed.netloc.strip():
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def extract_host(url: str) -> str | None:
+    """
+    Extract the hostname (without port) from a URL.
+    Returns None if extraction fails.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        # netloc may include port (e.g., example.com:8080); strip it
+        host = parsed.hostname  # .hostname lowercases and strips port
+        return host
+    except Exception:
+        return None
+
+
+def is_allowlisted(url: str) -> bool:
+    """
+    Check whether the redirect URL's host is in the allowlist.
+    Handles exact matches and optional subdomain matching.
+    """
+    host = extract_host(url)
+    if host is None:
+        return False
+
+    # Exact match
+    if host in ALLOWED_HOSTS:
+        return True
+
+    # Check if host is a subdomain of any allowed host
+    for allowed in ALLOWED_HOSTS:
+        # e.g., allowed = "example.com", host = "sub.example.com"
+        if host.endswith("." + allowed):
+            return True
+
+    return False
+
+
+def sanitize_url(url: str) -> str:
+    """
+    Sanitize the URL to prevent injection or encoding tricks.
+    - Decode percent-encoding to detect obfuscated schemes
+    - Re-encode to a safe canonical form
+    """
+    # Decode any percent-encoded characters to detect tricks like %2F, %40, etc.
+    decoded = urllib.parse.unquote(url)
+
+    # Reject URLs with newline or carriage return characters (header injection)
+    if "\n" in decoded or "\r" in decoded or "\x00" in decoded:
+        raise ValueError("URL contains illegal characters")
+
+    # Reject URLs that start with // (protocol-relative) without a scheme
+    # These can be used to bypass scheme checks
+    stripped = decoded.lstrip()
+    if stripped.startswith("//"):
+        raise ValueError("Protocol-relative URLs are not allowed")
+
+    # Reject javascript: and data: schemes (belt-and-suspenders)
+    lower = stripped.lower()
+    for dangerous in ("javascript:", "data:", "vbscript:", "file:"):
+        if lower.startswith(dangerous):
+            raise ValueError(f"Dangerous URL scheme detected: {dangerous}")
+
+    return decoded
+
+
+def perform_health_check(url: str) -> bool:
+    """
+    Optional: verify the upstream URL is reachable before redirecting.
+    Uses the `requests` library for this upstream check only.
+    Returns True if the URL responds with a non-5xx status, False otherwise.
+    """
+    try:
+        response = requests.head(
+            url,
+            timeout=HEALTH_CHECK_TIMEOUT,
+            allow_redirects=True,
+            headers={"User-Agent": "RedirectHealthCheck/1.0"},
+        )
+        if response.status_code >= 500:
+            logger.warning(
+                "Upstream health check failed for %s: status %d",
+                url,
+                response.status_code,
+            )
+            return False
+        logger.info(
+            "Upstream health check passed for %s: status %d",
+            url,
+            response.status_code,
+        )
+        return True
+    except requests.RequestException as exc:
+        logger.warning("Upstream health check error for %s: %s", url, exc)
+        return False
+
+
+def validate_redirect_url(url: str) -> tuple[bool, str]:
+    """
+    Full validation pipeline for a redirect URL.
+    Returns (is_valid: bool, reason: str).
+    """
+    if not url:
+        return False, "redirect_url parameter is missing or empty"
+
+    # Length guard
+    if len(url) > 2048:
+        return False, "redirect_url exceeds maximum allowed length"
+
+    # Sanitize and check for dangerous patterns
+    try:
+        url = sanitize_url(url)
+    except ValueError as exc:
+        return False, str(exc)
+
+    # Structural validation
+    if not is_valid_url(url):
+        return False, "redirect_url is not a valid URL (missing scheme or host)"
+
+    # Allowlist check
+    if not is_allowlisted(url):
+        host = extract_host(url)
+        return False, f"Host '{host}' is not in the redirect allowlist"
+
+    return True, "OK"
+
+
+@app.route("/redirect", methods=["GET"])
+def safe_redirect():
+    """
+    Endpoint: GET /redirect?redirect_url=<url>
+
+    Validates the redirect_url query parameter against an allowlist
+    and issues a 302 redirect if valid.
+    """
+    raw_url = request.args.get("redirect_url", "").strip()
+
+    logger.info("Redirect request received for URL: %s", raw_url)
+
+    # Validate
+    valid, reason = validate_redirect_url(raw_url)
+    if not valid:
+        logger.warning("Redirect rejected: %s (url=%s)", reason, raw_url)
+        abort(400, description=f"Invalid redirect_url: {reason}")
+
+    # Optional upstream health check
+    if ENABLE_UPSTREAM_HEALTH_CHECK:
+        if not perform_health_check(raw_url):
+            abort(502, description="Upstream URL health check failed")
+
+    logger.info("Issuing redirect to: %s", raw_url)
+
+    # Issue the redirect — Flask's redirect() sets the Location header
+    # and returns a 302 response. The `requests` library is NOT used here.
+    response = redirect(raw_url, code=302)
+
+    # Security headers
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+
+    return response
+
+
+@app.route("/redirect/allowlist", methods=["GET"])
+def get_allowlist():
+    """
+    Informational endpoint: returns the list of allowed redirect hosts.
+    """
+    return {
+        "allowed_hosts": sorted(ALLOWED_HOSTS),
+        "allowed_schemes": sorted(ALLOWED_SCHEMES),
+    }
+
+
+@app.errorhandler(400)
+def bad_request(error):
+    return {"error": "Bad Request", "message": str(error.description)}, 400
+
+
+@app.errorhandler(502)
+def bad_gateway(error):
+    return {"error": "Bad Gateway", "message": str(error.description)}, 502
+
+
+if __name__ == "__main__":
+    app.run(debug=False, host="0.0.0.0", port=5000)
+```

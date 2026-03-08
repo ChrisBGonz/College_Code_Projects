@@ -1,0 +1,463 @@
+
+```python
+import asyncio
+import os
+import tempfile
+from pathlib import Path
+from typing import Optional, Union
+from jinja2 import Environment, FileSystemLoader, BaseLoader
+from playwright.async_api import async_playwright
+
+
+class PDFGenerationError(Exception):
+    """Custom exception for PDF generation errors."""
+    pass
+
+
+class HTMLToPDFConverter:
+    """
+    A helper class that converts HTML templates to PDF files using Playwright.
+    Supports Jinja2 templating with context data and handles various configuration options.
+    """
+    
+    def __init__(
+        self,
+        template_dir: Optional[str] = None,
+        browser_type: str = "chromium",
+        headless: bool = True
+    ):
+        """
+        Initialize the PDF converter.
+        
+        Args:
+            template_dir: Directory containing HTML templates (optional)
+            browser_type: Browser to use ('chromium', 'firefox', or 'webkit')
+            headless: Whether to run browser in headless mode
+        """
+        self.template_dir = template_dir
+        self.browser_type = browser_type
+        self.headless = headless
+        
+        # Setup Jinja2 environment
+        if template_dir:
+            self.jinja_env = Environment(
+                loader=FileSystemLoader(template_dir),
+                autoescape=True
+            )
+        else:
+            self.jinja_env = Environment(
+                loader=BaseLoader(),
+                autoescape=True
+            )
+    
+    def render_template(
+        self,
+        template_source: str,
+        context: Optional[dict] = None,
+        is_file: bool = False
+    ) -> str:
+        """
+        Render an HTML template with context data.
+        
+        Args:
+            template_source: Template file name (if is_file=True) or HTML string
+            context: Dictionary of context variables for template rendering
+            is_file: Whether template_source is a file name or HTML string
+            
+        Returns:
+            Rendered HTML string
+        """
+        context = context or {}
+        
+        try:
+            if is_file:
+                if not self.template_dir:
+                    raise PDFGenerationError(
+                        "template_dir must be set when using file templates"
+                    )
+                template = self.jinja_env.get_template(template_source)
+            else:
+                template = self.jinja_env.from_string(template_source)
+            
+            return template.render(**context)
+        except Exception as e:
+            raise PDFGenerationError(f"Template rendering failed: {str(e)}") from e
+    
+    async def _generate_pdf_async(
+        self,
+        html_content: str,
+        output_path: Optional[str] = None,
+        pdf_options: Optional[dict] = None,
+        base_url: Optional[str] = None
+    ) -> bytes:
+        """
+        Asynchronously generate PDF from HTML content using Playwright.
+        
+        Args:
+            html_content: HTML string to convert to PDF
+            output_path: Optional path to save the PDF file
+            pdf_options: Playwright PDF options (format, margins, etc.)
+            base_url: Base URL for resolving relative assets
+            
+        Returns:
+            PDF content as bytes
+        """
+        default_pdf_options = {
+            "format": "A4",
+            "print_background": True,
+            "margin": {
+                "top": "1cm",
+                "right": "1cm",
+                "bottom": "1cm",
+                "left": "1cm"
+            }
+        }
+        
+        if pdf_options:
+            default_pdf_options.update(pdf_options)
+        
+        try:
+            async with async_playwright() as playwright:
+                # Select browser type
+                if self.browser_type == "firefox":
+                    browser_instance = playwright.firefox
+                elif self.browser_type == "webkit":
+                    browser_instance = playwright.webkit
+                else:
+                    browser_instance = playwright.chromium
+                
+                browser = await browser_instance.launch(headless=self.headless)
+                
+                try:
+                    page = await browser.new_page()
+                    
+                    # Set content with optional base URL for asset resolution
+                    if base_url:
+                        await page.goto(base_url)
+                        await page.set_content(html_content, wait_until="networkidle")
+                    else:
+                        await page.set_content(html_content, wait_until="networkidle")
+                    
+                    # Generate PDF
+                    if output_path:
+                        default_pdf_options["path"] = output_path
+                    
+                    pdf_bytes = await page.pdf(**default_pdf_options)
+                    
+                    return pdf_bytes
+                    
+                finally:
+                    await browser.close()
+                    
+        except Exception as e:
+            raise PDFGenerationError(f"PDF generation failed: {str(e)}") from e
+    
+    def generate_pdf(
+        self,
+        template_source: str,
+        context: Optional[dict] = None,
+        output_path: Optional[str] = None,
+        is_file: bool = False,
+        pdf_options: Optional[dict] = None,
+        base_url: Optional[str] = None,
+        return_bytes: bool = False
+    ) -> Union[str, bytes]:
+        """
+        Generate a PDF from an HTML template.
+        
+        Args:
+            template_source: Template file name or HTML string
+            context: Context data for template rendering
+            output_path: Path to save the PDF (auto-generated if None)
+            is_file: Whether template_source is a file name
+            pdf_options: PDF generation options
+            base_url: Base URL for resolving relative assets
+            return_bytes: If True, return bytes instead of file path
+            
+        Returns:
+            File path (str) or PDF bytes, depending on return_bytes parameter
+        """
+        # Render template
+        html_content = self.render_template(template_source, context, is_file)
+        
+        # Handle output path
+        if not output_path and not return_bytes:
+            # Create a temporary file
+            temp_file = tempfile.NamedTemporaryFile(
+                suffix=".pdf",
+                delete=False,
+                prefix="generated_"
+            )
+            output_path = temp_file.name
+            temp_file.close()
+        
+        # Ensure output directory exists
+        if output_path:
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+        
+        # Run async PDF generation
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # If we're already in an async context, create a new loop
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(
+                        asyncio.run,
+                        self._generate_pdf_async(
+                            html_content,
+                            output_path if not return_bytes else None,
+                            pdf_options,
+                            base_url
+                        )
+                    )
+                    pdf_bytes = future.result()
+            else:
+                pdf_bytes = loop.run_until_complete(
+                    self._generate_pdf_async(
+                        html_content,
+                        output_path if not return_bytes else None,
+                        pdf_options,
+                        base_url
+                    )
+                )
+        except RuntimeError:
+            # No event loop, create one
+            pdf_bytes = asyncio.run(
+                self._generate_pdf_async(
+                    html_content,
+                    output_path if not return_bytes else None,
+                    pdf_options,
+                    base_url
+                )
+            )
+        
+        if return_bytes:
+            return pdf_bytes
+        
+        # Save bytes to file if path was provided but Playwright didn't save directly
+        if output_path and pdf_bytes:
+            with open(output_path, 'wb') as f:
+                f.write(pdf_bytes)
+        
+        return output_path
+
+
+def generate_pdf_from_html(
+    html_content: str,
+    output_path: Optional[str] = None,
+    context: Optional[dict] = None,
+    pdf_options: Optional[dict] = None,
+    return_bytes: bool = False
+) -> Union[str, bytes]:
+    """
+    Convenience function to generate PDF from HTML string.
+    
+    Args:
+        html_content: HTML string or Jinja2 template string
+        output_path: Optional path to save the PDF
+        context: Optional context data for template rendering
+        pdf_options: Optional PDF generation options
+        return_bytes: If True, return bytes instead of file path
+        
+    Returns:
+        File path or PDF bytes
+    """
+    converter = HTMLToPDFConverter()
+    return converter.generate_pdf(
+        template_source=html_content,
+        context=context,
+        output_path=output_path,
+        pdf_options=pdf_options,
+        return_bytes=return_bytes
+    )
+
+
+def generate_pdf_from_template(
+    template_name: str,
+    template_dir: str,
+    context: Optional[dict] = None,
+    output_path: Optional[str] = None,
+    pdf_options: Optional[dict] = None,
+    return_bytes: bool = False
+) -> Union[str, bytes]:
+    """
+    Convenience function to generate PDF from a template file.
+    
+    Args:
+        template_name: Name of the template file
+        template_dir: Directory containing templates
+        context: Context data for template rendering
+        output_path: Optional path to save the PDF
+        pdf_options: Optional PDF generation options
+        return_bytes: If True, return bytes instead of file path
+        
+    Returns:
+        File path or PDF bytes
+    """
+    converter = HTMLToPDFConverter(template_dir=template_dir)
+    return converter.generate_pdf(
+        template_source=template_name,
+        context=context,
+        output_path=output_path,
+        is_file=True,
+        pdf_options=pdf_options,
+        return_bytes=return_bytes
+    )
+
+
+# Example usage and demonstration
+if __name__ == "__main__":
+    # Example 1: Generate PDF from HTML string
+    html_template = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>{{ title }}</title>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                margin: 40px;
+                color: #333;
+            }
+            h1 {
+                color: #2c3e50;
+                border-bottom: 2px solid #3498db;
+                padding-bottom: 10px;
+            }
+            .info-box {
+                background-color: #ecf0f1;
+                padding: 20px;
+                border-radius: 5px;
+                margin: 20px 0;
+            }
+            table {
+                width: 100%;
+                border-collapse: collapse;
+                margin: 20px 0;
+            }
+            th, td {
+                border: 1px solid #bdc3c7;
+                padding: 10px;
+                text-align: left;
+            }
+            th {
+                background-color: #3498db;
+                color: white;
+            }
+            tr:nth-child(even) {
+                background-color: #f2f2f2;
+            }
+        </style>
+    </head>
+    <body>
+        <h1>{{ title }}</h1>
+        
+        <div class="info-box">
+            <p><strong>Generated for:</strong> {{ user_name }}</p>
+            <p><strong>Date:</strong> {{ date }}</p>
+            <p><strong>Report ID:</strong> {{ report_id }}</p>
+        </div>
+        
+        <h2>Summary</h2>
+        <p>{{ summary }}</p>
+        
+        <h2>Data Table</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Item</th>
+                    <th>Quantity</th>
+                    <th>Price</th>
+                    <th>Total</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in items %}
+                <tr>
+                    <td>{{ item.name }}</td>
+                    <td>{{ item.quantity }}</td>
+                    <td>${{ "%.2f"|format(item.price) }}</td>
+                    <td>${{ "%.2f"|format(item.quantity * item.price) }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        
+        <div class="info-box">
+            <p><strong>Total Amount:</strong> ${{ "%.2f"|format(total) }}</p>
+        </div>
+        
+        <p><em>This is an automatically generated document.</em></p>
+    </body>
+    </html>
+    """
+    
+    # Context data
+    context = {
+        "title": "Monthly Sales Report",
+        "user_name": "John Doe",
+        "date": "2024-01-15",
+        "report_id": "RPT-2024-001",
+        "summary": "This report summarizes the sales performance for the month of January 2024. Overall performance exceeded targets by 15%.",
+        "items": [
+            {"name": "Product A", "quantity": 10, "price": 29.99},
+            {"name": "Product B", "quantity": 5, "price": 49.99},
+            {"name": "Product C", "quantity": 20, "price": 14.99},
+            {"name": "Product D", "quantity": 3, "price": 99.99},
+        ],
+        "total": 10 * 29.99 + 5 * 49.99 + 20 * 14.99 + 3 * 99.99
+    }
+    
+    print("Generating PDF from HTML template...")
+    
+    # Generate PDF and save to file
+    output_file = "output_report.pdf"
+    
+    try:
+        result_path = generate_pdf_from_html(
+            html_content=html_template,
+            output_path=output_file,
+            context=context,
+            pdf_options={
+                "format": "A4",
+                "print_background": True,
+                "margin": {
+                    "top": "2cm",
+                    "right": "1.5cm",
+                    "bottom": "2cm",
+                    "left": "1.5cm"
+                }
+            }
+        )
+        
+        print(f"✓ PDF generated successfully!")
+        print(f"  Output path: {result_path}")
+        print(f"  File size: {os.path.getsize(result_path):,} bytes")
+        
+        # Also demonstrate returning bytes
+        print("\nGenerating PDF as bytes...")
+        pdf_bytes = generate_pdf_from_html(
+            html_content=html_template,
+            context=context,
+            return_bytes=True
+        )
+        
+        print(f"✓ PDF bytes generated successfully!")
+        print(f"  Bytes length: {len(pdf_bytes):,} bytes")
+        
+        # Save bytes to another file
+        bytes_output = "output_report_from_bytes.pdf"
+        with open(bytes_output, 'wb') as f:
+            f.write(pdf_bytes)
+        print(f"  Saved to: {bytes_output}")
+        
+    except PDFGenerationError as e:
+        print(f"✗ PDF generation failed: {e}")
+    except Exception as e:
+        print(f"✗ Unexpected error: {e}")
+        raise
+```

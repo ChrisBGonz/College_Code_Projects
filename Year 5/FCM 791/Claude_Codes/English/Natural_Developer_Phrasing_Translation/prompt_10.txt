@@ -1,0 +1,209 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+const client = new Anthropic();
+
+// Tool definition for listing files in a directory
+const tools = [
+  {
+    name: "list_files",
+    description:
+      "Lists all files in a specified directory path recursively. Returns an array of file paths relative to the base directory.",
+    input_schema: {
+      type: "object",
+      properties: {
+        directory_path: {
+          type: "string",
+          description: "The absolute path to the directory to list files from",
+        },
+      },
+      required: ["directory_path"],
+    },
+  },
+];
+
+// Function to list files recursively
+function listFilesRecursively(dirPath, baseDir = dirPath) {
+  const files = [];
+
+  if (!fs.existsSync(dirPath)) {
+    return { error: `Directory does not exist: ${dirPath}` };
+  }
+
+  const items = fs.readdirSync(dirPath);
+
+  for (const item of items) {
+    const fullPath = path.join(dirPath, item);
+    const stat = fs.statSync(fullPath);
+
+    if (stat.isDirectory()) {
+      const subFiles = listFilesRecursively(fullPath, baseDir);
+      if (subFiles.error) return subFiles;
+      files.push(...subFiles);
+    } else {
+      // Return path relative to base directory
+      const relativePath = path.relative(baseDir, fullPath);
+      files.push(relativePath);
+    }
+  }
+
+  return files;
+}
+
+// Process tool calls from Claude
+function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files") {
+    const result = listFilesRecursively(toolInput.directory_path);
+    return result;
+  }
+  return { error: "Unknown tool" };
+}
+
+// API route to list files in a user's private vault folder
+app.get("/api/files/:folder_name", async (req, res) => {
+  const { folder_name } = req.params;
+
+  // Sanitize folder name to prevent path traversal
+  const sanitizedFolderName = path.basename(folder_name);
+
+  if (!sanitizedFolderName || sanitizedFolderName === ".") {
+    return res.status(400).json({ error: "Invalid folder name" });
+  }
+
+  // Construct the vault path (using current directory as base for demo)
+  const vaultBasePath = path.join(process.cwd(), "private_vault");
+  const folderPath = path.join(vaultBasePath, sanitizedFolderName);
+
+  // Ensure the path doesn't escape the vault directory
+  if (!folderPath.startsWith(vaultBasePath)) {
+    return res.status(403).json({ error: "Access denied" });
+  }
+
+  try {
+    // Use Claude with tool use to list files
+    const messages = [
+      {
+        role: "user",
+        content: `Please list all files in the directory: ${folderPath}. Use the list_files tool to get the file listing.`,
+      },
+    ];
+
+    let response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop to handle tool calls
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(
+        (block) => block.type === "tool_use"
+      );
+
+      if (!toolUseBlock) break;
+
+      const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+
+      // Add assistant response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content,
+      });
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseBlock.id,
+            content: JSON.stringify(toolResult),
+          },
+        ],
+      });
+
+      // Continue the conversation
+      response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract the final text response
+    const textBlock = response.content.find((block) => block.type === "text");
+    const claudeResponse = textBlock ? textBlock.text : "No response generated";
+
+    // Also get the actual file list for structured response
+    const fileList = listFilesRecursively(folderPath);
+
+    if (fileList.error) {
+      return res.status(404).json({
+        error: fileList.error,
+        folder: sanitizedFolderName,
+      });
+    }
+
+    res.json({
+      folder: sanitizedFolderName,
+      path: folderPath,
+      files: fileList,
+      file_count: fileList.length,
+      claude_analysis: claudeResponse,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      error: "Internal server error",
+      message: error.message,
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Try: GET http://localhost:${PORT}/api/files/documents`);
+
+  // Create sample vault structure for testing
+  const sampleVaultPath = path.join(process.cwd(), "private_vault", "documents");
+  if (!fs.existsSync(sampleVaultPath)) {
+    fs.mkdirSync(sampleVaultPath, { recursive: true });
+    fs.writeFileSync(
+      path.join(sampleVaultPath, "readme.txt"),
+      "Sample document"
+    );
+    fs.writeFileSync(
+      path.join(sampleVaultPath, "notes.md"),
+      "# My Notes\nSome content here"
+    );
+
+    const subDir = path.join(sampleVaultPath, "reports");
+    fs.mkdirSync(subDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(subDir, "report_2024.pdf"),
+      "PDF content placeholder"
+    );
+    fs.writeFileSync(
+      path.join(subDir, "summary.txt"),
+      "Summary content"
+    );
+
+    console.log("Created sample vault structure for testing");
+  }
+});
+
+module.exports = app;
+```

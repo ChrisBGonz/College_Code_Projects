@@ -1,0 +1,269 @@
+
+```python
+import os
+import secrets
+from datetime import datetime, timedelta
+from flask import Flask, request, jsonify, make_response
+import anthropic
+
+app = Flask(__name__)
+
+# Simple user database (in production, use a real database)
+USERS = {
+    "admin": "password123",
+    "user1": "mypassword",
+    "demo": "demo123"
+}
+
+# Session store (in production, use Redis or a database)
+sessions = {}
+
+# Initialize Anthropic client
+client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+def generate_session_token():
+    """Generate a secure random session token."""
+    return secrets.token_hex(32)
+
+def create_session(username):
+    """Create a new session for the user."""
+    token = generate_session_token()
+    sessions[token] = {
+        "username": username,
+        "created_at": datetime.now(),
+        "expires_at": datetime.now() + timedelta(hours=24)
+    }
+    return token
+
+def validate_session(token):
+    """Validate a session token."""
+    if token not in sessions:
+        return None
+    
+    session = sessions[token]
+    if datetime.now() > session["expires_at"]:
+        del sessions[token]
+        return None
+    
+    return session
+
+def get_ai_welcome_message(username):
+    """Get a personalized welcome message from Claude using streaming."""
+    message_content = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=150,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Generate a brief, friendly welcome message for a user named '{username}' who just logged into a web application. Keep it under 2 sentences and make it personalized."
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            message_content += text
+    
+    return message_content
+
+@app.route('/')
+def index():
+    """Home page - check if user is authenticated."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if auth_token:
+        session = validate_session(auth_token)
+        if session:
+            return jsonify({
+                "status": "authenticated",
+                "username": session["username"],
+                "message": f"Welcome back, {session['username']}! You are logged in.",
+                "session_expires": session["expires_at"].isoformat()
+            })
+    
+    return jsonify({
+        "status": "unauthenticated",
+        "message": "Please log in to access the application.",
+        "login_endpoint": "/login"
+    })
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Login endpoint - authenticates user and sets session cookie."""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({"error": "Request body must be JSON"}), 400
+    
+    username = data.get('username')
+    password = data.get('password')
+    
+    if not username or not password:
+        return jsonify({"error": "Username and password are required"}), 400
+    
+    # Validate credentials
+    if username not in USERS or USERS[username] != password:
+        return jsonify({"error": "Invalid username or password"}), 401
+    
+    # Create session
+    session_token = create_session(username)
+    
+    # Get personalized welcome message from Claude
+    welcome_message = get_ai_welcome_message(username)
+    
+    # Create response with session cookie
+    response = make_response(jsonify({
+        "status": "success",
+        "message": "Login successful",
+        "username": username,
+        "welcome": welcome_message,
+        "session_info": {
+            "expires_in": "24 hours",
+            "cookie_name": "auth_token"
+        }
+    }))
+    
+    # Set the auth_token cookie
+    response.set_cookie(
+        'auth_token',
+        session_token,
+        max_age=86400,  # 24 hours in seconds
+        httponly=True,  # Prevent JavaScript access
+        secure=False,   # Set to True in production with HTTPS
+        samesite='Lax'  # CSRF protection
+    )
+    
+    return response
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout endpoint - invalidates session and clears cookie."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if auth_token and auth_token in sessions:
+        del sessions[auth_token]
+    
+    response = make_response(jsonify({
+        "status": "success",
+        "message": "Logged out successfully"
+    }))
+    
+    # Clear the auth_token cookie
+    response.set_cookie(
+        'auth_token',
+        '',
+        max_age=0,
+        expires=0
+    )
+    
+    return response
+
+@app.route('/profile')
+def profile():
+    """Protected profile endpoint - requires authentication."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if not auth_token:
+        return jsonify({"error": "Authentication required. Please log in."}), 401
+    
+    session = validate_session(auth_token)
+    if not session:
+        return jsonify({"error": "Session expired or invalid. Please log in again."}), 401
+    
+    # Get AI-generated profile description
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=100,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Generate a brief, fun profile description for a user named '{session['username']}'. Keep it under 2 sentences."
+            }
+        ]
+    ) as stream:
+        profile_description = ""
+        for text in stream.text_stream:
+            profile_description += text
+    
+    return jsonify({
+        "status": "success",
+        "profile": {
+            "username": session["username"],
+            "description": profile_description,
+            "session_created": session["created_at"].isoformat(),
+            "session_expires": session["expires_at"].isoformat()
+        }
+    })
+
+@app.route('/dashboard')
+def dashboard():
+    """Protected dashboard endpoint - requires authentication."""
+    auth_token = request.cookies.get('auth_token')
+    
+    if not auth_token:
+        return jsonify({"error": "Authentication required. Please log in."}), 401
+    
+    session = validate_session(auth_token)
+    if not session:
+        return jsonify({"error": "Session expired or invalid. Please log in again."}), 401
+    
+    # Get AI-generated dashboard content
+    dashboard_content = ""
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=200,
+        messages=[
+            {
+                "role": "user",
+                "content": f"Generate a brief dashboard summary for user '{session['username']}' including 3 fictional but realistic metrics or activities. Format it as a simple text summary."
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            dashboard_content += text
+    
+    return jsonify({
+        "status": "success",
+        "dashboard": {
+            "username": session["username"],
+            "content": dashboard_content,
+            "last_login": session["created_at"].isoformat()
+        }
+    })
+
+@app.route('/sessions', methods=['GET'])
+def list_sessions():
+    """Admin endpoint to view active sessions (for demonstration)."""
+    active_sessions = []
+    current_time = datetime.now()
+    
+    for token, session in sessions.items():
+        if current_time <= session["expires_at"]:
+            active_sessions.append({
+                "username": session["username"],
+                "created_at": session["created_at"].isoformat(),
+                "expires_at": session["expires_at"].isoformat(),
+                "token_preview": token[:8] + "..."
+            })
+    
+    return jsonify({
+        "active_sessions": len(active_sessions),
+        "sessions": active_sessions
+    })
+
+if __name__ == '__main__':
+    print("Starting Flask Authentication App...")
+    print("Available endpoints:")
+    print("  GET  / - Check authentication status")
+    print("  POST /login - Login with username and password")
+    print("  POST /logout - Logout and clear session")
+    print("  GET  /profile - View profile (requires auth)")
+    print("  GET  /dashboard - View dashboard (requires auth)")
+    print("  GET  /sessions - List active sessions")
+    print("\nTest credentials:")
+    print("  admin / password123")
+    print("  user1 / mypassword")
+    print("  demo / demo123")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

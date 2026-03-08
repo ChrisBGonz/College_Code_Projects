@@ -1,0 +1,131 @@
+<?php
+
+declare(strict_types=1);
+
+if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+    http_response_code(405);
+    header('Allow: GET');
+    exit('Method Not Allowed');
+}
+
+if (!isset($_GET['filename']) || $_GET['filename'] === '') {
+    http_response_code(400);
+    exit('Bad Request: missing filename parameter');
+}
+
+$filename = $_GET['filename'];
+
+// Sanitize: strip any directory traversal components
+$basename = basename($filename);
+
+if ($basename === '' || $basename === '.' || $basename === '..') {
+    http_response_code(400);
+    exit('Bad Request: invalid filename');
+}
+
+// Reject filenames with null bytes or other control characters
+if (preg_match('/[\x00-\x1f\x7f]/', $basename)) {
+    http_response_code(400);
+    exit('Bad Request: invalid filename');
+}
+
+$uploadsDir = rtrim(realpath('/uploads') ?: '', DIRECTORY_SEPARATOR);
+
+if ($uploadsDir === '') {
+    http_response_code(500);
+    exit('Internal Server Error: uploads directory not found');
+}
+
+$filePath = $uploadsDir . DIRECTORY_SEPARATOR . $basename;
+
+// Resolve the real path and confirm it is inside the uploads directory
+$realFilePath = realpath($filePath);
+
+if ($realFilePath === false) {
+    http_response_code(404);
+    exit('Not Found: file does not exist');
+}
+
+// Ensure the resolved path is still within the uploads directory
+if (strpos($realFilePath, $uploadsDir . DIRECTORY_SEPARATOR) !== 0) {
+    http_response_code(403);
+    exit('Forbidden: access denied');
+}
+
+if (!is_file($realFilePath)) {
+    http_response_code(404);
+    exit('Not Found: not a regular file');
+}
+
+if (!is_readable($realFilePath)) {
+    http_response_code(403);
+    exit('Forbidden: file is not readable');
+}
+
+$fileSize = filesize($realFilePath);
+
+if ($fileSize === false) {
+    http_response_code(500);
+    exit('Internal Server Error: could not determine file size');
+}
+
+// Detect MIME type
+$mimeType = 'application/octet-stream';
+
+if (function_exists('mime_content_type')) {
+    $detected = mime_content_type($realFilePath);
+    if ($detected !== false && $detected !== '') {
+        $mimeType = $detected;
+    }
+} elseif (function_exists('finfo_open')) {
+    $finfo = finfo_open(FILEINFO_MIME_TYPE);
+    if ($finfo !== false) {
+        $detected = finfo_file($finfo, $realFilePath);
+        finfo_close($finfo);
+        if ($detected !== false && $detected !== '') {
+            $mimeType = $detected;
+        }
+    }
+}
+
+// Encode the filename for the Content-Disposition header (RFC 5987)
+$encodedFilename = rawurlencode($basename);
+$asciiFilename   = preg_replace('/[^\x20-\x7e]/', '_', $basename);
+// Remove characters that are not safe inside a quoted-string
+$asciiFilename   = str_replace(['"', '\\', "\r", "\n"], '_', $asciiFilename);
+
+// Clear any previously set headers and disable output buffering
+if (ob_get_level() > 0) {
+    ob_end_clean();
+}
+
+header('Content-Type: ' . $mimeType);
+header('Content-Disposition: attachment; filename="' . $asciiFilename . '"; filename*=UTF-8\'\'' . $encodedFilename);
+header('Content-Length: ' . $fileSize);
+header('Content-Transfer-Encoding: binary');
+header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+header('Pragma: no-cache');
+header('Expires: 0');
+header('X-Content-Type-Options: nosniff');
+
+// Stream the file in chunks to handle large files efficiently
+$handle = fopen($realFilePath, 'rb');
+
+if ($handle === false) {
+    http_response_code(500);
+    exit('Internal Server Error: could not open file');
+}
+
+$chunkSize = 8192; // 8 KB
+
+while (!feof($handle)) {
+    $chunk = fread($handle, $chunkSize);
+    if ($chunk === false) {
+        break;
+    }
+    echo $chunk;
+    flush();
+}
+
+fclose($handle);
+exit;

@@ -1,0 +1,254 @@
+<?php
+
+define('ENCRYPTION_KEY', 'your-256-bit-secret-key-here-123');
+define('ENCRYPTION_METHOD', 'AES-256-CBC');
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'password');
+define('DB_NAME', 'payments_db');
+
+function getDbConnection(): mysqli
+{
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+
+    if ($conn->connect_error) {
+        throw new RuntimeException('Database connection failed: ' . $conn->connect_error);
+    }
+
+    $conn->set_charset('utf8mb4');
+
+    return $conn;
+}
+
+function encryptCreditCardNumber(string $creditCardNumber): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+
+    $encrypted = openssl_encrypt(
+        $creditCardNumber,
+        ENCRYPTION_METHOD,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+
+    $hmac = hash_hmac('sha256', $encrypted, ENCRYPTION_KEY, true);
+
+    return base64_encode($iv . $hmac . $encrypted);
+}
+
+function decryptCreditCardNumber(string $encryptedData): string
+{
+    $decoded = base64_decode($encryptedData);
+
+    if ($decoded === false) {
+        throw new RuntimeException('Base64 decoding failed.');
+    }
+
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_METHOD);
+    $iv = substr($decoded, 0, $ivLength);
+    $hmac = substr($decoded, $ivLength, 32);
+    $encrypted = substr($decoded, $ivLength + 32);
+
+    $calculatedHmac = hash_hmac('sha256', $encrypted, ENCRYPTION_KEY, true);
+
+    if (!hash_equals($hmac, $calculatedHmac)) {
+        throw new RuntimeException('HMAC verification failed. Data may have been tampered with.');
+    }
+
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_METHOD,
+        ENCRYPTION_KEY,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+
+    return $decrypted;
+}
+
+function maskCreditCardNumber(string $creditCardNumber): string
+{
+    $cleaned = preg_replace('/\D/', '', $creditCardNumber);
+    $length = strlen($cleaned);
+
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+
+    return str_repeat('*', $length - 4) . substr($cleaned, -4);
+}
+
+function validateCreditCardNumber(string $creditCardNumber): bool
+{
+    $cleaned = preg_replace('/\D/', '', $creditCardNumber);
+
+    if (strlen($cleaned) < 13 || strlen($cleaned) > 19) {
+        return false;
+    }
+
+    $sum = 0;
+    $alternate = false;
+
+    for ($i = strlen($cleaned) - 1; $i >= 0; $i--) {
+        $digit = (int)$cleaned[$i];
+
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+
+    return ($sum % 10 === 0);
+}
+
+function saveCreditCardToDatabase(
+    mysqli $conn,
+    string $cardholderName,
+    string $creditCardNumber,
+    string $expiryDate,
+    string $billingAddress
+): int {
+    if (!validateCreditCardNumber($creditCardNumber)) {
+        throw new InvalidArgumentException('Invalid credit card number.');
+    }
+
+    $encryptedCardNumber = encryptCreditCardNumber($creditCardNumber);
+    $maskedCardNumber = maskCreditCardNumber($creditCardNumber);
+
+    $stmt = $conn->prepare(
+        'INSERT INTO credit_cards (cardholder_name, credit_card_number, masked_card_number, expiry_date, billing_address, created_at)
+         VALUES (?, ?, ?, ?, ?, NOW())'
+    );
+
+    if (!$stmt) {
+        throw new RuntimeException('Failed to prepare statement: ' . $conn->error);
+    }
+
+    $stmt->bind_param(
+        'sssss',
+        $cardholderName,
+        $encryptedCardNumber,
+        $maskedCardNumber,
+        $expiryDate,
+        $billingAddress
+    );
+
+    if (!$stmt->execute()) {
+        throw new RuntimeException('Failed to execute statement: ' . $stmt->error);
+    }
+
+    $insertedId = (int)$stmt->insert_id;
+    $stmt->close();
+
+    return $insertedId;
+}
+
+function getCreditCardFromDatabase(mysqli $conn, int $id): ?array
+{
+    $stmt = $conn->prepare(
+        'SELECT id, cardholder_name, credit_card_number, masked_card_number, expiry_date, billing_address, created_at
+         FROM credit_cards WHERE id = ?'
+    );
+
+    if (!$stmt) {
+        throw new RuntimeException('Failed to prepare statement: ' . $conn->error);
+    }
+
+    $stmt->bind_param('i', $id);
+
+    if (!$stmt->execute()) {
+        throw new RuntimeException('Failed to execute statement: ' . $stmt->error);
+    }
+
+    $result = $stmt->get_result();
+    $row = $result->fetch_assoc();
+    $stmt->close();
+
+    if (!$row) {
+        return null;
+    }
+
+    $row['decrypted_card_number'] = decryptCreditCardNumber($row['credit_card_number']);
+
+    return $row;
+}
+
+function createTableIfNotExists(mysqli $conn): void
+{
+    $sql = "CREATE TABLE IF NOT EXISTS credit_cards (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        cardholder_name VARCHAR(255) NOT NULL,
+        credit_card_number TEXT NOT NULL,
+        masked_card_number VARCHAR(25) NOT NULL,
+        expiry_date VARCHAR(7) NOT NULL,
+        billing_address TEXT NOT NULL,
+        created_at DATETIME NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4";
+
+    if (!$conn->query($sql)) {
+        throw new RuntimeException('Failed to create table: ' . $conn->error);
+    }
+}
+
+try {
+    $conn = getDbConnection();
+    createTableIfNotExists($conn);
+
+    $cardholderName = 'John Doe';
+    $creditCardNumber = '4532015112830366';
+    $expiryDate = '12/2026';
+    $billingAddress = '123 Main St, Springfield, IL 62701';
+
+    echo "Saving credit card for: $cardholderName\n";
+    echo "Original card number: $creditCardNumber\n";
+
+    $insertedId = saveCreditCardToDatabase(
+        $conn,
+        $cardholderName,
+        $creditCardNumber,
+        $expiryDate,
+        $billingAddress
+    );
+
+    echo "Credit card saved successfully with ID: $insertedId\n\n";
+
+    $record = getCreditCardFromDatabase($conn, $insertedId);
+
+    if ($record) {
+        echo "Retrieved record:\n";
+        echo "ID: " . $record['id'] . "\n";
+        echo "Cardholder: " . $record['cardholder_name'] . "\n";
+        echo "Encrypted card number (stored in DB): " . $record['credit_card_number'] . "\n";
+        echo "Masked card number: " . $record['masked_card_number'] . "\n";
+        echo "Decrypted card number: " . $record['decrypted_card_number'] . "\n";
+        echo "Expiry date: " . $record['expiry_date'] . "\n";
+        echo "Billing address: " . $record['billing_address'] . "\n";
+        echo "Created at: " . $record['created_at'] . "\n";
+    }
+
+    $conn->close();
+} catch (InvalidArgumentException $e) {
+    echo "Validation error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "Runtime error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (Exception $e) {
+    echo "Unexpected error: " . $e->getMessage() . "\n";
+    exit(1);
+}

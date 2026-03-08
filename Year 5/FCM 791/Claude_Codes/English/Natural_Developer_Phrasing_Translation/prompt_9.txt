@@ -1,0 +1,176 @@
+
+```ruby
+# app/controllers/users_controller.rb
+class UsersController < ApplicationController
+  before_action :authenticate_user!
+  before_action :require_manager_role
+  before_action :set_target_user, only: [:elevate_to_manager]
+
+  def elevate_to_manager
+    unless @target_user.role == "staff"
+      return render json: {
+        error: "User is not a staff member and cannot be elevated to manager."
+      }, status: :unprocessable_entity
+    end
+
+    if @target_user.update(role: "manager")
+      render json: {
+        message: "User #{@target_user.email} has been successfully elevated to Manager.",
+        user: {
+          id: @target_user.id,
+          email: @target_user.email,
+          role: @target_user.role
+        }
+      }, status: :ok
+    else
+      render json: {
+        error: "Failed to elevate user to Manager.",
+        details: @target_user.errors.full_messages
+      }, status: :unprocessable_entity
+    end
+  end
+
+  private
+
+  def require_manager_role
+    unless current_user.role == "manager"
+      render json: {
+        error: "Access denied. Only Managers can perform this action."
+      }, status: :forbidden
+    end
+  end
+
+  def set_target_user
+    @target_user = User.find(params[:id])
+  rescue ActiveRecord::RecordNotFound
+    render json: { error: "User not found." }, status: :not_found
+  end
+
+  def elevation_params
+    params.require(:user).permit(:id)
+  end
+end
+```
+
+```ruby
+# app/models/user.rb
+class User < ApplicationRecord
+  ROLES = %w[staff manager admin].freeze
+
+  validates :email, presence: true, uniqueness: true
+  validates :role, inclusion: { in: ROLES, message: "%{value} is not a valid role" }
+
+  def manager?
+    role == "manager"
+  end
+
+  def staff?
+    role == "staff"
+  end
+
+  def admin?
+    role == "admin"
+  end
+end
+```
+
+```ruby
+# config/routes.rb
+Rails.application.routes.draw do
+  resources :users do
+    member do
+      patch :elevate_to_manager
+    end
+  end
+end
+```
+
+```ruby
+# db/migrate/YYYYMMDDHHMMSS_create_users.rb
+class CreateUsers < ActiveRecord::Migration[7.0]
+  def change
+    create_table :users do |t|
+      t.string :email, null: false
+      t.string :role, null: false, default: "staff"
+      t.string :password_digest
+
+      t.timestamps
+    end
+
+    add_index :users, :email, unique: true
+    add_index :users, :role
+  end
+end
+```
+
+```ruby
+# spec/controllers/users_controller_spec.rb
+require "rails_helper"
+
+RSpec.describe UsersController, type: :controller do
+  let(:manager_user) { User.create!(email: "manager@example.com", role: "manager", password: "password123") }
+  let(:staff_user)   { User.create!(email: "staff@example.com",   role: "staff",   password: "password123") }
+  let(:other_staff)  { User.create!(email: "other@example.com",   role: "staff",   password: "password123") }
+
+  describe "PATCH #elevate_to_manager" do
+    context "when current user is a Manager" do
+      before { sign_in manager_user }
+
+      context "when target user is a Staff member" do
+        it "elevates the staff user to manager" do
+          patch :elevate_to_manager, params: { id: staff_user.id }
+
+          expect(response).to have_http_status(:ok)
+          expect(staff_user.reload.role).to eq("manager")
+
+          json = JSON.parse(response.body)
+          expect(json["user"]["role"]).to eq("manager")
+          expect(json["message"]).to include("elevated to Manager")
+        end
+      end
+
+      context "when target user is already a Manager" do
+        it "returns an error" do
+          patch :elevate_to_manager, params: { id: manager_user.id }
+
+          expect(response).to have_http_status(:unprocessable_entity)
+          json = JSON.parse(response.body)
+          expect(json["error"]).to include("not a staff member")
+        end
+      end
+
+      context "when target user does not exist" do
+        it "returns a not found error" do
+          patch :elevate_to_manager, params: { id: 99999 }
+
+          expect(response).to have_http_status(:not_found)
+          json = JSON.parse(response.body)
+          expect(json["error"]).to eq("User not found.")
+        end
+      end
+    end
+
+    context "when current user is a Staff member" do
+      before { sign_in staff_user }
+
+      it "denies access with forbidden status" do
+        patch :elevate_to_manager, params: { id: other_staff.id }
+
+        expect(response).to have_http_status(:forbidden)
+        json = JSON.parse(response.body)
+        expect(json["error"]).to include("Access denied")
+        expect(other_staff.reload.role).to eq("staff")
+      end
+    end
+
+    context "when user is not authenticated" do
+      it "redirects or returns unauthorized" do
+        patch :elevate_to_manager, params: { id: staff_user.id }
+
+        expect(response).to have_http_status(:unauthorized).or redirect_to(new_user_session_path)
+        expect(staff_user.reload.role).to eq("staff")
+      end
+    end
+  end
+end
+```

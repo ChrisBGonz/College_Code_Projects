@@ -1,0 +1,218 @@
+
+```javascript
+const express = require('express');
+const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+const db = require('../db'); // your database module
+const authenticate = require('../middleware/authenticate'); // your auth middleware
+
+const router = express.Router();
+
+// Rate limiting for profile updates
+const updateProfileLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,
+  message: { error: 'Too many update attempts, please try again later.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Validation rules
+const updateProfileValidation = [
+  body('email')
+    .optional()
+    .trim()
+    .toLowerCase()
+    .isEmail()
+    .withMessage('Must be a valid email address')
+    .isLength({ max: 255 })
+    .withMessage('Email must not exceed 255 characters')
+    .normalizeEmail({
+      gmail_remove_dots: false,
+      gmail_remove_subaddress: false,
+    }),
+
+  body('displayName')
+    .optional()
+    .trim()
+    .isLength({ min: 1, max: 100 })
+    .withMessage('Display name must be between 1 and 100 characters')
+    .matches(/^[a-zA-Z0-9\s\-_.]+$/)
+    .withMessage(
+      'Display name can only contain letters, numbers, spaces, hyphens, underscores, and periods'
+    )
+    .escape(),
+];
+
+// PUT /api/user/update-profile
+router.put(
+  '/update-profile',
+  authenticate,
+  updateProfileLimiter,
+  updateProfileValidation,
+  async (req, res) => {
+    try {
+      // Check for validation errors
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({
+          error: 'Validation failed',
+          details: errors.array().map((err) => ({
+            field: err.path,
+            message: err.msg,
+          })),
+        });
+      }
+
+      const userId = req.user.id;
+      const { email, displayName } = req.body;
+
+      // Ensure at least one field is provided
+      if (email === undefined && displayName === undefined) {
+        return res.status(400).json({
+          error: 'At least one field (email or displayName) must be provided',
+        });
+      }
+
+      // Fetch current user from DB
+      const currentUser = await db.query(
+        'SELECT id, email, display_name, created_at, updated_at FROM users WHERE id = $1 AND deleted_at IS NULL',
+        [userId]
+      );
+
+      if (currentUser.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+
+      const user = currentUser.rows[0];
+
+      // Build update fields dynamically
+      const updates = {};
+      const queryParams = [];
+      const setClauses = [];
+      let paramIndex = 1;
+
+      // Handle email update
+      if (email !== undefined) {
+        const normalizedEmail = email.toLowerCase().trim();
+
+        // Check if email is actually changing
+        if (normalizedEmail !== user.email) {
+          // Check for email uniqueness
+          const emailCheck = await db.query(
+            'SELECT id FROM users WHERE email = $1 AND id != $2 AND deleted_at IS NULL',
+            [normalizedEmail, userId]
+          );
+
+          if (emailCheck.rows.length > 0) {
+            return res.status(409).json({
+              error: 'Email address is already in use by another account',
+            });
+          }
+
+          updates.email = normalizedEmail;
+          setClauses.push(`email = $${paramIndex}`);
+          queryParams.push(normalizedEmail);
+          paramIndex++;
+        }
+      }
+
+      // Handle displayName update
+      if (displayName !== undefined) {
+        const sanitizedDisplayName = displayName.trim();
+
+        if (sanitizedDisplayName !== user.display_name) {
+          updates.displayName = sanitizedDisplayName;
+          setClauses.push(`display_name = $${paramIndex}`);
+          queryParams.push(sanitizedDisplayName);
+          paramIndex++;
+        }
+      }
+
+      // If no actual changes, return current user
+      if (setClauses.length === 0) {
+        return res.status(200).json({
+          message: 'No changes detected',
+          user: {
+            id: user.id,
+            email: user.email,
+            displayName: user.display_name,
+            createdAt: user.created_at,
+            updatedAt: user.updated_at,
+          },
+        });
+      }
+
+      // Add updated_at and WHERE clause
+      setClauses.push(`updated_at = NOW()`);
+      queryParams.push(userId);
+
+      const updateQuery = `
+        UPDATE users
+        SET ${setClauses.join(', ')}
+        WHERE id = $${paramIndex} AND deleted_at IS NULL
+        RETURNING id, email, display_name, created_at, updated_at
+      `;
+
+      const result = await db.query(updateQuery, queryParams);
+
+      if (result.rows.length === 0) {
+        return res.status(404).json({ error: 'User not found or update failed' });
+      }
+
+      const updatedUser = result.rows[0];
+
+      // Log the update for audit purposes
+      await db.query(
+        `INSERT INTO audit_logs (user_id, action, details, created_at)
+         VALUES ($1, $2, $3, NOW())`,
+        [
+          userId,
+          'PROFILE_UPDATE',
+          JSON.stringify({
+            changedFields: Object.keys(updates),
+            previousEmail: updates.email ? user.email : undefined,
+          }),
+        ]
+      ).catch((auditErr) => {
+        // Non-critical: log but don't fail the request
+        console.error('Failed to write audit log:', auditErr);
+      });
+
+      return res.status(200).json({
+        message: 'Profile updated successfully',
+        user: {
+          id: updatedUser.id,
+          email: updatedUser.email,
+          displayName: updatedUser.display_name,
+          createdAt: updatedUser.created_at,
+          updatedAt: updatedUser.updated_at,
+        },
+      });
+    } catch (error) {
+      console.error('Error updating user profile:', error);
+
+      // Handle specific DB errors
+      if (error.code === '23505') {
+        // Unique constraint violation
+        return res.status(409).json({
+          error: 'Email address is already in use',
+        });
+      }
+
+      if (error.code === '23503') {
+        // Foreign key violation
+        return res.status(400).json({
+          error: 'Invalid reference in update data',
+        });
+      }
+
+      return res.status(500).json({
+        error: 'An internal server error occurred. Please try again later.',
+      });
+    }
+  }
+);
+
+module.exports = router;
+```

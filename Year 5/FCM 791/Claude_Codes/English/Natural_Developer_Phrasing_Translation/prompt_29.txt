@@ -1,0 +1,462 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Script to automatically bump all Maven dependencies to their latest versions.
+Uses Claude AI to analyze and update pom.xml files.
+"""
+
+import subprocess
+import sys
+import os
+import re
+import json
+from pathlib import Path
+import anthropic
+
+def run_command(cmd: list[str], cwd: str = None) -> tuple[str, str, int]:
+    """Run a shell command and return stdout, stderr, and return code."""
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=cwd
+    )
+    return result.stdout, result.stderr, result.returncode
+
+def find_pom_files(project_dir: str) -> list[str]:
+    """Find all pom.xml files in the project directory."""
+    pom_files = []
+    for root, dirs, files in os.walk(project_dir):
+        # Skip hidden directories and common non-project directories
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['target', 'node_modules']]
+        if 'pom.xml' in files:
+            pom_files.append(os.path.join(root, 'pom.xml'))
+    return pom_files
+
+def get_latest_version(group_id: str, artifact_id: str) -> str:
+    """Get the latest version of a Maven artifact from Maven Central."""
+    # Use Maven's dependency:get to check latest version
+    cmd = [
+        'mvn', 'dependency:get',
+        f'-Dartifact={group_id}:{artifact_id}:LATEST',
+        '-q', '--batch-mode'
+    ]
+    stdout, stderr, code = run_command(cmd)
+    
+    # Alternative: use Maven Central API
+    import urllib.request
+    import urllib.error
+    
+    url = f"https://search.maven.org/solrsearch/select?q=g:{group_id}+AND+a:{artifact_id}&rows=1&wt=json"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as response:
+            data = json.loads(response.read().decode())
+            if data['response']['numFound'] > 0:
+                return data['response']['docs'][0].get('latestVersion', '')
+    except (urllib.error.URLError, json.JSONDecodeError, KeyError):
+        pass
+    
+    return ''
+
+def read_pom_file(pom_path: str) -> str:
+    """Read the content of a pom.xml file."""
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def write_pom_file(pom_path: str, content: str) -> None:
+    """Write content to a pom.xml file."""
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+def get_dependency_updates_with_claude(pom_content: str, client: anthropic.Anthropic) -> dict:
+    """Use Claude to analyze pom.xml and identify dependencies that need updating."""
+    
+    print("Analyzing pom.xml with Claude AI...")
+    
+    # Use streaming for the analysis
+    dependencies_info = {}
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=4096,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Analyze this Maven pom.xml file and extract all dependencies with their current versions.
+                
+For each dependency, provide:
+1. groupId
+2. artifactId  
+3. current version (if specified)
+4. Whether it's a direct dependency or plugin
+
+Return the response as a JSON object with this structure:
+{{
+    "dependencies": [
+        {{
+            "groupId": "...",
+            "artifactId": "...",
+            "currentVersion": "...",
+            "type": "dependency|plugin|parent"
+        }}
+    ]
+}}
+
+Only include dependencies that have explicit version numbers (not inherited or managed versions).
+
+pom.xml content:
+{pom_content}"""
+            }
+        ]
+    ) as stream:
+        response_text = ""
+        for text in stream.text_stream:
+            response_text += text
+            print(".", end="", flush=True)
+        print()
+        
+        # Extract JSON from response
+        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if json_match:
+            try:
+                dependencies_info = json.loads(json_match.group())
+            except json.JSONDecodeError:
+                print("Warning: Could not parse Claude's response as JSON")
+    
+    return dependencies_info
+
+def update_pom_with_claude(pom_content: str, version_updates: dict, client: anthropic.Anthropic) -> str:
+    """Use Claude to update the pom.xml with new versions."""
+    
+    if not version_updates:
+        return pom_content
+    
+    print("\nUpdating pom.xml with Claude AI...")
+    
+    updates_str = json.dumps(version_updates, indent=2)
+    updated_pom = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=8192,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Update this Maven pom.xml file with the following version updates.
+                
+Version updates to apply:
+{updates_str}
+
+Rules:
+1. Only update the versions specified in the updates list
+2. Preserve all formatting, comments, and structure
+3. If a version is in a property (like ${{spring.version}}), update the property value
+4. Return ONLY the updated pom.xml content, no explanations
+
+Original pom.xml:
+{pom_content}"""
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            updated_pom += text
+            print(".", end="", flush=True)
+        print()
+    
+    # Clean up the response - remove any markdown code blocks if present
+    updated_pom = re.sub(r'^```xml\n', '', updated_pom, flags=re.MULTILINE)
+    updated_pom = re.sub(r'^```\n', '', updated_pom, flags=re.MULTILINE)
+    updated_pom = updated_pom.strip()
+    
+    return updated_pom
+
+def check_for_updates_with_maven(project_dir: str) -> dict:
+    """Use Maven versions plugin to check for available updates."""
+    print("\nChecking for updates with Maven versions plugin...")
+    
+    cmd = [
+        'mvn', 'versions:display-dependency-updates',
+        'versions:display-plugin-updates',
+        '--batch-mode', '-q'
+    ]
+    
+    stdout, stderr, code = run_command(cmd, cwd=project_dir)
+    
+    updates = {}
+    
+    # Parse the output to find available updates
+    update_pattern = re.compile(
+        r'\[INFO\]\s+(\S+):(\S+)\s+\.\.\.\s+(\S+)\s+->\s+(\S+)'
+    )
+    
+    for line in stdout.split('\n'):
+        match = update_pattern.search(line)
+        if match:
+            group_id, artifact_id, current_version, new_version = match.groups()
+            key = f"{group_id}:{artifact_id}"
+            updates[key] = {
+                'groupId': group_id,
+                'artifactId': artifact_id,
+                'currentVersion': current_version,
+                'latestVersion': new_version
+            }
+    
+    return updates
+
+def apply_updates_with_maven(project_dir: str) -> bool:
+    """Use Maven versions plugin to automatically update versions."""
+    print("\nApplying updates with Maven versions plugin...")
+    
+    # Update dependencies
+    cmd_deps = [
+        'mvn', 'versions:use-latest-releases',
+        '--batch-mode', '-q'
+    ]
+    
+    stdout, stderr, code = run_command(cmd_deps, cwd=project_dir)
+    if code != 0:
+        print(f"Warning: versions:use-latest-releases failed: {stderr}")
+    
+    # Update plugins
+    cmd_plugins = [
+        'mvn', 'versions:use-latest-versions',
+        '--batch-mode', '-q'
+    ]
+    
+    stdout, stderr, code = run_command(cmd_plugins, cwd=project_dir)
+    if code != 0:
+        print(f"Warning: versions:use-latest-versions failed: {stderr}")
+    
+    return True
+
+def validate_pom(project_dir: str) -> bool:
+    """Validate the updated pom.xml by running mvn validate."""
+    print("\nValidating updated pom.xml...")
+    
+    cmd = ['mvn', 'validate', '--batch-mode', '-q']
+    stdout, stderr, code = run_command(cmd, cwd=project_dir)
+    
+    if code != 0:
+        print(f"Validation failed: {stderr}")
+        return False
+    
+    print("Validation successful!")
+    return True
+
+def create_backup(pom_path: str) -> str:
+    """Create a backup of the pom.xml file."""
+    backup_path = pom_path + '.backup'
+    import shutil
+    shutil.copy2(pom_path, backup_path)
+    return backup_path
+
+def restore_backup(pom_path: str, backup_path: str) -> None:
+    """Restore pom.xml from backup."""
+    import shutil
+    shutil.copy2(backup_path, pom_path)
+    os.remove(backup_path)
+
+def bump_dependencies(project_dir: str = '.', use_maven_plugin: bool = True) -> None:
+    """Main function to bump all Maven dependencies to latest versions."""
+    
+    print(f"Maven Dependency Bumper")
+    print(f"=" * 50)
+    print(f"Project directory: {os.path.abspath(project_dir)}")
+    
+    # Initialize Anthropic client
+    client = anthropic.Anthropic()
+    
+    # Find all pom.xml files
+    pom_files = find_pom_files(project_dir)
+    
+    if not pom_files:
+        print("No pom.xml files found!")
+        sys.exit(1)
+    
+    print(f"\nFound {len(pom_files)} pom.xml file(s):")
+    for pom in pom_files:
+        print(f"  - {pom}")
+    
+    # Check if Maven is available
+    _, _, maven_code = run_command(['mvn', '--version'])
+    maven_available = maven_code == 0
+    
+    if not maven_available:
+        print("\nWarning: Maven not found in PATH. Will use Claude AI only for updates.")
+        use_maven_plugin = False
+    
+    # Process each pom.xml
+    for pom_path in pom_files:
+        print(f"\n{'=' * 50}")
+        print(f"Processing: {pom_path}")
+        print('=' * 50)
+        
+        # Create backup
+        backup_path = create_backup(pom_path)
+        print(f"Backup created: {backup_path}")
+        
+        try:
+            # Read current pom.xml
+            pom_content = read_pom_file(pom_path)
+            
+            if use_maven_plugin and maven_available:
+                # Use Maven versions plugin for updates
+                pom_dir = os.path.dirname(pom_path)
+                
+                # Check what updates are available
+                available_updates = check_for_updates_with_maven(pom_dir)
+                
+                if available_updates:
+                    print(f"\nFound {len(available_updates)} potential update(s):")
+                    for key, update in available_updates.items():
+                        print(f"  {key}: {update['currentVersion']} -> {update['latestVersion']}")
+                    
+                    # Apply updates using Maven plugin
+                    apply_updates_with_maven(pom_dir)
+                    
+                    # Read updated pom.xml
+                    updated_content = read_pom_file(pom_path)
+                    
+                    # Use Claude to verify and potentially enhance the updates
+                    print("\nVerifying updates with Claude AI...")
+                    
+                    with client.messages.stream(
+                        model="claude-opus-4-5",
+                        max_tokens=2048,
+                        messages=[
+                            {
+                                "role": "user",
+                                "content": f"""Compare these two pom.xml files and summarize what changed:
+
+Original:
+{pom_content[:3000]}...
+
+Updated:
+{updated_content[:3000]}...
+
+Provide a brief summary of the version changes made."""
+                            }
+                        ]
+                    ) as stream:
+                        summary = ""
+                        for text in stream.text_stream:
+                            summary += text
+                        print(f"\nUpdate Summary:\n{summary}")
+                
+                else:
+                    print("No updates available via Maven plugin.")
+                    
+                    # Try Claude-based analysis as fallback
+                    deps_info = get_dependency_updates_with_claude(pom_content, client)
+                    
+                    if deps_info and 'dependencies' in deps_info:
+                        print(f"\nFound {len(deps_info['dependencies'])} dependencies to check")
+                        
+                        # Get latest versions for each dependency
+                        version_updates = []
+                        for dep in deps_info['dependencies']:
+                            if dep.get('currentVersion') and dep['currentVersion'] != 'LATEST':
+                                latest = get_latest_version(dep['groupId'], dep['artifactId'])
+                                if latest and latest != dep['currentVersion']:
+                                    version_updates.append({
+                                        'groupId': dep['groupId'],
+                                        'artifactId': dep['artifactId'],
+                                        'currentVersion': dep['currentVersion'],
+                                        'latestVersion': latest
+                                    })
+                                    print(f"  Update available: {dep['groupId']}:{dep['artifactId']} "
+                                          f"{dep['currentVersion']} -> {latest}")
+                        
+                        if version_updates:
+                            # Use Claude to update the pom.xml
+                            updated_content = update_pom_with_claude(pom_content, version_updates, client)
+                            write_pom_file(pom_path, updated_content)
+                            print(f"\nUpdated {pom_path}")
+            
+            else:
+                # Use Claude-only approach
+                deps_info = get_dependency_updates_with_claude(pom_content, client)
+                
+                if deps_info and 'dependencies' in deps_info:
+                    print(f"\nFound {len(deps_info['dependencies'])} dependencies")
+                    
+                    # Get latest versions
+                    version_updates = []
+                    for dep in deps_info['dependencies']:
+                        if dep.get('currentVersion'):
+                            latest = get_latest_version(dep['groupId'], dep['artifactId'])
+                            if latest and latest != dep['currentVersion']:
+                                version_updates.append({
+                                    'groupId': dep['groupId'],
+                                    'artifactId': dep['artifactId'],
+                                    'currentVersion': dep['currentVersion'],
+                                    'latestVersion': latest
+                                })
+                    
+                    if version_updates:
+                        updated_content = update_pom_with_claude(pom_content, version_updates, client)
+                        write_pom_file(pom_path, updated_content)
+                        print(f"\nUpdated {pom_path} with {len(version_updates)} version update(s)")
+            
+            # Validate the updated pom.xml if Maven is available
+            if maven_available:
+                pom_dir = os.path.dirname(pom_path)
+                if not validate_pom(pom_dir):
+                    print("Validation failed! Restoring backup...")
+                    restore_backup(pom_path, backup_path)
+                    print("Backup restored.")
+                else:
+                    # Remove backup on success
+                    os.remove(backup_path)
+                    print(f"Backup removed: {backup_path}")
+            else:
+                # Remove backup without validation
+                os.remove(backup_path)
+        
+        except Exception as e:
+            print(f"Error processing {pom_path}: {e}")
+            print("Restoring backup...")
+            restore_backup(pom_path, backup_path)
+            print("Backup restored.")
+            raise
+    
+    print(f"\n{'=' * 50}")
+    print("Dependency bump complete!")
+    print('=' * 50)
+
+def main():
+    """Main entry point."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='Automatically bump Maven dependencies to latest versions'
+    )
+    parser.add_argument(
+        'project_dir',
+        nargs='?',
+        default='.',
+        help='Path to the Maven project directory (default: current directory)'
+    )
+    parser.add_argument(
+        '--no-maven-plugin',
+        action='store_true',
+        help='Skip Maven versions plugin and use Claude AI only'
+    )
+    
+    args = parser.parse_args()
+    
+    project_dir = os.path.abspath(args.project_dir)
+    
+    if not os.path.isdir(project_dir):
+        print(f"Error: Directory not found: {project_dir}")
+        sys.exit(1)
+    
+    bump_dependencies(
+        project_dir=project_dir,
+        use_maven_plugin=not args.no_maven_plugin
+    )
+
+if __name__ == '__main__':
+    main()
+```

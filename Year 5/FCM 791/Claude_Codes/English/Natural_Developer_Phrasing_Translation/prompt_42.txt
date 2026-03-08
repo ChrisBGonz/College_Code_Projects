@@ -1,0 +1,169 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const { execSync } = require("child_process");
+const os = require("os");
+
+const client = new Anthropic();
+
+// Define the ping tool
+const pingTool = {
+  name: "ping_host",
+  description:
+    "Executes a system ping command to check if a host is reachable. Returns whether the host is up or down along with ping statistics.",
+  input_schema: {
+    type: "object",
+    properties: {
+      domain_name: {
+        type: "string",
+        description: "The domain name or IP address to ping",
+      },
+      count: {
+        type: "number",
+        description: "Number of ping packets to send (default: 4)",
+      },
+    },
+    required: ["domain_name"],
+  },
+};
+
+// Function to execute ping command
+function executePing(domainName, count = 4) {
+  const platform = os.platform();
+  let command;
+
+  // Different ping syntax for different OS
+  if (platform === "win32") {
+    command = `ping -n ${count} ${domainName}`;
+  } else {
+    // Linux/Mac
+    command = `ping -c ${count} ${domainName}`;
+  }
+
+  try {
+    const output = execSync(command, {
+      timeout: 30000,
+      encoding: "utf8",
+    });
+
+    return {
+      success: true,
+      isReachable: true,
+      output: output,
+      domain: domainName,
+    };
+  } catch (error) {
+    // If ping fails (host unreachable), execSync throws an error
+    return {
+      success: false,
+      isReachable: false,
+      output: error.stdout || error.message,
+      domain: domainName,
+      error: error.message,
+    };
+  }
+}
+
+// Process tool calls from Claude
+function processToolCall(toolName, toolInput) {
+  if (toolName === "ping_host") {
+    const { domain_name, count } = toolInput;
+    return executePing(domain_name, count || 4);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+// Main function to check if a domain is reachable
+async function checkDomainReachability(domainName) {
+  console.log(`\nChecking reachability for: ${domainName}`);
+  console.log("=".repeat(50));
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the domain "${domainName}" is reachable by pinging it. Use the ping_host tool to verify connectivity and provide a clear status report.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: [pingTool],
+    messages: messages,
+  });
+
+  // Agentic loop - continue until Claude stops using tools
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nExecuting tool: ${toolUseBlock.name}`);
+    console.log("Tool input:", JSON.stringify(toolUseBlock.input, null, 2));
+
+    // Execute the tool
+    const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+
+    console.log("\nPing Result:");
+    console.log("Is Reachable:", toolResult.isReachable);
+    if (toolResult.output) {
+      console.log("Output:", toolResult.output.substring(0, 500)); // Limit output length
+    }
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult),
+        },
+      ],
+    });
+
+    // Continue the conversation
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: [pingTool],
+      messages: messages,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\nFinal Status Report:");
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+// Main execution
+async function main() {
+  // Test with different domains
+  const domainsToTest = ["google.com", "github.com", "nonexistent-domain-xyz.com"];
+
+  for (const domain of domainsToTest) {
+    try {
+      await checkDomainReachability(domain);
+      console.log("\n" + "=".repeat(50) + "\n");
+    } catch (error) {
+      console.error(`Error checking ${domain}:`, error.message);
+    }
+  }
+}
+
+main().catch(console.error);
+```

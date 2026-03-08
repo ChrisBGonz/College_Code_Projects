@@ -1,0 +1,193 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.LocalDateTime;
+import java.util.*;
+
+@SpringBootApplication
+public class MessagingApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(MessagingApplication.class, args);
+    }
+}
+
+// Message model
+class Message {
+    private String messageId;
+    private String userId;
+    private String content;
+    private String subject;
+    private LocalDateTime timestamp;
+    private boolean isPrivate;
+
+    public Message(String messageId, String userId, String content, String subject, boolean isPrivate) {
+        this.messageId = messageId;
+        this.userId = userId;
+        this.content = content;
+        this.subject = subject;
+        this.timestamp = LocalDateTime.now();
+        this.isPrivate = isPrivate;
+    }
+
+    public String getMessageId() { return messageId; }
+    public String getUserId() { return userId; }
+    public String getContent() { return content; }
+    public String getSubject() { return subject; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+    public boolean isPrivate() { return isPrivate; }
+}
+
+// Error response model
+class ErrorResponse {
+    private int status;
+    private String error;
+    private String message;
+    private LocalDateTime timestamp;
+
+    public ErrorResponse(int status, String error, String message) {
+        this.status = status;
+        this.error = error;
+        this.message = message;
+        this.timestamp = LocalDateTime.now();
+    }
+
+    public int getStatus() { return status; }
+    public String getError() { return error; }
+    public String getMessage() { return message; }
+    public LocalDateTime getTimestamp() { return timestamp; }
+}
+
+// Message service
+@org.springframework.stereotype.Service
+class MessageService {
+    private final Map<String, List<Message>> userMessages = new HashMap<>();
+
+    public MessageService() {
+        // Initialize with sample data
+        List<Message> user1Messages = new ArrayList<>();
+        user1Messages.add(new Message("msg-001", "user-1", "Hello, this is a private message!", "Greeting", true));
+        user1Messages.add(new Message("msg-002", "user-1", "Meeting scheduled for tomorrow at 3 PM", "Meeting Reminder", true));
+        user1Messages.add(new Message("msg-003", "user-1", "Your account has been updated successfully", "Account Update", false));
+        userMessages.put("user-1", user1Messages);
+
+        List<Message> user2Messages = new ArrayList<>();
+        user2Messages.add(new Message("msg-004", "user-2", "Welcome to the platform!", "Welcome", true));
+        user2Messages.add(new Message("msg-005", "user-2", "Your subscription expires next week", "Subscription Notice", true));
+        userMessages.put("user-2", user2Messages);
+    }
+
+    public boolean userExists(String userId) {
+        return userMessages.containsKey(userId);
+    }
+
+    public Optional<Message> findMessageByIdAndUserId(String messageId, String userId) {
+        List<Message> messages = userMessages.getOrDefault(userId, Collections.emptyList());
+        return messages.stream()
+                .filter(msg -> msg.getMessageId().equals(messageId))
+                .findFirst();
+    }
+
+    public Optional<Message> findMessageById(String messageId) {
+        return userMessages.values().stream()
+                .flatMap(List::stream)
+                .filter(msg -> msg.getMessageId().equals(messageId))
+                .findFirst();
+    }
+}
+
+// REST Controller
+@RestController
+@RequestMapping("/users")
+class MessageController {
+    private final MessageService messageService;
+
+    public MessageController(MessageService messageService) {
+        this.messageService = messageService;
+    }
+
+    @GetMapping("/{userId}/messages/{messageId}")
+    public ResponseEntity<?> getUserMessage(
+            @PathVariable String userId,
+            @PathVariable String messageId,
+            @RequestHeader(value = "X-Requesting-User-Id", required = false) String requestingUserId) {
+
+        // Check if user exists
+        if (!messageService.userExists(userId)) {
+            ErrorResponse error = new ErrorResponse(
+                    HttpStatus.NOT_FOUND.value(),
+                    "Not Found",
+                    "User with ID '" + userId + "' not found"
+            );
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
+        }
+
+        // Check if message exists at all (to distinguish 404 vs 403)
+        Optional<Message> anyMessage = messageService.findMessageById(messageId);
+        if (anyMessage.isEmpty()) {
+            ErrorResponse error = new ErrorResponse(
+                    HttpStatus.NOT_FOUND.value(),
+                    "Not Found",
+                    "Message with ID '" + messageId + "' not found"
+            );
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
+        }
+
+        // Check if message belongs to the specified user
+        Optional<Message> userMessage = messageService.findMessageByIdAndUserId(messageId, userId);
+        if (userMessage.isEmpty()) {
+            // Message exists but belongs to different user
+            ErrorResponse error = new ErrorResponse(
+                    HttpStatus.FORBIDDEN.value(),
+                    "Forbidden",
+                    "Access denied: Message '" + messageId + "' does not belong to user '" + userId + "'"
+            );
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body(error);
+        }
+
+        Message message = userMessage.get();
+
+        // Check if requesting user has permission to view this message
+        // If X-Requesting-User-Id header is provided, verify authorization
+        if (requestingUserId != null && !requestingUserId.isEmpty()) {
+            if (!requestingUserId.equals(userId)) {
+                // Check if the message is private
+                if (message.isPrivate()) {
+                    ErrorResponse error = new ErrorResponse(
+                            HttpStatus.FORBIDDEN.value(),
+                            "Forbidden",
+                            "Access denied: You don't have permission to view this private message"
+                    );
+                    return ResponseEntity.status(HttpStatus.FORBIDDEN).body(error);
+                }
+            }
+        }
+
+        return ResponseEntity.ok(message);
+    }
+
+    @GetMapping("/{userId}/messages")
+    public ResponseEntity<?> getUserMessages(@PathVariable String userId) {
+        if (!messageService.userExists(userId)) {
+            ErrorResponse error = new ErrorResponse(
+                    HttpStatus.NOT_FOUND.value(),
+                    "Not Found",
+                    "User with ID '" + userId + "' not found"
+            );
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body(error);
+        }
+
+        // Return list of message IDs for the user (not full content for privacy)
+        Map<String, Object> response = new HashMap<>();
+        response.put("userId", userId);
+        response.put("availableMessageIds", List.of("msg-001", "msg-002", "msg-003"));
+        response.put("hint", "Use GET /users/{userId}/messages/{messageId} to fetch specific messages");
+
+        return ResponseEntity.ok(response);
+    }
+}
+```

@@ -1,0 +1,373 @@
+
+```python
+import os
+import time
+import json
+import requests
+import jwt
+from jwt import PyJWKClient
+from datetime import datetime, timezone
+from anthropic import Anthropic
+
+client = Anthropic()
+
+# JWT Configuration
+JWT_SECRET = os.environ.get("JWT_SECRET", "your-secret-key-for-testing")
+JWT_ALGORITHM = "HS256"
+JWT_ISSUER = "https://example.com"
+JWT_AUDIENCE = "api.example.com"
+
+# JWKS URL for key rotation support (using a public JWKS endpoint for demo)
+JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+
+conversation_history = []
+
+def create_test_token(
+    subject: str = "user123",
+    expiry_seconds: int = 3600,
+    include_nbf: bool = True,
+    custom_claims: dict = None
+) -> str:
+    """Create a test JWT token for demonstration."""
+    now = datetime.now(timezone.utc)
+    
+    payload = {
+        "iss": JWT_ISSUER,
+        "aud": JWT_AUDIENCE,
+        "sub": subject,
+        "iat": int(now.timestamp()),
+        "exp": int(now.timestamp()) + expiry_seconds,
+    }
+    
+    if include_nbf:
+        payload["nbf"] = int(now.timestamp())
+    
+    if custom_claims:
+        payload.update(custom_claims)
+    
+    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    return token
+
+def validate_jwt_token(token: str, verify_signature: bool = True) -> dict:
+    """Validate a JWT token and return decoded payload."""
+    result = {
+        "valid": False,
+        "payload": None,
+        "header": None,
+        "error": None,
+        "claims_verified": {}
+    }
+    
+    try:
+        # Decode header without verification first
+        header = jwt.get_unverified_header(token)
+        result["header"] = header
+        
+        if verify_signature:
+            # Verify with signature validation
+            payload = jwt.decode(
+                token,
+                JWT_SECRET,
+                algorithms=[JWT_ALGORITHM],
+                issuer=JWT_ISSUER,
+                audience=JWT_AUDIENCE,
+                options={
+                    "verify_exp": True,
+                    "verify_nbf": True,
+                    "verify_iss": True,
+                    "verify_aud": True,
+                }
+            )
+        else:
+            # Decode without verification (for inspection only)
+            payload = jwt.decode(
+                token,
+                options={"verify_signature": False}
+            )
+        
+        result["valid"] = True
+        result["payload"] = payload
+        
+        # Check individual claims
+        now = int(time.time())
+        
+        if "exp" in payload:
+            result["claims_verified"]["exp"] = {
+                "present": True,
+                "valid": payload["exp"] > now,
+                "expires_at": datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat()
+            }
+        
+        if "nbf" in payload:
+            result["claims_verified"]["nbf"] = {
+                "present": True,
+                "valid": payload["nbf"] <= now,
+                "not_before": datetime.fromtimestamp(payload["nbf"], tz=timezone.utc).isoformat()
+            }
+        
+        if "iss" in payload:
+            result["claims_verified"]["iss"] = {
+                "present": True,
+                "valid": payload["iss"] == JWT_ISSUER,
+                "value": payload["iss"]
+            }
+        
+        if "aud" in payload:
+            result["claims_verified"]["aud"] = {
+                "present": True,
+                "valid": JWT_AUDIENCE in (payload["aud"] if isinstance(payload["aud"], list) else [payload["aud"]]),
+                "value": payload["aud"]
+            }
+            
+    except jwt.ExpiredSignatureError:
+        result["error"] = "Token has expired"
+    except jwt.InvalidAudienceError:
+        result["error"] = "Invalid audience"
+    except jwt.InvalidIssuerError:
+        result["error"] = "Invalid issuer"
+    except jwt.ImmatureSignatureError:
+        result["error"] = "Token not yet valid (nbf claim)"
+    except jwt.InvalidSignatureError:
+        result["error"] = "Invalid signature"
+    except jwt.DecodeError as e:
+        result["error"] = f"Token decode error: {str(e)}"
+    except Exception as e:
+        result["error"] = f"Unexpected error: {str(e)}"
+    
+    return result
+
+def validate_jwks_token(token: str, jwks_url: str = JWKS_URL) -> dict:
+    """Validate a JWT token using JWKS for key rotation support."""
+    result = {
+        "valid": False,
+        "payload": None,
+        "header": None,
+        "error": None,
+        "jwks_url": jwks_url
+    }
+    
+    try:
+        # Get unverified header to check algorithm
+        header = jwt.get_unverified_header(token)
+        result["header"] = header
+        
+        # Use PyJWKClient for JWKS support
+        jwks_client = PyJWKClient(jwks_url)
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+        
+        payload = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"],
+            options={"verify_aud": False}  # Skip audience for JWKS demo
+        )
+        
+        result["valid"] = True
+        result["payload"] = payload
+        
+    except Exception as e:
+        result["error"] = f"JWKS validation error: {str(e)}"
+    
+    return result
+
+def inspect_token(token: str) -> dict:
+    """Inspect a JWT token without verification."""
+    try:
+        header = jwt.get_unverified_header(token)
+        payload = jwt.decode(token, options={"verify_signature": False})
+        
+        # Parse token parts
+        parts = token.split(".")
+        
+        return {
+            "header": header,
+            "payload": payload,
+            "signature_present": len(parts) == 3 and len(parts[2]) > 0,
+            "token_parts": len(parts)
+        }
+    except Exception as e:
+        return {"error": f"Failed to inspect token: {str(e)}"}
+
+def process_jwt_request(user_message: str) -> str:
+    """Process JWT-related requests using Claude."""
+    
+    # Add context about available JWT operations
+    system_prompt = """You are a JWT authentication assistant. You help users understand and work with JWT tokens.
+
+You have access to the following JWT operations:
+1. CREATE_TOKEN: Create a test JWT token with custom parameters
+2. VALIDATE_TOKEN: Validate a JWT token (signature, claims, expiry)
+3. INSPECT_TOKEN: Inspect a JWT token without verification
+4. VALIDATE_JWKS: Validate a token using JWKS endpoint for key rotation
+
+When users ask about JWT operations, provide clear explanations and when appropriate, 
+suggest specific operations. Format your responses clearly.
+
+Current JWT Configuration:
+- Algorithm: HS256 (for local tokens)
+- Issuer: https://example.com
+- Audience: api.example.com
+- JWKS URL: https://www.googleapis.com/oauth2/v3/certs
+
+For demonstration purposes, you can create tokens and validate them."""
+    
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=system_prompt,
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def handle_jwt_operation(operation: str, params: dict = None) -> str:
+    """Handle specific JWT operations."""
+    if params is None:
+        params = {}
+    
+    if operation == "create":
+        token = create_test_token(
+            subject=params.get("subject", "user123"),
+            expiry_seconds=params.get("expiry", 3600),
+            include_nbf=params.get("include_nbf", True),
+            custom_claims=params.get("custom_claims")
+        )
+        return f"Created JWT Token:\n{token}"
+    
+    elif operation == "validate":
+        token = params.get("token", "")
+        if not token:
+            # Create a demo token for validation
+            token = create_test_token()
+            print(f"Using demo token: {token[:50]}...")
+        
+        result = validate_jwt_token(token)
+        return json.dumps(result, indent=2, default=str)
+    
+    elif operation == "inspect":
+        token = params.get("token", "")
+        if not token:
+            token = create_test_token()
+            print(f"Using demo token: {token[:50]}...")
+        
+        result = inspect_token(token)
+        return json.dumps(result, indent=2, default=str)
+    
+    elif operation == "validate_jwks":
+        token = params.get("token", "")
+        jwks_url = params.get("jwks_url", JWKS_URL)
+        
+        if not token:
+            return "Please provide a token signed with RS256 for JWKS validation"
+        
+        result = validate_jwks_token(token, jwks_url)
+        return json.dumps(result, indent=2, default=str)
+    
+    else:
+        return f"Unknown operation: {operation}"
+
+def main():
+    """Main function to run the JWT authentication assistant."""
+    print("JWT Authentication Assistant")
+    print("=" * 50)
+    print("This assistant helps you work with JWT tokens.")
+    print("You can ask about creating, validating, and inspecting JWT tokens.")
+    print("Type 'quit' to exit.\n")
+    
+    # Demo operations
+    print("Running initial JWT demonstrations...\n")
+    
+    # 1. Create a token
+    print("1. Creating a test JWT token:")
+    token = create_test_token(
+        subject="demo_user",
+        custom_claims={"role": "admin", "email": "demo@example.com"}
+    )
+    print(f"Token: {token[:80]}...\n")
+    
+    # 2. Validate the token
+    print("2. Validating the token:")
+    validation_result = validate_jwt_token(token)
+    print(f"Valid: {validation_result['valid']}")
+    if validation_result['payload']:
+        print(f"Subject: {validation_result['payload'].get('sub')}")
+        print(f"Claims verified: {list(validation_result['claims_verified'].keys())}")
+    print()
+    
+    # 3. Inspect token
+    print("3. Inspecting token structure:")
+    inspection = inspect_token(token)
+    print(f"Algorithm: {inspection['header'].get('alg')}")
+    print(f"Token type: {inspection['header'].get('typ')}")
+    print()
+    
+    # 4. Test expired token
+    print("4. Testing expired token validation:")
+    expired_token = create_test_token(expiry_seconds=-3600)  # Already expired
+    expired_result = validate_jwt_token(expired_token)
+    print(f"Valid: {expired_result['valid']}")
+    print(f"Error: {expired_result['error']}")
+    print()
+    
+    print("=" * 50)
+    print("Interactive JWT Assistant Ready!")
+    print("Commands: 'create', 'validate', 'inspect', 'validate_jwks', or ask questions")
+    print("=" * 50 + "\n")
+    
+    while True:
+        user_input = input("You: ").strip()
+        
+        if not user_input:
+            continue
+        
+        if user_input.lower() == 'quit':
+            print("Goodbye!")
+            break
+        
+        # Check for direct operations
+        if user_input.lower().startswith("create"):
+            result = handle_jwt_operation("create")
+            print(f"\nAssistant: {result}\n")
+        
+        elif user_input.lower().startswith("validate "):
+            token = user_input[9:].strip()
+            result = handle_jwt_operation("validate", {"token": token})
+            print(f"\nAssistant: {result}\n")
+        
+        elif user_input.lower() == "validate":
+            result = handle_jwt_operation("validate")
+            print(f"\nAssistant: {result}\n")
+        
+        elif user_input.lower().startswith("inspect "):
+            token = user_input[8:].strip()
+            result = handle_jwt_operation("inspect", {"token": token})
+            print(f"\nAssistant: {result}\n")
+        
+        elif user_input.lower() == "inspect":
+            result = handle_jwt_operation("inspect")
+            print(f"\nAssistant: {result}\n")
+        
+        elif user_input.lower().startswith("validate_jwks "):
+            token = user_input[14:].strip()
+            result = handle_jwt_operation("validate_jwks", {"token": token})
+            print(f"\nAssistant: {result}\n")
+        
+        else:
+            # Use Claude for general JWT questions
+            response = process_jwt_request(user_input)
+            print(f"\nAssistant: {response}\n")
+
+if __name__ == "__main__":
+    main()
+```

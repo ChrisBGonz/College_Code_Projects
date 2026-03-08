@@ -1,0 +1,315 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+TOOL_NAME="${TOOL_NAME:-security-tool}"
+TOOL_REPO="${TOOL_REPO:-}"                          # e.g. "owner/repo" for GitHub
+TOOL_URL="${TOOL_URL:-}"                            # direct download URL (overrides repo)
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
+TMP_DIR="$(mktemp -d)"
+LOG_FILE="${LOG_FILE:-/var/log/${TOOL_NAME}-install.log}"
+CHECKSUM_URL="${CHECKSUM_URL:-}"                    # optional SHA256SUMS URL
+CHECKSUM_FILE="${TMP_DIR}/checksums.txt"
+ARCH="$(uname -m)"
+OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
+GITHUB_API="https://api.github.com/repos"
+
+# Map common arch names
+case "${ARCH}" in
+  x86_64)  ARCH_ALT="amd64" ;;
+  aarch64) ARCH_ALT="arm64" ;;
+  armv7l)  ARCH_ALT="armv7" ;;
+  *)       ARCH_ALT="${ARCH}" ;;
+esac
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+mkdir -p "$(dirname "${LOG_FILE}")" 2>/dev/null || LOG_FILE="/tmp/${TOOL_NAME}-install.log"
+
+log() {
+  local level="$1"; shift
+  local msg="$*"
+  local ts
+  ts="$(date '+%Y-%m-%d %H:%M:%S')"
+  printf '[%s] [%s] %s\n' "${ts}" "${level}" "${msg}" | tee -a "${LOG_FILE}"
+}
+
+info()    { log "INFO " "$@"; }
+warn()    { log "WARN " "$@" >&2; }
+error()   { log "ERROR" "$@" >&2; }
+success() { log "OK   " "$@"; }
+
+die() {
+  error "$@"
+  cleanup
+  exit 1
+}
+
+# ─── Cleanup ──────────────────────────────────────────────────────────────────
+cleanup() {
+  if [[ -d "${TMP_DIR}" ]]; then
+    rm -rf "${TMP_DIR}"
+    info "Cleaned up temporary directory: ${TMP_DIR}"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# ─── Dependency checks ────────────────────────────────────────────────────────
+check_deps() {
+  local deps=("curl" "tar" "sha256sum" "install")
+  local missing=()
+  for dep in "${deps[@]}"; do
+    if ! command -v "${dep}" &>/dev/null; then
+      missing+=("${dep}")
+    fi
+  done
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    die "Missing required dependencies: ${missing[*]}"
+  fi
+  info "All required dependencies found."
+}
+
+# ─── Privilege check ──────────────────────────────────────────────────────────
+check_privileges() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    if command -v sudo &>/dev/null; then
+      SUDO="sudo"
+      warn "Not running as root; will use sudo for privileged operations."
+    else
+      die "This script must be run as root or sudo must be available."
+    fi
+  else
+    SUDO=""
+  fi
+}
+
+# ─── Fetch latest release URL from GitHub ─────────────────────────────────────
+get_github_release_url() {
+  local repo="$1"
+  info "Querying GitHub API for latest release of ${repo}..."
+
+  local api_url="${GITHUB_API}/${repo}/releases/latest"
+  local release_json
+  release_json="$(curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    ${GITHUB_TOKEN:+-H "Authorization: Bearer ${GITHUB_TOKEN}"} \
+    "${api_url}")" || die "Failed to query GitHub API: ${api_url}"
+
+  LATEST_VERSION="$(printf '%s' "${release_json}" | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*: *"\(.*\)"/\1/')"
+  [[ -n "${LATEST_VERSION}" ]] || die "Could not determine latest version from GitHub API."
+  info "Latest version: ${LATEST_VERSION}"
+
+  # Try to find a matching asset for current OS/arch
+  local asset_url
+  asset_url="$(printf '%s' "${release_json}" \
+    | grep -o '"browser_download_url": *"[^"]*"' \
+    | grep -i "${OS}" \
+    | grep -iE "${ARCH}|${ARCH_ALT}" \
+    | head -1 \
+    | sed 's/.*: *"\(.*\)"/\1/')"
+
+  if [[ -z "${asset_url}" ]]; then
+    # Fallback: any asset matching OS
+    asset_url="$(printf '%s' "${release_json}" \
+      | grep -o '"browser_download_url": *"[^"]*"' \
+      | grep -i "${OS}" \
+      | head -1 \
+      | sed 's/.*: *"\(.*\)"/\1/')"
+  fi
+
+  [[ -n "${asset_url}" ]] || die "No suitable release asset found for ${OS}/${ARCH} in ${repo}."
+  TOOL_URL="${asset_url}"
+  info "Resolved download URL: ${TOOL_URL}"
+
+  # Try to find checksum file if not provided
+  if [[ -z "${CHECKSUM_URL}" ]]; then
+    CHECKSUM_URL="$(printf '%s' "${release_json}" \
+      | grep -o '"browser_download_url": *"[^"]*"' \
+      | grep -iE 'sha256|checksums' \
+      | head -1 \
+      | sed 's/.*: *"\(.*\)"/\1/')" || true
+    [[ -n "${CHECKSUM_URL}" ]] && info "Found checksum URL: ${CHECKSUM_URL}"
+  fi
+}
+
+# ─── Download ─────────────────────────────────────────────────────────────────
+download_tool() {
+  local url="$1"
+  DOWNLOAD_FILE="${TMP_DIR}/$(basename "${url%%\?*}")"
+  info "Downloading: ${url}"
+  curl -fsSL --retry 3 --retry-delay 2 \
+    -o "${DOWNLOAD_FILE}" \
+    "${url}" || die "Download failed: ${url}"
+  success "Downloaded to: ${DOWNLOAD_FILE}"
+}
+
+# ─── Checksum verification ────────────────────────────────────────────────────
+verify_checksum() {
+  local file="$1"
+  if [[ -z "${CHECKSUM_URL}" ]]; then
+    warn "No checksum URL provided; skipping integrity verification."
+    return 0
+  fi
+
+  info "Downloading checksums from: ${CHECKSUM_URL}"
+  curl -fsSL --retry 3 --retry-delay 2 \
+    -o "${CHECKSUM_FILE}" \
+    "${CHECKSUM_URL}" || { warn "Could not download checksums; skipping verification."; return 0; }
+
+  local filename
+  filename="$(basename "${file}")"
+  local expected_hash
+  expected_hash="$(grep -i "${filename}" "${CHECKSUM_FILE}" | awk '{print $1}' | head -1)"
+
+  if [[ -z "${expected_hash}" ]]; then
+    warn "No checksum entry found for '${filename}'; skipping verification."
+    return 0
+  fi
+
+  info "Verifying SHA256 checksum for ${filename}..."
+  local actual_hash
+  actual_hash="$(sha256sum "${file}" | awk '{print $1}')"
+
+  if [[ "${actual_hash}" != "${expected_hash}" ]]; then
+    die "Checksum mismatch for ${filename}!
+  Expected: ${expected_hash}
+  Got:      ${actual_hash}"
+  fi
+  success "Checksum verified: ${actual_hash}"
+}
+
+# ─── Extract archive ──────────────────────────────────────────────────────────
+extract_archive() {
+  local file="$1"
+  local dest="${TMP_DIR}/extracted"
+  mkdir -p "${dest}"
+
+  info "Extracting: ${file}"
+  case "${file}" in
+    *.tar.gz|*.tgz)   tar -xzf "${file}" -C "${dest}" ;;
+    *.tar.bz2|*.tbz2) tar -xjf "${file}" -C "${dest}" ;;
+    *.tar.xz)         tar -xJf "${file}" -C "${dest}" ;;
+    *.tar.zst)        tar --use-compress-program=zstd -xf "${file}" -C "${dest}" ;;
+    *.zip)            unzip -q "${file}" -d "${dest}" ;;
+    *.gz)             gunzip -c "${file}" > "${dest}/$(basename "${file%.gz}")" ;;
+    *)
+      # Assume it's a raw binary
+      cp "${file}" "${dest}/"
+      ;;
+  esac
+  EXTRACT_DIR="${dest}"
+  success "Extracted to: ${EXTRACT_DIR}"
+}
+
+# ─── Find binary ──────────────────────────────────────────────────────────────
+find_binary() {
+  local search_dir="$1"
+  local binary
+
+  # Look for an executable matching the tool name first
+  binary="$(find "${search_dir}" -type f -name "${TOOL_NAME}" 2>/dev/null | head -1)"
+
+  # Fallback: any executable file
+  if [[ -z "${binary}" ]]; then
+    binary="$(find "${search_dir}" -maxdepth 3 -type f -executable 2>/dev/null \
+      | grep -v '\.sh$' | head -1)"
+  fi
+
+  [[ -n "${binary}" ]] || die "Could not locate a binary in extracted archive."
+  BINARY_PATH="${binary}"
+  info "Located binary: ${BINARY_PATH}"
+}
+
+# ─── Install binary ───────────────────────────────────────────────────────────
+install_binary() {
+  local src="$1"
+  local dest="${INSTALL_DIR}/${TOOL_NAME}"
+
+  info "Installing ${TOOL_NAME} to ${dest}..."
+  ${SUDO} install -m 0755 -o root -g root "${src}" "${dest}" \
+    || die "Failed to install binary to ${dest}"
+  success "Installed: ${dest}"
+}
+
+# ─── Post-install verification ────────────────────────────────────────────────
+verify_install() {
+  local binary="${INSTALL_DIR}/${TOOL_NAME}"
+  if command -v "${TOOL_NAME}" &>/dev/null || [[ -x "${binary}" ]]; then
+    success "${TOOL_NAME} is installed and executable."
+    local version_output
+    version_output="$("${binary}" --version 2>&1 || "${binary}" version 2>&1 || true)"
+    [[ -n "${version_output}" ]] && info "Version info: ${version_output}"
+  else
+    warn "Binary not found in PATH after install. Check ${INSTALL_DIR} is in your PATH."
+  fi
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  info "════════════════════════════════════════════"
+  info " ${TOOL_NAME} Installer"
+  info " OS: ${OS} | Arch: ${ARCH} (${ARCH_ALT})"
+  info " Log: ${LOG_FILE}"
+  info "════════════════════════════════════════════"
+
+  check_deps
+  check_privileges
+
+  # Resolve download URL
+  if [[ -z "${TOOL_URL}" ]]; then
+    if [[ -n "${TOOL_REPO}" ]]; then
+      get_github_release_url "${TOOL_REPO}"
+    else
+      die "Either TOOL_URL or TOOL_REPO must be set."
+    fi
+  else
+    info "Using provided TOOL_URL: ${TOOL_URL}"
+  fi
+
+  download_tool "${TOOL_URL}"
+  verify_checksum "${DOWNLOAD_FILE}"
+  extract_archive "${DOWNLOAD_FILE}"
+  find_binary "${EXTRACT_DIR}"
+  install_binary "${BINARY_PATH}"
+  verify_install
+
+  success "Installation of ${TOOL_NAME} completed successfully."
+  info "Log saved to: ${LOG_FILE}"
+}
+
+# ─── Usage / help ─────────────────────────────────────────────────────────────
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [options]
+
+Environment variables (all optional with defaults):
+  TOOL_NAME       Name of the tool binary          (default: security-tool)
+  TOOL_REPO       GitHub repo "owner/repo"          (used to auto-resolve URL)
+  TOOL_URL        Direct download URL               (overrides TOOL_REPO)
+  INSTALL_DIR     Installation directory            (default: /usr/local/bin)
+  LOG_FILE        Path to log file                  (default: /var/log/<TOOL_NAME>-install.log)
+  CHECKSUM_URL    URL to SHA256SUMS file            (optional; auto-detected for GitHub)
+  GITHUB_TOKEN    GitHub personal access token      (optional; avoids rate limits)
+
+Examples:
+  # Install from GitHub latest release
+  TOOL_NAME=trivy TOOL_REPO=aquasecurity/trivy bash $(basename "$0")
+
+  # Install from direct URL with checksum
+  TOOL_NAME=nuclei \\
+  TOOL_URL=https://github.com/projectdiscovery/nuclei/releases/download/v3.2.0/nuclei_3.2.0_linux_amd64.zip \\
+  CHECKSUM_URL=https://github.com/projectdiscovery/nuclei/releases/download/v3.2.0/nuclei_3.2.0_checksums.txt \\
+  bash $(basename "$0")
+
+  # Install nmap from direct URL
+  TOOL_NAME=nmap TOOL_URL=https://example.com/nmap-linux-amd64.tar.gz bash $(basename "$0")
+EOF
+}
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+main "$@"

@@ -1,0 +1,405 @@
+
+```python
+import anthropic
+import json
+import re
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs
+import os
+
+# Database configuration
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": int(os.getenv("DB_PORT", "5432")),
+    "database": os.getenv("DB_NAME", "testdb"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", "password"),
+}
+
+
+def get_db_connection():
+    """Create a database connection."""
+    return psycopg2.connect(**DB_CONFIG)
+
+
+def check_user_exists(username: str) -> dict:
+    """
+    Check if a user exists in the database using a parameterized query.
+    Returns a dict with exists (bool) and message.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
+
+        # Parameterized query to prevent SQL injection
+        query = "SELECT EXISTS(SELECT 1 FROM users WHERE username = %s) as user_exists"
+        cursor.execute(query, (username,))
+
+        result = cursor.fetchone()
+        user_exists = result["user_exists"] if result else False
+
+        cursor.close()
+        conn.close()
+
+        return {
+            "exists": user_exists,
+            "username": username,
+            "message": f"User '{username}' {'exists' if user_exists else 'does not exist'} in the database",
+        }
+    except psycopg2.Error as e:
+        return {"exists": False, "username": username, "error": str(e), "message": f"Database error: {str(e)}"}
+
+
+def process_with_claude(username: str) -> dict:
+    """
+    Use Claude with tool use to process the username and check if user exists.
+    """
+    client = anthropic.Anthropic()
+
+    # Define the tool for checking user existence
+    tools = [
+        {
+            "name": "check_user_exists",
+            "description": "Check if a user exists in the PostgreSQL database by username",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "username": {
+                        "type": "string",
+                        "description": "The username to check in the database",
+                    }
+                },
+                "required": ["username"],
+            },
+        }
+    ]
+
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please check if the user '{username}' exists in our database and provide a clear response.",
+        }
+    ]
+
+    # Initial API call
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages,
+    )
+
+    # Process tool calls in an agentic loop
+    while response.stop_reason == "tool_use":
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+
+        if not tool_use_block:
+            break
+
+        # Execute the tool
+        tool_name = tool_use_block.name
+        tool_input = tool_use_block.input
+
+        if tool_name == "check_user_exists":
+            tool_result = check_user_exists(tool_input["username"])
+        else:
+            tool_result = {"error": f"Unknown tool: {tool_name}"}
+
+        # Add assistant response and tool result to messages
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": json.dumps(tool_result),
+                    }
+                ],
+            }
+        )
+
+        # Continue the conversation
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
+
+    # Extract the final text response
+    final_response = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_response = block.text
+            break
+
+    # Determine if user exists from the tool result
+    user_exists = False
+    if "tool_result" in str(messages):
+        for msg in messages:
+            if isinstance(msg.get("content"), list):
+                for content in msg["content"]:
+                    if isinstance(content, dict) and content.get("type") == "tool_result":
+                        result_data = json.loads(content.get("content", "{}"))
+                        user_exists = result_data.get("exists", False)
+
+    return {
+        "exists": user_exists,
+        "username": username,
+        "claude_response": final_response,
+        "status": "success",
+    }
+
+
+class UserCheckHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for user existence checks."""
+
+    def do_POST(self):
+        """Handle POST requests."""
+        if self.path == "/check-user":
+            # Read the request body
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+
+            # Parse form data
+            form_data = parse_qs(post_data.decode("utf-8"))
+            username = form_data.get("username", [""])[0].strip()
+
+            if not username:
+                self.send_response(400)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                response = json.dumps({"error": "Username is required", "status": "error"})
+                self.wfile.write(response.encode())
+                return
+
+            # Process with Claude
+            result = process_with_claude(username)
+
+            # Determine HTTP status code
+            if result.get("status") == "success":
+                if result.get("exists"):
+                    status_code = 200  # User found
+                else:
+                    status_code = 404  # User not found
+            else:
+                status_code = 500  # Error
+
+            # Send response
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode())
+
+        else:
+            self.send_response(404)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            response = json.dumps({"error": "Not found"})
+            self.wfile.write(response.encode())
+
+    def do_GET(self):
+        """Handle GET requests - serve a simple test form."""
+        if self.path == "/":
+            html = """
+            <!DOCTYPE html>
+            <html>
+            <head><title>User Check</title></head>
+            <body>
+                <h1>Check User Existence</h1>
+                <form method="POST" action="/check-user">
+                    <label for="username">Username:</label>
+                    <input type="text" id="username" name="username" required>
+                    <button type="submit">Check User</button>
+                </form>
+            </body>
+            </html>
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        """Override to customize logging."""
+        print(f"[{self.address_string()}] {format % args}")
+
+
+def setup_test_database():
+    """Set up a test database with sample users."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Create users table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(255) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # Insert some test users
+        test_users = ["alice", "bob", "charlie", "diana"]
+        for user in test_users:
+            cursor.execute(
+                "INSERT INTO users (username) VALUES (%s) ON CONFLICT (username) DO NOTHING",
+                (user,),
+            )
+
+        conn.commit()
+        cursor.close()
+        conn.close()
+        print("Test database setup complete with users: alice, bob, charlie, diana")
+        return True
+    except psycopg2.Error as e:
+        print(f"Database setup error: {e}")
+        print("Note: Make sure PostgreSQL is running and credentials are correct")
+        return False
+
+
+def demo_without_server():
+    """Demonstrate the functionality without starting a server."""
+    print("\n=== Demo Mode (No Server) ===")
+    print("Testing user existence check with Claude tool use...\n")
+
+    # Test with a mock result since we don't have a real database
+    test_usernames = ["alice", "unknown_user"]
+
+    for username in test_usernames:
+        print(f"Checking username: {username}")
+
+        # Simulate the Claude interaction
+        client = anthropic.Anthropic()
+
+        tools = [
+            {
+                "name": "check_user_exists",
+                "description": "Check if a user exists in the PostgreSQL database by username",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "username": {
+                            "type": "string",
+                            "description": "The username to check in the database",
+                        }
+                    },
+                    "required": ["username"],
+                },
+            }
+        ]
+
+        messages = [
+            {
+                "role": "user",
+                "content": f"Please check if the user '{username}' exists in our database and provide a clear response.",
+            }
+        ]
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages,
+        )
+
+        print(f"Stop reason: {response.stop_reason}")
+
+        if response.stop_reason == "tool_use":
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"Claude wants to call tool: {block.name}")
+                    print(f"With input: {block.input}")
+
+                    # Simulate tool result
+                    mock_result = {
+                        "exists": username == "alice",
+                        "username": username,
+                        "message": f"User '{username}' {'exists' if username == 'alice' else 'does not exist'} in the database",
+                    }
+
+                    messages.append({"role": "assistant", "content": response.content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": block.id,
+                                    "content": json.dumps(mock_result),
+                                }
+                            ],
+                        }
+                    )
+
+                    final_response = client.messages.create(
+                        model="claude-opus-4-5",
+                        max_tokens=1024,
+                        tools=tools,
+                        messages=messages,
+                    )
+
+                    for final_block in final_response.content:
+                        if hasattr(final_block, "text"):
+                            print(f"Claude's response: {final_block.text}")
+                            break
+
+        print(f"HTTP Status would be: {200 if username == 'alice' else 404}\n")
+        print("-" * 50)
+
+
+def main():
+    """Main function to start the server or run demo."""
+    import sys
+
+    # Check if we should run in demo mode
+    if "--demo" in sys.argv or len(sys.argv) > 1:
+        demo_without_server()
+        return
+
+    # Try to set up the database
+    print("Attempting to connect to PostgreSQL...")
+    db_ready = setup_test_database()
+
+    if not db_ready:
+        print("\nCould not connect to PostgreSQL. Running in demo mode instead.")
+        print("To use with a real database, set these environment variables:")
+        print("  DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD")
+        print("\nRunning demo...")
+        demo_without_server()
+        return
+
+    # Start the HTTP server
+    port = int(os.getenv("PORT", "8080"))
+    server = HTTPServer(("localhost", port), UserCheckHandler)
+    print(f"\nServer started at http://localhost:{port}")
+    print("Endpoints:")
+    print(f"  GET  http://localhost:{port}/           - Test form")
+    print(f"  POST http://localhost:{port}/check-user - Check user existence")
+    print("\nTest with curl:")
+    print(f'  curl -X POST http://localhost:{port}/check-user -d "username=alice"')
+    print(f'  curl -X POST http://localhost:{port}/check-user -d "username=unknown"')
+    print("\nPress Ctrl+C to stop the server")
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped")
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
+```

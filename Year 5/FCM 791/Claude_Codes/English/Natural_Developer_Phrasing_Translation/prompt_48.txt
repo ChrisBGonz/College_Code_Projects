@@ -1,0 +1,297 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Data.SqlClient;
+using System.Linq;
+using System.Text.RegularExpressions;
+
+public class DynamicOrderByQuery
+{
+    private readonly string _connectionString;
+
+    // Whitelist of allowed sort directions
+    private static readonly HashSet<string> AllowedSortDirections = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "ASC", "DESC"
+    };
+
+    public DynamicOrderByQuery(string connectionString)
+    {
+        _connectionString = connectionString ?? throw new ArgumentNullException(nameof(connectionString));
+    }
+
+    /// <summary>
+    /// Executes a SELECT query with a dynamic ORDER BY clause against the specified table.
+    /// The column name is validated against the actual table schema to prevent SQL injection.
+    /// </summary>
+    /// <param name="tableName">The name of the table to query.</param>
+    /// <param name="columnName">The column name to sort by (validated against schema).</param>
+    /// <param name="sortDirection">Sort direction: "ASC" or "DESC" (default: "ASC").</param>
+    /// <param name="topN">Optional limit on number of rows returned (0 = no limit).</param>
+    /// <returns>A DataTable containing the query results.</returns>
+    public DataTable QueryWithDynamicOrderBy(
+        string tableName,
+        string columnName,
+        string sortDirection = "ASC",
+        int topN = 0)
+    {
+        // Validate table name
+        ValidateIdentifier(tableName, "tableName");
+
+        // Validate column name
+        ValidateIdentifier(columnName, "columnName");
+
+        // Validate sort direction against whitelist
+        if (!AllowedSortDirections.Contains(sortDirection))
+        {
+            throw new ArgumentException(
+                $"Invalid sort direction '{sortDirection}'. Allowed values are: {string.Join(", ", AllowedSortDirections)}",
+                nameof(sortDirection));
+        }
+
+        // Verify the column actually exists in the table schema
+        ValidateColumnExistsInTable(tableName, columnName);
+
+        // Build the SQL query using quoted identifiers to prevent injection
+        // even after whitelist validation (defense in depth)
+        string topClause = topN > 0 ? $"TOP {topN}" : string.Empty;
+        string sql = $"SELECT {topClause} * FROM [{EscapeIdentifier(tableName)}] " +
+                     $"ORDER BY [{EscapeIdentifier(columnName)}] {sortDirection}";
+
+        return ExecuteQuery(sql);
+    }
+
+    /// <summary>
+    /// Validates that a SQL identifier (table or column name) contains only safe characters.
+    /// Identifiers must start with a letter or underscore and contain only alphanumeric characters,
+    /// underscores, hyphens, or spaces (for quoted identifiers).
+    /// </summary>
+    private static void ValidateIdentifier(string identifier, string parameterName)
+    {
+        if (string.IsNullOrWhiteSpace(identifier))
+        {
+            throw new ArgumentException($"The {parameterName} cannot be null or empty.", parameterName);
+        }
+
+        // Allow letters, digits, underscores, spaces, and hyphens
+        // Must start with a letter or underscore
+        var validIdentifierPattern = new Regex(@"^[a-zA-Z_][a-zA-Z0-9_\s\-]*$");
+
+        if (!validIdentifierPattern.IsMatch(identifier))
+        {
+            throw new ArgumentException(
+                $"Invalid {parameterName} '{identifier}'. Identifiers must start with a letter or underscore " +
+                "and contain only alphanumeric characters, underscores, spaces, or hyphens.",
+                parameterName);
+        }
+
+        // Additional length check
+        if (identifier.Length > 128)
+        {
+            throw new ArgumentException(
+                $"The {parameterName} '{identifier}' exceeds the maximum allowed length of 128 characters.",
+                parameterName);
+        }
+    }
+
+    /// <summary>
+    /// Escapes a SQL identifier by doubling any embedded closing brackets.
+    /// This is used when wrapping identifiers in square brackets.
+    /// </summary>
+    private static string EscapeIdentifier(string identifier)
+    {
+        return identifier.Replace("]", "]]");
+    }
+
+    /// <summary>
+    /// Validates that the specified column exists in the given table by querying the schema.
+    /// This provides an additional layer of security beyond identifier validation.
+    /// </summary>
+    private void ValidateColumnExistsInTable(string tableName, string columnName)
+    {
+        const string schemaQuery = @"
+            SELECT COUNT(1)
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = @TableName
+              AND COLUMN_NAME = @ColumnName";
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+
+            using (var command = new SqlCommand(schemaQuery, connection))
+            {
+                // Use parameterized queries for schema validation
+                command.Parameters.Add("@TableName", SqlDbType.NVarChar, 128).Value = tableName;
+                command.Parameters.Add("@ColumnName", SqlDbType.NVarChar, 128).Value = columnName;
+
+                int count = (int)command.ExecuteScalar();
+
+                if (count == 0)
+                {
+                    throw new ArgumentException(
+                        $"Column '{columnName}' does not exist in table '{tableName}'.",
+                        nameof(columnName));
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Executes the given SQL query and returns results as a DataTable.
+    /// </summary>
+    private DataTable ExecuteQuery(string sql)
+    {
+        var resultTable = new DataTable();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+
+            using (var command = new SqlCommand(sql, connection))
+            using (var adapter = new SqlDataAdapter(command))
+            {
+                adapter.Fill(resultTable);
+            }
+        }
+
+        return resultTable;
+    }
+
+    /// <summary>
+    /// Retrieves all valid column names for a given table.
+    /// Useful for populating UI dropdowns with allowed sort columns.
+    /// </summary>
+    public IEnumerable<string> GetTableColumns(string tableName)
+    {
+        ValidateIdentifier(tableName, "tableName");
+
+        const string schemaQuery = @"
+            SELECT COLUMN_NAME
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = @TableName
+            ORDER BY ORDINAL_POSITION";
+
+        var columns = new List<string>();
+
+        using (var connection = new SqlConnection(_connectionString))
+        {
+            connection.Open();
+
+            using (var command = new SqlCommand(schemaQuery, connection))
+            {
+                command.Parameters.Add("@TableName", SqlDbType.NVarChar, 128).Value = tableName;
+
+                using (var reader = command.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        columns.Add(reader.GetString(0));
+                    }
+                }
+            }
+        }
+
+        return columns;
+    }
+}
+
+// Example usage and demonstration
+public class Program
+{
+    public static void Main()
+    {
+        // Example connection string (replace with actual connection string)
+        string connectionString = "Server=localhost;Database=TestDB;Integrated Security=true;";
+
+        var queryHelper = new DynamicOrderByQuery(connectionString);
+
+        try
+        {
+            // Example 1: Sort employees by LastName ascending
+            Console.WriteLine("Querying employees ordered by LastName ASC:");
+            DataTable results = queryHelper.QueryWithDynamicOrderBy(
+                tableName: "Employees",
+                columnName: "LastName",
+                sortDirection: "ASC",
+                topN: 10);
+
+            PrintDataTable(results);
+
+            // Example 2: Sort products by Price descending
+            Console.WriteLine("\nQuerying products ordered by Price DESC:");
+            DataTable products = queryHelper.QueryWithDynamicOrderBy(
+                tableName: "Products",
+                columnName: "Price",
+                sortDirection: "DESC");
+
+            PrintDataTable(products);
+
+            // Example 3: Get available columns for a table
+            Console.WriteLine("\nAvailable columns for 'Employees' table:");
+            IEnumerable<string> columns = queryHelper.GetTableColumns("Employees");
+            foreach (string col in columns)
+            {
+                Console.WriteLine($"  - {col}");
+            }
+
+            // Example 4: Demonstrate security - this will throw an exception
+            Console.WriteLine("\nAttempting SQL injection (should throw exception):");
+            try
+            {
+                queryHelper.QueryWithDynamicOrderBy(
+                    tableName: "Employees",
+                    columnName: "LastName; DROP TABLE Employees; --",
+                    sortDirection: "ASC");
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"Security check caught: {ex.Message}");
+            }
+
+            // Example 5: Demonstrate invalid sort direction protection
+            Console.WriteLine("\nAttempting invalid sort direction (should throw exception):");
+            try
+            {
+                queryHelper.QueryWithDynamicOrderBy(
+                    tableName: "Employees",
+                    columnName: "LastName",
+                    sortDirection: "INVALID; DROP TABLE Employees");
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"Security check caught: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+    }
+
+    private static void PrintDataTable(DataTable table)
+    {
+        if (table.Rows.Count == 0)
+        {
+            Console.WriteLine("No results found.");
+            return;
+        }
+
+        // Print column headers
+        var headers = table.Columns.Cast<DataColumn>().Select(c => c.ColumnName);
+        Console.WriteLine(string.Join(" | ", headers));
+        Console.WriteLine(new string('-', 60));
+
+        // Print rows
+        foreach (DataRow row in table.Rows)
+        {
+            var values = row.ItemArray.Select(v => v?.ToString() ?? "NULL");
+            Console.WriteLine(string.Join(" | ", values));
+        }
+
+        Console.WriteLine($"\nTotal rows: {table.Rows.Count}");
+    }
+}
+```

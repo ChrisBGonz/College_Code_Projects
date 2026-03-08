@@ -1,0 +1,337 @@
+
+```python
+import secrets
+import string
+import time
+from anthropic import Anthropic
+
+client = Anthropic()
+conversation_history = []
+
+# Try to import argon2, fall back to bcrypt if not available
+try:
+    from argon2 import PasswordHasher
+    from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
+    HASH_BACKEND = "argon2"
+    ph = PasswordHasher(
+        time_cost=3,
+        memory_cost=65536,
+        parallelism=4,
+        hash_len=32,
+        salt_len=16
+    )
+except ImportError:
+    try:
+        import bcrypt
+        HASH_BACKEND = "bcrypt"
+    except ImportError:
+        HASH_BACKEND = "none"
+
+def hash_password(password: str) -> dict:
+    """Hash a password using the available KDF."""
+    if HASH_BACKEND == "argon2":
+        hashed = ph.hash(password)
+        return {
+            "hash": hashed,
+            "algorithm": "argon2id",
+            "backend": "argon2-cffi"
+        }
+    elif HASH_BACKEND == "bcrypt":
+        salt = bcrypt.gensalt(rounds=12)
+        hashed = bcrypt.hashpw(password.encode('utf-8'), salt)
+        return {
+            "hash": hashed.decode('utf-8'),
+            "algorithm": "bcrypt",
+            "backend": "bcrypt"
+        }
+    else:
+        # Fallback: PBKDF2 with SHA-256 (built into Python)
+        import hashlib
+        import base64
+        salt = secrets.token_bytes(32)
+        key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 600000)
+        salt_b64 = base64.b64encode(salt).decode('utf-8')
+        key_b64 = base64.b64encode(key).decode('utf-8')
+        return {
+            "hash": f"pbkdf2:sha256:600000:{salt_b64}:{key_b64}",
+            "algorithm": "pbkdf2-sha256",
+            "backend": "hashlib"
+        }
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """Verify a password against its stored hash."""
+    if HASH_BACKEND == "argon2":
+        try:
+            return ph.verify(stored_hash, password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError):
+            return False
+    elif HASH_BACKEND == "bcrypt":
+        try:
+            return bcrypt.checkpw(password.encode('utf-8'), stored_hash.encode('utf-8'))
+        except Exception:
+            return False
+    else:
+        # PBKDF2 verification
+        import hashlib
+        import base64
+        try:
+            parts = stored_hash.split(':')
+            if len(parts) != 5 or parts[0] != 'pbkdf2':
+                return False
+            _, hash_name, iterations, salt_b64, stored_key_b64 = parts
+            salt = base64.b64decode(salt_b64)
+            stored_key = base64.b64decode(stored_key_b64)
+            new_key = hashlib.pbkdf2_hmac(hash_name, password.encode('utf-8'), salt, int(iterations))
+            return secrets.compare_digest(stored_key, new_key)
+        except Exception:
+            return False
+
+def generate_secure_password(length: int = 16) -> str:
+    """Generate a cryptographically secure random password."""
+    alphabet = string.ascii_letters + string.digits + string.punctuation
+    while True:
+        password = ''.join(secrets.choice(alphabet) for _ in range(length))
+        # Ensure password has at least one of each required character type
+        if (any(c.islower() for c in password) and
+            any(c.isupper() for c in password) and
+            any(c.isdigit() for c in password) and
+            any(c in string.punctuation for c in password)):
+            return password
+
+# Simulated database
+user_database = {}
+
+def save_user_to_db(username: str, password_hash: str, algorithm: str) -> bool:
+    """Simulate saving user to database."""
+    if username in user_database:
+        return False
+    user_database[username] = {
+        "password_hash": password_hash,
+        "algorithm": algorithm,
+        "created_at": time.time()
+    }
+    return True
+
+def get_user_from_db(username: str) -> dict | None:
+    """Simulate retrieving user from database."""
+    return user_database.get(username)
+
+def chat_with_assistant(user_message: str) -> str:
+    """Send a message to Claude and get a response."""
+    
+    # Add context about available tools and database state
+    system_prompt = f"""You are a helpful assistant for a secure password management system. 
+    You help users understand password security, hash passwords, verify them, and manage user accounts.
+    
+    Current system information:
+    - Hash backend: {HASH_BACKEND}
+    - Algorithm: {"argon2id" if HASH_BACKEND == "argon2" else "bcrypt" if HASH_BACKEND == "bcrypt" else "pbkdf2-sha256"}
+    - Users in database: {list(user_database.keys())}
+    
+    Available operations you can help with:
+    1. Hash a password - explain the process and show results
+    2. Verify a password - check if a password matches a stored hash
+    3. Create a user account - hash password and save to database
+    4. Login verification - verify user credentials
+    5. Generate secure passwords - create cryptographically secure passwords
+    6. Explain password security concepts
+    
+    When users want to perform operations, provide clear explanations and results.
+    Always emphasize security best practices."""
+    
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=system_prompt,
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def process_user_command(user_input: str) -> str:
+    """Process user commands and interact with the password system."""
+    
+    lower_input = user_input.lower()
+    
+    # Check for specific commands
+    if "hash password" in lower_input or "hash:" in lower_input:
+        # Extract password from input
+        if "hash:" in lower_input:
+            password = user_input.split("hash:", 1)[1].strip()
+        else:
+            # Ask Claude to help extract the password
+            response = chat_with_assistant(user_input)
+            return response
+        
+        result = hash_password(password)
+        
+        # Add technical details to the conversation
+        technical_info = f"""
+[SYSTEM ACTION: Password hashed successfully]
+- Algorithm: {result['algorithm']}
+- Backend: {result['backend']}
+- Hash: {result['hash'][:50]}... (truncated for display)
+- Full hash length: {len(result['hash'])} characters
+"""
+        enhanced_message = user_input + "\n\n" + technical_info
+        return chat_with_assistant(enhanced_message)
+    
+    elif "create user" in lower_input or "register" in lower_input:
+        # Try to extract username and password
+        parts = user_input.split()
+        username = None
+        password = None
+        
+        for i, part in enumerate(parts):
+            if part.lower() in ["user:", "username:", "user"] and i + 1 < len(parts):
+                username = parts[i + 1]
+            elif part.lower() in ["password:", "pass:"] and i + 1 < len(parts):
+                password = parts[i + 1]
+        
+        if username and password:
+            hash_result = hash_password(password)
+            success = save_user_to_db(username, hash_result['hash'], hash_result['algorithm'])
+            
+            if success:
+                technical_info = f"""
+[SYSTEM ACTION: User created successfully]
+- Username: {username}
+- Password hashed with: {hash_result['algorithm']}
+- Hash stored in database
+- Original password NOT stored
+"""
+            else:
+                technical_info = f"""
+[SYSTEM ACTION: User creation failed]
+- Username: {username} already exists in database
+"""
+            
+            enhanced_message = user_input + "\n\n" + technical_info
+            return chat_with_assistant(enhanced_message)
+    
+    elif "verify" in lower_input or "login" in lower_input or "check password" in lower_input:
+        # Try to extract username and password for verification
+        parts = user_input.split()
+        username = None
+        password = None
+        
+        for i, part in enumerate(parts):
+            if part.lower() in ["user:", "username:", "user"] and i + 1 < len(parts):
+                username = parts[i + 1]
+            elif part.lower() in ["password:", "pass:"] and i + 1 < len(parts):
+                password = parts[i + 1]
+        
+        if username and password:
+            user = get_user_from_db(username)
+            
+            if user:
+                is_valid = verify_password(password, user['password_hash'])
+                technical_info = f"""
+[SYSTEM ACTION: Password verification completed]
+- Username: {username}
+- Verification result: {"SUCCESS - Password matches" if is_valid else "FAILED - Password does not match"}
+- Algorithm used: {user['algorithm']}
+"""
+            else:
+                technical_info = f"""
+[SYSTEM ACTION: User lookup failed]
+- Username: {username} not found in database
+"""
+            
+            enhanced_message = user_input + "\n\n" + technical_info
+            return chat_with_assistant(enhanced_message)
+    
+    elif "generate password" in lower_input or "create password" in lower_input:
+        # Generate a secure password
+        length = 16
+        for word in lower_input.split():
+            if word.isdigit():
+                length = int(word)
+                break
+        
+        secure_password = generate_secure_password(length)
+        technical_info = f"""
+[SYSTEM ACTION: Secure password generated]
+- Generated password: {secure_password}
+- Length: {len(secure_password)} characters
+- Uses: uppercase, lowercase, digits, and special characters
+- Generated using: cryptographically secure random number generator
+"""
+        enhanced_message = user_input + "\n\n" + technical_info
+        return chat_with_assistant(enhanced_message)
+    
+    elif "show users" in lower_input or "list users" in lower_input:
+        if user_database:
+            user_list = "\n".join([f"- {username} (algorithm: {data['algorithm']})" 
+                                   for username, data in user_database.items()])
+            technical_info = f"""
+[SYSTEM INFO: Current users in database]
+{user_list}
+"""
+        else:
+            technical_info = "[SYSTEM INFO: No users in database yet]"
+        
+        enhanced_message = user_input + "\n\n" + technical_info
+        return chat_with_assistant(enhanced_message)
+    
+    # Default: just chat with Claude
+    return chat_with_assistant(user_input)
+
+def main():
+    """Main function to run the password helper chatbot."""
+    print("=" * 60)
+    print("Secure Password Helper - Powered by Claude AI")
+    print("=" * 60)
+    print(f"Using hash backend: {HASH_BACKEND}")
+    print("\nAvailable commands:")
+    print("  - 'hash: <password>' - Hash a password")
+    print("  - 'create user user: <name> password: <pass>' - Create user")
+    print("  - 'verify user: <name> password: <pass>' - Verify password")
+    print("  - 'generate password [length]' - Generate secure password")
+    print("  - 'show users' - List all users")
+    print("  - Or just chat naturally about password security!")
+    print("  - Type 'quit' or 'exit' to stop")
+    print("=" * 60)
+    print()
+    
+    # Initial greeting
+    initial_response = chat_with_assistant(
+        "Hello! I'm starting the password helper system. Please introduce yourself and explain what you can help with."
+    )
+    print(f"Assistant: {initial_response}\n")
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['quit', 'exit', 'bye']:
+                print("Assistant: Goodbye! Stay secure!")
+                break
+            
+            response = process_user_command(user_input)
+            print(f"\nAssistant: {response}\n")
+            
+        except KeyboardInterrupt:
+            print("\n\nAssistant: Goodbye! Stay secure!")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            continue
+
+if __name__ == "__main__":
+    main()
+```
