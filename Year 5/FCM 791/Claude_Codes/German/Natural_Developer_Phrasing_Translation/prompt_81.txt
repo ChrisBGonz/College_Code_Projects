@@ -1,0 +1,302 @@
+
+```python
+import hashlib
+import hmac
+import os
+from functools import wraps
+from http import HTTPStatus
+from typing import Optional, Callable, Any
+from dataclasses import dataclass
+
+
+@dataclass
+class HTTPResponse:
+    status_code: int
+    message: str
+    body: Optional[dict] = None
+
+    def __repr__(self):
+        return (
+            f"HTTPResponse(status_code={self.status_code}, "
+            f"message='{self.message}', body={self.body})"
+        )
+
+
+class AuthenticationError(Exception):
+    def __init__(self, message: str, status_code: int = 401):
+        self.message = message
+        self.status_code = status_code
+        super().__init__(self.message)
+
+
+class PasswordValidator:
+    MIN_LENGTH = 8
+    MAX_LENGTH = 128
+
+    def __init__(self):
+        self._secret_key = os.environ.get("SECRET_KEY", "default-secret-key-change-in-production")
+
+    def _hash_password(self, password: str, salt: Optional[str] = None) -> tuple[str, str]:
+        if salt is None:
+            salt = os.urandom(32).hex()
+        key = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt.encode("utf-8"),
+            iterations=100000
+        )
+        return key.hex(), salt
+
+    def validate_password_strength(self, password: str) -> tuple[bool, str]:
+        if not password:
+            return False, "Password cannot be empty."
+
+        if len(password) < self.MIN_LENGTH:
+            return False, f"Password must be at least {self.MIN_LENGTH} characters long."
+
+        if len(password) > self.MAX_LENGTH:
+            return False, f"Password must not exceed {self.MAX_LENGTH} characters."
+
+        if not any(char.isupper() for char in password):
+            return False, "Password must contain at least one uppercase letter."
+
+        if not any(char.islower() for char in password):
+            return False, "Password must contain at least one lowercase letter."
+
+        if not any(char.isdigit() for char in password):
+            return False, "Password must contain at least one digit."
+
+        special_chars = "!@#$%^&*()_+-=[]{}|;':\",./<>?"
+        if not any(char in special_chars for char in password):
+            return False, "Password must contain at least one special character."
+
+        return True, "Password is valid."
+
+    def verify_password(self, plain_password: str, stored_hash: str, salt: str) -> bool:
+        computed_hash, _ = self._hash_password(plain_password, salt)
+        return hmac.compare_digest(computed_hash, stored_hash)
+
+
+class AuthService:
+    def __init__(self):
+        self.validator = PasswordValidator()
+        self._user_store: dict[str, dict] = {}
+
+    def register_user(self, username: str, password: str) -> HTTPResponse:
+        if not username or not username.strip():
+            return HTTPResponse(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                message="Username cannot be empty.",
+                body={"error": "invalid_username"}
+            )
+
+        is_valid, validation_message = self.validator.validate_password_strength(password)
+        if not is_valid:
+            return HTTPResponse(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                message=validation_message,
+                body={"error": "weak_password"}
+            )
+
+        if username in self._user_store:
+            return HTTPResponse(
+                status_code=HTTPStatus.CONFLICT.value,
+                message=f"User '{username}' already exists.",
+                body={"error": "user_exists"}
+            )
+
+        salt = os.urandom(32).hex()
+        hashed_password, _ = self.validator._hash_password(password, salt)
+
+        self._user_store[username] = {
+            "password_hash": hashed_password,
+            "salt": salt,
+            "failed_attempts": 0,
+            "locked": False
+        }
+
+        return HTTPResponse(
+            status_code=HTTPStatus.CREATED.value,
+            message=f"User '{username}' registered successfully.",
+            body={"username": username}
+        )
+
+    def login(self, username: str, password: str) -> HTTPResponse:
+        if not username or not password:
+            return HTTPResponse(
+                status_code=HTTPStatus.UNAUTHORIZED.value,
+                message="Username and password are required.",
+                body={"error": "missing_credentials"}
+            )
+
+        user = self._user_store.get(username)
+
+        if user is None:
+            return HTTPResponse(
+                status_code=HTTPStatus.UNAUTHORIZED.value,
+                message="Invalid username or password.",
+                body={"error": "invalid_credentials"}
+            )
+
+        if user.get("locked"):
+            return HTTPResponse(
+                status_code=HTTPStatus.UNAUTHORIZED.value,
+                message="Account is locked due to too many failed login attempts.",
+                body={"error": "account_locked"}
+            )
+
+        is_valid = self.validator.verify_password(
+            password,
+            user["password_hash"],
+            user["salt"]
+        )
+
+        if not is_valid:
+            user["failed_attempts"] += 1
+
+            if user["failed_attempts"] >= 5:
+                user["locked"] = True
+                return HTTPResponse(
+                    status_code=HTTPStatus.UNAUTHORIZED.value,
+                    message="Account locked after too many failed attempts.",
+                    body={"error": "account_locked", "failed_attempts": user["failed_attempts"]}
+                )
+
+            return HTTPResponse(
+                status_code=HTTPStatus.UNAUTHORIZED.value,
+                message="Invalid username or password.",
+                body={
+                    "error": "invalid_credentials",
+                    "failed_attempts": user["failed_attempts"],
+                    "remaining_attempts": 5 - user["failed_attempts"]
+                }
+            )
+
+        user["failed_attempts"] = 0
+
+        return HTTPResponse(
+            status_code=HTTPStatus.OK.value,
+            message="Login successful.",
+            body={"username": username, "authenticated": True}
+        )
+
+
+def require_auth(auth_service: AuthService) -> Callable:
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(username: str, password: str, *args: Any, **kwargs: Any) -> Any:
+            response = auth_service.login(username, password)
+
+            if response.status_code != HTTPStatus.OK.value:
+                return response
+
+            return func(username, *args, **kwargs)
+        return wrapper
+    return decorator
+
+
+def validate_password(password: str, stored_hash: str, salt: str) -> HTTPResponse:
+    validator = PasswordValidator()
+
+    if not password:
+        return HTTPResponse(
+            status_code=HTTPStatus.UNAUTHORIZED.value,
+            message="Password cannot be empty.",
+            body={"error": "empty_password"}
+        )
+
+    is_valid = validator.verify_password(password, stored_hash, salt)
+
+    if not is_valid:
+        return HTTPResponse(
+            status_code=HTTPStatus.UNAUTHORIZED.value,
+            message="Password validation failed. Unauthorized access.",
+            body={"error": "invalid_password", "authenticated": False}
+        )
+
+    return HTTPResponse(
+        status_code=HTTPStatus.OK.value,
+        message="Password validated successfully.",
+        body={"authenticated": True}
+    )
+
+
+def main():
+    print("=" * 60)
+    print("Authentication System Demo")
+    print("=" * 60)
+
+    auth_service = AuthService()
+
+    print("\n--- User Registration ---")
+    response = auth_service.register_user("alice", "SecurePass123!")
+    print(f"Register Alice: {response}")
+
+    response = auth_service.register_user("bob", "weak")
+    print(f"Register Bob (weak password): {response}")
+
+    response = auth_service.register_user("charlie", "AnotherSecure@456")
+    print(f"Register Charlie: {response}")
+
+    print("\n--- Login Attempts ---")
+    response = auth_service.login("alice", "SecurePass123!")
+    print(f"Alice correct login: {response}")
+
+    response = auth_service.login("alice", "WrongPassword!")
+    print(f"Alice wrong password: {response}")
+
+    response = auth_service.login("unknown_user", "SomePassword123!")
+    print(f"Unknown user login: {response}")
+
+    response = auth_service.login("", "")
+    print(f"Empty credentials: {response}")
+
+    print("\n--- Account Lockout Demo ---")
+    for i in range(6):
+        response = auth_service.login("charlie", "WrongPassword!")
+        print(f"Attempt {i + 1}: {response}")
+
+    print("\n--- Direct Password Validation ---")
+    validator = PasswordValidator()
+    test_password = "TestPassword@789"
+    hashed, salt = validator._hash_password(test_password)
+
+    response = validate_password(test_password, hashed, salt)
+    print(f"Correct password validation: {response}")
+
+    response = validate_password("WrongPassword", hashed, salt)
+    print(f"Wrong password validation: {response}")
+
+    response = validate_password("", hashed, salt)
+    print(f"Empty password validation: {response}")
+
+    print("\n--- Password Strength Validation ---")
+    test_passwords = [
+        "short",
+        "nouppercase123!",
+        "NOLOWERCASE123!",
+        "NoDigitsHere!",
+        "NoSpecialChars123",
+        "ValidPassword123!"
+    ]
+
+    for pwd in test_passwords:
+        is_valid, message = validator.validate_password_strength(pwd)
+        print(f"Password '{pwd}': Valid={is_valid}, Message='{message}'")
+
+    print("\n--- Decorator Usage ---")
+
+    @require_auth(auth_service)
+    def protected_resource(username: str) -> str:
+        return f"Welcome, {username}! You have access to the protected resource."
+
+    result = protected_resource("alice", "SecurePass123!")
+    print(f"Protected resource (correct): {result}")
+
+    result = protected_resource("alice", "WrongPassword!")
+    print(f"Protected resource (wrong password): {result}")
+
+
+if __name__ == "__main__":
+    main()
+```

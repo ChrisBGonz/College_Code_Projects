@@ -1,0 +1,505 @@
+
+```csharp
+using System;
+using System.Threading.Tasks;
+using Amazon.BedrockRuntime;
+using Amazon.BedrockRuntime.Model;
+using System.Text.Json;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+using System.Text;
+
+// Data models for the Remember Me feature
+public class UserSession
+{
+    public string UserId { get; set; } = string.Empty;
+    public string Username { get; set; } = string.Empty;
+    public string Email { get; set; } = string.Empty;
+    public string RememberMeToken { get; set; } = string.Empty;
+    public DateTime TokenExpiry { get; set; }
+    public bool IsAuthenticated { get; set; }
+    public DateTime LastActivity { get; set; }
+}
+
+public class RememberMeCookie
+{
+    public string UserId { get; set; } = string.Empty;
+    public string Token { get; set; } = string.Empty;
+    public DateTime ExpiryDate { get; set; }
+    public string DeviceFingerprint { get; set; } = string.Empty;
+}
+
+public class AuthenticationResult
+{
+    public bool Success { get; set; }
+    public string Message { get; set; } = string.Empty;
+    public UserSession? Session { get; set; }
+    public string? CookieValue { get; set; }
+    public DateTime? CookieExpiry { get; set; }
+}
+
+// Simulated database for demo purposes
+public static class UserDatabase
+{
+    private static readonly Dictionary<string, (string PasswordHash, string Email)> Users = new()
+    {
+        { "user123", (HashPassword("password123"), "user@example.com") },
+        { "admin", (HashPassword("adminpass"), "admin@example.com") },
+        { "testuser", (HashPassword("test123"), "test@example.com") }
+    };
+
+    private static readonly Dictionary<string, RememberMeCookie> RememberMeTokens = new();
+
+    public static string HashPassword(string password)
+    {
+        using var sha256 = SHA256.Create();
+        var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password + "salt_value"));
+        return Convert.ToBase64String(bytes);
+    }
+
+    public static bool ValidateCredentials(string username, string password)
+    {
+        if (Users.TryGetValue(username, out var userData))
+        {
+            return userData.PasswordHash == HashPassword(password);
+        }
+        return false;
+    }
+
+    public static string? GetUserEmail(string username)
+    {
+        return Users.TryGetValue(username, out var userData) ? userData.Email : null;
+    }
+
+    public static void StoreRememberMeToken(string userId, RememberMeCookie cookie)
+    {
+        RememberMeTokens[userId] = cookie;
+    }
+
+    public static RememberMeCookie? GetRememberMeToken(string userId)
+    {
+        return RememberMeTokens.TryGetValue(userId, out var cookie) ? cookie : null;
+    }
+
+    public static void RemoveRememberMeToken(string userId)
+    {
+        RememberMeTokens.Remove(userId);
+    }
+
+    public static bool UserExists(string userId)
+    {
+        return Users.ContainsKey(userId);
+    }
+}
+
+// Main Remember Me Authentication Service
+public class RememberMeAuthService
+{
+    private const int RememberMeDays = 30;
+    private const int SessionHours = 24;
+    private readonly AmazonBedrockRuntimeClient _bedrockClient;
+    private readonly string _modelId = "anthropic.claude-3-5-sonnet-20241022-v2:0";
+
+    public RememberMeAuthService()
+    {
+        _bedrockClient = new AmazonBedrockRuntimeClient(Amazon.RegionEndpoint.USEast1);
+    }
+
+    // Generate a secure random token
+    private string GenerateSecureToken()
+    {
+        var tokenBytes = new byte[32];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(tokenBytes);
+        return Convert.ToBase64String(tokenBytes);
+    }
+
+    // Generate device fingerprint (simplified for demo)
+    private string GenerateDeviceFingerprint(string userAgent = "DefaultBrowser", string ipAddress = "127.0.0.1")
+    {
+        var fingerprintData = $"{userAgent}:{ipAddress}";
+        using var sha256 = SHA256.Create();
+        var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(fingerprintData));
+        return Convert.ToBase64String(bytes);
+    }
+
+    // Create Remember Me cookie value
+    private string CreateCookieValue(RememberMeCookie cookie)
+    {
+        var cookieData = JsonSerializer.Serialize(cookie);
+        return Convert.ToBase64String(Encoding.UTF8.GetBytes(cookieData));
+    }
+
+    // Parse Remember Me cookie value
+    private RememberMeCookie? ParseCookieValue(string cookieValue)
+    {
+        try
+        {
+            var cookieData = Encoding.UTF8.GetString(Convert.FromBase64String(cookieValue));
+            return JsonSerializer.Deserialize<RememberMeCookie>(cookieData);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    // Login with Remember Me option
+    public async Task<AuthenticationResult> LoginAsync(
+        string username,
+        string password,
+        bool rememberMe = false,
+        string userAgent = "DefaultBrowser",
+        string ipAddress = "127.0.0.1")
+    {
+        // Validate credentials
+        if (!UserDatabase.ValidateCredentials(username, password))
+        {
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = "Invalid username or password"
+            };
+        }
+
+        var email = UserDatabase.GetUserEmail(username) ?? "";
+        var session = new UserSession
+        {
+            UserId = username,
+            Username = username,
+            Email = email,
+            IsAuthenticated = true,
+            LastActivity = DateTime.UtcNow
+        };
+
+        AuthenticationResult result;
+
+        if (rememberMe)
+        {
+            // Generate Remember Me token
+            var token = GenerateSecureToken();
+            var deviceFingerprint = GenerateDeviceFingerprint(userAgent, ipAddress);
+            var expiryDate = DateTime.UtcNow.AddDays(RememberMeDays);
+
+            var rememberMeCookie = new RememberMeCookie
+            {
+                UserId = username,
+                Token = token,
+                ExpiryDate = expiryDate,
+                DeviceFingerprint = deviceFingerprint
+            };
+
+            // Store token in database
+            UserDatabase.StoreRememberMeToken(username, rememberMeCookie);
+
+            session.RememberMeToken = token;
+            session.TokenExpiry = expiryDate;
+
+            var cookieValue = CreateCookieValue(rememberMeCookie);
+
+            result = new AuthenticationResult
+            {
+                Success = true,
+                Message = "Login successful with Remember Me",
+                Session = session,
+                CookieValue = cookieValue,
+                CookieExpiry = expiryDate
+            };
+        }
+        else
+        {
+            session.TokenExpiry = DateTime.UtcNow.AddHours(SessionHours);
+
+            result = new AuthenticationResult
+            {
+                Success = true,
+                Message = "Login successful",
+                Session = session
+            };
+        }
+
+        // Use Claude to generate security advice
+        var securityAdvice = await GetSecurityAdviceFromClaude(username, rememberMe);
+        result.Message += $"\n\nSecurity Note: {securityAdvice}";
+
+        return result;
+    }
+
+    // Authenticate using Remember Me cookie
+    public async Task<AuthenticationResult> AuthenticateWithCookieAsync(
+        string cookieValue,
+        string userAgent = "DefaultBrowser",
+        string ipAddress = "127.0.0.1")
+    {
+        var parsedCookie = ParseCookieValue(cookieValue);
+
+        if (parsedCookie == null)
+        {
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = "Invalid cookie format"
+            };
+        }
+
+        // Check if cookie is expired
+        if (parsedCookie.ExpiryDate < DateTime.UtcNow)
+        {
+            UserDatabase.RemoveRememberMeToken(parsedCookie.UserId);
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = "Remember Me cookie has expired"
+            };
+        }
+
+        // Verify token in database
+        var storedCookie = UserDatabase.GetRememberMeToken(parsedCookie.UserId);
+
+        if (storedCookie == null || storedCookie.Token != parsedCookie.Token)
+        {
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = "Invalid or revoked Remember Me token"
+            };
+        }
+
+        // Verify device fingerprint
+        var currentFingerprint = GenerateDeviceFingerprint(userAgent, ipAddress);
+        if (storedCookie.DeviceFingerprint != currentFingerprint)
+        {
+            // Security: Different device detected
+            var warningAdvice = await GetSecurityWarningFromClaude(parsedCookie.UserId);
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = $"Security Warning: {warningAdvice}"
+            };
+        }
+
+        // Check if user still exists
+        if (!UserDatabase.UserExists(parsedCookie.UserId))
+        {
+            return new AuthenticationResult
+            {
+                Success = false,
+                Message = "User account not found"
+            };
+        }
+
+        // Rotate token for security (token rotation)
+        var newToken = GenerateSecureToken();
+        var newExpiryDate = DateTime.UtcNow.AddDays(RememberMeDays);
+
+        var newCookie = new RememberMeCookie
+        {
+            UserId = parsedCookie.UserId,
+            Token = newToken,
+            ExpiryDate = newExpiryDate,
+            DeviceFingerprint = currentFingerprint
+        };
+
+        UserDatabase.StoreRememberMeToken(parsedCookie.UserId, newCookie);
+
+        var email = UserDatabase.GetUserEmail(parsedCookie.UserId) ?? "";
+        var session = new UserSession
+        {
+            UserId = parsedCookie.UserId,
+            Username = parsedCookie.UserId,
+            Email = email,
+            RememberMeToken = newToken,
+            TokenExpiry = newExpiryDate,
+            IsAuthenticated = true,
+            LastActivity = DateTime.UtcNow
+        };
+
+        var newCookieValue = CreateCookieValue(newCookie);
+
+        return new AuthenticationResult
+        {
+            Success = true,
+            Message = "Authenticated successfully via Remember Me cookie",
+            Session = session,
+            CookieValue = newCookieValue,
+            CookieExpiry = newExpiryDate
+        };
+    }
+
+    // Logout and invalidate Remember Me cookie
+    public async Task<AuthenticationResult> LogoutAsync(string userId, bool invalidateAllDevices = false)
+    {
+        UserDatabase.RemoveRememberMeToken(userId);
+
+        var logoutAdvice = await GetLogoutAdviceFromClaude(userId, invalidateAllDevices);
+
+        return new AuthenticationResult
+        {
+            Success = true,
+            Message = $"Logged out successfully. {logoutAdvice}"
+        };
+    }
+
+    // Get security advice from Claude
+    private async Task<string> GetSecurityAdviceFromClaude(string username, bool rememberMeEnabled)
+    {
+        var prompt = rememberMeEnabled
+            ? $"User '{username}' has enabled 'Remember Me' feature. Provide a brief, one-sentence security tip about using persistent login cookies safely."
+            : $"User '{username}' logged in without 'Remember Me'. Provide a brief, one-sentence tip about session security.";
+
+        return await CallClaudeAsync(prompt);
+    }
+
+    private async Task<string> GetSecurityWarningFromClaude(string userId)
+    {
+        var prompt = $"A Remember Me cookie for user '{userId}' was used from a different device/location than where it was created. Provide a brief security warning message in one sentence.";
+        return await CallClaudeAsync(prompt);
+    }
+
+    private async Task<string> GetLogoutAdviceFromClaude(string userId, bool allDevices)
+    {
+        var prompt = allDevices
+            ? $"User '{userId}' logged out from all devices. Provide a brief confirmation message about security in one sentence."
+            : $"User '{userId}' logged out from current device. Provide a brief tip about managing active sessions in one sentence.";
+
+        return await CallClaudeAsync(prompt);
+    }
+
+    // Call Claude API using Converse API
+    private async Task<string> CallClaudeAsync(string prompt)
+    {
+        try
+        {
+            var request = new ConverseRequest
+            {
+                ModelId = _modelId,
+                Messages = new List<Message>
+                {
+                    new Message
+                    {
+                        Role = ConversationRole.User,
+                        Content = new List<ContentBlock>
+                        {
+                            new ContentBlock { Text = prompt }
+                        }
+                    }
+                },
+                InferenceConfig = new InferenceConfiguration
+                {
+                    MaxTokens = 150,
+                    Temperature = 0.7f
+                }
+            };
+
+            var response = await _bedrockClient.ConverseAsync(request);
+
+            if (response.Output?.Message?.Content?.Count > 0)
+            {
+                return response.Output.Message.Content[0].Text ?? "Security advice unavailable.";
+            }
+
+            return "Security advice unavailable.";
+        }
+        catch (Exception ex)
+        {
+            return $"Security service temporarily unavailable: {ex.Message}";
+        }
+    }
+}
+
+// Demo program
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("=== Remember Me Authentication Demo ===\n");
+
+        var authService = new RememberMeAuthService();
+
+        // Demo 1: Login with Remember Me
+        Console.WriteLine("1. Testing Login with Remember Me...");
+        var loginResult = await authService.LoginAsync(
+            username: "user123",
+            password: "password123",
+            rememberMe: true,
+            userAgent: "Mozilla/5.0 Chrome/120.0",
+            ipAddress: "192.168.1.100"
+        );
+
+        Console.WriteLine($"Login Success: {loginResult.Success}");
+        Console.WriteLine($"Message: {loginResult.Message}");
+        if (loginResult.CookieValue != null)
+        {
+            Console.WriteLine($"Cookie Value (truncated): {loginResult.CookieValue[..Math.Min(50, loginResult.CookieValue.Length)]}...");
+            Console.WriteLine($"Cookie Expiry: {loginResult.CookieExpiry}");
+        }
+        Console.WriteLine();
+
+        // Demo 2: Authenticate with Remember Me Cookie
+        if (loginResult.Success && loginResult.CookieValue != null)
+        {
+            Console.WriteLine("2. Testing Authentication with Remember Me Cookie...");
+            var cookieAuthResult = await authService.AuthenticateWithCookieAsync(
+                cookieValue: loginResult.CookieValue,
+                userAgent: "Mozilla/5.0 Chrome/120.0",
+                ipAddress: "192.168.1.100"
+            );
+
+            Console.WriteLine($"Cookie Auth Success: {cookieAuthResult.Success}");
+            Console.WriteLine($"Message: {cookieAuthResult.Message}");
+            if (cookieAuthResult.Session != null)
+            {
+                Console.WriteLine($"Authenticated User: {cookieAuthResult.Session.Username}");
+                Console.WriteLine($"Session Valid Until: {cookieAuthResult.Session.TokenExpiry}");
+            }
+            Console.WriteLine();
+
+            // Demo 3: Test with different device (security check)
+            Console.WriteLine("3. Testing Cookie from Different Device (Security Check)...");
+            var differentDeviceResult = await authService.AuthenticateWithCookieAsync(
+                cookieValue: loginResult.CookieValue,
+                userAgent: "Mozilla/5.0 Firefox/120.0",
+                ipAddress: "10.0.0.1"
+            );
+
+            Console.WriteLine($"Different Device Auth Success: {differentDeviceResult.Success}");
+            Console.WriteLine($"Message: {differentDeviceResult.Message}");
+            Console.WriteLine();
+        }
+
+        // Demo 4: Login without Remember Me
+        Console.WriteLine("4. Testing Login without Remember Me...");
+        var sessionLoginResult = await authService.LoginAsync(
+            username: "admin",
+            password: "adminpass",
+            rememberMe: false
+        );
+
+        Console.WriteLine($"Session Login Success: {sessionLoginResult.Success}");
+        Console.WriteLine($"Message: {sessionLoginResult.Message}");
+        Console.WriteLine($"Has Cookie: {sessionLoginResult.CookieValue != null}");
+        Console.WriteLine();
+
+        // Demo 5: Invalid credentials
+        Console.WriteLine("5. Testing Invalid Credentials...");
+        var invalidLoginResult = await authService.LoginAsync(
+            username: "user123",
+            password: "wrongpassword",
+            rememberMe: true
+        );
+
+        Console.WriteLine($"Invalid Login Success: {invalidLoginResult.Success}");
+        Console.WriteLine($"Message: {invalidLoginResult.Message}");
+        Console.WriteLine();
+
+        // Demo 6: Logout
+        Console.WriteLine("6. Testing Logout...");
+        var logoutResult = await authService.LogoutAsync("user123", invalidateAllDevices: false);
+        Console.WriteLine($"Logout Success: {logoutResult.Success}");
+        Console.WriteLine($"Message: {logoutResult.Message}");
+        Console.WriteLine();
+
+        Console.WriteLine("=== Demo Complete ===");
+    }
+}
+```

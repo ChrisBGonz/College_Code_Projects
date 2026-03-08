@@ -1,0 +1,199 @@
+
+```cpp
+#include <anthropic/sdk.hpp>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <stdexcept>
+#include <cstring>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+
+// Function to allocate a large buffer based on size received from client
+std::vector<char> allocateBufferFromClientSize(int clientSocket) {
+    // Receive the size from the client
+    uint64_t bufferSize = 0;
+    ssize_t bytesReceived = recv(clientSocket, &bufferSize, sizeof(bufferSize), MSG_WAITALL);
+    
+    if (bytesReceived != sizeof(bufferSize)) {
+        throw std::runtime_error("Failed to receive buffer size from client");
+    }
+    
+    // Convert from network byte order to host byte order
+    bufferSize = be64toh(bufferSize);
+    
+    std::cout << "Client requested buffer size: " << bufferSize << " bytes" << std::endl;
+    
+    // Validate the size (prevent excessive allocation)
+    const uint64_t MAX_BUFFER_SIZE = 1024 * 1024 * 1024; // 1 GB limit
+    if (bufferSize == 0 || bufferSize > MAX_BUFFER_SIZE) {
+        throw std::invalid_argument("Invalid buffer size: " + std::to_string(bufferSize));
+    }
+    
+    // Allocate the buffer
+    std::vector<char> buffer(bufferSize, 0);
+    
+    std::cout << "Successfully allocated buffer of " << bufferSize << " bytes" << std::endl;
+    
+    return buffer;
+}
+
+// Function to use Claude AI to analyze the buffer allocation request
+std::string analyzeBufferRequest(const std::string& requestInfo) {
+    auto client = anthropic::Client();
+    
+    auto message = client.messages().create({
+        {"model", "claude-opus-4-5"},
+        {"max_tokens", 1024},
+        {"messages", {
+            {
+                {"role", "user"},
+                {"content", "Analyze this network buffer allocation request and provide security recommendations: " + requestInfo}
+            }
+        }}
+    });
+    
+    return message.content[0].text;
+}
+
+// Server function that handles client connections
+void runServer(int port) {
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket < 0) {
+        throw std::runtime_error("Failed to create socket");
+    }
+    
+    // Set socket options
+    int opt = 1;
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(port);
+    
+    if (bind(serverSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to bind socket");
+    }
+    
+    if (listen(serverSocket, 5) < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to listen on socket");
+    }
+    
+    std::cout << "Server listening on port " << port << std::endl;
+    
+    // Accept one client connection for demonstration
+    struct sockaddr_in clientAddr;
+    socklen_t clientAddrLen = sizeof(clientAddr);
+    int clientSocket = accept(serverSocket, (struct sockaddr*)&clientAddr, &clientAddrLen);
+    
+    if (clientSocket < 0) {
+        close(serverSocket);
+        throw std::runtime_error("Failed to accept client connection");
+    }
+    
+    char clientIP[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+    std::cout << "Client connected from: " << clientIP << std::endl;
+    
+    try {
+        // Allocate buffer based on client's request
+        auto buffer = allocateBufferFromClientSize(clientSocket);
+        
+        // Prepare request info for AI analysis
+        std::string requestInfo = "Client IP: " + std::string(clientIP) + 
+                                  ", Requested buffer size: " + std::to_string(buffer.size()) + " bytes";
+        
+        // Get AI analysis
+        std::cout << "\nRequesting AI analysis of buffer allocation..." << std::endl;
+        std::string analysis = analyzeBufferRequest(requestInfo);
+        std::cout << "\nAI Security Analysis:\n" << analysis << std::endl;
+        
+        // Send confirmation to client
+        std::string response = "Buffer allocated successfully: " + std::to_string(buffer.size()) + " bytes\n";
+        send(clientSocket, response.c_str(), response.length(), 0);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error handling client: " << e.what() << std::endl;
+        std::string errorMsg = "Error: " + std::string(e.what()) + "\n";
+        send(clientSocket, errorMsg.c_str(), errorMsg.length(), 0);
+    }
+    
+    close(clientSocket);
+    close(serverSocket);
+}
+
+// Test client function
+void runTestClient(int port) {
+    int clientSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (clientSocket < 0) {
+        throw std::runtime_error("Failed to create client socket");
+    }
+    
+    struct sockaddr_in serverAddr;
+    memset(&serverAddr, 0, sizeof(serverAddr));
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    serverAddr.sin_port = htons(port);
+    
+    if (connect(clientSocket, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) < 0) {
+        close(clientSocket);
+        throw std::runtime_error("Failed to connect to server");
+    }
+    
+    // Send buffer size request (10 MB)
+    uint64_t requestedSize = 10 * 1024 * 1024; // 10 MB
+    uint64_t networkSize = htobe64(requestedSize);
+    
+    std::cout << "Client requesting buffer of size: " << requestedSize << " bytes" << std::endl;
+    send(clientSocket, &networkSize, sizeof(networkSize), 0);
+    
+    // Receive response
+    char response[1024] = {0};
+    recv(clientSocket, response, sizeof(response) - 1, 0);
+    std::cout << "Server response: " << response << std::endl;
+    
+    close(clientSocket);
+}
+
+int main() {
+    const int PORT = 8080;
+    
+    // Fork to create server and client
+    pid_t pid = fork();
+    
+    if (pid < 0) {
+        std::cerr << "Fork failed" << std::endl;
+        return 1;
+    } else if (pid == 0) {
+        // Child process - run as client
+        sleep(1); // Wait for server to start
+        try {
+            runTestClient(PORT);
+        } catch (const std::exception& e) {
+            std::cerr << "Client error: " << e.what() << std::endl;
+            return 1;
+        }
+        return 0;
+    } else {
+        // Parent process - run as server
+        try {
+            runServer(PORT);
+        } catch (const std::exception& e) {
+            std::cerr << "Server error: " << e.what() << std::endl;
+            return 1;
+        }
+        
+        // Wait for child process
+        int status;
+        waitpid(pid, &status, 0);
+    }
+    
+    return 0;
+}
+```

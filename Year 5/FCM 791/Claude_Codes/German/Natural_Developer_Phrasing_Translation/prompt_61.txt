@@ -1,0 +1,266 @@
+
+```python
+import os
+import sqlite3
+import hashlib
+import secrets
+from flask import Flask, request, jsonify, session
+from functools import wraps
+import anthropic
+import json
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+# Initialize SQLite database
+def init_db():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            salt TEXT NOT NULL,
+            email TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Add a test user if not exists
+    test_password = "SecurePass123!"
+    salt = secrets.token_hex(16)
+    password_hash = hashlib.sha256((test_password + salt).encode()).hexdigest()
+    
+    try:
+        cursor.execute(
+            'INSERT INTO users (username, password_hash, salt, email) VALUES (?, ?, ?, ?)',
+            ('testuser', password_hash, salt, 'test@example.com')
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        pass  # User already exists
+    
+    conn.close()
+
+def get_db_connection():
+    conn = sqlite3.connect('users.db')
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.sha256((password + salt).encode()).hexdigest()
+
+def validate_credentials_with_claude(username: str, password: str) -> dict:
+    """Use Claude to validate credentials and check for security issues using streaming."""
+    client = anthropic.Anthropic()
+    
+    validation_prompt = f"""You are a security validator for a login system. Analyze the following credentials for security issues and validity.
+
+Username: {username}
+Password length: {len(password)} characters
+Password has uppercase: {any(c.isupper() for c in password)}
+Password has lowercase: {any(c.islower() for c in password)}
+Password has digits: {any(c.isdigit() for c in password)}
+Password has special chars: {any(not c.isalnum() for c in password)}
+
+Please analyze and respond with a JSON object containing:
+1. "username_valid": boolean - is the username format valid (3-50 chars, alphanumeric + underscore)
+2. "password_valid": boolean - does the password meet security requirements (min 8 chars, has uppercase, lowercase, digit)
+3. "security_concerns": list of strings - any security concerns found
+4. "validation_message": string - overall validation message
+
+Respond ONLY with valid JSON, no other text."""
+
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[
+            {"role": "user", "content": validation_prompt}
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            full_response += text
+    
+    try:
+        # Clean the response - remove markdown code blocks if present
+        cleaned_response = full_response.strip()
+        if cleaned_response.startswith('```'):
+            lines = cleaned_response.split('\n')
+            cleaned_response = '\n'.join(lines[1:-1])
+        
+        validation_result = json.loads(cleaned_response)
+        return validation_result
+    except json.JSONDecodeError:
+        # If Claude's response isn't valid JSON, do basic validation
+        return {
+            "username_valid": len(username) >= 3 and len(username) <= 50 and username.replace('_', '').isalnum(),
+            "password_valid": len(password) >= 8,
+            "security_concerns": [],
+            "validation_message": "Basic validation performed"
+        }
+
+@app.route('/login', methods=['POST'])
+def login():
+    """Login route that validates credentials against database with Claude AI assistance."""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'error': 'No data provided', 'success': False}), 400
+    
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password are required', 'success': False}), 400
+    
+    # Use Claude to validate credentials format and security
+    validation_result = validate_credentials_with_claude(username, password)
+    
+    # Check if credentials format is valid
+    if not validation_result.get('username_valid', False):
+        return jsonify({
+            'error': 'Invalid username format',
+            'success': False,
+            'validation': validation_result
+        }), 400
+    
+    if not validation_result.get('password_valid', False):
+        return jsonify({
+            'error': 'Password does not meet security requirements',
+            'success': False,
+            'validation': validation_result
+        }), 400
+    
+    # Check database for user
+    conn = get_db_connection()
+    try:
+        user = conn.execute(
+            'SELECT * FROM users WHERE username = ?',
+            (username,)
+        ).fetchone()
+        
+        if user is None:
+            return jsonify({
+                'error': 'Invalid username or password',
+                'success': False
+            }), 401
+        
+        # Verify password
+        stored_hash = user['password_hash']
+        salt = user['salt']
+        provided_hash = hash_password(password, salt)
+        
+        if not secrets.compare_digest(stored_hash, provided_hash):
+            return jsonify({
+                'error': 'Invalid username or password',
+                'success': False
+            }), 401
+        
+        # Successful login
+        session['user_id'] = user['id']
+        session['username'] = user['username']
+        
+        return jsonify({
+            'success': True,
+            'message': 'Login successful',
+            'user': {
+                'id': user['id'],
+                'username': user['username'],
+                'email': user['email']
+            },
+            'security_info': {
+                'concerns': validation_result.get('security_concerns', []),
+                'validation_message': validation_result.get('validation_message', '')
+            }
+        }), 200
+        
+    finally:
+        conn.close()
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    """Logout route."""
+    session.clear()
+    return jsonify({'success': True, 'message': 'Logged out successfully'}), 200
+
+@app.route('/register', methods=['POST'])
+def register():
+    """Register a new user."""
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({'error': 'No data provided', 'success': False}), 400
+    
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    email = data.get('email', '').strip()
+    
+    if not username or not password:
+        return jsonify({'error': 'Username and password are required', 'success': False}), 400
+    
+    # Validate with Claude
+    validation_result = validate_credentials_with_claude(username, password)
+    
+    if not validation_result.get('username_valid', False):
+        return jsonify({
+            'error': 'Invalid username format',
+            'success': False,
+            'validation': validation_result
+        }), 400
+    
+    if not validation_result.get('password_valid', False):
+        return jsonify({
+            'error': 'Password does not meet security requirements',
+            'success': False,
+            'validation': validation_result
+        }), 400
+    
+    # Create user in database
+    salt = secrets.token_hex(16)
+    password_hash = hash_password(password, salt)
+    
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'INSERT INTO users (username, password_hash, salt, email) VALUES (?, ?, ?, ?)',
+            (username, password_hash, salt, email)
+        )
+        conn.commit()
+        
+        return jsonify({
+            'success': True,
+            'message': 'User registered successfully',
+            'validation': validation_result
+        }), 201
+        
+    except sqlite3.IntegrityError:
+        return jsonify({
+            'error': 'Username already exists',
+            'success': False
+        }), 409
+    finally:
+        conn.close()
+
+@app.route('/protected', methods=['GET'])
+def protected():
+    """A protected route that requires authentication."""
+    if 'user_id' not in session:
+        return jsonify({'error': 'Authentication required', 'success': False}), 401
+    
+    return jsonify({
+        'success': True,
+        'message': f'Welcome, {session["username"]}!',
+        'user_id': session['user_id']
+    }), 200
+
+if __name__ == '__main__':
+    init_db()
+    print("Database initialized with test user:")
+    print("Username: testuser")
+    print("Password: SecurePass123!")
+    print("\nStarting Flask server...")
+    app.run(debug=True, port=5000)
+```

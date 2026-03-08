@@ -1,0 +1,702 @@
+```javascript
+// ============================================================
+// circuit-breaker.js
+// ============================================================
+
+/**
+ * Circuit Breaker States
+ */
+const STATE = Object.freeze({
+  CLOSED: 'CLOSED',
+  OPEN: 'OPEN',
+  HALF_OPEN: 'HALF_OPEN',
+});
+
+/**
+ * Default configuration
+ */
+const DEFAULT_CONFIG = {
+  failureThreshold: 5,        // failures before opening
+  successThreshold: 2,        // successes in half-open before closing
+  cooldownMs: 15_000,         // ms to wait before half-open probe
+  requestTimeoutMs: 5_000,    // per-request timeout
+  monitorWindowMs: 60_000,    // sliding window for failure tracking
+  halfOpenMaxConcurrent: 1,   // max concurrent probes in half-open
+  fallback: null,             // optional: (url, options, error) => any
+  onStateChange: null,        // optional: (from, to, breaker) => void
+  isFailure: defaultIsFailure, // pluggable failure classifier
+};
+
+/**
+ * Classify a response/error as a failure.
+ * Override via config.isFailure for custom logic.
+ */
+function defaultIsFailure(error, response) {
+  if (error) return true; // network error, timeout, abort
+  if (response && response.status >= 500) return true;
+  return false;
+}
+
+/**
+ * Lightweight event emitter for internal use
+ */
+class EventEmitter {
+  constructor() {
+    this._listeners = {};
+  }
+
+  on(event, fn) {
+    (this._listeners[event] = this._listeners[event] || []).push(fn);
+    return this;
+  }
+
+  off(event, fn) {
+    if (this._listeners[event]) {
+      this._listeners[event] = this._listeners[event].filter(f => f !== fn);
+    }
+    return this;
+  }
+
+  emit(event, ...args) {
+    (this._listeners[event] || []).forEach(fn => fn(...args));
+  }
+}
+
+// ============================================================
+// CircuitBreaker
+// ============================================================
+
+class CircuitBreaker extends EventEmitter {
+  /**
+   * @param {string} name          - Identifier for this breaker instance
+   * @param {object} config        - Override DEFAULT_CONFIG keys
+   * @param {function} requestAdapter - async (url, options) => Response
+   */
+  constructor(name, config = {}, requestAdapter = fetchAdapter) {
+    super();
+
+    this.name = name;
+    this.cfg = { ...DEFAULT_CONFIG, ...config };
+    this._adapter = requestAdapter;
+
+    // State
+    this._state = STATE.CLOSED;
+    this._failures = [];          // timestamps of failures in window
+    this._successCount = 0;       // consecutive successes in HALF_OPEN
+    this._openedAt = null;        // timestamp when circuit opened
+    this._halfOpenProbes = 0;     // concurrent probes in HALF_OPEN
+
+    // Metrics (cumulative)
+    this.metrics = {
+      totalRequests: 0,
+      totalFailures: 0,
+      totalSuccesses: 0,
+      totalRejected: 0,
+      totalFallbacks: 0,
+      stateChanges: [],
+    };
+  }
+
+  // ----------------------------------------------------------
+  // Public API
+  // ----------------------------------------------------------
+
+  get state() {
+    return this._state;
+  }
+
+  get isOpen() {
+    return this._state === STATE.OPEN;
+  }
+
+  get isClosed() {
+    return this._state === STATE.CLOSED;
+  }
+
+  get isHalfOpen() {
+    return this._state === STATE.HALF_OPEN;
+  }
+
+  /**
+   * Execute a request through the circuit breaker.
+   * @param {string} url
+   * @param {object} options  - fetch options
+   * @returns {Promise<Response|any>}
+   */
+  async execute(url, options = {}) {
+    this.metrics.totalRequests++;
+
+    // Evaluate whether to allow the request
+    const decision = this._evaluateState();
+
+    if (decision === 'REJECT') {
+      this.metrics.totalRejected++;
+      const err = new CircuitOpenError(this.name, this._openedAt, this.cfg.cooldownMs);
+      return this._handleFallback(url, options, err);
+    }
+
+    if (decision === 'PROBE') {
+      this._halfOpenProbes++;
+    }
+
+    // Wrap request with timeout
+    let response = null;
+    let requestError = null;
+
+    try {
+      response = await this._timedRequest(url, options);
+    } catch (err) {
+      requestError = err;
+    }
+
+    // Classify outcome
+    const failed = this.cfg.isFailure(requestError, response);
+
+    if (decision === 'PROBE') {
+      this._halfOpenProbes--;
+    }
+
+    if (failed) {
+      this._recordFailure();
+      const err = requestError || new BackendError(response);
+      return this._handleFallback(url, options, err);
+    }
+
+    this._recordSuccess();
+    return response;
+  }
+
+  /**
+   * Manually force the circuit to a specific state.
+   * Useful for testing or admin overrides.
+   */
+  forceState(state) {
+    if (!Object.values(STATE).includes(state)) {
+      throw new Error(`Unknown state: ${state}`);
+    }
+    this._transition(state, 'manual');
+  }
+
+  /**
+   * Reset the circuit breaker to initial CLOSED state.
+   */
+  reset() {
+    this._failures = [];
+    this._successCount = 0;
+    this._openedAt = null;
+    this._halfOpenProbes = 0;
+    this._transition(STATE.CLOSED, 'reset');
+  }
+
+  /**
+   * Snapshot of current breaker status.
+   */
+  status() {
+    const now = Date.now();
+    const windowFailures = this._failuresInWindow(now);
+    const cooldownRemaining =
+      this._state === STATE.OPEN
+        ? Math.max(0, this.cfg.cooldownMs - (now - this._openedAt))
+        : 0;
+
+    return {
+      name: this.name,
+      state: this._state,
+      failuresInWindow: windowFailures,
+      failureThreshold: this.cfg.failureThreshold,
+      cooldownRemainingMs: cooldownRemaining,
+      halfOpenProbes: this._halfOpenProbes,
+      metrics: { ...this.metrics },
+    };
+  }
+
+  // ----------------------------------------------------------
+  // Internal state machine
+  // ----------------------------------------------------------
+
+  /**
+   * Decide whether to allow, probe, or reject the request.
+   * @returns {'ALLOW'|'PROBE'|'REJECT'}
+   */
+  _evaluateState() {
+    const now = Date.now();
+
+    switch (this._state) {
+      case STATE.CLOSED:
+        return 'ALLOW';
+
+      case STATE.OPEN: {
+        const elapsed = now - this._openedAt;
+        if (elapsed >= this.cfg.cooldownMs) {
+          this._transition(STATE.HALF_OPEN, 'cooldown-elapsed');
+          // Fall through to HALF_OPEN logic
+        } else {
+          return 'REJECT';
+        }
+        // intentional fall-through
+      }
+      // eslint-disable-next-line no-fallthrough
+      case STATE.HALF_OPEN: {
+        if (this._halfOpenProbes < this.cfg.halfOpenMaxConcurrent) {
+          return 'PROBE';
+        }
+        return 'REJECT'; // already probing, reject additional
+      }
+
+      default:
+        return 'ALLOW';
+    }
+  }
+
+  _recordFailure() {
+    const now = Date.now();
+    this.metrics.totalFailures++;
+    this._failures.push(now);
+    this._successCount = 0;
+
+    const windowFailures = this._failuresInWindow(now);
+
+    this.emit('failure', { breaker: this, failuresInWindow: windowFailures });
+
+    if (
+      this._state === STATE.CLOSED &&
+      windowFailures >= this.cfg.failureThreshold
+    ) {
+      this._transition(STATE.OPEN, 'failure-threshold-reached');
+    } else if (this._state === STATE.HALF_OPEN) {
+      // Probe failed → reopen
+      this._transition(STATE.OPEN, 'probe-failed');
+    }
+  }
+
+  _recordSuccess() {
+    this.metrics.totalSuccesses++;
+    this._successCount++;
+
+    this.emit('success', { breaker: this, successCount: this._successCount });
+
+    if (
+      this._state === STATE.HALF_OPEN &&
+      this._successCount >= this.cfg.successThreshold
+    ) {
+      this._transition(STATE.CLOSED, 'probe-succeeded');
+    }
+  }
+
+  _transition(newState, reason) {
+    if (this._state === newState) return;
+
+    const from = this._state;
+    this._state = newState;
+
+    if (newState === STATE.OPEN) {
+      this._openedAt = Date.now();
+      this._successCount = 0;
+    } else if (newState === STATE.CLOSED) {
+      this._failures = [];
+      this._successCount = 0;
+      this._openedAt = null;
+    } else if (newState === STATE.HALF_OPEN) {
+      this._successCount = 0;
+    }
+
+    const change = { from, to: newState, reason, at: new Date().toISOString() };
+    this.metrics.stateChanges.push(change);
+
+    this.emit('stateChange', change);
+
+    if (typeof this.cfg.onStateChange === 'function') {
+      this.cfg.onStateChange(from, newState, this);
+    }
+
+    console.info(
+      `[CircuitBreaker:${this.name}] ${from} → ${newState} (${reason})`
+    );
+  }
+
+  // ----------------------------------------------------------
+  // Helpers
+  // ----------------------------------------------------------
+
+  _failuresInWindow(now) {
+    const cutoff = now - this.cfg.monitorWindowMs;
+    // Prune old entries
+    this._failures = this._failures.filter(ts => ts > cutoff);
+    return this._failures.length;
+  }
+
+  async _timedRequest(url, options) {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      this.cfg.requestTimeoutMs
+    );
+
+    try {
+      const mergedOptions = {
+        ...options,
+        signal: options.signal
+          ? anySignal([options.signal, controller.signal])
+          : controller.signal,
+      };
+      return await this._adapter(url, mergedOptions);
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        throw new TimeoutError(url, this.cfg.requestTimeoutMs);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  async _handleFallback(url, options, error) {
+    if (typeof this.cfg.fallback === 'function') {
+      this.metrics.totalFallbacks++;
+      this.emit('fallback', { breaker: this, url, error });
+      return this.cfg.fallback(url, options, error);
+    }
+    throw error;
+  }
+}
+
+// ============================================================
+// Custom Errors
+// ============================================================
+
+class CircuitOpenError extends Error {
+  constructor(name, openedAt, cooldownMs) {
+    const remaining = openedAt
+      ? Math.max(0, cooldownMs - (Date.now() - openedAt))
+      : cooldownMs;
+    super(
+      `Circuit "${name}" is OPEN. Retry in ~${Math.ceil(remaining / 1000)}s.`
+    );
+    this.name = 'CircuitOpenError';
+    this.circuitName = name;
+    this.retryAfterMs = remaining;
+  }
+}
+
+class TimeoutError extends Error {
+  constructor(url, timeoutMs) {
+    super(`Request to "${url}" timed out after ${timeoutMs}ms`);
+    this.name = 'TimeoutError';
+    this.url = url;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+class BackendError extends Error {
+  constructor(response) {
+    super(`Backend responded with status ${response?.status}`);
+    this.name = 'BackendError';
+    this.status = response?.status;
+    this.response = response;
+  }
+}
+
+// ============================================================
+// Request Adapters
+// ============================================================
+
+/**
+ * Default adapter: native fetch
+ */
+async function fetchAdapter(url, options = {}) {
+  return fetch(url, options);
+}
+
+/**
+ * Utility: combine multiple AbortSignals (polyfill for older browsers)
+ */
+function anySignal(signals) {
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      return controller.signal;
+    }
+    signal.addEventListener('abort', () => controller.abort(signal.reason), {
+      once: true,
+    });
+  }
+  return controller.signal;
+}
+
+// ============================================================
+// CircuitBreakerRegistry
+// ============================================================
+
+/**
+ * Manages multiple named circuit breakers.
+ * Useful for per-service isolation.
+ */
+class CircuitBreakerRegistry {
+  constructor(defaultConfig = {}) {
+    this._breakers = new Map();
+    this._defaultConfig = defaultConfig;
+  }
+
+  /**
+   * Get or create a named circuit breaker.
+   */
+  get(name, config = {}, adapter = fetchAdapter) {
+    if (!this._breakers.has(name)) {
+      const breaker = new CircuitBreaker(
+        name,
+        { ...this._defaultConfig, ...config },
+        adapter
+      );
+      this._breakers.set(name, breaker);
+    }
+    return this._breakers.get(name);
+  }
+
+  /**
+   * Status snapshot for all registered breakers.
+   */
+  statusAll() {
+    const result = {};
+    for (const [name, breaker] of this._breakers) {
+      result[name] = breaker.status();
+    }
+    return result;
+  }
+
+  /**
+   * Reset all breakers.
+   */
+  resetAll() {
+    for (const breaker of this._breakers.values()) {
+      breaker.reset();
+    }
+  }
+}
+
+// ============================================================
+// API Client Integration Example
+// ============================================================
+
+/**
+ * Creates a circuit-breaker-aware API client.
+ *
+ * @param {string} baseUrl
+ * @param {CircuitBreaker} breaker
+ * @returns {object} apiClient
+ */
+function createApiClient(baseUrl, breaker) {
+  async function request(path, options = {}) {
+    const url = `${baseUrl}${path}`;
+    const response = await breaker.execute(url, {
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {}),
+      },
+      ...options,
+    });
+
+    // If fallback returned a plain object (not a Response), pass it through
+    if (!(response instanceof Response)) {
+      return response;
+    }
+
+    if (!response.ok) {
+      throw new BackendError(response);
+    }
+
+    return response.json();
+  }
+
+  return {
+    get: (path, options = {}) =>
+      request(path, { method: 'GET', ...options }),
+
+    post: (path, body, options = {}) =>
+      request(path, {
+        method: 'POST',
+        body: JSON.stringify(body),
+        ...options,
+      }),
+
+    put: (path, body, options = {}) =>
+      request(path, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+        ...options,
+      }),
+
+    delete: (path, options = {}) =>
+      request(path, { method: 'DELETE', ...options }),
+
+    /** Expose breaker for monitoring */
+    breaker,
+  };
+}
+
+// ============================================================
+// Usage / Integration Demo
+// ============================================================
+
+async function demo() {
+  // ── 1. Create a registry (optional, but recommended for multi-service apps)
+  const registry = new CircuitBreakerRegistry({
+    failureThreshold: 3,
+    cooldownMs: 10_000,
+    requestTimeoutMs: 4_000,
+    successThreshold: 2,
+    monitorWindowMs: 30_000,
+    halfOpenMaxConcurrent: 1,
+
+    // Fallback: return cached/static data when circuit is open
+    fallback: (url, _options, error) => {
+      console.warn(`[Fallback] ${url} → ${error.message}`);
+      return { data: null, cached: true, error: error.message };
+    },
+
+    onStateChange: (from, to, breaker) => {
+      // Hook into your monitoring/alerting system
+      console.log(`[Monitor] ${breaker.name}: ${from} → ${to}`);
+      // e.g. sendMetric('circuit_state', { service: breaker.name, state: to });
+    },
+  });
+
+  // ── 2. Get (or create) a breaker for the "users" service
+  const usersBreaker = registry.get('users-service');
+
+  // ── 3. Wire up the API client
+  const usersApi = createApiClient('https://api.example.com', usersBreaker);
+
+  // ── 4. Subscribe to events for fine-grained observability
+  usersBreaker
+    .on('failure', ({ failuresInWindow }) =>
+      console.log(`Failure recorded. Window failures: ${failuresInWindow}`)
+    )
+    .on('stateChange', ({ from, to, reason }) =>
+      console.log(`State: ${from} → ${to} [${reason}]`)
+    )
+    .on('fallback', ({ url }) =>
+      console.log(`Fallback triggered for: ${url}`)
+    );
+
+  // ── 5. Make requests — the circuit breaker handles everything transparently
+  try {
+    const user = await usersApi.get('/users/42');
+    console.log('User:', user);
+  } catch (err) {
+    if (err instanceof CircuitOpenError) {
+      console.error(`Circuit open! Retry in ${err.retryAfterMs}ms`);
+    } else {
+      console.error('Request failed:', err.message);
+    }
+  }
+
+  // ── 6. Inspect status at any time
+  console.log('Breaker status:', usersBreaker.status());
+  console.log('All breakers:', registry.statusAll());
+
+  // ── 7. Example: simulate failures to trip the circuit
+  await simulateFailures(usersBreaker);
+}
+
+/**
+ * Simulate backend failures to demonstrate state transitions.
+ * Uses a mock adapter instead of real fetch.
+ */
+async function simulateFailures(breaker) {
+  console.log('\n--- Simulation Start ---');
+
+  let callCount = 0;
+
+  // Mock adapter: fails first 6 calls, succeeds after
+  const mockAdapter = async (_url, _options) => {
+    callCount++;
+    if (callCount <= 6) {
+      // Simulate 500 error
+      return new Response(JSON.stringify({ error: 'Internal Server Error' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    // Simulate success
+    return new Response(JSON.stringify({ id: 1, name: 'Alice' }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const testBreaker = new CircuitBreaker(
+    'test',
+    {
+      failureThreshold: 3,
+      cooldownMs: 2_000,   // short for demo
+      successThreshold: 2,
+      requestTimeoutMs: 3_000,
+      fallback: (_url, _opts, err) => ({ fallback: true, reason: err.message }),
+    },
+    mockAdapter
+  );
+
+  const makeCall = async (label) => {
+    try {
+      const result = await testBreaker.execute('https://mock/api/data');
+      console.log(`[${label}] Success:`, result instanceof Response ? await result.json() : result);
+    } catch (err) {
+      console.log(`[${label}] Error: ${err.message}`);
+    }
+    console.log(`  State: ${testBreaker.state}`);
+  };
+
+  // Calls 1-3: failures → circuit opens
+  await makeCall('Call 1');
+  await makeCall('Call 2');
+  await makeCall('Call 3');
+
+  // Call 4: circuit is OPEN → rejected immediately (fallback)
+  await makeCall('Call 4 (should be rejected)');
+
+  // Wait for cooldown
+  console.log('\nWaiting 2.1s for cooldown...\n');
+  await sleep(2_100);
+
+  // Call 5: HALF_OPEN probe → still fails (call 5 of mock = fail)
+  await makeCall('Call 5 (probe, fails → reopen)');
+
+  // Wait again
+  console.log('\nWaiting 2.1s for second cooldown...\n');
+  await sleep(2_100);
+
+  // Calls 6-8: probe succeeds (call 7+ of mock = success) → closes
+  await makeCall('Call 6 (probe, fails once more)');
+  await sleep(2_100);
+  await makeCall('Call 7 (probe, success 1)');
+  await makeCall('Call 8 (success 2 → CLOSED)');
+
+  console.log('\nFinal status:', testBreaker.status());
+  console.log('--- Simulation End ---\n');
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// ============================================================
+// Exports
+// ============================================================
+
+// ES Module exports
+export {
+  CircuitBreaker,
+  CircuitBreakerRegistry,
+  CircuitOpenError,
+  TimeoutError,
+  BackendError,
+  STATE,
+  fetchAdapter,
+  createApiClient,
+  demo,
+};
+
+// Run demo if executed directly (Node.js / browser console)
+// demo().catch(console.error);
+```

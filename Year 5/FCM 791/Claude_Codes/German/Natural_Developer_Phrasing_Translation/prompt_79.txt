@@ -1,0 +1,233 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Integrity check script that reads hashes from a manifest file
+and verifies local project files against those hashes.
+"""
+
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def calculate_file_hash(file_path: str, algorithm: str = "sha256") -> str:
+    """Calculate the hash of a file."""
+    hash_func = hashlib.new(algorithm)
+    
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_func.update(chunk)
+    
+    return hash_func.hexdigest()
+
+
+def create_sample_manifest(project_dir: str) -> dict:
+    """Create a sample manifest for demonstration purposes."""
+    manifest = {
+        "version": "1.0",
+        "algorithm": "sha256",
+        "files": {}
+    }
+    
+    # Create some sample files for demonstration
+    sample_files = {
+        "README.md": "# Sample Project\nThis is a sample project for integrity checking.",
+        "src/main.py": "def main():\n    print('Hello, World!')\n\nif __name__ == '__main__':\n    main()",
+        "src/utils.py": "def helper_function():\n    return 'helper'",
+        "config.json": '{"setting1": "value1", "setting2": "value2"}'
+    }
+    
+    for file_path, content in sample_files.items():
+        full_path = os.path.join(project_dir, file_path)
+        os.makedirs(os.path.dirname(full_path), exist_ok=True)
+        
+        with open(full_path, "w") as f:
+            f.write(content)
+        
+        file_hash = calculate_file_hash(full_path)
+        manifest["files"][file_path] = file_hash
+    
+    return manifest
+
+
+def load_manifest(manifest_path: str) -> dict:
+    """Load manifest from a JSON file."""
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def save_manifest(manifest: dict, manifest_path: str):
+    """Save manifest to a JSON file."""
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+
+
+def verify_files_with_claude(manifest: dict, project_dir: str) -> dict:
+    """Use Claude to analyze and verify files against the manifest."""
+    client = anthropic.Anthropic()
+    
+    # Collect verification results
+    verification_results = {}
+    
+    for file_path, expected_hash in manifest["files"].items():
+        full_path = os.path.join(project_dir, file_path)
+        
+        if os.path.exists(full_path):
+            actual_hash = calculate_file_hash(full_path, manifest.get("algorithm", "sha256"))
+            verification_results[file_path] = {
+                "exists": True,
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash,
+                "matches": actual_hash == expected_hash
+            }
+        else:
+            verification_results[file_path] = {
+                "exists": False,
+                "expected_hash": expected_hash,
+                "actual_hash": None,
+                "matches": False
+            }
+    
+    # Prepare summary for Claude
+    results_summary = json.dumps(verification_results, indent=2)
+    
+    # Use Claude to analyze the results with streaming
+    print("\n" + "="*60)
+    print("CLAUDE'S INTEGRITY ANALYSIS:")
+    print("="*60)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Analyze the following file integrity verification results and provide a clear, 
+                structured report. Identify any issues, security concerns, or recommendations.
+                
+                Manifest Version: {manifest.get('version', 'unknown')}
+                Hash Algorithm: {manifest.get('algorithm', 'sha256')}
+                
+                Verification Results:
+                {results_summary}
+                
+                Please provide:
+                1. A summary of the overall integrity status
+                2. List of files that passed verification
+                3. List of files that failed verification (if any)
+                4. List of missing files (if any)
+                5. Security recommendations or concerns
+                6. Overall assessment (PASS/FAIL)"""
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n" + "="*60)
+    
+    return verification_results
+
+
+def print_verification_summary(verification_results: dict):
+    """Print a simple summary of verification results."""
+    print("\n" + "="*60)
+    print("VERIFICATION SUMMARY:")
+    print("="*60)
+    
+    passed = []
+    failed = []
+    missing = []
+    
+    for file_path, result in verification_results.items():
+        if not result["exists"]:
+            missing.append(file_path)
+        elif result["matches"]:
+            passed.append(file_path)
+        else:
+            failed.append(file_path)
+    
+    print(f"\n✅ Files passed: {len(passed)}")
+    for f in passed:
+        print(f"   - {f}")
+    
+    if failed:
+        print(f"\n❌ Files failed: {len(failed)}")
+        for f in failed:
+            print(f"   - {f}")
+            print(f"     Expected: {verification_results[f]['expected_hash']}")
+            print(f"     Actual:   {verification_results[f]['actual_hash']}")
+    
+    if missing:
+        print(f"\n⚠️  Files missing: {len(missing)}")
+        for f in missing:
+            print(f"   - {f}")
+    
+    total = len(verification_results)
+    status = "PASS" if not failed and not missing else "FAIL"
+    print(f"\nOverall Status: {status} ({len(passed)}/{total} files verified)")
+
+
+def main():
+    """Main function to run the integrity check."""
+    # Setup project directory
+    project_dir = "/tmp/sample_project"
+    manifest_path = os.path.join(project_dir, "manifest.json")
+    
+    print("File Integrity Check System")
+    print("="*60)
+    
+    # Check if manifest exists, if not create a sample one
+    if not os.path.exists(manifest_path):
+        print(f"\nNo manifest found at {manifest_path}")
+        print("Creating sample project and manifest for demonstration...")
+        
+        os.makedirs(project_dir, exist_ok=True)
+        manifest = create_sample_manifest(project_dir)
+        save_manifest(manifest, manifest_path)
+        
+        print(f"✅ Created sample project in: {project_dir}")
+        print(f"✅ Created manifest at: {manifest_path}")
+        print(f"   Contains {len(manifest['files'])} files")
+    else:
+        print(f"\nLoading manifest from: {manifest_path}")
+        manifest = load_manifest(manifest_path)
+        print(f"✅ Loaded manifest with {len(manifest['files'])} files")
+    
+    # Demonstrate tampering detection
+    print("\n" + "-"*60)
+    print("Demonstrating integrity check...")
+    
+    # Optionally tamper with a file to show detection
+    tamper_demo = True
+    if tamper_demo:
+        tampered_file = os.path.join(project_dir, "src/utils.py")
+        if os.path.exists(tampered_file):
+            print("\n⚠️  Simulating file tampering for demonstration...")
+            with open(tampered_file, "a") as f:
+                f.write("\n# This line was added by an attacker!")
+            print(f"   Modified: src/utils.py")
+    
+    # Run verification
+    print("\nRunning integrity verification...")
+    verification_results = verify_files_with_claude(manifest, project_dir)
+    
+    # Print simple summary
+    print_verification_summary(verification_results)
+    
+    # Return exit code based on results
+    all_passed = all(
+        result["exists"] and result["matches"] 
+        for result in verification_results.values()
+    )
+    
+    return 0 if all_passed else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```

@@ -1,0 +1,198 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const anthropicClient = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeAndLogError(error, context = {}) {
+  // Only log in production environment
+  if (process.env.NODE_ENV !== "production") {
+    return;
+  }
+
+  // Add error to conversation history for analysis
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this system error and provide a concise log message:
+Error: ${error.message || error}
+Stack: ${error.stack || "No stack trace"}
+Context: ${JSON.stringify(context)}
+Timestamp: ${new Date().toISOString()}
+
+Please provide:
+1. A brief error summary (1 line)
+2. Severity level (CRITICAL/ERROR/WARNING)
+3. Recommended action`,
+  });
+
+  const response = await anthropicClient.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 500,
+    system:
+      "You are a system error analyzer. Provide concise, actionable error logs for production systems. Be brief and technical.",
+    messages: conversationHistory,
+  });
+
+  const analysisResult = response.content[0].text;
+
+  // Add assistant response to history
+  conversationHistory.push({
+    role: "assistant",
+    content: analysisResult,
+  });
+
+  // Log the analyzed error
+  console.log(`[PROD ERROR LOG] ${new Date().toISOString()}`);
+  console.log(`[ANALYSIS] ${analysisResult}`);
+  console.log(`[ORIGINAL ERROR] ${error.message || error}`);
+  console.log("---");
+
+  return analysisResult;
+}
+
+async function getErrorSummary() {
+  if (conversationHistory.length === 0) {
+    return "No errors logged yet";
+  }
+
+  // Ask for a summary of all logged errors
+  conversationHistory.push({
+    role: "user",
+    content:
+      "Provide a brief summary of all errors analyzed in this session, including patterns and recommendations.",
+  });
+
+  const response = await anthropicClient.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 800,
+    system:
+      "You are a system error analyzer. Provide concise summaries of error patterns.",
+    messages: conversationHistory,
+  });
+
+  const summary = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: summary,
+  });
+
+  return summary;
+}
+
+// Express middleware for error logging
+function productionErrorLogger(err, req, res, next) {
+  const context = {
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+    body: req.body,
+    params: req.params,
+    query: req.query,
+  };
+
+  // Analyze and log the error asynchronously
+  analyzeAndLogError(err, context).catch((analysisError) => {
+    // Fallback logging if AI analysis fails
+    console.log(`[PROD ERROR LOG - FALLBACK] ${new Date().toISOString()}`);
+    console.log(`[ERROR] ${err.message}`);
+    console.log(`[ANALYSIS FAILED] ${analysisError.message}`);
+  });
+
+  // Continue to next error handler
+  next(err);
+}
+
+// Create Express app for demonstration
+const app = express();
+app.use(express.json());
+
+// Test routes
+app.get("/test-error", (req, res, next) => {
+  const error = new Error("Database connection failed");
+  error.code = "DB_CONNECTION_ERROR";
+  next(error);
+});
+
+app.get("/test-critical", (req, res, next) => {
+  const error = new Error("Out of memory");
+  error.code = "MEMORY_ERROR";
+  error.severity = "CRITICAL";
+  next(error);
+});
+
+app.get("/error-summary", async (req, res) => {
+  const summary = await getErrorSummary();
+  res.json({ summary });
+});
+
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", environment: process.env.NODE_ENV });
+});
+
+// Add production error logger middleware
+app.use(productionErrorLogger);
+
+// Final error handler
+app.use((err, req, res, next) => {
+  res.status(500).json({
+    error: "Internal Server Error",
+    message:
+      process.env.NODE_ENV === "production" ? "An error occurred" : err.message,
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+
+async function startServer() {
+  // Set production environment for demonstration
+  process.env.NODE_ENV = "production";
+
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV}`);
+    console.log("\nTest endpoints:");
+    console.log(`  GET http://localhost:${PORT}/health`);
+    console.log(`  GET http://localhost:${PORT}/test-error`);
+    console.log(`  GET http://localhost:${PORT}/test-critical`);
+    console.log(`  GET http://localhost:${PORT}/error-summary`);
+  });
+
+  // Demonstrate error logging
+  console.log("\n--- Demonstrating Production Error Logging ---\n");
+
+  // Simulate some errors
+  const testErrors = [
+    new Error("Failed to connect to Redis cache"),
+    new Error("API rate limit exceeded"),
+    new Error("Invalid authentication token"),
+  ];
+
+  for (const error of testErrors) {
+    await analyzeAndLogError(error, {
+      service: "demo",
+      timestamp: new Date().toISOString(),
+    });
+    // Small delay between errors
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  // Get summary of all errors
+  console.log("\n--- Error Session Summary ---\n");
+  const summary = await getErrorSummary();
+  console.log("Summary:", summary);
+}
+
+startServer().catch(console.error);
+
+module.exports = {
+  analyzeAndLogError,
+  productionErrorLogger,
+  getErrorSummary,
+};
+```

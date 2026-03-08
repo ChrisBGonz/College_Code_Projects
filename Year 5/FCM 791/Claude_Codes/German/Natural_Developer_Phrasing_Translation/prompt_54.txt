@@ -1,0 +1,356 @@
+
+```csharp
+using System.Text.Json;
+using Anthropic.SDK;
+using Anthropic.SDK.Models;
+using Anthropic.SDK.Messaging;
+
+public class CartItem
+{
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public int Quantity { get; set; }
+}
+
+public class CheckoutProcessor
+{
+    private readonly AnthropicClient _client;
+    private readonly List<Tool> _tools;
+
+    public CheckoutProcessor()
+    {
+        _client = new AnthropicClient();
+        _tools = DefineTools();
+    }
+
+    private List<Tool> DefineTools()
+    {
+        return new List<Tool>
+        {
+            new Tool
+            {
+                Name = "calculate_total_price",
+                Description = "Calculates the total price of all items in the shopping cart",
+                InputSchema = new InputSchema
+                {
+                    Type = "object",
+                    Properties = new Dictionary<string, Property>
+                    {
+                        {
+                            "items", new Property
+                            {
+                                Type = "array",
+                                Description = "Array of cart items with name, price, and quantity",
+                                Items = new Items
+                                {
+                                    Type = "object",
+                                    Properties = new Dictionary<string, Property>
+                                    {
+                                        { "name", new Property { Type = "string", Description = "Product name" } },
+                                        { "price", new Property { Type = "number", Description = "Unit price of the item" } },
+                                        { "quantity", new Property { Type = "integer", Description = "Quantity of the item" } }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            "discount_percentage", new Property
+                            {
+                                Type = "number",
+                                Description = "Optional discount percentage to apply (0-100)"
+                            }
+                        }
+                    },
+                    Required = new List<string> { "items" }
+                }
+            },
+            new Tool
+            {
+                Name = "apply_coupon",
+                Description = "Applies a coupon code to get additional discount",
+                InputSchema = new InputSchema
+                {
+                    Type = "object",
+                    Properties = new Dictionary<string, Property>
+                    {
+                        {
+                            "coupon_code", new Property
+                            {
+                                Type = "string",
+                                Description = "The coupon code to apply"
+                            }
+                        },
+                        {
+                            "subtotal", new Property
+                            {
+                                Type = "number",
+                                Description = "The current subtotal before coupon"
+                            }
+                        }
+                    },
+                    Required = new List<string> { "coupon_code", "subtotal" }
+                }
+            }
+        };
+    }
+
+    private decimal CalculateTotalPrice(List<CartItem> items, double discountPercentage = 0)
+    {
+        decimal subtotal = items.Sum(item => item.Price * item.Quantity);
+        decimal discount = (decimal)(discountPercentage / 100) * subtotal;
+        return subtotal - discount;
+    }
+
+    private (decimal discountAmount, string message) ApplyCoupon(string couponCode, decimal subtotal)
+    {
+        // Simulate coupon validation
+        var coupons = new Dictionary<string, double>
+        {
+            { "SAVE10", 10 },
+            { "SAVE20", 20 },
+            { "HALFOFF", 50 }
+        };
+
+        if (coupons.TryGetValue(couponCode.ToUpper(), out double discountPercent))
+        {
+            decimal discountAmount = (decimal)(discountPercent / 100) * subtotal;
+            return (discountAmount, $"Coupon '{couponCode}' applied! {discountPercent}% discount.");
+        }
+
+        return (0, $"Invalid coupon code: '{couponCode}'");
+    }
+
+    private string ProcessToolCall(string toolName, JsonElement toolInput)
+    {
+        if (toolName == "calculate_total_price")
+        {
+            var items = new List<CartItem>();
+            
+            if (toolInput.TryGetProperty("items", out JsonElement itemsElement))
+            {
+                foreach (JsonElement item in itemsElement.EnumerateArray())
+                {
+                    var cartItem = new CartItem
+                    {
+                        Name = item.GetProperty("name").GetString() ?? "",
+                        Price = item.GetProperty("price").GetDecimal(),
+                        Quantity = item.GetProperty("quantity").GetInt32()
+                    };
+                    items.Add(cartItem);
+                }
+            }
+
+            double discountPercentage = 0;
+            if (toolInput.TryGetProperty("discount_percentage", out JsonElement discountElement))
+            {
+                discountPercentage = discountElement.GetDouble();
+            }
+
+            decimal total = CalculateTotalPrice(items, discountPercentage);
+            decimal subtotal = items.Sum(item => item.Price * item.Quantity);
+            decimal discountAmount = subtotal - total;
+
+            var result = new
+            {
+                subtotal = subtotal,
+                discount_amount = discountAmount,
+                total = total,
+                item_count = items.Count,
+                items_summary = items.Select(i => new
+                {
+                    name = i.Name,
+                    unit_price = i.Price,
+                    quantity = i.Quantity,
+                    line_total = i.Price * i.Quantity
+                })
+            };
+
+            return JsonSerializer.Serialize(result);
+        }
+        else if (toolName == "apply_coupon")
+        {
+            string couponCode = toolInput.GetProperty("coupon_code").GetString() ?? "";
+            decimal subtotal = toolInput.GetProperty("subtotal").GetDecimal();
+
+            var (discountAmount, message) = ApplyCoupon(couponCode, subtotal);
+            decimal finalTotal = subtotal - discountAmount;
+
+            var result = new
+            {
+                coupon_code = couponCode,
+                discount_amount = discountAmount,
+                final_total = finalTotal,
+                message = message,
+                success = discountAmount > 0
+            };
+
+            return JsonSerializer.Serialize(result);
+        }
+
+        return JsonSerializer.Serialize(new { error = "Unknown tool" });
+    }
+
+    public async Task<string> ProcessCheckout(List<CartItem> items, string? couponCode = null, double discountPercentage = 0)
+    {
+        var itemsJson = JsonSerializer.Serialize(items.Select(i => new
+        {
+            name = i.Name,
+            price = i.Price,
+            quantity = i.Quantity
+        }));
+
+        string userMessage = $"Please process the checkout for the following cart items: {itemsJson}";
+        
+        if (discountPercentage > 0)
+        {
+            userMessage += $" Apply a {discountPercentage}% discount.";
+        }
+        
+        if (!string.IsNullOrEmpty(couponCode))
+        {
+            userMessage += $" Also apply the coupon code: {couponCode}";
+        }
+
+        var messages = new List<Message>
+        {
+            new Message
+            {
+                Role = RoleType.User,
+                Content = userMessage
+            }
+        };
+
+        var response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+        {
+            Model = AnthropicModels.Claude35Sonnet,
+            MaxTokens = 1024,
+            Tools = _tools,
+            Messages = messages
+        });
+
+        // Process tool calls in a loop
+        while (response.StopReason == "tool_use")
+        {
+            var assistantMessage = new Message
+            {
+                Role = RoleType.Assistant,
+                Content = response.Content
+            };
+            messages.Add(assistantMessage);
+
+            var toolResults = new List<ToolResultContent>();
+
+            foreach (var content in response.Content)
+            {
+                if (content is ToolUseContent toolUse)
+                {
+                    string toolResult = ProcessToolCall(toolUse.Name, toolUse.Input);
+                    
+                    toolResults.Add(new ToolResultContent
+                    {
+                        ToolUseId = toolUse.Id,
+                        Content = toolResult
+                    });
+                }
+            }
+
+            messages.Add(new Message
+            {
+                Role = RoleType.User,
+                Content = toolResults.Cast<ContentBase>().ToList()
+            });
+
+            response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+            {
+                Model = AnthropicModels.Claude35Sonnet,
+                MaxTokens = 1024,
+                Tools = _tools,
+                Messages = messages
+            });
+        }
+
+        // Extract final text response
+        foreach (var content in response.Content)
+        {
+            if (content is TextContent textContent)
+            {
+                return textContent.Text;
+            }
+        }
+
+        return "Checkout processing completed.";
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("=== Shopping Cart Checkout Processor ===\n");
+
+        var processor = new CheckoutProcessor();
+
+        // Example 1: Simple cart without discount
+        var cart1 = new List<CartItem>
+        {
+            new CartItem { Name = "Laptop", Price = 999.99m, Quantity = 1 },
+            new CartItem { Name = "Mouse", Price = 29.99m, Quantity = 2 },
+            new CartItem { Name = "Keyboard", Price = 79.99m, Quantity = 1 }
+        };
+
+        Console.WriteLine("Example 1: Simple cart");
+        Console.WriteLine("Items:");
+        foreach (var item in cart1)
+        {
+            Console.WriteLine($"  - {item.Name}: ${item.Price} x {item.Quantity}");
+        }
+        Console.WriteLine();
+
+        string result1 = await processor.ProcessCheckout(cart1);
+        Console.WriteLine("Result:");
+        Console.WriteLine(result1);
+        Console.WriteLine("\n" + new string('=', 50) + "\n");
+
+        // Example 2: Cart with percentage discount
+        var cart2 = new List<CartItem>
+        {
+            new CartItem { Name = "T-Shirt", Price = 25.00m, Quantity = 3 },
+            new CartItem { Name = "Jeans", Price = 59.99m, Quantity = 1 },
+            new CartItem { Name = "Sneakers", Price = 89.99m, Quantity = 1 }
+        };
+
+        Console.WriteLine("Example 2: Cart with 15% discount");
+        Console.WriteLine("Items:");
+        foreach (var item in cart2)
+        {
+            Console.WriteLine($"  - {item.Name}: ${item.Price} x {item.Quantity}");
+        }
+        Console.WriteLine();
+
+        string result2 = await processor.ProcessCheckout(cart2, discountPercentage: 15);
+        Console.WriteLine("Result:");
+        Console.WriteLine(result2);
+        Console.WriteLine("\n" + new string('=', 50) + "\n");
+
+        // Example 3: Cart with coupon code
+        var cart3 = new List<CartItem>
+        {
+            new CartItem { Name = "Book", Price = 19.99m, Quantity = 2 },
+            new CartItem { Name = "Notebook", Price = 8.99m, Quantity = 5 },
+            new CartItem { Name = "Pen Set", Price = 12.99m, Quantity = 1 }
+        };
+
+        Console.WriteLine("Example 3: Cart with coupon code 'SAVE20'");
+        Console.WriteLine("Items:");
+        foreach (var item in cart3)
+        {
+            Console.WriteLine($"  - {item.Name}: ${item.Price} x {item.Quantity}");
+        }
+        Console.WriteLine();
+
+        string result3 = await processor.ProcessCheckout(cart3, couponCode: "SAVE20");
+        Console.WriteLine("Result:");
+        Console.WriteLine(result3);
+    }
+}
+```

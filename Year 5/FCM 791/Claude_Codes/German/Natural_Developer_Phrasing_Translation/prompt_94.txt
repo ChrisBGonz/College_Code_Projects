@@ -1,0 +1,249 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import express from "express";
+import { Request, Response, NextFunction } from "express";
+
+const client = new Anthropic();
+
+// Custom error classes
+class AppError extends Error {
+  statusCode: number;
+  isOperational: boolean;
+
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = true;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+// Error analysis using Claude AI
+async function analyzeErrorWithClaude(error: Error): Promise<string> {
+  const conversation = [
+    {
+      role: "user" as const,
+      content: `Analyze this error and provide a brief, user-friendly explanation and potential fix:
+      
+Error Name: ${error.name}
+Error Message: ${error.message}
+Stack Trace: ${error.stack?.substring(0, 500) || "No stack trace available"}
+
+Please provide:
+1. A brief explanation of what went wrong
+2. Whether this is likely a client error (4xx) or server error (5xx)
+3. A suggested fix or next steps`,
+    },
+  ];
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 500,
+    messages: conversation,
+  });
+
+  const firstContent = response.content[0];
+  if (firstContent.type === "text") {
+    return firstContent.text;
+  }
+  return "Unable to analyze error";
+}
+
+// Global error handler middleware
+async function globalErrorHandler(
+  err: Error | AppError,
+  req: Request,
+  res: Response,
+  _next: NextFunction
+): Promise<void> {
+  // Default error values
+  let statusCode = 500;
+  let status = "error";
+  let message = "Internal Server Error";
+  let aiAnalysis: string | undefined;
+
+  // Handle known operational errors
+  if (err instanceof AppError) {
+    statusCode = err.statusCode;
+    status = statusCode >= 400 && statusCode < 500 ? "fail" : "error";
+    message = err.message;
+  }
+
+  // Handle specific error types
+  if (err.name === "ValidationError") {
+    statusCode = 400;
+    status = "fail";
+    message = err.message;
+  } else if (err.name === "CastError") {
+    statusCode = 400;
+    status = "fail";
+    message = "Invalid data format";
+  } else if (err.name === "JsonWebTokenError") {
+    statusCode = 401;
+    status = "fail";
+    message = "Invalid token";
+  } else if (err.name === "TokenExpiredError") {
+    statusCode = 401;
+    status = "fail";
+    message = "Token expired";
+  }
+
+  // Log error
+  console.error("Error caught by global handler:", {
+    name: err.name,
+    message: err.message,
+    statusCode,
+    stack: err.stack,
+    url: req.url,
+    method: req.method,
+    timestamp: new Date().toISOString(),
+  });
+
+  // Get AI analysis for server errors in development
+  if (process.env.NODE_ENV !== "production" && statusCode >= 500) {
+    try {
+      aiAnalysis = await analyzeErrorWithClaude(err);
+    } catch (aiError) {
+      console.error("Failed to get AI analysis:", aiError);
+    }
+  }
+
+  // Send error response
+  const errorResponse: {
+    status: string;
+    message: string;
+    error?: {
+      name: string;
+      stack?: string;
+    };
+    aiAnalysis?: string;
+    timestamp: string;
+    path: string;
+  } = {
+    status,
+    message,
+    timestamp: new Date().toISOString(),
+    path: req.url,
+  };
+
+  // Include additional details in development
+  if (process.env.NODE_ENV !== "production") {
+    errorResponse.error = {
+      name: err.name,
+      stack: err.stack,
+    };
+
+    if (aiAnalysis) {
+      errorResponse.aiAnalysis = aiAnalysis;
+    }
+  }
+
+  res.status(statusCode).json(errorResponse);
+}
+
+// Async error wrapper
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<void>
+) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    fn(req, res, next).catch(next);
+  };
+}
+
+// Setup Express app
+const app = express();
+app.use(express.json());
+
+// Test routes
+app.get("/", (_req: Request, res: Response) => {
+  res.json({
+    message: "Global Error Handler Demo",
+    routes: [
+      "/error/operational - Operational error (404)",
+      "/error/validation - Validation error (400)",
+      "/error/server - Server error (500)",
+      "/error/async - Async error",
+      "/error/unhandled - Unhandled promise rejection",
+    ],
+  });
+});
+
+app.get(
+  "/error/operational",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    throw new AppError("Resource not found", 404);
+  })
+);
+
+app.get(
+  "/error/validation",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    const error = new Error("Invalid email format");
+    error.name = "ValidationError";
+    throw error;
+  })
+);
+
+app.get(
+  "/error/server",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    throw new Error("Database connection failed");
+  })
+);
+
+app.get(
+  "/error/async",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    await new Promise<void>((_resolve, reject) => {
+      setTimeout(() => reject(new Error("Async operation failed")), 100);
+    });
+  })
+);
+
+app.get("/error/unhandled", (_req: Request, _res: Response) => {
+  // This creates an unhandled rejection
+  Promise.reject(new Error("Unhandled promise rejection"));
+  _res.json({ message: "Check console for unhandled rejection" });
+});
+
+// 404 handler for unknown routes
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  next(new AppError(`Route ${req.url} not found`, 404));
+});
+
+// Register global error handler (must be last)
+app.use(
+  (err: Error, req: Request, res: Response, next: NextFunction): void => {
+    globalErrorHandler(err, req, res, next);
+  }
+);
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason: Error) => {
+  console.error("UNHANDLED REJECTION:", reason);
+  // In production, you might want to gracefully shutdown
+  // process.exit(1);
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", (error: Error) => {
+  console.error("UNCAUGHT EXCEPTION:", error);
+  // Graceful shutdown
+  process.exit(1);
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log("\nTest the error handler:");
+  console.log(`  curl http://localhost:${PORT}/error/operational`);
+  console.log(`  curl http://localhost:${PORT}/error/validation`);
+  console.log(`  curl http://localhost:${PORT}/error/server`);
+  console.log(`  curl http://localhost:${PORT}/error/async`);
+});
+
+export { app, AppError, globalErrorHandler, asyncHandler };
+```

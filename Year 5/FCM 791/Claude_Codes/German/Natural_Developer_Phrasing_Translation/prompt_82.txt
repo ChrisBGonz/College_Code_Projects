@@ -1,0 +1,371 @@
+```javascript
+const express = require('express');
+const multer = require('multer');
+const getRawBody = require('raw-body');
+const contentType = require('content-type');
+const { v4: uuidv4 } = require('uuid');
+
+// ─── Logger ──────────────────────────────────────────────────────────────────
+
+function createLogger(options = {}) {
+  const {
+    logLevel = 'debug',
+    prettyPrint = process.env.NODE_ENV !== 'production',
+    maxBodyLength = 10_000,
+    redactHeaders = ['authorization', 'cookie', 'x-api-key'],
+    redactFields = ['password', 'token', 'secret', 'creditCard'],
+    outputStream = process.stdout,
+  } = options;
+
+  const LEVELS = { debug: 0, info: 1, warn: 2, error: 3 };
+  const currentLevel = LEVELS[logLevel] ?? 0;
+
+  function redactObject(obj, fields) {
+    if (!obj || typeof obj !== 'object') return obj;
+    const result = Array.isArray(obj) ? [] : {};
+    for (const [key, value] of Object.entries(obj)) {
+      if (fields.some((f) => key.toLowerCase().includes(f.toLowerCase()))) {
+        result[key] = '[REDACTED]';
+      } else if (typeof value === 'object' && value !== null) {
+        result[key] = redactObject(value, fields);
+      } else {
+        result[key] = value;
+      }
+    }
+    return result;
+  }
+
+  function redactHeaders_(headers) {
+    const result = { ...headers };
+    for (const h of redactHeaders) {
+      if (result[h]) result[h] = '[REDACTED]';
+    }
+    return result;
+  }
+
+  function truncate(str, max) {
+    if (typeof str !== 'string') return str;
+    if (str.length <= max) return str;
+    return str.slice(0, max) + `… [truncated ${str.length - max} chars]`;
+  }
+
+  function write(level, entry) {
+    if (LEVELS[level] < currentLevel) return;
+    const record = {
+      timestamp: new Date().toISOString(),
+      level,
+      ...entry,
+    };
+    const output = prettyPrint
+      ? JSON.stringify(record, null, 2)
+      : JSON.stringify(record);
+    outputStream.write(output + '\n');
+  }
+
+  return { write, redactObject, redactHeaders_, truncate, maxBodyLength };
+}
+
+// ─── Body Capture ─────────────────────────────────────────────────────────────
+
+async function captureBody(req, logger) {
+  const ct = req.headers['content-type'] || '';
+  const result = {
+    contentType: ct,
+    raw: null,
+    parsed: null,
+    parseError: null,
+    isMultipart: false,
+  };
+
+  // Already parsed by a previous middleware (e.g. express.json())
+  if (req.body !== undefined && req._rawBody !== undefined) {
+    result.raw = req._rawBody.toString('utf8');
+    result.parsed = req.body;
+    return result;
+  }
+
+  // Multipart – handled separately via multer
+  if (ct.includes('multipart/form-data')) {
+    result.isMultipart = true;
+    result.parsed = {
+      fields: req.body || {},
+      files: formatFiles(req.files || []),
+    };
+    return result;
+  }
+
+  // Read raw bytes from stream (works even if body-parser already consumed it
+  // because we attach rawBody in the verify callback)
+  let rawBuffer;
+  if (req._rawBody) {
+    rawBuffer = req._rawBody;
+  } else {
+    try {
+      const encoding = (() => {
+        try {
+          return contentType.parse(req).parameters.charset || 'utf-8';
+        } catch {
+          return 'utf-8';
+        }
+      })();
+      rawBuffer = await getRawBody(req, {
+        length: req.headers['content-length'],
+        limit: '10mb',
+        encoding,
+      });
+    } catch (err) {
+      result.parseError = `raw-body read error: ${err.message}`;
+      return result;
+    }
+  }
+
+  result.raw = logger.truncate(rawBuffer.toString('utf8'), logger.maxBodyLength);
+
+  // Parse based on content-type
+  if (ct.includes('application/json')) {
+    try {
+      result.parsed = JSON.parse(rawBuffer.toString('utf8'));
+      result.parsed = logger.redactObject(result.parsed, []);
+    } catch (err) {
+      result.parseError = `JSON parse error: ${err.message}`;
+    }
+  } else if (ct.includes('application/x-www-form-urlencoded')) {
+    try {
+      const params = new URLSearchParams(rawBuffer.toString('utf8'));
+      result.parsed = Object.fromEntries(params.entries());
+    } catch (err) {
+      result.parseError = `URLEncoded parse error: ${err.message}`;
+    }
+  } else if (ct.includes('text/')) {
+    result.parsed = result.raw;
+  } else {
+    result.parsed = `[binary or unknown content-type: ${ct}]`;
+  }
+
+  return result;
+}
+
+function formatFiles(files) {
+  if (!files) return [];
+  const arr = Array.isArray(files) ? files : Object.values(files).flat();
+  return arr.map((f) => ({
+    fieldname: f.fieldname,
+    originalname: f.originalname,
+    mimetype: f.mimetype,
+    size: f.size,
+    encoding: f.encoding,
+    destination: f.destination,
+    filename: f.filename,
+    path: f.path,
+    buffer: f.buffer ? `[Buffer ${f.buffer.length} bytes]` : undefined,
+  }));
+}
+
+// ─── Middleware Factory ───────────────────────────────────────────────────────
+
+function requestLogger(options = {}) {
+  const logger = createLogger(options);
+
+  // multer for multipart (memory storage – adjust for production)
+  const upload = multer({ storage: multer.memoryStorage() });
+
+  // verify callback for body-parser to capture raw bytes
+  function verifyRawBody(req, _res, buf) {
+    req._rawBody = buf;
+  }
+
+  // Built-in body parsers with raw-body hook
+  const jsonParser = express.json({
+    limit: '10mb',
+    strict: false,
+    verify: verifyRawBody,
+  });
+
+  const urlencodedParser = express.urlencoded({
+    extended: true,
+    limit: '10mb',
+    verify: verifyRawBody,
+  });
+
+  // Multipart middleware (any field, any file)
+  const multipartParser = upload.any();
+
+  return [
+    // 1. Assign request ID early
+    (req, _res, next) => {
+      req.requestId = req.headers['x-request-id'] || uuidv4();
+      req._startTime = process.hrtime.bigint();
+      next();
+    },
+
+    // 2. Conditionally apply body parsers
+    (req, res, next) => {
+      const ct = req.headers['content-type'] || '';
+
+      if (ct.includes('multipart/form-data')) {
+        multipartParser(req, res, next);
+      } else if (ct.includes('application/json')) {
+        jsonParser(req, res, next);
+      } else if (ct.includes('application/x-www-form-urlencoded')) {
+        urlencodedParser(req, res, next);
+      } else {
+        next();
+      }
+    },
+
+    // 3. Capture & log
+    async (req, res, next) => {
+      let bodyInfo;
+      try {
+        bodyInfo = await captureBody(req, logger);
+      } catch (err) {
+        bodyInfo = { parseError: err.message };
+      }
+
+      const safeHeaders = logger.redactHeaders_(req.headers);
+
+      const entry = {
+        event: 'incoming_request',
+        requestId: req.requestId,
+        request: {
+          method: req.method,
+          url: req.url,
+          path: req.path,
+          baseUrl: req.baseUrl,
+          originalUrl: req.originalUrl,
+          httpVersion: req.httpVersion,
+          protocol: req.protocol,
+          hostname: req.hostname,
+          ip: req.ip || req.socket?.remoteAddress,
+          ips: req.ips,
+          query: req.query,
+          params: req.params,
+          headers: safeHeaders,
+          body: {
+            contentType: bodyInfo.contentType,
+            raw: bodyInfo.raw,
+            parsed: bodyInfo.isMultipart
+              ? bodyInfo.parsed
+              : logger.redactObject(bodyInfo.parsed, options.redactFields || []),
+            parseError: bodyInfo.parseError,
+            isMultipart: bodyInfo.isMultipart,
+          },
+        },
+      };
+
+      logger.write('debug', entry);
+
+      // Optionally log response when finished
+      if (options.logResponse !== false) {
+        const originalEnd = res.end.bind(res);
+        const chunks = [];
+
+        res.write = (chunk, ...args) => {
+          if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          return res.write.__original.call(res, chunk, ...args);
+        };
+        res.write.__original = res.write;
+
+        res.end = (chunk, ...args) => {
+          if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+
+          const durationMs = Number(process.hrtime.bigint() - req._startTime) / 1e6;
+          const responseBody = Buffer.concat(chunks).toString('utf8');
+
+          const responseEntry = {
+            event: 'outgoing_response',
+            requestId: req.requestId,
+            response: {
+              statusCode: res.statusCode,
+              statusMessage: res.statusMessage,
+              headers: res.getHeaders(),
+              body: logger.truncate(responseBody, logger.maxBodyLength),
+              durationMs: Math.round(durationMs * 100) / 100,
+            },
+          };
+
+          logger.write('debug', responseEntry);
+          return originalEnd(chunk, ...args);
+        };
+      }
+
+      next();
+    },
+  ];
+}
+
+// ─── Demo App ─────────────────────────────────────────────────────────────────
+
+const app = express();
+
+app.use(
+  requestLogger({
+    logLevel: 'debug',
+    prettyPrint: true,
+    maxBodyLength: 5_000,
+    redactHeaders: ['authorization', 'cookie', 'x-api-key'],
+    redactFields: ['password', 'token', 'secret'],
+    logResponse: true,
+  })
+);
+
+// ── Routes ──
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime() });
+});
+
+app.post('/json', (req, res) => {
+  res.json({ received: req.body });
+});
+
+app.post('/form', (req, res) => {
+  res.json({ received: req.body });
+});
+
+app.post('/upload', (req, res) => {
+  res.json({
+    fields: req.body,
+    files: (req.files || []).map((f) => ({
+      name: f.originalname,
+      size: f.size,
+      mime: f.mimetype,
+    })),
+  });
+});
+
+app.get('/echo', (req, res) => {
+  res.json({
+    query: req.query,
+    headers: req.headers,
+  });
+});
+
+// 404 fallback
+app.use((_req, res) => {
+  res.status(404).json({ error: 'Not Found' });
+});
+
+// Error handler
+// eslint-disable-next-line no-unused-vars
+app.use((err, _req, res, _next) => {
+  console.error(err);
+  res.status(500).json({ error: err.message });
+});
+
+// ─── Start ────────────────────────────────────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Debug logger running on http://localhost:${PORT}`);
+  console.log('');
+  console.log('Test endpoints:');
+  console.log(`  GET  http://localhost:${PORT}/health`);
+  console.log(`  GET  http://localhost:${PORT}/echo?foo=bar`);
+  console.log(`  POST http://localhost:${PORT}/json          (application/json)`);
+  console.log(`  POST http://localhost:${PORT}/form          (application/x-www-form-urlencoded)`);
+  console.log(`  POST http://localhost:${PORT}/upload        (multipart/form-data)`);
+});
+
+module.exports = { requestLogger, createLogger };
+```

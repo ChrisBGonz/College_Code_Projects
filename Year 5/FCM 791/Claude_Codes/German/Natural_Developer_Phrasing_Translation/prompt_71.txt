@@ -1,0 +1,268 @@
+
+```python
+import anthropic
+import pickle
+import os
+import json
+from datetime import datetime
+
+client = anthropic.Anthropic()
+
+def create_game_state(user_id: str, character_name: str, level: int = 1) -> dict:
+    """Create a complex game state object for a user."""
+    return {
+        "user_id": user_id,
+        "character": {
+            "name": character_name,
+            "level": level,
+            "experience": 0,
+            "health": 100,
+            "max_health": 100,
+            "mana": 50,
+            "max_mana": 50,
+            "stats": {
+                "strength": 10,
+                "dexterity": 10,
+                "intelligence": 10,
+                "vitality": 10
+            }
+        },
+        "inventory": {
+            "gold": 100,
+            "items": [
+                {"id": 1, "name": "Iron Sword", "type": "weapon", "damage": 15},
+                {"id": 2, "name": "Leather Armor", "type": "armor", "defense": 10},
+                {"id": 3, "name": "Health Potion", "type": "consumable", "heal": 50, "quantity": 3}
+            ],
+            "equipped": {
+                "weapon": 1,
+                "armor": 2
+            }
+        },
+        "quests": {
+            "active": [
+                {"id": "q001", "name": "The Lost Artifact", "progress": 0, "total": 5}
+            ],
+            "completed": []
+        },
+        "world": {
+            "current_location": "Starting Village",
+            "discovered_locations": ["Starting Village", "Forest Path"],
+            "coordinates": {"x": 0, "y": 0}
+        },
+        "achievements": [],
+        "settings": {
+            "difficulty": "normal",
+            "sound_enabled": True,
+            "music_volume": 0.7
+        },
+        "timestamps": {
+            "created": datetime.now().isoformat(),
+            "last_saved": None,
+            "play_time_seconds": 0
+        }
+    }
+
+def save_game_state(game_state: dict, filename: str) -> str:
+    """Serialize and save game state to a file using pickle."""
+    game_state["timestamps"]["last_saved"] = datetime.now().isoformat()
+    
+    with open(filename, 'wb') as f:
+        pickle.dump(game_state, f, protocol=pickle.HIGHEST_PROTOCOL)
+    
+    file_size = os.path.getsize(filename)
+    return f"Game saved successfully to '{filename}' ({file_size} bytes)"
+
+def load_game_state(filename: str) -> dict:
+    """Deserialize and load game state from a file using pickle."""
+    if not os.path.exists(filename):
+        raise FileNotFoundError(f"Save file '{filename}' not found")
+    
+    with open(filename, 'rb') as f:
+        game_state = pickle.load(f)
+    
+    return game_state
+
+def update_game_state(game_state: dict, updates: dict) -> dict:
+    """Apply updates to the game state."""
+    def deep_update(base: dict, updates: dict) -> dict:
+        for key, value in updates.items():
+            if key in base and isinstance(base[key], dict) and isinstance(value, dict):
+                deep_update(base[key], value)
+            else:
+                base[key] = value
+        return base
+    
+    return deep_update(game_state, updates)
+
+def format_game_state_summary(game_state: dict) -> str:
+    """Format a human-readable summary of the game state."""
+    char = game_state["character"]
+    inv = game_state["inventory"]
+    world = game_state["world"]
+    
+    summary = f"""
+=== GAME STATE SUMMARY ===
+Character: {char['name']} (Level {char['level']})
+Health: {char['health']}/{char['max_health']} | Mana: {char['mana']}/{char['max_mana']}
+Stats: STR:{char['stats']['strength']} DEX:{char['stats']['dexterity']} INT:{char['stats']['intelligence']} VIT:{char['stats']['vitality']}
+
+Inventory: {len(inv['items'])} items | Gold: {inv['gold']}
+Location: {world['current_location']} ({world['coordinates']['x']}, {world['coordinates']['y']})
+Active Quests: {len(game_state['quests']['active'])}
+Completed Quests: {len(game_state['quests']['completed'])}
+
+Last Saved: {game_state['timestamps']['last_saved'] or 'Never'}
+========================
+"""
+    return summary
+
+def process_ai_game_action(game_state: dict, user_action: str) -> tuple[dict, str]:
+    """Use Claude to process a game action and update the game state."""
+    
+    game_state_json = json.dumps(game_state, indent=2)
+    
+    system_prompt = """You are a game master AI for a fantasy RPG. 
+    You will receive the current game state and a player action.
+    Respond with:
+    1. A narrative description of what happens (2-3 sentences)
+    2. A JSON object with the state changes to apply
+    
+    Format your response as:
+    NARRATIVE: [your narrative here]
+    CHANGES: [JSON object with changes]
+    
+    Keep changes realistic and balanced. Only include fields that actually change."""
+    
+    user_message = f"""Current Game State:
+{game_state_json}
+
+Player Action: {user_action}
+
+Process this action and provide the narrative and state changes."""
+    
+    print(f"\n🤖 Processing action with Claude: '{user_action}'")
+    
+    narrative = ""
+    changes_json = ""
+    in_changes = False
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system=system_prompt,
+        messages=[{"role": "user", "content": user_message}]
+    ) as stream:
+        full_response = ""
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n")
+    
+    lines = full_response.split('\n')
+    narrative_lines = []
+    changes_lines = []
+    
+    for line in lines:
+        if line.startswith("NARRATIVE:"):
+            narrative_lines.append(line.replace("NARRATIVE:", "").strip())
+        elif line.startswith("CHANGES:"):
+            in_changes = True
+            changes_lines.append(line.replace("CHANGES:", "").strip())
+        elif in_changes:
+            changes_lines.append(line)
+    
+    narrative = " ".join(narrative_lines)
+    changes_json = "\n".join(changes_lines)
+    
+    try:
+        if changes_json.strip():
+            changes = json.loads(changes_json)
+            game_state = update_game_state(game_state, changes)
+    except json.JSONDecodeError as e:
+        print(f"⚠️  Could not parse state changes: {e}")
+    
+    return game_state, narrative
+
+def main():
+    """Main function demonstrating the save/load flow with AI game actions."""
+    
+    print("🎮 RPG Game State Manager with AI")
+    print("=" * 50)
+    
+    print("\n📝 Creating new game state...")
+    game_state = create_game_state(
+        user_id="player_001",
+        character_name="Aiden the Brave",
+        level=1
+    )
+    
+    print(format_game_state_summary(game_state))
+    
+    save_file = "game_save.pkl"
+    print(f"\n💾 Saving initial game state...")
+    result = save_game_state(game_state, save_file)
+    print(f"✅ {result}")
+    
+    print("\n🎯 Performing game actions...")
+    
+    actions = [
+        "I explore the forest path and look for enemies to fight",
+        "I use a health potion to restore my health",
+        "I find a treasure chest and open it"
+    ]
+    
+    for action in actions:
+        print(f"\n⚔️  Player Action: {action}")
+        game_state, narrative = process_ai_game_action(game_state, action)
+        print(f"📖 Narrative: {narrative}")
+        
+        game_state["timestamps"]["play_time_seconds"] += 300
+    
+    print(f"\n💾 Saving updated game state...")
+    result = save_game_state(game_state, save_file)
+    print(f"✅ {result}")
+    
+    print(format_game_state_summary(game_state))
+    
+    print("\n🔄 Testing Load/Reload functionality...")
+    print(f"Loading game from '{save_file}'...")
+    
+    loaded_state = load_game_state(save_file)
+    print("✅ Game loaded successfully!")
+    
+    print("\n📊 Verifying loaded state integrity...")
+    assert loaded_state["user_id"] == game_state["user_id"], "User ID mismatch!"
+    assert loaded_state["character"]["name"] == game_state["character"]["name"], "Character name mismatch!"
+    assert loaded_state["timestamps"]["last_saved"] == game_state["timestamps"]["last_saved"], "Timestamp mismatch!"
+    print("✅ All data integrity checks passed!")
+    
+    print(format_game_state_summary(loaded_state))
+    
+    print("\n🎮 Continuing game from loaded state...")
+    final_action = "I return to the village to rest and sell my loot"
+    print(f"⚔️  Player Action: {final_action}")
+    loaded_state, narrative = process_ai_game_action(loaded_state, final_action)
+    print(f"📖 Narrative: {narrative}")
+    
+    final_save_file = "game_save_final.pkl"
+    print(f"\n💾 Saving final game state...")
+    result = save_game_state(loaded_state, final_save_file)
+    print(f"✅ {result}")
+    
+    print("\n📁 Save files created:")
+    for save_file_path in [save_file, final_save_file]:
+        if os.path.exists(save_file_path):
+            size = os.path.getsize(save_file_path)
+            print(f"  - {save_file_path}: {size} bytes")
+    
+    print("\n🎉 Game State Save/Load Flow Complete!")
+    print("=" * 50)
+    
+    print("\n📊 Final Game Summary:")
+    print(format_game_state_summary(loaded_state))
+
+if __name__ == "__main__":
+    main()
+```
