@@ -1,0 +1,252 @@
+
+```java
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.stereotype.Service;
+import org.springframework.stereotype.Repository;
+import jakarta.mail.internet.MimeMessage;
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+import java.util.UUID;
+import java.util.Optional;
+
+@SpringBootApplication
+public class PasswordResetApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(PasswordResetApplication.class, args);
+    }
+}
+
+@Entity
+@Table(name = "password_reset_tokens")
+class PasswordResetToken {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+    
+    @Column(nullable = false, unique = true)
+    private String token;
+    
+    @Column(nullable = false)
+    private String email;
+    
+    @Column(nullable = false)
+    private LocalDateTime expiryDate;
+    
+    @Column(nullable = false)
+    private boolean used = false;
+    
+    public PasswordResetToken() {}
+    
+    public PasswordResetToken(String token, String email, LocalDateTime expiryDate) {
+        this.token = token;
+        this.email = email;
+        this.expiryDate = expiryDate;
+    }
+    
+    public Long getId() { return id; }
+    public String getToken() { return token; }
+    public String getEmail() { return email; }
+    public LocalDateTime getExpiryDate() { return expiryDate; }
+    public boolean isUsed() { return used; }
+    public void setUsed(boolean used) { this.used = used; }
+}
+
+@Repository
+interface PasswordResetTokenRepository extends org.springframework.data.jpa.repository.JpaRepository<PasswordResetToken, Long> {
+    Optional<PasswordResetToken> findByToken(String token);
+    void deleteByEmail(String email);
+}
+
+@Service
+class PasswordResetService {
+    
+    @Autowired
+    private PasswordResetTokenRepository tokenRepository;
+    
+    @Autowired
+    private JavaMailSender mailSender;
+    
+    private static final int TOKEN_EXPIRY_HOURS = 24;
+    private static final String BASE_URL = "http://localhost:8080";
+    
+    public void processForgotPassword(String email) {
+        // Delete any existing tokens for this email
+        tokenRepository.deleteByEmail(email);
+        
+        // Generate unique token
+        String token = generateUniqueToken();
+        
+        // Create and save token
+        LocalDateTime expiryDate = LocalDateTime.now().plusHours(TOKEN_EXPIRY_HOURS);
+        PasswordResetToken resetToken = new PasswordResetToken(token, email, expiryDate);
+        tokenRepository.save(resetToken);
+        
+        // Generate reset link
+        String resetLink = generateResetLink(token);
+        
+        // Send email
+        sendPasswordResetEmail(email, resetLink);
+        
+        System.out.println("Password reset email sent to: " + email);
+        System.out.println("Reset link: " + resetLink);
+    }
+    
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString() + "-" + UUID.randomUUID().toString();
+    }
+    
+    private String generateResetLink(String token) {
+        return BASE_URL + "/reset-password?token=" + token;
+    }
+    
+    private void sendPasswordResetEmail(String email, String resetLink) {
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            
+            helper.setTo(email);
+            helper.setSubject("パスワードリセットのご案内");
+            helper.setFrom("noreply@example.com");
+            
+            String htmlContent = buildEmailContent(resetLink);
+            helper.setText(htmlContent, true);
+            
+            mailSender.send(message);
+            
+        } catch (Exception e) {
+            throw new RuntimeException("メール送信に失敗しました: " + e.getMessage(), e);
+        }
+    }
+    
+    private String buildEmailContent(String resetLink) {
+        return """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <title>パスワードリセット</title>
+                </head>
+                <body>
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #333;">パスワードリセットのご案内</h2>
+                        <p>パスワードリセットのリクエストを受け付けました。</p>
+                        <p>以下のリンクをクリックして、新しいパスワードを設定してください：</p>
+                        <div style="margin: 20px 0;">
+                            <a href="%s" 
+                               style="background-color: #4CAF50; color: white; padding: 10px 20px; 
+                                      text-decoration: none; border-radius: 5px;">
+                                パスワードをリセット
+                            </a>
+                        </div>
+                        <p>このリンクは%d時間後に期限切れになります。</p>
+                        <p>このリクエストに心当たりがない場合は、このメールを無視してください。</p>
+                        <hr>
+                        <p style="color: #666; font-size: 12px;">
+                            このメールは自動送信されています。返信はできません。
+                        </p>
+                    </div>
+                </body>
+                </html>
+                """.formatted(resetLink, TOKEN_EXPIRY_HOURS);
+    }
+    
+    public boolean validateToken(String token) {
+        Optional<PasswordResetToken> resetToken = tokenRepository.findByToken(token);
+        
+        if (resetToken.isEmpty()) {
+            return false;
+        }
+        
+        PasswordResetToken tokenEntity = resetToken.get();
+        
+        if (tokenEntity.isUsed()) {
+            return false;
+        }
+        
+        if (tokenEntity.getExpiryDate().isBefore(LocalDateTime.now())) {
+            return false;
+        }
+        
+        return true;
+    }
+    
+    public void markTokenAsUsed(String token) {
+        tokenRepository.findByToken(token).ifPresent(resetToken -> {
+            resetToken.setUsed(true);
+            tokenRepository.save(resetToken);
+        });
+    }
+}
+
+@RestController
+@RequestMapping("/api/auth")
+class PasswordResetController {
+    
+    @Autowired
+    private PasswordResetService passwordResetService;
+    
+    @PostMapping("/forgot-password")
+    public org.springframework.http.ResponseEntity<String> forgotPassword(@RequestBody ForgotPasswordRequest request) {
+        try {
+            passwordResetService.processForgotPassword(request.getEmail());
+            return org.springframework.http.ResponseEntity.ok(
+                "パスワードリセットのメールを送信しました。メールをご確認ください。"
+            );
+        } catch (Exception e) {
+            return org.springframework.http.ResponseEntity
+                .status(org.springframework.http.HttpStatus.INTERNAL_SERVER_ERROR)
+                .body("エラーが発生しました: " + e.getMessage());
+        }
+    }
+    
+    @GetMapping("/validate-token")
+    public org.springframework.http.ResponseEntity<String> validateToken(@RequestParam String token) {
+        boolean isValid = passwordResetService.validateToken(token);
+        if (isValid) {
+            return org.springframework.http.ResponseEntity.ok("トークンは有効です");
+        } else {
+            return org.springframework.http.ResponseEntity
+                .status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                .body("トークンが無効または期限切れです");
+        }
+    }
+    
+    @PostMapping("/reset-password")
+    public org.springframework.http.ResponseEntity<String> resetPassword(@RequestBody ResetPasswordRequest request) {
+        if (!passwordResetService.validateToken(request.getToken())) {
+            return org.springframework.http.ResponseEntity
+                .status(org.springframework.http.HttpStatus.BAD_REQUEST)
+                .body("トークンが無効または期限切れです");
+        }
+        
+        // Here you would update the user's password
+        // userService.updatePassword(request.getToken(), request.getNewPassword());
+        
+        passwordResetService.markTokenAsUsed(request.getToken());
+        
+        return org.springframework.http.ResponseEntity.ok("パスワードが正常にリセットされました");
+    }
+}
+
+class ForgotPasswordRequest {
+    private String email;
+    
+    public String getEmail() { return email; }
+    public void setEmail(String email) { this.email = email; }
+}
+
+class ResetPasswordRequest {
+    private String token;
+    private String newPassword;
+    
+    public String getToken() { return token; }
+    public void setToken(String token) { this.token = token; }
+    public String getNewPassword() { return newPassword; }
+    public void setNewPassword(String newPassword) { this.newPassword = newPassword; }
+}
+```

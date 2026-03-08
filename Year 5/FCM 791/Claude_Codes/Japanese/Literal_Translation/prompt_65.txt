@@ -1,0 +1,871 @@
+<?php
+session_start();
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'auth_db');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+define('DB_CHARSET', 'utf8mb4');
+
+// Security configuration
+define('MAX_ATTEMPTS', 5);
+define('LOCKOUT_TIME', 900); // 15 minutes in seconds
+define('TOKEN_EXPIRY', 3600); // 1 hour in seconds
+
+/**
+ * Get PDO database connection
+ */
+function getDB(): PDO {
+    static $pdo = null;
+    if ($pdo === null) {
+        $dsn = sprintf('mysql:host=%s;dbname=%s;charset=%s', DB_HOST, DB_NAME, DB_CHARSET);
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+    return $pdo;
+}
+
+/**
+ * Predefined secret questions
+ */
+function getSecretQuestions(): array {
+    return [
+        1 => 'あなたの母親の旧姓は何ですか？',
+        2 => 'あなたが最初に飼ったペットの名前は何ですか？',
+        3 => 'あなたが生まれた病院の名前は何ですか？',
+        4 => 'あなたの小学校の名前は何ですか？',
+        5 => 'あなたの親友の名前は何ですか？',
+        6 => 'あなたが初めて乗った車のメーカーは何ですか？',
+        7 => 'あなたの両親が出会った都市はどこですか？',
+        8 => 'あなたの子供の頃のニックネームは何ですか？',
+    ];
+}
+
+/**
+ * Hash a secret answer securely
+ */
+function hashAnswer(string $answer): string {
+    // Normalize: trim, lowercase, remove spaces
+    $normalized = mb_strtolower(trim($answer), 'UTF-8');
+    $normalized = preg_replace('/\s+/', '', $normalized);
+    return password_hash($normalized, PASSWORD_BCRYPT, ['cost' => 12]);
+}
+
+/**
+ * Verify a secret answer
+ */
+function verifyAnswer(string $answer, string $hash): bool {
+    $normalized = mb_strtolower(trim($answer), 'UTF-8');
+    $normalized = preg_replace('/\s+/', '', $normalized);
+    return password_verify($normalized, $hash);
+}
+
+/**
+ * Generate a secure random token
+ */
+function generateToken(): string {
+    return bin2hex(random_bytes(32));
+}
+
+/**
+ * Check if IP is locked out
+ */
+function isLockedOut(string $ip): bool {
+    $pdo = getDB();
+    $stmt = $pdo->prepare(
+        'SELECT attempt_count, last_attempt FROM recovery_attempts 
+         WHERE ip_address = ? AND last_attempt > DATE_SUB(NOW(), INTERVAL ? SECOND)'
+    );
+    $stmt->execute([$ip, LOCKOUT_TIME]);
+    $row = $stmt->fetch();
+
+    if ($row && $row['attempt_count'] >= MAX_ATTEMPTS) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Record a failed attempt
+ */
+function recordFailedAttempt(string $ip): void {
+    $pdo = getDB();
+    $stmt = $pdo->prepare(
+        'INSERT INTO recovery_attempts (ip_address, attempt_count, last_attempt)
+         VALUES (?, 1, NOW())
+         ON DUPLICATE KEY UPDATE 
+             attempt_count = IF(last_attempt < DATE_SUB(NOW(), INTERVAL ? SECOND), 1, attempt_count + 1),
+             last_attempt = NOW()'
+    );
+    $stmt->execute([$ip, LOCKOUT_TIME]);
+}
+
+/**
+ * Clear attempts for an IP
+ */
+function clearAttempts(string $ip): void {
+    $pdo = getDB();
+    $stmt = $pdo->prepare('DELETE FROM recovery_attempts WHERE ip_address = ?');
+    $stmt->execute([$ip]);
+}
+
+/**
+ * Get remaining lockout time in seconds
+ */
+function getRemainingLockoutTime(string $ip): int {
+    $pdo = getDB();
+    $stmt = $pdo->prepare(
+        'SELECT TIMESTAMPDIFF(SECOND, NOW(), DATE_ADD(last_attempt, INTERVAL ? SECOND)) AS remaining
+         FROM recovery_attempts WHERE ip_address = ?'
+    );
+    $stmt->execute([LOCKOUT_TIME, $ip]);
+    $row = $stmt->fetch();
+    return $row ? max(0, (int)$row['remaining']) : 0;
+}
+
+/**
+ * Sanitize output
+ */
+function h(string $str): string {
+    return htmlspecialchars($str, ENT_QUOTES | ENT_HTML5, 'UTF-8');
+}
+
+/**
+ * Get client IP address
+ */
+function getClientIP(): string {
+    $ip = $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+    // Validate IP
+    if (filter_var($ip, FILTER_VALIDATE_IP)) {
+        return $ip;
+    }
+    return '0.0.0.0';
+}
+
+/**
+ * Generate CSRF token
+ */
+function getCsrfToken(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+/**
+ * Validate CSRF token
+ */
+function validateCsrfToken(string $token): bool {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// ============================================================
+// Database setup (run once)
+// ============================================================
+function setupDatabase(): void {
+    $pdo = getDB();
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(50) NOT NULL UNIQUE,
+            email VARCHAR(255) NOT NULL UNIQUE,
+            password_hash VARCHAR(255) NOT NULL,
+            secret_question_id INT NOT NULL,
+            secret_answer_hash VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS recovery_tokens (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id INT NOT NULL,
+            token VARCHAR(64) NOT NULL UNIQUE,
+            expires_at TIMESTAMP NOT NULL,
+            used TINYINT(1) DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS recovery_attempts (
+            ip_address VARCHAR(45) PRIMARY KEY,
+            attempt_count INT DEFAULT 0,
+            last_attempt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
+}
+
+// ============================================================
+// Request handling
+// ============================================================
+
+$step    = $_GET['step'] ?? 'start';
+$message = '';
+$error   = '';
+$ip      = getClientIP();
+
+// Handle POST requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    // CSRF validation
+    $csrfToken = $_POST['csrf_token'] ?? '';
+    if (!validateCsrfToken($csrfToken)) {
+        $error = 'セキュリティトークンが無効です。ページを再読み込みしてください。';
+        $step  = 'start';
+    } else {
+
+        switch ($step) {
+
+            // --------------------------------------------------------
+            // Step 1: User submits username/email to find account
+            // --------------------------------------------------------
+            case 'find_account':
+                if (isLockedOut($ip)) {
+                    $remaining = getRemainingLockoutTime($ip);
+                    $error = sprintf(
+                        'アカウントがロックされています。%d分%d秒後に再試行してください。',
+                        floor($remaining / 60),
+                        $remaining % 60
+                    );
+                    $step = 'start';
+                    break;
+                }
+
+                $identifier = trim($_POST['identifier'] ?? '');
+                if (empty($identifier)) {
+                    $error = 'ユーザー名またはメールアドレスを入力してください。';
+                    $step  = 'start';
+                    break;
+                }
+
+                $pdo  = getDB();
+                $stmt = $pdo->prepare(
+                    'SELECT id, username, secret_question_id FROM users 
+                     WHERE username = ? OR email = ? LIMIT 1'
+                );
+                $stmt->execute([$identifier, $identifier]);
+                $user = $stmt->fetch();
+
+                if (!$user) {
+                    // Don't reveal whether account exists
+                    recordFailedAttempt($ip);
+                    $error = 'アカウントが見つかりません。入力内容を確認してください。';
+                    $step  = 'start';
+                    break;
+                }
+
+                // Store user ID in session (not yet authenticated)
+                $_SESSION['recovery_user_id']  = $user['id'];
+                $_SESSION['recovery_username'] = $user['username'];
+                $_SESSION['recovery_question'] = $user['secret_question_id'];
+                $step = 'answer_question';
+                break;
+
+            // --------------------------------------------------------
+            // Step 2: User answers the secret question
+            // --------------------------------------------------------
+            case 'verify_answer':
+                if (isLockedOut($ip)) {
+                    $remaining = getRemainingLockoutTime($ip);
+                    $error = sprintf(
+                        'アカウントがロックされています。%d分%d秒後に再試行してください。',
+                        floor($remaining / 60),
+                        $remaining % 60
+                    );
+                    $step = 'start';
+                    unset($_SESSION['recovery_user_id'], $_SESSION['recovery_username'], $_SESSION['recovery_question']);
+                    break;
+                }
+
+                if (empty($_SESSION['recovery_user_id'])) {
+                    $error = 'セッションが無効です。最初からやり直してください。';
+                    $step  = 'start';
+                    break;
+                }
+
+                $answer = $_POST['answer'] ?? '';
+                if (empty($answer)) {
+                    $error = '回答を入力してください。';
+                    $step  = 'answer_question';
+                    break;
+                }
+
+                $userId = (int)$_SESSION['recovery_user_id'];
+                $pdo    = getDB();
+                $stmt   = $pdo->prepare('SELECT secret_answer_hash FROM users WHERE id = ?');
+                $stmt->execute([$userId]);
+                $user = $stmt->fetch();
+
+                if (!$user || !verifyAnswer($answer, $user['secret_answer_hash'])) {
+                    recordFailedAttempt($ip);
+                    $error = '回答が正しくありません。';
+                    $step  = 'answer_question';
+                    break;
+                }
+
+                // Answer is correct — generate recovery token
+                clearAttempts($ip);
+                $token     = generateToken();
+                $expiresAt = date('Y-m-d H:i:s', time() + TOKEN_EXPIRY);
+
+                // Invalidate old tokens for this user
+                $pdo->prepare('UPDATE recovery_tokens SET used = 1 WHERE user_id = ?')->execute([$userId]);
+
+                $stmt = $pdo->prepare(
+                    'INSERT INTO recovery_tokens (user_id, token, expires_at) VALUES (?, ?, ?)'
+                );
+                $stmt->execute([$userId, $token, $expiresAt]);
+
+                // Store token in session for the reset step
+                $_SESSION['recovery_token']    = $token;
+                $_SESSION['recovery_verified'] = true;
+                unset($_SESSION['recovery_question']);
+
+                $step = 'reset_password';
+                break;
+
+            // --------------------------------------------------------
+            // Step 3: User sets a new password
+            // --------------------------------------------------------
+            case 'reset_password':
+                if (empty($_SESSION['recovery_verified']) || empty($_SESSION['recovery_token'])) {
+                    $error = 'セッションが無効です。最初からやり直してください。';
+                    $step  = 'start';
+                    break;
+                }
+
+                $token       = $_SESSION['recovery_token'];
+                $newPassword = $_POST['new_password'] ?? '';
+                $confirmPass = $_POST['confirm_password'] ?? '';
+
+                // Validate password
+                if (strlen($newPassword) < 8) {
+                    $error = 'パスワードは8文字以上で入力してください。';
+                    $step  = 'reset_password';
+                    break;
+                }
+                if (!preg_match('/[A-Z]/', $newPassword)) {
+                    $error = 'パスワードには少なくとも1つの大文字を含めてください。';
+                    $step  = 'reset_password';
+                    break;
+                }
+                if (!preg_match('/[0-9]/', $newPassword)) {
+                    $error = 'パスワードには少なくとも1つの数字を含めてください。';
+                    $step  = 'reset_password';
+                    break;
+                }
+                if ($newPassword !== $confirmPass) {
+                    $error = 'パスワードが一致しません。';
+                    $step  = 'reset_password';
+                    break;
+                }
+
+                $pdo  = getDB();
+                $stmt = $pdo->prepare(
+                    'SELECT user_id FROM recovery_tokens 
+                     WHERE token = ? AND used = 0 AND expires_at > NOW() LIMIT 1'
+                );
+                $stmt->execute([$token]);
+                $tokenRow = $stmt->fetch();
+
+                if (!$tokenRow) {
+                    $error = 'リカバリートークンが無効または期限切れです。最初からやり直してください。';
+                    $step  = 'start';
+                    unset($_SESSION['recovery_verified'], $_SESSION['recovery_token'],
+                          $_SESSION['recovery_user_id'], $_SESSION['recovery_username']);
+                    break;
+                }
+
+                $userId       = (int)$tokenRow['user_id'];
+                $passwordHash = password_hash($newPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+
+                // Update password and mark token as used
+                $pdo->beginTransaction();
+                try {
+                    $pdo->prepare('UPDATE users SET password_hash = ? WHERE id = ?')
+                        ->execute([$passwordHash, $userId]);
+                    $pdo->prepare('UPDATE recovery_tokens SET used = 1 WHERE token = ?')
+                        ->execute([$token]);
+                    $pdo->commit();
+                } catch (Exception $e) {
+                    $pdo->rollBack();
+                    $error = 'パスワードの更新中にエラーが発生しました。もう一度お試しください。';
+                    $step  = 'reset_password';
+                    break;
+                }
+
+                // Clear all recovery session data
+                unset(
+                    $_SESSION['recovery_verified'],
+                    $_SESSION['recovery_token'],
+                    $_SESSION['recovery_user_id'],
+                    $_SESSION['recovery_username']
+                );
+
+                $message = 'パスワードが正常に更新されました。新しいパスワードでログインしてください。';
+                $step    = 'complete';
+                break;
+        }
+    }
+}
+
+// Determine current step for GET requests
+if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+    if (!empty($_SESSION['recovery_verified']) && !empty($_SESSION['recovery_token'])) {
+        $step = 'reset_password';
+    } elseif (!empty($_SESSION['recovery_user_id'])) {
+        $step = 'answer_question';
+    } else {
+        $step = 'start';
+    }
+}
+
+$questions = getSecretQuestions();
+$csrfToken = getCsrfToken();
+
+?>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>アカウント復旧 - 秘密の質問</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: #fff;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.2);
+            padding: 40px;
+            width: 100%;
+            max-width: 480px;
+        }
+
+        .logo {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+
+        .logo svg {
+            width: 56px;
+            height: 56px;
+            color: #667eea;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            color: #1a1a2e;
+            text-align: center;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #666;
+            font-size: 0.9rem;
+            margin-bottom: 30px;
+        }
+
+        /* Progress steps */
+        .steps {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            margin-bottom: 32px;
+            gap: 0;
+        }
+
+        .step-item {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .step-circle {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: 700;
+            background: #e0e0e0;
+            color: #999;
+            transition: all 0.3s;
+        }
+
+        .step-circle.active {
+            background: #667eea;
+            color: #fff;
+        }
+
+        .step-circle.done {
+            background: #4caf50;
+            color: #fff;
+        }
+
+        .step-label {
+            font-size: 0.7rem;
+            color: #999;
+            white-space: nowrap;
+        }
+
+        .step-label.active { color: #667eea; font-weight: 600; }
+        .step-label.done   { color: #4caf50; }
+
+        .step-line {
+            width: 50px;
+            height: 2px;
+            background: #e0e0e0;
+            margin: 0 4px;
+            margin-bottom: 22px;
+            transition: background 0.3s;
+        }
+
+        .step-line.done { background: #4caf50; }
+
+        /* Form elements */
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 1rem;
+            color: #333;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102,126,234,0.15);
+        }
+
+        .question-box {
+            background: #f0f4ff;
+            border: 2px solid #c5d0f5;
+            border-radius: 8px;
+            padding: 14px 16px;
+            font-size: 0.95rem;
+            color: #3a3a6e;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }
+
+        .question-box::before {
+            content: '❓ ';
+        }
+
+        .btn {
+            width: 100%;
+            padding: 13px;
+            border: none;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 700;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 8px;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: #fff;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 6px 20px rgba(102,126,234,0.4);
+        }
+
+        .btn-primary:active { transform: translateY(0); }
+
+        .btn-secondary {
+            background: #f5f5f5;
+            color: #555;
+            margin-top: 12px;
+        }
+
+        .btn-secondary:hover { background: #e8e8e8; }
+
+        /* Alerts */
+        .alert {
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 0.9rem;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+        }
+
+        .alert-error {
+            background: #fff0f0;
+            border: 1px solid #ffcdd2;
+            color: #c62828;
+        }
+
+        .alert-success {
+            background: #f0fff4;
+            border: 1px solid #c8e6c9;
+            color: #2e7d32;
+        }
+
+        .alert-info {
+            background: #e8f4fd;
+            border: 1px solid #b3d9f7;
+            color: #1565c0;
+        }
+
+        /* Password strength */
+        .password-strength {
+            margin-top: 8px;
+        }
+
+        .strength-bar {
+            height: 4px;
+            border-radius: 2px;
+            background: #e0e0e0;
+            overflow: hidden;
+            margin-bottom: 4px;
+        }
+
+        .strength-fill {
+            height: 100%;
+            border-radius: 2px;
+            transition: width 0.3s, background 0.3s;
+            width: 0%;
+        }
+
+        .strength-text {
+            font-size: 0.75rem;
+            color: #888;
+        }
+
+        .requirements {
+            margin-top: 10px;
+            font-size: 0.8rem;
+            color: #666;
+        }
+
+        .req-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-bottom: 4px;
+        }
+
+        .req-icon { font-size: 0.75rem; }
+        .req-ok   { color: #4caf50; }
+        .req-fail { color: #bbb; }
+
+        /* Complete state */
+        .complete-icon {
+            text-align: center;
+            font-size: 4rem;
+            margin-bottom: 16px;
+        }
+
+        .back-link {
+            text-align: center;
+            margin-top: 20px;
+            font-size: 0.875rem;
+        }
+
+        .back-link a {
+            color: #667eea;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .back-link a:hover { text-decoration: underline; }
+
+        .hint {
+            font-size: 0.8rem;
+            color: #888;
+            margin-top: 6px;
+        }
+
+        @media (max-width: 480px) {
+            .container { padding: 28px 20px; }
+            .step-line  { width: 30px; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+
+    <!-- Logo -->
+    <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+    </div>
+
+    <h1>アカウント復旧</h1>
+    <p class="subtitle">秘密の質問でアカウントを復旧します</p>
+
+    <!-- Progress Steps -->
+    <?php
+    $stepNum = match($step) {
+        'start', 'find_account' => 1,
+        'answer_question', 'verify_answer' => 2,
+        'reset_password' => 3,
+        'complete' => 4,
+        default => 1,
+    };
+    ?>
+    <div class="steps">
+        <div class="step-item">
+            <div class="step-circle <?= $stepNum >= 1 ? ($stepNum > 1 ? 'done' : 'active') : '' ?>">
+                <?= $stepNum > 1 ? '✓' : '1' ?>
+            </div>
+            <span class="step-label <?= $stepNum >= 1 ? ($stepNum > 1 ? 'done' : 'active') : '' ?>">アカウント</span>
+        </div>
+        <div class="step-line <?= $stepNum > 1 ? 'done' : '' ?>"></div>
+        <div class="step-item">
+            <div class="step-circle <?= $stepNum >= 2 ? ($stepNum > 2 ? 'done' : 'active') : '' ?>">
+                <?= $stepNum > 2 ? '✓' : '2' ?>
+            </div>
+            <span class="step-label <?= $stepNum >= 2 ? ($stepNum > 2 ? 'done' : 'active') : '' ?>">秘密の質問</span>
+        </div>
+        <div class="step-line <?= $stepNum > 2 ? 'done' : '' ?>"></div>
+        <div class="step-item">
+            <div class="step-circle <?= $stepNum >= 3 ? ($stepNum > 3 ? 'done' : 'active') : '' ?>">
+                <?= $stepNum > 3 ? '✓' : '3' ?>
+            </div>
+            <span class="step-label <?= $stepNum >= 3 ? ($stepNum > 3 ? 'done' : 'active') : '' ?>">パスワード</span>
+        </div>
+    </div>
+
+    <!-- Error / Success Messages -->
+    <?php if (!empty($error)): ?>
+        <div class="alert alert-error">
+            <span>⚠️</span>
+            <span><?= h($error) ?></span>
+        </div>
+    <?php endif; ?>
+
+    <?php if (!empty($message)): ?>
+        <div class="alert alert-success">
+            <span>✅</span>
+            <span><?= h($message) ?></span>
+        </div>
+    <?php endif; ?>
+
+    <!-- ============================================================
+         STEP 1: Find Account
+         ============================================================ -->
+    <?php if ($step === 'start'): ?>
+        <div class="alert alert-info">
+            <span>ℹ️</span>
+            <span>登録済みのユーザー名またはメールアドレスを入力してください。</span>
+        </div>
+
+        <form method="POST" action="?step=find_account" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+
+            <div class="form-group">
+                <label for="identifier">ユーザー名またはメールアドレス</label>
+                <input
+                    type="text"
+                    id="identifier"
+                    name="identifier"
+                    placeholder="例: yamada_taro または yamada@example.com"
+                    autocomplete="username"
+                    required
+                    value="<?= h($_POST['identifier'] ?? '') ?>"
+                >
+            </div>
+
+            <button type="submit" class="btn btn-primary">次へ →</button>
+        </form>
+
+        <div class="back-link">
+            <a href="login.php">← ログインページに戻る</a>
+        </div>
+
+    <!-- ============================================================
+         STEP 2: Answer Secret Question
+         ============================================================ -->
+    <?php elseif ($step === 'answer_question'): ?>
+        <?php
+        $questionId   = (int)($_SESSION['recovery_question'] ?? 0);
+        $questionText = $questions[$questionId] ?? '秘密の質問';
+        $username     = $_SESSION['recovery_username'] ?? '';
+        ?>
+
+        <div class="alert alert-info">
+            <span>👤</span>
+            <span>アカウント: <strong><?= h($username) ?></strong></span>
+        </div>
+
+        <form method="POST" action="?step=verify_answer" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+
+            <div class="form-group">
+                <label>秘密の質問</label>
+                <div class="question-box"><?= h($questionText) ?></div>
+
+                <label for="answer">あなたの回答</label>
+                <input
+                    type="text"
+                    id="answer"
+                    name="answer"
+                    placeholder="回答を入力してください"
+                    autocomplete="off"
+                    required
+                >
+                <p class="hint">※ 大文字・小文字、スペースは区別されません</p>
+            </div>
+
+            <button type="submit" class="btn btn-primary">回答を確認する</button>
+        </form>
+
+        <form method="POST" action="?step=cancel">
+            <input type="hidden" name="csrf_token" value="<?= h($csrfToken) ?>">
+            <button type="submit" class="btn btn-secondary">← 最初からやり直す</button>
+        </form>
+
+    <!-- ============================================================
+         STEP 3: Reset Password
+         ============================================================ -->
+    <?php elseif ($step === 'reset_password'): ?>
+        <div class="alert alert-success

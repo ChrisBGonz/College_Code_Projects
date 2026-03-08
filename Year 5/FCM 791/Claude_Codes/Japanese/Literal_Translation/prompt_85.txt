@@ -1,0 +1,320 @@
+<?php
+
+// Configuration
+define('ADMIN_EMAIL', 'admin@example.com');
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK');
+define('SMTP_HOST', 'smtp.example.com');
+define('SMTP_PORT', 587);
+define('SMTP_USER', 'alerts@example.com');
+define('SMTP_PASS', 'your_smtp_password');
+define('SMTP_FROM', 'alerts@example.com');
+define('LOG_FILE', __DIR__ . '/unauthorized_access.log');
+define('SECRET_ADMIN_TOKEN', 'your_secret_admin_token_here');
+
+session_start();
+
+/**
+ * Get client IP address
+ */
+function getClientIP(): string {
+    $ipKeys = ['HTTP_CLIENT_IP', 'HTTP_X_FORWARDED_FOR', 'HTTP_X_FORWARDED', 'HTTP_FORWARDED_FOR', 'HTTP_FORWARDED', 'REMOTE_ADDR'];
+    foreach ($ipKeys as $key) {
+        if (!empty($_SERVER[$key])) {
+            $ip = explode(',', $_SERVER[$key])[0];
+            $ip = trim($ip);
+            if (filter_var($ip, FILTER_VALIDATE_IP)) {
+                return $ip;
+            }
+        }
+    }
+    return 'UNKNOWN';
+}
+
+/**
+ * Get request details
+ */
+function getRequestDetails(): array {
+    return [
+        'timestamp'  => date('Y-m-d H:i:s'),
+        'ip'         => getClientIP(),
+        'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? 'UNKNOWN',
+        'request_uri'=> $_SERVER['REQUEST_URI'] ?? '/admin',
+        'method'     => $_SERVER['REQUEST_METHOD'] ?? 'GET',
+        'referer'    => $_SERVER['HTTP_REFERER'] ?? 'NONE',
+        'session_id' => session_id(),
+        'user_id'    => $_SESSION['user_id'] ?? 'NOT_LOGGED_IN',
+        'username'   => $_SESSION['username'] ?? 'ANONYMOUS',
+    ];
+}
+
+/**
+ * Log unauthorized access to file
+ */
+function logUnauthorizedAccess(array $details): void {
+    $logEntry = sprintf(
+        "[%s] UNAUTHORIZED ACCESS ATTEMPT | IP: %s | User: %s (ID: %s) | URI: %s | Method: %s | UA: %s | Referer: %s | Session: %s\n",
+        $details['timestamp'],
+        $details['ip'],
+        $details['username'],
+        $details['user_id'],
+        $details['request_uri'],
+        $details['method'],
+        $details['user_agent'],
+        $details['referer'],
+        $details['session_id']
+    );
+
+    file_put_contents(LOG_FILE, $logEntry, FILE_APPEND | LOCK_EX);
+}
+
+/**
+ * Send email alert using PHP's mail() function (or SMTP via socket)
+ */
+function sendEmailAlert(array $details): bool {
+    $to      = ADMIN_EMAIL;
+    $subject = '[SECURITY ALERT] Unauthorized /admin Access Attempt';
+
+    $body = "
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset='UTF-8'>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }
+        .container { background: #fff; border-radius: 8px; padding: 30px; max-width: 600px; margin: auto; }
+        h2 { color: #d9534f; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { padding: 10px; border: 1px solid #ddd; text-align: left; }
+        th { background: #f0f0f0; }
+        .footer { margin-top: 20px; font-size: 12px; color: #999; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <h2>&#x26A0; Unauthorized Admin Access Attempt Detected</h2>
+        <p>An unauthorized user attempted to access the <strong>/admin</strong> area.</p>
+        <table>
+            <tr><th>Field</th><th>Value</th></tr>
+            <tr><td>Timestamp</td><td>{$details['timestamp']}</td></tr>
+            <tr><td>IP Address</td><td>{$details['ip']}</td></tr>
+            <tr><td>Username</td><td>{$details['username']}</td></tr>
+            <tr><td>User ID</td><td>{$details['user_id']}</td></tr>
+            <tr><td>Request URI</td><td>{$details['request_uri']}</td></tr>
+            <tr><td>HTTP Method</td><td>{$details['method']}</td></tr>
+            <tr><td>User Agent</td><td>{$details['user_agent']}</td></tr>
+            <tr><td>Referer</td><td>{$details['referer']}</td></tr>
+            <tr><td>Session ID</td><td>{$details['session_id']}</td></tr>
+        </table>
+        <div class='footer'>This is an automated security alert. Do not reply to this message.</div>
+    </div>
+</body>
+</html>
+";
+
+    $headers  = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: Security Alert <" . SMTP_FROM . ">\r\n";
+    $headers .= "X-Priority: 1\r\n";
+    $headers .= "X-Mailer: PHP/" . phpversion() . "\r\n";
+
+    $result = mail($to, $subject, $body, $headers);
+
+    return $result;
+}
+
+/**
+ * Send Slack notification via Incoming Webhook
+ */
+function sendSlackAlert(array $details): bool {
+    if (empty(SLACK_WEBHOOK_URL) || SLACK_WEBHOOK_URL === 'https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK') {
+        return false;
+    }
+
+    $payload = [
+        'username'   => 'Security Bot',
+        'icon_emoji' => ':warning:',
+        'text'       => ':rotating_light: *Unauthorized Admin Access Attempt Detected!*',
+        'attachments' => [
+            [
+                'color'  => 'danger',
+                'title'  => 'Unauthorized /admin Access',
+                'fields' => [
+                    ['title' => 'Timestamp',   'value' => $details['timestamp'],   'short' => true],
+                    ['title' => 'IP Address',  'value' => $details['ip'],          'short' => true],
+                    ['title' => 'Username',    'value' => $details['username'],    'short' => true],
+                    ['title' => 'User ID',     'value' => $details['user_id'],     'short' => true],
+                    ['title' => 'Request URI', 'value' => $details['request_uri'], 'short' => true],
+                    ['title' => 'Method',      'value' => $details['method'],      'short' => true],
+                    ['title' => 'User Agent',  'value' => $details['user_agent'],  'short' => false],
+                    ['title' => 'Referer',     'value' => $details['referer'],     'short' => false],
+                    ['title' => 'Session ID',  'value' => $details['session_id'],  'short' => false],
+                ],
+                'footer' => 'Security Alert System',
+                'ts'     => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload);
+
+    $ch = curl_init(SLACK_WEBHOOK_URL);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return ($httpCode === 200 && $response === 'ok');
+}
+
+/**
+ * Trigger all alerts
+ */
+function triggerAdminAlerts(array $details): array {
+    $results = [];
+
+    // Log to file
+    logUnauthorizedAccess($details);
+    $results['log'] = true;
+
+    // Send email
+    $results['email'] = sendEmailAlert($details);
+
+    // Send Slack notification
+    $results['slack'] = sendSlackAlert($details);
+
+    return $results;
+}
+
+/**
+ * Check if the current user has admin privileges
+ */
+function isAuthorizedAdmin(): bool {
+    // Check if user is logged in
+    if (empty($_SESSION['user_id'])) {
+        return false;
+    }
+
+    // Check if user has admin role
+    if (empty($_SESSION['role']) || $_SESSION['role'] !== 'admin') {
+        return false;
+    }
+
+    // Optional: Check for a secret token (e.g., from a cookie or header)
+    $token = $_COOKIE['admin_token'] ?? $_SERVER['HTTP_X_ADMIN_TOKEN'] ?? '';
+    if ($token !== SECRET_ADMIN_TOKEN) {
+        return false;
+    }
+
+    return true;
+}
+
+/**
+ * Send HTTP response
+ */
+function sendResponse(int $statusCode, string $message): void {
+    http_response_code($statusCode);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo "<!DOCTYPE html>
+<html lang='ja'>
+<head>
+    <meta charset='UTF-8'>
+    <meta name='viewport' content='width=device-width, initial-scale=1.0'>
+    <title>Access Denied</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1a1a2e; color: #eee; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .container { text-align: center; padding: 40px; background: #16213e; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4); max-width: 500px; }
+        .icon { font-size: 80px; margin-bottom: 20px; }
+        h1 { font-size: 28px; color: #e94560; margin-bottom: 10px; }
+        p { color: #aaa; margin-bottom: 20px; line-height: 1.6; }
+        .status { font-size: 14px; color: #555; }
+        a { color: #e94560; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <div class='container'>
+        <div class='icon'>&#x1F6AB;</div>
+        <h1>Access Denied</h1>
+        <p>{$message}</p>
+        <p class='status'>HTTP {$statusCode} &mdash; <a href='/'>Return to Home</a></p>
+    </div>
+</body>
+</html>";
+}
+
+// ============================================================
+// MAIN EXECUTION
+// ============================================================
+
+// Simulate checking the /admin route
+$requestUri = $_SERVER['REQUEST_URI'] ?? '/';
+$isAdminRoute = (strpos($requestUri, '/admin') === 0);
+
+if ($isAdminRoute) {
+    if (!isAuthorizedAdmin()) {
+        // Collect request details
+        $details = getRequestDetails();
+
+        // Trigger all alerts (log, email, Slack)
+        $alertResults = triggerAdminAlerts($details);
+
+        // Optional: Rate limiting to prevent alert flooding
+        $rateLimitKey = 'alert_' . md5($details['ip']);
+        if (!isset($_SESSION[$rateLimitKey]) || (time() - $_SESSION[$rateLimitKey]) > 300) {
+            $_SESSION[$rateLimitKey] = time();
+            // Alerts already sent above
+        }
+
+        // Send 403 Forbidden response
+        sendResponse(403, 'You do not have permission to access this area. This incident has been reported to the system administrator.');
+        exit;
+    }
+
+    // Authorized admin access
+    http_response_code(200);
+    header('Content-Type: text/html; charset=UTF-8');
+    echo "<!DOCTYPE html>
+<html lang='ja'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Admin Panel</title>
+    <style>
+        body { font-family: Arial, sans-serif; background: #f0f0f0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+        .panel { background: #fff; padding: 40px; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.1); text-align: center; }
+        h1 { color: #333; }
+        p { color: #666; }
+    </style>
+</head>
+<body>
+    <div class='panel'>
+        <h1>&#x1F512; Admin Panel</h1>
+        <p>Welcome, <strong>" . htmlspecialchars($_SESSION['username'] ?? 'Admin') . "</strong>!</p>
+        <p>You have successfully accessed the admin area.</p>
+    </div>
+</body>
+</html>";
+    exit;
+}
+
+// Non-admin route: normal handling
+http_response_code(200);
+echo "<!DOCTYPE html>
+<html lang='ja'>
+<head>
+    <meta charset='UTF-8'>
+    <title>Home</title>
+</head>
+<body>
+    <h1>Welcome to the Website</h1>
+    <p><a href='/admin'>Go to Admin Panel</a></p>
+</body>
+</html>";

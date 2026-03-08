@@ -1,0 +1,343 @@
+
+```go
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"reflect"
+	"strings"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+// AppConfig represents the configuration structure
+type AppConfig struct {
+	Name        string                 `json:"name"`
+	Version     string                 `json:"version"`
+	Debug       bool                   `json:"debug"`
+	MaxRetries  int                    `json:"max_retries"`
+	Timeout     float64                `json:"timeout"`
+	Features    []string               `json:"features"`
+	Settings    map[string]interface{} `json:"settings"`
+}
+
+// DatabaseConfig represents database configuration
+type DatabaseConfig struct {
+	Host     string `json:"host"`
+	Port     int    `json:"port"`
+	Name     string `json:"name"`
+	User     string `json:"user"`
+	Password string `json:"password"`
+	SSL      bool   `json:"ssl"`
+}
+
+// ServerConfig represents server configuration
+type ServerConfig struct {
+	Host    string `json:"host"`
+	Port    int    `json:"port"`
+	Workers int    `json:"workers"`
+	TLS     bool   `json:"tls"`
+}
+
+// Application represents the main application with configurable properties
+type Application struct {
+	Config   AppConfig
+	Database DatabaseConfig
+	Server   ServerConfig
+}
+
+// readJSONConfig reads a JSON configuration file and returns the parsed data
+func readJSONConfig(filename string) (map[string]interface{}, error) {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	var config map[string]interface{}
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse JSON config: %w", err)
+	}
+
+	return config, nil
+}
+
+// setObjectProperties dynamically sets properties of an object using reflection
+func setObjectProperties(obj interface{}, properties map[string]interface{}) error {
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Ptr || objValue.IsNil() {
+		return fmt.Errorf("object must be a non-nil pointer")
+	}
+
+	objValue = objValue.Elem()
+	objType := objValue.Type()
+
+	for key, value := range properties {
+		// Convert key to match struct field naming (handle snake_case to CamelCase)
+		fieldName := snakeToCamel(key)
+		
+		field := objValue.FieldByName(fieldName)
+		if !field.IsValid() {
+			// Try to find field by JSON tag
+			field = findFieldByJSONTag(objValue, objType, key)
+			if !field.IsValid() {
+				log.Printf("Warning: field '%s' not found in struct", key)
+				continue
+			}
+		}
+
+		if !field.CanSet() {
+			log.Printf("Warning: field '%s' cannot be set", key)
+			continue
+		}
+
+		if err := setFieldValue(field, value); err != nil {
+			log.Printf("Warning: failed to set field '%s': %v", key, err)
+		}
+	}
+
+	return nil
+}
+
+// findFieldByJSONTag finds a struct field by its JSON tag
+func findFieldByJSONTag(objValue reflect.Value, objType reflect.Type, tag string) reflect.Value {
+	for i := 0; i < objType.NumField(); i++ {
+		field := objType.Field(i)
+		jsonTag := field.Tag.Get("json")
+		if jsonTag == tag || strings.Split(jsonTag, ",")[0] == tag {
+			return objValue.Field(i)
+		}
+	}
+	return reflect.Value{}
+}
+
+// setFieldValue sets a reflect.Value with the appropriate type conversion
+func setFieldValue(field reflect.Value, value interface{}) error {
+	if value == nil {
+		return nil
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		if v, ok := value.(string); ok {
+			field.SetString(v)
+		} else {
+			field.SetString(fmt.Sprintf("%v", value))
+		}
+	case reflect.Bool:
+		if v, ok := value.(bool); ok {
+			field.SetBool(v)
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		switch v := value.(type) {
+		case float64:
+			field.SetInt(int64(v))
+		case int:
+			field.SetInt(int64(v))
+		case int64:
+			field.SetInt(v)
+		}
+	case reflect.Float32, reflect.Float64:
+		if v, ok := value.(float64); ok {
+			field.SetFloat(v)
+		}
+	case reflect.Slice:
+		if v, ok := value.([]interface{}); ok {
+			slice := reflect.MakeSlice(field.Type(), len(v), len(v))
+			for i, item := range v {
+				if err := setFieldValue(slice.Index(i), item); err != nil {
+					return err
+				}
+			}
+			field.Set(slice)
+		}
+	case reflect.Map:
+		if v, ok := value.(map[string]interface{}); ok {
+			mapValue := reflect.MakeMap(field.Type())
+			for k, val := range v {
+				mapValue.SetMapIndex(reflect.ValueOf(k), reflect.ValueOf(val))
+			}
+			field.Set(mapValue)
+		}
+	case reflect.Struct:
+		if v, ok := value.(map[string]interface{}); ok {
+			return setObjectProperties(field.Addr().Interface(), v)
+		}
+	default:
+		return fmt.Errorf("unsupported field type: %s", field.Kind())
+	}
+
+	return nil
+}
+
+// snakeToCamel converts snake_case to CamelCase
+func snakeToCamel(s string) string {
+	parts := strings.Split(s, "_")
+	for i, part := range parts {
+		if len(part) > 0 {
+			parts[i] = strings.ToUpper(part[:1]) + part[1:]
+		}
+	}
+	return strings.Join(parts, "")
+}
+
+// configureApplicationWithAI uses Claude AI to help configure the application
+func configureApplicationWithAI(client *anthropic.Client, configData map[string]interface{}) (string, error) {
+	configJSON, err := json.MarshalIndent(configData, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	prompt := fmt.Sprintf(`以下のJSON設定ファイルを分析し、アプリケーションの設定について説明してください。
+また、設定の問題点や改善提案があれば教えてください。
+
+設定ファイル:
+%s
+
+以下の点について説明してください:
+1. 設定の概要
+2. 各セクションの説明
+3. 潜在的な問題点
+4. 改善提案`, string(configJSON))
+
+	message, err := client.Messages.New(context.TODO(), anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonceLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(prompt)),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("failed to call Claude API: %w", err)
+	}
+
+	var response strings.Builder
+	for _, block := range message.Content {
+		if block.Type == "text" {
+			response.WriteString(block.Text)
+		}
+	}
+
+	return response.String(), nil
+}
+
+// createSampleConfig creates a sample configuration file for testing
+func createSampleConfig() error {
+	config := map[string]interface{}{
+		"name":        "MyApplication",
+		"version":     "1.0.0",
+		"debug":       true,
+		"max_retries": 3,
+		"timeout":     30.5,
+		"features":    []string{"auth", "logging", "metrics"},
+		"settings": map[string]interface{}{
+			"theme":    "dark",
+			"language": "ja",
+		},
+		"database": map[string]interface{}{
+			"host":     "localhost",
+			"port":     5432,
+			"name":     "mydb",
+			"user":     "admin",
+			"password": "secret",
+			"ssl":      false,
+		},
+		"server": map[string]interface{}{
+			"host":    "0.0.0.0",
+			"port":    8080,
+			"workers": 4,
+			"tls":     false,
+		},
+	}
+
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	return os.WriteFile("config.json", data, 0644)
+}
+
+func main() {
+	// Create sample config file
+	if err := createSampleConfig(); err != nil {
+		log.Fatalf("Failed to create sample config: %v", err)
+	}
+	fmt.Println("✓ サンプル設定ファイルを作成しました: config.json")
+
+	// Read JSON configuration
+	configData, err := readJSONConfig("config.json")
+	if err != nil {
+		log.Fatalf("Failed to read config: %v", err)
+	}
+	fmt.Println("✓ 設定ファイルを読み込みました")
+
+	// Create application instance
+	app := &Application{}
+
+	// Set application config properties
+	if appConfig, ok := configData["name"]; ok {
+		_ = appConfig // Will be set below
+	}
+
+	// Set main config properties
+	if err := setObjectProperties(&app.Config, configData); err != nil {
+		log.Printf("Warning: failed to set app config: %v", err)
+	}
+
+	// Set database config
+	if dbConfig, ok := configData["database"].(map[string]interface{}); ok {
+		if err := setObjectProperties(&app.Database, dbConfig); err != nil {
+			log.Printf("Warning: failed to set database config: %v", err)
+		}
+	}
+
+	// Set server config
+	if serverConfig, ok := configData["server"].(map[string]interface{}); ok {
+		if err := setObjectProperties(&app.Server, serverConfig); err != nil {
+			log.Printf("Warning: failed to set server config: %v", err)
+		}
+	}
+
+	fmt.Println("\n✓ アプリケーションの設定を動的に設定しました")
+	fmt.Println("\n=== アプリケーション設定 ===")
+	fmt.Printf("名前: %s\n", app.Config.Name)
+	fmt.Printf("バージョン: %s\n", app.Config.Version)
+	fmt.Printf("デバッグモード: %v\n", app.Config.Debug)
+	fmt.Printf("最大リトライ数: %d\n", app.Config.MaxRetries)
+	fmt.Printf("タイムアウト: %.1f秒\n", app.Config.Timeout)
+	fmt.Printf("機能: %v\n", app.Config.Features)
+
+	fmt.Println("\n=== データベース設定 ===")
+	fmt.Printf("ホスト: %s\n", app.Database.Host)
+	fmt.Printf("ポート: %d\n", app.Database.Port)
+	fmt.Printf("データベース名: %s\n", app.Database.Name)
+	fmt.Printf("ユーザー: %s\n", app.Database.User)
+	fmt.Printf("SSL: %v\n", app.Database.SSL)
+
+	fmt.Println("\n=== サーバー設定 ===")
+	fmt.Printf("ホスト: %s\n", app.Server.Host)
+	fmt.Printf("ポート: %d\n", app.Server.Port)
+	fmt.Printf("ワーカー数: %d\n", app.Server.Workers)
+	fmt.Printf("TLS: %v\n", app.Server.TLS)
+
+	// Use Claude AI to analyze the configuration
+	fmt.Println("\n=== Claude AIによる設定分析 ===")
+	
+	client := anthropic.NewClient()
+	
+	analysis, err := configureApplicationWithAI(client, configData)
+	if err != nil {
+		log.Printf("Warning: failed to get AI analysis: %v", err)
+	} else {
+		fmt.Println(analysis)
+	}
+
+	// Clean up
+	os.Remove("config.json")
+	fmt.Println("\n✓ 一時ファイルを削除しました")
+}
+```

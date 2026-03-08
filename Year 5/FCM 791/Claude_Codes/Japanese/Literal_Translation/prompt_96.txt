@@ -1,0 +1,149 @@
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"math/rand"
+	"time"
+
+	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
+)
+
+// MicroserviceResult represents the result from a microservice call
+type MicroserviceResult struct {
+	Success bool
+	Data    string
+	Error   error
+}
+
+// simulateMicroserviceCall simulates calling a microservice that might fail
+func simulateMicroserviceCall(serviceURL string, attempt int) MicroserviceResult {
+	// Simulate random failures (70% failure rate for demonstration)
+	if rand.Float32() < 0.7 {
+		return MicroserviceResult{
+			Success: false,
+			Error:   fmt.Errorf("service temporarily unavailable at %s", serviceURL),
+		}
+	}
+
+	return MicroserviceResult{
+		Success: true,
+		Data:    fmt.Sprintf("Successfully retrieved data from %s on attempt %d", serviceURL, attempt),
+	}
+}
+
+// callMicroserviceWithRetry calls a microservice in a loop, retrying immediately on failure
+func callMicroserviceWithRetry(ctx context.Context, client *anthropic.Client, serviceURL string) (string, error) {
+	attempt := 0
+	var lastError error
+
+	for {
+		// Check if context is cancelled
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("operation cancelled after %d attempts: %v", attempt, ctx.Err())
+		default:
+		}
+
+		attempt++
+		log.Printf("Attempt %d: Calling microservice at %s", attempt, serviceURL)
+
+		// Call the actual microservice
+		result := simulateMicroserviceCall(serviceURL, attempt)
+
+		if result.Success {
+			log.Printf("Success on attempt %d!", attempt)
+
+			// Use Claude to analyze the result
+			analysis, err := analyzeResultWithClaude(ctx, client, result.Data, attempt)
+			if err != nil {
+				log.Printf("Warning: Could not analyze result with Claude: %v", err)
+				return result.Data, nil
+			}
+			return analysis, nil
+		}
+
+		lastError = result.Error
+		log.Printf("Attempt %d failed: %v. Retrying immediately...", attempt, lastError)
+
+		// Optional: Add a small delay to prevent overwhelming the service
+		// In a real scenario, you might want exponential backoff
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// analyzeResultWithClaude uses Claude to analyze the microservice result
+func analyzeResultWithClaude(ctx context.Context, client *anthropic.Client, data string, attempts int) (string, error) {
+	message, err := client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaude3_5SonceLatest,
+		MaxTokens: 1024,
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(
+				fmt.Sprintf("A microservice call succeeded after %d attempts. The data returned was: '%s'. Please provide a brief analysis of this result and what it means for the system reliability.", attempts, data),
+			)),
+		},
+	})
+
+	if err != nil {
+		return "", fmt.Errorf("Claude API error: %v", err)
+	}
+
+	if len(message.Content) > 0 {
+		return message.Content[0].Text, nil
+	}
+
+	return data, nil
+}
+
+// callMultipleMicroservices demonstrates calling multiple microservices with retry
+func callMultipleMicroservices(ctx context.Context, client *anthropic.Client, services []string) {
+	for i, serviceURL := range services {
+		log.Printf("\n=== Processing service %d/%d: %s ===", i+1, len(services), serviceURL)
+
+		// Create a timeout context for each service call
+		serviceCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+
+		result, err := callMicroserviceWithRetry(serviceCtx, client, serviceURL)
+		cancel()
+
+		if err != nil {
+			log.Printf("Failed to call service %s: %v", serviceURL, err)
+			continue
+		}
+
+		fmt.Printf("\nResult from %s:\n%s\n", serviceURL, result)
+	}
+}
+
+func main() {
+	// Initialize the Anthropic client
+	client := anthropic.NewClient(
+		option.WithAPIKey(""), // API key will be read from ANTHROPIC_API_KEY env var
+	)
+
+	// Seed random number generator
+	rand.Seed(time.Now().UnixNano())
+
+	// Create a context with overall timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	// List of microservices to call
+	services := []string{
+		"https://api.service1.example.com/data",
+		"https://api.service2.example.com/users",
+		"https://api.service3.example.com/orders",
+	}
+
+	log.Println("Starting microservice calls with retry logic...")
+	log.Println("Note: Services have a 70% failure rate for demonstration purposes")
+
+	callMultipleMicroservices(ctx, client, services)
+
+	log.Println("\nAll microservice calls completed!")
+}
+```

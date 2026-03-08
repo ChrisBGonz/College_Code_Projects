@@ -1,0 +1,925 @@
+<?php
+session_start();
+
+// Configuration
+define('UPLOAD_DIR', __DIR__ . '/uploads/');
+define('MAX_FILE_SIZE', 50 * 1024 * 1024); // 50MB
+define('ALLOWED_MIME_TYPES', ['application/pdf']);
+define('ALLOWED_EXTENSIONS', ['pdf']);
+define('DB_FILE', __DIR__ . '/database.json');
+
+// Initialize database
+function initDatabase() {
+    if (!file_exists(DB_FILE)) {
+        $data = [
+            'users' => [
+                ['id' => 1, 'username' => 'admin', 'password' => password_hash('admin123', PASSWORD_DEFAULT), 'role' => 'admin', 'name' => '管理者'],
+                ['id' => 2, 'username' => 'employee1', 'password' => password_hash('emp123', PASSWORD_DEFAULT), 'role' => 'employee', 'name' => '田中太郎'],
+                ['id' => 3, 'username' => 'employee2', 'password' => password_hash('emp456', PASSWORD_DEFAULT), 'role' => 'employee', 'name' => '佐藤花子'],
+            ],
+            'files' => []
+        ];
+        file_put_contents(DB_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+    }
+    return json_decode(file_get_contents(DB_FILE), true);
+}
+
+function saveDatabase($data) {
+    file_put_contents(DB_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
+}
+
+// Create upload directory
+if (!is_dir(UPLOAD_DIR)) {
+    mkdir(UPLOAD_DIR, 0755, true);
+}
+
+$db = initDatabase();
+
+// Authentication functions
+function isLoggedIn() {
+    return isset($_SESSION['user_id']);
+}
+
+function getCurrentUser() {
+    global $db;
+    if (!isLoggedIn()) return null;
+    foreach ($db['users'] as $user) {
+        if ($user['id'] === $_SESSION['user_id']) return $user;
+    }
+    return null;
+}
+
+function isAdmin() {
+    $user = getCurrentUser();
+    return $user && $user['role'] === 'admin';
+}
+
+// Handle actions
+$action = $_GET['action'] ?? $_POST['action'] ?? 'list';
+$message = '';
+$messageType = '';
+
+// Login
+if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    $username = trim($_POST['username'] ?? '');
+    $password = $_POST['password'] ?? '';
+    
+    foreach ($db['users'] as $user) {
+        if ($user['username'] === $username && password_verify($password, $user['password'])) {
+            $_SESSION['user_id'] = $user['id'];
+            $_SESSION['user_name'] = $user['name'];
+            header('Location: ?action=list');
+            exit;
+        }
+    }
+    $message = 'ユーザー名またはパスワードが正しくありません。';
+    $messageType = 'error';
+}
+
+// Logout
+if ($action === 'logout') {
+    session_destroy();
+    header('Location: ?action=login');
+    exit;
+}
+
+// Upload file
+if ($action === 'upload' && $_SERVER['REQUEST_METHOD'] === 'POST' && isLoggedIn()) {
+    if (!isset($_FILES['pdf_file']) || $_FILES['pdf_file']['error'] !== UPLOAD_ERR_OK) {
+        $errorMessages = [
+            UPLOAD_ERR_INI_SIZE => 'ファイルサイズがサーバーの制限を超えています。',
+            UPLOAD_ERR_FORM_SIZE => 'ファイルサイズがフォームの制限を超えています。',
+            UPLOAD_ERR_PARTIAL => 'ファイルが部分的にしかアップロードされませんでした。',
+            UPLOAD_ERR_NO_FILE => 'ファイルが選択されていません。',
+            UPLOAD_ERR_NO_TMP_DIR => '一時フォルダが見つかりません。',
+            UPLOAD_ERR_CANT_WRITE => 'ファイルの書き込みに失敗しました。',
+        ];
+        $errorCode = $_FILES['pdf_file']['error'] ?? UPLOAD_ERR_NO_FILE;
+        $message = $errorMessages[$errorCode] ?? 'アップロードエラーが発生しました。';
+        $messageType = 'error';
+    } else {
+        $file = $_FILES['pdf_file'];
+        $originalName = basename($file['name']);
+        $fileSize = $file['size'];
+        $tmpPath = $file['tmp_name'];
+        
+        // Validate file size
+        if ($fileSize > MAX_FILE_SIZE) {
+            $message = 'ファイルサイズが上限（50MB）を超えています。';
+            $messageType = 'error';
+        } else {
+            // Validate extension
+            $extension = strtolower(pathinfo($originalName, PATHINFO_EXTENSION));
+            if (!in_array($extension, ALLOWED_EXTENSIONS)) {
+                $message = 'PDFファイルのみアップロード可能です。';
+                $messageType = 'error';
+            } else {
+                // Validate MIME type
+                $finfo = finfo_open(FILEINFO_MIME_TYPE);
+                $mimeType = finfo_file($finfo, $tmpPath);
+                finfo_close($finfo);
+                
+                if (!in_array($mimeType, ALLOWED_MIME_TYPES)) {
+                    $message = '無効なファイル形式です。PDFファイルのみアップロード可能です。';
+                    $messageType = 'error';
+                } else {
+                    // Generate unique filename
+                    $uniqueId = uniqid('pdf_', true);
+                    $safeFilename = $uniqueId . '.pdf';
+                    $destPath = UPLOAD_DIR . $safeFilename;
+                    
+                    if (move_uploaded_file($tmpPath, $destPath)) {
+                        $currentUser = getCurrentUser();
+                        $description = trim($_POST['description'] ?? '');
+                        $category = trim($_POST['category'] ?? '一般');
+                        
+                        $fileRecord = [
+                            'id' => uniqid(),
+                            'original_name' => $originalName,
+                            'stored_name' => $safeFilename,
+                            'size' => $fileSize,
+                            'mime_type' => $mimeType,
+                            'description' => $description,
+                            'category' => $category,
+                            'uploaded_by' => $currentUser['id'],
+                            'uploaded_by_name' => $currentUser['name'],
+                            'uploaded_at' => date('Y-m-d H:i:s'),
+                        ];
+                        
+                        $db['files'][] = $fileRecord;
+                        saveDatabase($db);
+                        
+                        $message = 'ファイル「' . htmlspecialchars($originalName) . '」が正常にアップロードされました。';
+                        $messageType = 'success';
+                    } else {
+                        $message = 'ファイルの保存に失敗しました。';
+                        $messageType = 'error';
+                    }
+                }
+            }
+        }
+    }
+    $action = 'list';
+}
+
+// Delete file
+if ($action === 'delete' && isLoggedIn()) {
+    $fileId = $_GET['id'] ?? '';
+    $currentUser = getCurrentUser();
+    
+    foreach ($db['files'] as $key => $file) {
+        if ($file['id'] === $fileId) {
+            if ($currentUser['role'] === 'admin' || $file['uploaded_by'] === $currentUser['id']) {
+                $filePath = UPLOAD_DIR . $file['stored_name'];
+                if (file_exists($filePath)) {
+                    unlink($filePath);
+                }
+                array_splice($db['files'], $key, 1);
+                saveDatabase($db);
+                $message = 'ファイルを削除しました。';
+                $messageType = 'success';
+            } else {
+                $message = '削除権限がありません。';
+                $messageType = 'error';
+            }
+            break;
+        }
+    }
+    $action = 'list';
+}
+
+// Download file
+if ($action === 'download' && isLoggedIn()) {
+    $fileId = $_GET['id'] ?? '';
+    
+    foreach ($db['files'] as $file) {
+        if ($file['id'] === $fileId) {
+            $filePath = UPLOAD_DIR . $file['stored_name'];
+            if (file_exists($filePath)) {
+                header('Content-Type: application/pdf');
+                header('Content-Disposition: attachment; filename="' . $file['original_name'] . '"');
+                header('Content-Length: ' . filesize($filePath));
+                header('Cache-Control: private, max-age=0, must-revalidate');
+                readfile($filePath);
+                exit;
+            }
+        }
+    }
+    $message = 'ファイルが見つかりません。';
+    $messageType = 'error';
+    $action = 'list';
+}
+
+// Search/filter files
+$searchQuery = trim($_GET['search'] ?? '');
+$filterCategory = trim($_GET['category'] ?? '');
+$files = $db['files'];
+
+if ($searchQuery) {
+    $files = array_filter($files, function($file) use ($searchQuery) {
+        return stripos($file['original_name'], $searchQuery) !== false ||
+               stripos($file['description'], $searchQuery) !== false ||
+               stripos($file['uploaded_by_name'], $searchQuery) !== false;
+    });
+}
+
+if ($filterCategory) {
+    $files = array_filter($files, function($file) use ($filterCategory) {
+        return $file['category'] === $filterCategory;
+    });
+}
+
+$files = array_reverse($files);
+
+// Get unique categories
+$categories = array_unique(array_column($db['files'], 'category'));
+
+function formatFileSize($bytes) {
+    if ($bytes >= 1048576) return round($bytes / 1048576, 2) . ' MB';
+    if ($bytes >= 1024) return round($bytes / 1024, 2) . ' KB';
+    return $bytes . ' B';
+}
+
+?>
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>社内ドライブ - PDFファイル管理</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', 'Hiragino Sans', 'Meiryo', sans-serif;
+            background: #f0f2f5;
+            color: #333;
+            min-height: 100vh;
+        }
+
+        /* Header */
+        .header {
+            background: linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%);
+            color: white;
+            padding: 0 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 64px;
+        }
+
+        .header-logo {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+        }
+
+        .header-logo .icon {
+            font-size: 28px;
+        }
+
+        .header-user {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            font-size: 14px;
+        }
+
+        .header-user .user-info {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .user-avatar {
+            width: 36px;
+            height: 36px;
+            background: rgba(255,255,255,0.2);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+        }
+
+        .btn-logout {
+            background: rgba(255,255,255,0.15);
+            color: white;
+            border: 1px solid rgba(255,255,255,0.3);
+            padding: 6px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            text-decoration: none;
+            transition: background 0.2s;
+        }
+
+        .btn-logout:hover {
+            background: rgba(255,255,255,0.25);
+        }
+
+        /* Login Page */
+        .login-container {
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, #1a237e 0%, #3949ab 100%);
+            padding: 20px;
+        }
+
+        .login-card {
+            background: white;
+            border-radius: 16px;
+            padding: 48px 40px;
+            width: 100%;
+            max-width: 420px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        .login-logo {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .login-logo .icon {
+            font-size: 56px;
+            display: block;
+            margin-bottom: 12px;
+        }
+
+        .login-logo h1 {
+            font-size: 24px;
+            color: #1a237e;
+            font-weight: 700;
+        }
+
+        .login-logo p {
+            color: #666;
+            font-size: 14px;
+            margin-top: 4px;
+        }
+
+        /* Main Layout */
+        .main-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 24px;
+        }
+
+        /* Cards */
+        .card {
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            overflow: hidden;
+        }
+
+        .card-header {
+            padding: 20px 24px;
+            border-bottom: 1px solid #e8eaf6;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .card-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #1a237e;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-body {
+            padding: 24px;
+        }
+
+        /* Upload Area */
+        .upload-section {
+            margin-bottom: 24px;
+        }
+
+        .upload-area {
+            border: 2px dashed #c5cae9;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: #f8f9ff;
+            position: relative;
+        }
+
+        .upload-area:hover, .upload-area.dragover {
+            border-color: #3949ab;
+            background: #e8eaf6;
+        }
+
+        .upload-area input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            cursor: pointer;
+            width: 100%;
+            height: 100%;
+        }
+
+        .upload-icon {
+            font-size: 48px;
+            margin-bottom: 12px;
+            display: block;
+        }
+
+        .upload-text {
+            font-size: 16px;
+            color: #3949ab;
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .upload-subtext {
+            font-size: 13px;
+            color: #888;
+        }
+
+        .upload-filename {
+            margin-top: 12px;
+            padding: 8px 16px;
+            background: #e8eaf6;
+            border-radius: 6px;
+            font-size: 14px;
+            color: #1a237e;
+            display: none;
+        }
+
+        /* Form Elements */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 600;
+            color: #444;
+            margin-bottom: 6px;
+        }
+
+        .form-control {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+            font-family: inherit;
+        }
+
+        .form-control:focus {
+            outline: none;
+            border-color: #3949ab;
+            box-shadow: 0 0 0 3px rgba(57, 73, 171, 0.1);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 600;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            text-decoration: none;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #3949ab, #1a237e);
+            color: white;
+        }
+
+        .btn-primary:hover {
+            background: linear-gradient(135deg, #283593, #0d1b6e);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(57, 73, 171, 0.4);
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #43a047, #2e7d32);
+            color: white;
+        }
+
+        .btn-success:hover {
+            background: linear-gradient(135deg, #388e3c, #1b5e20);
+            transform: translateY(-1px);
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #e53935, #b71c1c);
+            color: white;
+        }
+
+        .btn-danger:hover {
+            background: linear-gradient(135deg, #c62828, #7f0000);
+        }
+
+        .btn-secondary {
+            background: #f5f5f5;
+            color: #555;
+            border: 1px solid #ddd;
+        }
+
+        .btn-secondary:hover {
+            background: #e0e0e0;
+        }
+
+        .btn-sm {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-full {
+            width: 100%;
+            justify-content: center;
+            padding: 12px;
+            font-size: 15px;
+        }
+
+        /* Alert Messages */
+        .alert {
+            padding: 14px 18px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .alert-success {
+            background: #e8f5e9;
+            color: #2e7d32;
+            border: 1px solid #a5d6a7;
+        }
+
+        .alert-error {
+            background: #ffebee;
+            color: #c62828;
+            border: 1px solid #ef9a9a;
+        }
+
+        /* Search Bar */
+        .search-bar {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .search-input-wrap {
+            flex: 1;
+            min-width: 200px;
+            position: relative;
+        }
+
+        .search-input-wrap .search-icon {
+            position: absolute;
+            left: 12px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #888;
+            font-size: 16px;
+        }
+
+        .search-input-wrap input {
+            padding-left: 38px;
+        }
+
+        /* Stats */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .stat-icon {
+            width: 48px;
+            height: 48px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 24px;
+        }
+
+        .stat-icon.blue { background: #e8eaf6; }
+        .stat-icon.green { background: #e8f5e9; }
+        .stat-icon.orange { background: #fff3e0; }
+
+        .stat-value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #1a237e;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        /* File Table */
+        .file-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .file-table th {
+            background: #f5f6ff;
+            padding: 12px 16px;
+            text-align: left;
+            font-size: 13px;
+            font-weight: 600;
+            color: #555;
+            border-bottom: 2px solid #e8eaf6;
+        }
+
+        .file-table td {
+            padding: 14px 16px;
+            border-bottom: 1px solid #f0f0f0;
+            font-size: 14px;
+            vertical-align: middle;
+        }
+
+        .file-table tr:hover td {
+            background: #f8f9ff;
+        }
+
+        .file-table tr:last-child td {
+            border-bottom: none;
+        }
+
+        .file-name {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .file-icon {
+            width: 36px;
+            height: 36px;
+            background: linear-gradient(135deg, #e53935, #b71c1c);
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-size: 14px;
+            font-weight: 700;
+            flex-shrink: 0;
+        }
+
+        .file-name-text {
+            font-weight: 500;
+            color: #1a237e;
+            word-break: break-all;
+        }
+
+        .file-desc {
+            font-size: 12px;
+            color: #888;
+            margin-top: 2px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 600;
+        }
+
+        .badge-blue {
+            background: #e8eaf6;
+            color: #3949ab;
+        }
+
+        .badge-green {
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+
+        .badge-orange {
+            background: #fff3e0;
+            color: #e65100;
+        }
+
+        .actions {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #888;
+        }
+
+        .empty-state .icon {
+            font-size: 64px;
+            display: block;
+            margin-bottom: 16px;
+            opacity: 0.5;
+        }
+
+        .empty-state h3 {
+            font-size: 18px;
+            margin-bottom: 8px;
+            color: #555;
+        }
+
+        /* Progress Bar */
+        .progress-bar {
+            width: 100%;
+            height: 4px;
+            background: #e0e0e0;
+            border-radius: 2px;
+            overflow: hidden;
+            display: none;
+            margin-top: 12px;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #3949ab, #7986cb);
+            border-radius: 2px;
+            animation: progress 2s ease-in-out infinite;
+        }
+
+        @keyframes progress {
+            0% { width: 0%; }
+            50% { width: 70%; }
+            100% { width: 100%; }
+        }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .main-container { padding: 16px; }
+            .form-row { grid-template-columns: 1fr; }
+            .file-table { font-size: 12px; }
+            .file-table th:nth-child(3),
+            .file-table td:nth-child(3),
+            .file-table th:nth-child(4),
+            .file-table td:nth-child(4) { display: none; }
+            .header-logo span { display: none; }
+            .stats-grid { grid-template-columns: 1fr 1fr; }
+        }
+
+        /* Tooltip */
+        [title] { cursor: help; }
+
+        /* Scrollable table */
+        .table-wrap {
+            overflow-x: auto;
+        }
+    </style>
+</head>
+<body>
+
+<?php if (!isLoggedIn() || $action === 'login'): ?>
+<!-- Login Page -->
+<div class="login-container">
+    <div class="login-card">
+        <div class="login-logo">
+            <span class="icon">🏢</span>
+            <h1>社内ドライブ</h1>
+            <p>PDFファイル管理システム</p>
+        </div>
+
+        <?php if ($message): ?>
+        <div class="alert alert-<?= $messageType ?>">
+            <?= $messageType === 'error' ? '⚠️' : '✅' ?> <?= htmlspecialchars($message) ?>
+        </div>
+        <?php endif; ?>
+
+        <form method="POST" action="?action=login">
+            <div class="form-group">
+                <label class="form-label">👤 ユーザー名</label>
+                <input type="text" name="username" class="form-control" placeholder="ユーザー名を入力" required autocomplete="username">
+            </div>
+            <div class="form-group">
+                <label class="form-label">🔒 パスワード</label>
+                <input type="password" name="password" class="form-control" placeholder="パスワードを入力" required autocomplete="current-password">
+            </div>
+            <button type="submit" class="btn btn-primary btn-full" style="margin-top: 8px;">
+                🔑 ログイン
+            </button>
+        </form>
+
+        <div style="margin-top: 24px; padding: 16px; background: #f5f6ff; border-radius: 8px; font-size: 13px; color: #666;">
+            <strong>テストアカウント:</strong><br>
+            管理者: admin / admin123<br>
+            従業員1: employee1 / emp123<br>
+            従業員2: employee2 / emp456
+        </div>
+    </div>
+</div>
+
+<?php else: ?>
+<!-- Main App -->
+<?php $currentUser = getCurrentUser(); ?>
+
+<header class="header">
+    <div class="header-inner">
+        <div class="header-logo">
+            <span class="icon">🏢</span>
+            <span>社内ドライブ - PDFファイル管理</span>
+        </div>
+        <div class="header-user">
+            <div class="user-info">
+                <div class="user-avatar">👤</div>
+                <div>
+                    <div style="font-weight: 600; font-size: 14px;"><?= htmlspecialchars($currentUser['name']) ?></div>
+                    <div style="font-size: 11px; opacity: 0.8;"><?= $currentUser['role'] === 'admin' ? '管理者' : '従業員' ?></div>
+                </div>
+            </div>
+            <a href="?action=logout" class="btn-logout">ログアウト</a>
+        </div>
+    </div>
+</header>
+
+<div class="main-container">
+
+    <?php if ($message): ?>
+    <div class="alert alert-<?= $messageType ?>">
+        <?= $messageType === 'success' ? '✅' : '⚠️' ?> <?= htmlspecialchars($message) ?>
+    </div>
+    <?php endif; ?>
+
+    <!-- Stats -->
+    <?php
+    $totalFiles = count($db['files']);
+    $totalSize = array_sum(array_column($db['files'], 'size'));
+    $myFiles = count(array_filter($db['files'], fn($f) => $f['uploaded_by'] === $currentUser['id']));
+    ?>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-icon blue">📁</div>
+            <div>
+                <div class="stat-value"><?= $totalFiles ?></div>
+                <div class="stat-label">総ファイル数</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon green">💾</div>
+            <div>
+                <div class="stat-value"><?= formatFileSize($totalSize) ?></div>
+                <div class="stat-label">総ストレージ使用量</div>
+            </div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-icon orange">📤</div>
+            <div>
+                <div class="stat-value"><?= $myFiles ?></div>
+                

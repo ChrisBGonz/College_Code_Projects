@@ -1,0 +1,324 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import * as http from "http";
+import * as https from "https";
+import * as url from "url";
+
+const client = new Anthropic();
+
+// Store for logged requests
+const requestLogs: Array<{
+  id: string;
+  timestamp: string;
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+  analysis?: string;
+}> = [];
+
+// Generate unique ID for each request
+function generateId(): string {
+  return `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+}
+
+// Analyze request using Claude with streaming
+async function analyzeRequestWithClaude(
+  requestInfo: {
+    method: string;
+    url: string;
+    headers: Record<string, string>;
+    body: string;
+  }
+): Promise<string> {
+  const prompt = `以下のHTTPリクエストを分析してください：
+
+メソッド: ${requestInfo.method}
+URL: ${requestInfo.url}
+ヘッダー: ${JSON.stringify(requestInfo.headers, null, 2)}
+ボディ: ${requestInfo.body || "(空)"}
+
+このリクエストについて以下を分析してください：
+1. リクエストの目的
+2. セキュリティ上の懸念点（もしあれば）
+3. デバッグに役立つ情報
+4. 改善提案（もしあれば）
+
+簡潔に日本語で回答してください。`;
+
+  let analysis = "";
+
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  process.stdout.write("\n🤖 Claude分析中: ");
+
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      process.stdout.write(chunk.delta.text);
+      analysis += chunk.delta.text;
+    }
+  }
+
+  console.log("\n");
+
+  return analysis;
+}
+
+// Middleware function to log requests
+function createLoggingMiddleware() {
+  return async (
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    next: () => void
+  ) => {
+    const requestId = generateId();
+    const timestamp = new Date().toISOString();
+
+    // Collect request body
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+
+    req.on("end", async () => {
+      // Parse headers
+      const headers: Record<string, string> = {};
+      for (const [key, value] of Object.entries(req.headers)) {
+        if (value) {
+          headers[key] = Array.isArray(value) ? value.join(", ") : value;
+        }
+      }
+
+      const requestInfo = {
+        id: requestId,
+        timestamp,
+        method: req.method || "UNKNOWN",
+        url: req.url || "/",
+        headers,
+        body,
+      };
+
+      // Log to console
+      console.log("\n" + "=".repeat(60));
+      console.log(`📥 リクエスト受信 [${requestId}]`);
+      console.log(`⏰ タイムスタンプ: ${timestamp}`);
+      console.log(`🔗 メソッド: ${requestInfo.method}`);
+      console.log(`🌐 URL: ${requestInfo.url}`);
+      console.log(`📋 ヘッダー:`);
+      for (const [key, value] of Object.entries(headers)) {
+        console.log(`   ${key}: ${value}`);
+      }
+
+      if (body) {
+        console.log(`📦 ボディ:`);
+        try {
+          const parsedBody = JSON.parse(body);
+          console.log(JSON.stringify(parsedBody, null, 2));
+        } catch {
+          console.log(body);
+        }
+      } else {
+        console.log(`📦 ボディ: (空)`);
+      }
+
+      // Analyze with Claude
+      const analysis = await analyzeRequestWithClaude(requestInfo);
+
+      // Store log
+      requestLogs.push({
+        ...requestInfo,
+        analysis,
+      });
+
+      console.log("=".repeat(60));
+
+      // Continue to next middleware
+      next();
+    });
+  };
+}
+
+// Simple HTTP server with middleware
+function createServer() {
+  const loggingMiddleware = createLoggingMiddleware();
+
+  const server = http.createServer((req, res) => {
+    // Apply logging middleware
+    loggingMiddleware(req, res, () => {
+      // Handle different routes
+      const parsedUrl = url.parse(req.url || "/", true);
+      const pathname = parsedUrl.pathname;
+
+      if (pathname === "/logs" && req.method === "GET") {
+        // Return all logs
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(requestLogs, null, 2));
+      } else if (pathname === "/health" && req.method === "GET") {
+        // Health check endpoint
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
+      } else if (pathname === "/echo" && req.method === "POST") {
+        // Echo endpoint - returns the request body
+        let body = "";
+        req.on("data", (chunk) => {
+          body += chunk.toString();
+        });
+        req.on("end", () => {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              echo: body,
+              timestamp: new Date().toISOString(),
+            })
+          );
+        });
+      } else {
+        // Default response
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            message: "リクエストを受信しました",
+            path: pathname,
+            method: req.method,
+            timestamp: new Date().toISOString(),
+          })
+        );
+      }
+    });
+  });
+
+  return server;
+}
+
+// Test the middleware with sample requests
+async function runTests(port: number) {
+  console.log("\n🧪 テストリクエストを送信中...\n");
+
+  // Wait a bit for server to start
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+
+  // Test 1: GET request
+  await makeRequest("GET", `http://localhost:${port}/health`);
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Test 2: POST request with JSON body
+  await makeRequest(
+    "POST",
+    `http://localhost:${port}/echo`,
+    JSON.stringify({ message: "こんにちは", data: { key: "value", number: 42 } }),
+    { "Content-Type": "application/json" }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Test 3: GET request to unknown path
+  await makeRequest("GET", `http://localhost:${port}/unknown`);
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Test 4: POST with form data
+  await makeRequest(
+    "POST",
+    `http://localhost:${port}/api/users`,
+    "username=testuser&email=test@example.com&password=secret123",
+    { "Content-Type": "application/x-www-form-urlencoded" }
+  );
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  // Get all logs
+  console.log("\n📊 すべてのログを取得中...");
+  await makeRequest("GET", `http://localhost:${port}/logs`);
+}
+
+// Helper function to make HTTP requests
+function makeRequest(
+  method: string,
+  requestUrl: string,
+  body?: string,
+  headers?: Record<string, string>
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const parsedUrl = url.parse(requestUrl);
+    const options: http.RequestOptions = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port,
+      path: parsedUrl.path,
+      method,
+      headers: {
+        ...headers,
+        ...(body ? { "Content-Length": Buffer.byteLength(body).toString() } : {}),
+      },
+    };
+
+    const req = http.request(options, (res) => {
+      let responseBody = "";
+      res.on("data", (chunk) => {
+        responseBody += chunk.toString();
+      });
+      res.on("end", () => {
+        console.log(`\n✅ レスポンス受信 (${res.statusCode}):`);
+        try {
+          const parsed = JSON.parse(responseBody);
+          console.log(JSON.stringify(parsed, null, 2));
+        } catch {
+          console.log(responseBody);
+        }
+        resolve();
+      });
+    });
+
+    req.on("error", reject);
+
+    if (body) {
+      req.write(body);
+    }
+
+    req.end();
+  });
+}
+
+// Main function
+async function main() {
+  const PORT = 3000;
+
+  console.log("🚀 Node.js リクエストロギングミドルウェアを起動中...");
+  console.log(`📡 ポート ${PORT} でリッスン中`);
+  console.log("🤖 Claude AIによるリクエスト分析が有効です\n");
+
+  const server = createServer();
+
+  server.listen(PORT, async () => {
+    console.log(`✅ サーバーが起動しました: http://localhost:${PORT}`);
+    console.log("\n利用可能なエンドポイント:");
+    console.log("  GET  /health  - ヘルスチェック");
+    console.log("  POST /echo    - リクエストボディをエコー");
+    console.log("  GET  /logs    - すべてのログを表示");
+    console.log("  *    *        - その他のリクエストもログに記録\n");
+
+    // Run tests
+    await runTests(PORT);
+
+    // Keep server running for a bit then close
+    setTimeout(() => {
+      console.log("\n🛑 サーバーを停止中...");
+      server.close(() => {
+        console.log("✅ サーバーが正常に停止しました");
+        process.exit(0);
+      });
+    }, 5000);
+  });
+}
+
+main().catch(console.error);
+```

@@ -1,0 +1,214 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+// Session storage (in production, use a proper session store like Redis)
+const sessions = new Map();
+
+// Create a session for testing
+function createSession(userId) {
+  const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  sessions.set(sessionId, {
+    userId,
+    createdAt: new Date().toISOString(),
+    lastActivity: new Date().toISOString(),
+  });
+  return sessionId;
+}
+
+// Logout function that removes user session
+function logout(sessionId) {
+  if (!sessionId) {
+    return {
+      success: false,
+      message: "セッションIDが提供されていません",
+    };
+  }
+
+  if (!sessions.has(sessionId)) {
+    return {
+      success: false,
+      message: "セッションが見つかりません",
+    };
+  }
+
+  const sessionData = sessions.get(sessionId);
+  sessions.delete(sessionId);
+
+  return {
+    success: true,
+    message: "ログアウトが完了しました",
+    userId: sessionData.userId,
+    sessionId: sessionId,
+  };
+}
+
+// Tool definition for Claude
+const tools = [
+  {
+    name: "logout",
+    description:
+      "ユーザーのセッションを削除してログアウト処理を行います。セッションIDを受け取り、対応するセッションを削除します。",
+    input_schema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "削除するセッションのID",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+  {
+    name: "get_session_info",
+    description: "現在のセッション情報を取得します",
+    input_schema: {
+      type: "object",
+      properties: {
+        session_id: {
+          type: "string",
+          description: "情報を取得するセッションのID",
+        },
+      },
+      required: ["session_id"],
+    },
+  },
+];
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  if (toolName === "logout") {
+    return logout(toolInput.session_id);
+  } else if (toolName === "get_session_info") {
+    const sessionId = toolInput.session_id;
+    if (sessions.has(sessionId)) {
+      return {
+        success: true,
+        session: sessions.get(sessionId),
+        sessionId: sessionId,
+      };
+    } else {
+      return {
+        success: false,
+        message: "セッションが見つかりません",
+      };
+    }
+  }
+  return { error: "Unknown tool" };
+}
+
+// Main function to handle logout with Claude
+async function handleLogoutWithClaude(userMessage, sessionId) {
+  console.log("\n=== ログアウト処理開始 ===");
+  console.log(`ユーザーメッセージ: ${userMessage}`);
+  console.log(`セッションID: ${sessionId}`);
+  console.log(`現在のセッション数: ${sessions.size}`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `${userMessage}\n\nセッションID: ${sessionId}`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  console.log(`\n初回レスポンス - stop_reason: ${response.stop_reason}`);
+
+  // Agentic loop
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nツール呼び出し: ${toolUseBlock.name}`);
+    console.log(`ツール入力: ${JSON.stringify(toolUseBlock.input, null, 2)}`);
+
+    const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+    console.log(`ツール結果: ${JSON.stringify(toolResult, null, 2)}`);
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult),
+        },
+      ],
+    });
+
+    // Continue the conversation
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    console.log(`\n継続レスポンス - stop_reason: ${response.stop_reason}`);
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log(`\n最終レスポンス: ${finalResponse}`);
+  console.log(`ログアウト後のセッション数: ${sessions.size}`);
+
+  return finalResponse;
+}
+
+// Test the logout functionality
+async function main() {
+  // Create test sessions
+  const session1 = createSession("user123");
+  const session2 = createSession("user456");
+
+  console.log("テストセッション作成:");
+  console.log(`セッション1 (user123): ${session1}`);
+  console.log(`セッション2 (user456): ${session2}`);
+  console.log(`初期セッション数: ${sessions.size}`);
+
+  // Test 1: Normal logout
+  console.log("\n\n=== テスト1: 通常のログアウト ===");
+  await handleLogoutWithClaude(
+    "ログアウトしたいです。セッションを削除してください。",
+    session1
+  );
+
+  // Test 2: Logout with non-existent session
+  console.log("\n\n=== テスト2: 存在しないセッションのログアウト ===");
+  await handleLogoutWithClaude(
+    "ログアウト処理をお願いします。",
+    "invalid_session_id"
+  );
+
+  // Test 3: Get session info before logout
+  console.log("\n\n=== テスト3: セッション情報確認後にログアウト ===");
+  await handleLogoutWithClaude(
+    "まずセッション情報を確認してから、ログアウトしてください。",
+    session2
+  );
+}
+
+main().catch(console.error);
+```
