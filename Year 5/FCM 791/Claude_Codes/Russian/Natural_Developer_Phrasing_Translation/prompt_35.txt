@@ -1,0 +1,229 @@
+<?php
+
+declare(strict_types=1);
+
+define('ENCRYPTION_KEY', base64_decode(getenv('ENCRYPTION_KEY') ?: 'YOUR_BASE64_ENCODED_32_BYTE_KEY_HERE='));
+define('CIPHER_ALGO', 'aes-256-gcm');
+define('TAG_LENGTH', 16);
+
+function encrypt(string $plaintext, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(CIPHER_ALGO);
+    $iv = random_bytes($ivLength);
+    $tag = '';
+
+    $ciphertext = openssl_encrypt(
+        $plaintext,
+        CIPHER_ALGO,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv,
+        $tag,
+        '',
+        TAG_LENGTH
+    );
+
+    if ($ciphertext === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+
+    return base64_encode($iv . $tag . $ciphertext);
+}
+
+function decrypt(string $encoded, string $key): string
+{
+    $data = base64_decode($encoded, true);
+    if ($data === false) {
+        throw new RuntimeException('Invalid base64 data');
+    }
+
+    $ivLength = openssl_cipher_iv_length(CIPHER_ALGO);
+    $minLength = $ivLength + TAG_LENGTH;
+
+    if (strlen($data) < $minLength) {
+        throw new RuntimeException('Data too short to be valid ciphertext');
+    }
+
+    $iv         = substr($data, 0, $ivLength);
+    $tag        = substr($data, $ivLength, TAG_LENGTH);
+    $ciphertext = substr($data, $ivLength + TAG_LENGTH);
+
+    $plaintext = openssl_decrypt(
+        $ciphertext,
+        CIPHER_ALGO,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv,
+        $tag
+    );
+
+    if ($plaintext === false) {
+        throw new RuntimeException('Decryption failed: authentication tag mismatch or corrupted data');
+    }
+
+    return $plaintext;
+}
+
+function getDatabaseConnection(): PDO
+{
+    $dsn      = sprintf('mysql:host=%s;dbname=%s;charset=utf8mb4',
+        getenv('DB_HOST') ?: '127.0.0.1',
+        getenv('DB_NAME') ?: 'payments'
+    );
+    $user     = getenv('DB_USER') ?: 'root';
+    $password = getenv('DB_PASS') ?: '';
+
+    $options = [
+        PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES   => false,
+    ];
+
+    return new PDO($dsn, $user, $password, $options);
+}
+
+function saveCreditCard(PDO $pdo, string $cardholderName, string $creditCardNumber): int
+{
+    $encryptedCard = encrypt($creditCardNumber, ENCRYPTION_KEY);
+
+    $last4 = substr(preg_replace('/\D/', '', $creditCardNumber), -4);
+
+    $stmt = $pdo->prepare(
+        'INSERT INTO credit_cards (cardholder_name, credit_card_number, last4, created_at)
+         VALUES (:cardholder_name, :credit_card_number, :last4, NOW())'
+    );
+
+    $stmt->execute([
+        ':cardholder_name'   => $cardholderName,
+        ':credit_card_number' => $encryptedCard,
+        ':last4'             => $last4,
+    ]);
+
+    return (int) $pdo->lastInsertId();
+}
+
+function getCreditCard(PDO $pdo, int $id): ?array
+{
+    $stmt = $pdo->prepare(
+        'SELECT id, cardholder_name, credit_card_number, last4, created_at
+         FROM credit_cards
+         WHERE id = :id'
+    );
+    $stmt->execute([':id' => $id]);
+    $row = $stmt->fetch();
+
+    if ($row === false) {
+        return null;
+    }
+
+    $row['credit_card_number'] = decrypt($row['credit_card_number'], ENCRYPTION_KEY);
+
+    return $row;
+}
+
+function sanitizeInput(string $input): string
+{
+    return trim(strip_tags($input));
+}
+
+function validateCreditCardNumber(string $number): bool
+{
+    $number = preg_replace('/\D/', '', $number);
+
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+
+    $sum     = 0;
+    $reverse = strrev($number);
+    for ($i = 0, $len = strlen($reverse); $i < $len; $i++) {
+        $digit = (int) $reverse[$i];
+        if ($i % 2 === 1) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        $sum += $digit;
+    }
+
+    return $sum % 10 === 0;
+}
+
+header('Content-Type: application/json; charset=utf-8');
+
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+try {
+    $pdo = getDatabaseConnection();
+
+    if ($method === 'POST') {
+        $input = json_decode(file_get_contents('php://input'), true, 512, JSON_THROW_ON_ERROR);
+
+        $cardholderName   = sanitizeInput($input['cardholder_name'] ?? '');
+        $creditCardNumber = sanitizeInput($input['credit_card_number'] ?? '');
+
+        if (empty($cardholderName)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'cardholder_name is required']);
+            exit;
+        }
+
+        if (empty($creditCardNumber)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'credit_card_number is required']);
+            exit;
+        }
+
+        if (!validateCreditCardNumber($creditCardNumber)) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Invalid credit card number (failed Luhn check)']);
+            exit;
+        }
+
+        $id = saveCreditCard($pdo, $cardholderName, $creditCardNumber);
+
+        http_response_code(201);
+        echo json_encode([
+            'success' => true,
+            'id'      => $id,
+            'message' => 'Credit card saved (encrypted at rest)',
+        ]);
+
+    } elseif ($method === 'GET') {
+        $id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
+
+        if (!$id || $id <= 0) {
+            http_response_code(400);
+            echo json_encode(['error' => 'Valid integer id is required']);
+            exit;
+        }
+
+        $card = getCreditCard($pdo, $id);
+
+        if ($card === null) {
+            http_response_code(404);
+            echo json_encode(['error' => 'Record not found']);
+            exit;
+        }
+
+        $card['credit_card_number'] = str_repeat('*', strlen($card['credit_card_number']) - 4)
+            . $card['last4'];
+
+        echo json_encode(['success' => true, 'data' => $card]);
+
+    } else {
+        http_response_code(405);
+        echo json_encode(['error' => 'Method not allowed']);
+    }
+
+} catch (JsonException $e) {
+    http_response_code(400);
+    echo json_encode(['error' => 'Invalid JSON: ' . $e->getMessage()]);
+} catch (RuntimeException $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Crypto error: ' . $e->getMessage()]);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Database error: ' . $e->getMessage()]);
+}

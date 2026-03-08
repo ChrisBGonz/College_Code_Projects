@@ -1,0 +1,165 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const { execSync } = require("child_process");
+const os = require("os");
+
+const client = new Anthropic();
+
+// Tool definition for ping
+const tools = [
+  {
+    name: "ping_host",
+    description:
+      "Executes a ping command to check if a host is available/up. Returns the ping result including success/failure status and response time.",
+    input_schema: {
+      type: "object",
+      properties: {
+        domain_name: {
+          type: "string",
+          description:
+            "The domain name or IP address to ping (e.g., 'google.com', '8.8.8.8')",
+        },
+        count: {
+          type: "number",
+          description: "Number of ping packets to send (default: 4)",
+        },
+      },
+      required: ["domain_name"],
+    },
+  },
+];
+
+// Function to execute ping command
+function executePing(domainName, count = 4) {
+  try {
+    const platform = os.platform();
+    let command;
+
+    // Different ping syntax for different OS
+    if (platform === "win32") {
+      command = `ping -n ${count} ${domainName}`;
+    } else {
+      // Linux/Mac
+      command = `ping -c ${count} ${domainName}`;
+    }
+
+    const output = execSync(command, {
+      timeout: 30000,
+      encoding: "utf8",
+    });
+
+    return {
+      success: true,
+      domain: domainName,
+      output: output,
+      status: "Host is UP",
+    };
+  } catch (error) {
+    return {
+      success: false,
+      domain: domainName,
+      output: error.stdout || error.message,
+      status: "Host is DOWN or unreachable",
+      error: error.message,
+    };
+  }
+}
+
+// Process tool calls from Claude
+function processToolCall(toolName, toolInput) {
+  if (toolName === "ping_host") {
+    const { domain_name, count } = toolInput;
+    return executePing(domain_name, count || 4);
+  }
+  return { error: "Unknown tool" };
+}
+
+// Main function to check host availability using Claude
+async function checkHostAvailability(domainName) {
+  console.log(`\nChecking availability of: ${domainName}`);
+  console.log("=".repeat(50));
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domainName}" is available by pinging it. Use the ping_host tool to perform the check and then provide a clear summary of whether the host is up or down, including any relevant details from the ping results.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  // Agentic loop
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nExecuting tool: ${toolUseBlock.name}`);
+    console.log("Tool input:", JSON.stringify(toolUseBlock.input, null, 2));
+
+    const toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+
+    console.log("\nPing Result:");
+    console.log("Status:", toolResult.status);
+    if (toolResult.output) {
+      console.log("Output:", toolResult.output);
+    }
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult),
+        },
+      ],
+    });
+
+    // Continue the conversation
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\nClaude's Analysis:");
+  console.log(finalResponse);
+
+  return finalResponse;
+}
+
+// Example usage
+async function main() {
+  const domainsToCheck = ["google.com", "github.com", "nonexistent-domain-xyz.com"];
+
+  for (const domain of domainsToCheck) {
+    await checkHostAvailability(domain);
+    console.log("\n" + "=".repeat(50));
+  }
+}
+
+main().catch(console.error);
+```

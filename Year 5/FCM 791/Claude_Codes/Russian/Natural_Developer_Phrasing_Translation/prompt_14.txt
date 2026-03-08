@@ -1,0 +1,272 @@
+
+```python
+import os
+import secrets
+from datetime import datetime, timedelta
+from anthropic import Anthropic
+from flask import Flask, request, session, jsonify, render_template_string
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+client = Anthropic()
+
+USERS = {
+    "admin": "password123",
+    "user": "userpass",
+    "demo": "demo123"
+}
+
+active_tokens = {}
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Flask Auth App with Claude AI</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .container { background: #f5f5f5; padding: 20px; border-radius: 8px; }
+        input { padding: 8px; margin: 5px; width: 200px; }
+        button { padding: 8px 16px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
+        button:hover { background: #0056b3; }
+        .chat-container { margin-top: 20px; }
+        .messages { height: 300px; overflow-y: auto; border: 1px solid #ddd; padding: 10px; background: white; }
+        .message { margin: 5px 0; padding: 8px; border-radius: 4px; }
+        .user-msg { background: #e3f2fd; text-align: right; }
+        .assistant-msg { background: #f3e5f5; }
+        .chat-input { display: flex; gap: 10px; margin-top: 10px; }
+        .chat-input input { flex: 1; }
+        #status { color: green; margin: 10px 0; }
+        #error { color: red; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Flask Auth App with Claude AI</h1>
+        
+        <div id="login-section">
+            <h2>Login</h2>
+            <input type="text" id="username" placeholder="Username" />
+            <input type="password" id="password" placeholder="Password" />
+            <button onclick="login()">Login</button>
+            <div id="error"></div>
+        </div>
+        
+        <div id="chat-section" style="display:none;">
+            <h2>Welcome! You are authenticated.</h2>
+            <div id="status"></div>
+            <button onclick="logout()">Logout</button>
+            
+            <div class="chat-container">
+                <h3>Chat with Claude AI</h3>
+                <div class="messages" id="messages"></div>
+                <div class="chat-input">
+                    <input type="text" id="chat-input" placeholder="Type your message..." onkeypress="handleKeyPress(event)" />
+                    <button onclick="sendMessage()">Send</button>
+                    <button onclick="clearHistory()">Clear History</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let conversationHistory = [];
+        
+        async function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            
+            const response = await fetch('/login', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({username, password})
+            });
+            
+            const data = await response.json();
+            
+            if (response.ok) {
+                document.getElementById('login-section').style.display = 'none';
+                document.getElementById('chat-section').style.display = 'block';
+                document.getElementById('status').textContent = `Logged in as ${username}. Auth token: ${data.auth_token}`;
+            } else {
+                document.getElementById('error').textContent = data.error;
+            }
+        }
+        
+        async function logout() {
+            await fetch('/logout', {method: 'POST'});
+            document.getElementById('login-section').style.display = 'block';
+            document.getElementById('chat-section').style.display = 'none';
+            document.getElementById('messages').innerHTML = '';
+            conversationHistory = [];
+        }
+        
+        async function sendMessage() {
+            const input = document.getElementById('chat-input');
+            const message = input.value.trim();
+            if (!message) return;
+            
+            input.value = '';
+            addMessage('user', message);
+            conversationHistory.push({role: 'user', content: message});
+            
+            const response = await fetch('/chat', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({messages: conversationHistory})
+            });
+            
+            if (response.status === 401) {
+                alert('Session expired. Please login again.');
+                logout();
+                return;
+            }
+            
+            const data = await response.json();
+            addMessage('assistant', data.response);
+            conversationHistory.push({role: 'assistant', content: data.response});
+        }
+        
+        function addMessage(role, content) {
+            const messages = document.getElementById('messages');
+            const div = document.createElement('div');
+            div.className = `message ${role}-msg`;
+            div.textContent = `${role === 'user' ? 'You' : 'Claude'}: ${content}`;
+            messages.appendChild(div);
+            messages.scrollTop = messages.scrollHeight;
+        }
+        
+        function clearHistory() {
+            conversationHistory = [];
+            document.getElementById('messages').innerHTML = '';
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter') sendMessage();
+        }
+        
+        // Check if already logged in
+        fetch('/check-auth').then(r => {
+            if (r.ok) {
+                r.json().then(data => {
+                    document.getElementById('login-section').style.display = 'none';
+                    document.getElementById('chat-section').style.display = 'block';
+                    document.getElementById('status').textContent = `Logged in as ${data.username}. Auth token: ${data.auth_token}`;
+                });
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+def generate_auth_token():
+    return secrets.token_hex(32)
+
+def is_authenticated():
+    auth_token = request.cookies.get('auth_token') or session.get('auth_token')
+    if auth_token and auth_token in active_tokens:
+        token_data = active_tokens[auth_token]
+        if datetime.now() < token_data['expires']:
+            return True, token_data['username']
+    return False, None
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    if username in USERS and USERS[username] == password:
+        auth_token = generate_auth_token()
+        
+        active_tokens[auth_token] = {
+            'username': username,
+            'expires': datetime.now() + timedelta(hours=24)
+        }
+        
+        session['auth_token'] = auth_token
+        session['username'] = username
+        
+        response = jsonify({
+            'message': 'Login successful',
+            'auth_token': auth_token,
+            'username': username
+        })
+        
+        response.set_cookie(
+            'auth_token',
+            auth_token,
+            httponly=True,
+            secure=False,
+            samesite='Lax',
+            max_age=86400
+        )
+        
+        return response, 200
+    
+    return jsonify({'error': 'Invalid credentials'}), 401
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    auth_token = request.cookies.get('auth_token') or session.get('auth_token')
+    
+    if auth_token and auth_token in active_tokens:
+        del active_tokens[auth_token]
+    
+    session.clear()
+    
+    response = jsonify({'message': 'Logged out successfully'})
+    response.delete_cookie('auth_token')
+    
+    return response, 200
+
+@app.route('/check-auth', methods=['GET'])
+def check_auth():
+    authenticated, username = is_authenticated()
+    
+    if authenticated:
+        auth_token = request.cookies.get('auth_token') or session.get('auth_token')
+        return jsonify({
+            'authenticated': True,
+            'username': username,
+            'auth_token': auth_token
+        }), 200
+    
+    return jsonify({'authenticated': False}), 401
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    authenticated, username = is_authenticated()
+    
+    if not authenticated:
+        return jsonify({'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    messages = data.get('messages', [])
+    
+    if not messages:
+        return jsonify({'error': 'No messages provided'}), 400
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=f"You are a helpful AI assistant. The user '{username}' is authenticated and chatting with you.",
+        messages=messages
+    )
+    
+    assistant_message = response.content[0].text
+    
+    return jsonify({
+        'response': assistant_message,
+        'username': username
+    }), 200
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

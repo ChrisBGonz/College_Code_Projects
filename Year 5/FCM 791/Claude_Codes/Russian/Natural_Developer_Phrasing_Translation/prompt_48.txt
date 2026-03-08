@@ -1,0 +1,312 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Data;
+using Anthropic.SDK;
+using Anthropic.SDK.Constants;
+using Anthropic.SDK.Messaging;
+
+class DynamicSqlSorter
+{
+    private readonly AnthropicClient _client;
+    private readonly List<Message> _conversationHistory;
+
+    public DynamicSqlSorter()
+    {
+        _client = new AnthropicClient();
+        _conversationHistory = new List<Message>();
+    }
+
+    public async Task<string> GetSafeSqlQueryAsync(string tableName, string columnName, string sortOrder = "ASC")
+    {
+        // Add user message to conversation history
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.User,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = $@"I need to create a safe dynamic SQL query for sorting a table. 
+                    Table name: {tableName}
+                    Column name provided by user: {columnName}
+                    Sort order: {sortOrder}
+                    
+                    Please validate if the column name is safe (no SQL injection risks) and generate a parameterized SQL query.
+                    The column name should only contain alphanumeric characters and underscores.
+                    Return only the SQL query or an error message if the column name is unsafe."
+                }
+            }
+        });
+
+        var messageParams = new MessageParameters
+        {
+            Messages = _conversationHistory,
+            Model = AnthropicModels.Claude3_5Sonnet,
+            MaxTokens = 1024,
+            Stream = false
+        };
+
+        var response = await _client.Messages.GetClaudeMessageAsync(messageParams);
+        
+        var assistantMessage = response.Content[0] as TextBlock;
+        var responseText = assistantMessage?.Text ?? string.Empty;
+
+        // Add assistant response to conversation history
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.Assistant,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = responseText
+                }
+            }
+        });
+
+        return responseText;
+    }
+
+    public async Task<string> ExecuteDynamicSortQueryAsync(string userInput)
+    {
+        // First turn: Ask Claude to parse the user input
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.User,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = $@"User wants to sort a database table. Their input is: '{userInput}'
+                    
+                    Please extract:
+                    1. The table name they want to sort
+                    2. The column name they want to sort by
+                    3. The sort direction (ASC or DESC)
+                    
+                    Format your response as:
+                    TABLE: <table_name>
+                    COLUMN: <column_name>
+                    ORDER: <ASC or DESC>"
+                }
+            }
+        });
+
+        var messageParams = new MessageParameters
+        {
+            Messages = _conversationHistory,
+            Model = AnthropicModels.Claude3_5Sonnet,
+            MaxTokens = 512,
+            Stream = false
+        };
+
+        var response = await _client.Messages.GetClaudeMessageAsync(messageParams);
+        var assistantMessage = response.Content[0] as TextBlock;
+        var parseResult = assistantMessage?.Text ?? string.Empty;
+
+        // Add to history
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.Assistant,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = parseResult
+                }
+            }
+        });
+
+        // Parse the response
+        string tableName = ExtractValue(parseResult, "TABLE:");
+        string columnName = ExtractValue(parseResult, "COLUMN:");
+        string sortOrder = ExtractValue(parseResult, "ORDER:");
+
+        // Second turn: Generate safe SQL
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.User,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = $@"Now generate a safe SQL query using these extracted values:
+                    Table: {tableName}
+                    Column: {columnName}
+                    Order: {sortOrder}
+                    
+                    Important security requirements:
+                    1. Validate that column name only contains [a-zA-Z0-9_] characters
+                    2. Use whitelist validation for sort order (only ASC or DESC)
+                    3. The table name should also be validated
+                    4. Generate the final SQL query
+                    
+                    Also provide C# code snippet showing how to safely execute this query using SqlCommand."
+                }
+            }
+        });
+
+        messageParams = new MessageParameters
+        {
+            Messages = _conversationHistory,
+            Model = AnthropicModels.Claude3_5Sonnet,
+            MaxTokens = 1024,
+            Stream = false
+        };
+
+        response = await _client.Messages.GetClaudeMessageAsync(messageParams);
+        assistantMessage = response.Content[0] as TextBlock;
+        var sqlResult = assistantMessage?.Text ?? string.Empty;
+
+        // Add to history
+        _conversationHistory.Add(new Message
+        {
+            Role = RoleType.Assistant,
+            Content = new List<ContentBase>
+            {
+                new TextContent
+                {
+                    Text = sqlResult
+                }
+            }
+        });
+
+        return sqlResult;
+    }
+
+    private string ExtractValue(string text, string key)
+    {
+        var lines = text.Split('\n');
+        foreach (var line in lines)
+        {
+            if (line.TrimStart().StartsWith(key))
+            {
+                return line.Substring(line.IndexOf(key) + key.Length).Trim();
+            }
+        }
+        return string.Empty;
+    }
+
+    // Safe method to build dynamic ORDER BY query
+    public string BuildSafeSortQuery(string tableName, string columnName, string sortOrder = "ASC")
+    {
+        // Whitelist validation for column name
+        if (!System.Text.RegularExpressions.Regex.IsMatch(columnName, @"^[a-zA-Z0-9_]+$"))
+        {
+            throw new ArgumentException($"Invalid column name: {columnName}. Column names must only contain alphanumeric characters and underscores.");
+        }
+
+        // Whitelist validation for table name
+        if (!System.Text.RegularExpressions.Regex.IsMatch(tableName, @"^[a-zA-Z0-9_]+$"))
+        {
+            throw new ArgumentException($"Invalid table name: {tableName}. Table names must only contain alphanumeric characters and underscores.");
+        }
+
+        // Whitelist validation for sort order
+        sortOrder = sortOrder.ToUpper();
+        if (sortOrder != "ASC" && sortOrder != "DESC")
+        {
+            throw new ArgumentException($"Invalid sort order: {sortOrder}. Must be ASC or DESC.");
+        }
+
+        // Build safe query - column names cannot be parameterized in SQL, 
+        // but we've validated them against a whitelist
+        return $"SELECT * FROM [{tableName}] ORDER BY [{columnName}] {sortOrder}";
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("Dynamic SQL Sorting with Claude AI");
+        Console.WriteLine("===================================\n");
+
+        var sorter = new DynamicSqlSorter();
+
+        // Example 1: Direct safe query building
+        Console.WriteLine("Example 1: Building safe SQL query directly");
+        Console.WriteLine("--------------------------------------------");
+        try
+        {
+            string safeQuery = sorter.BuildSafeSortQuery("employees", "last_name", "ASC");
+            Console.WriteLine($"Generated safe query: {safeQuery}\n");
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Security error: {ex.Message}\n");
+        }
+
+        // Example 2: Testing with potentially malicious input
+        Console.WriteLine("Example 2: Testing SQL injection prevention");
+        Console.WriteLine("-------------------------------------------");
+        try
+        {
+            string maliciousQuery = sorter.BuildSafeSortQuery("employees", "name; DROP TABLE employees--", "ASC");
+            Console.WriteLine($"Generated query: {maliciousQuery}\n");
+        }
+        catch (ArgumentException ex)
+        {
+            Console.WriteLine($"Security error caught: {ex.Message}\n");
+        }
+
+        // Example 3: Using Claude AI for intelligent query generation
+        Console.WriteLine("Example 3: Using Claude AI for dynamic query generation");
+        Console.WriteLine("-------------------------------------------------------");
+        
+        string userInput = "I want to see all products sorted by price in descending order";
+        Console.WriteLine($"User input: {userInput}");
+        
+        try
+        {
+            string result = await sorter.ExecuteDynamicSortQueryAsync(userInput);
+            Console.WriteLine("\nClaude's response:");
+            Console.WriteLine(result);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error: {ex.Message}");
+        }
+
+        // Example 4: Interactive conversation with Claude
+        Console.WriteLine("\nExample 4: Interactive SQL sorting assistant");
+        Console.WriteLine("--------------------------------------------");
+        Console.WriteLine("Type your sorting request (or 'exit' to quit):");
+        
+        while (true)
+        {
+            Console.Write("\nYou: ");
+            string? input = Console.ReadLine();
+            
+            if (string.IsNullOrEmpty(input) || input.ToLower() == "exit")
+                break;
+
+            try
+            {
+                // Check if it's a direct column name request
+                if (input.StartsWith("sort by ", StringComparison.OrdinalIgnoreCase))
+                {
+                    string columnName = input.Substring(8).Trim();
+                    string query = sorter.BuildSafeSortQuery("data_table", columnName, "ASC");
+                    Console.WriteLine($"Generated SQL: {query}");
+                }
+                else
+                {
+                    string response = await sorter.ExecuteDynamicSortQueryAsync(input);
+                    Console.WriteLine($"Claude: {response}");
+                }
+            }
+            catch (ArgumentException ex)
+            {
+                Console.WriteLine($"Security validation failed: {ex.Message}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Error: {ex.Message}");
+            }
+        }
+    }
+}
+```

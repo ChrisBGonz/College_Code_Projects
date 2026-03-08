@@ -1,0 +1,339 @@
+
+```python
+import re
+import ast
+import operator
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+ALLOWED_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+    ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv,
+}
+
+ALLOWED_FUNCTIONS = {
+    'abs': abs,
+    'round': round,
+}
+
+import math
+MATH_FUNCTIONS = {
+    'sqrt': math.sqrt,
+    'sin': math.sin,
+    'cos': math.cos,
+    'tan': math.tan,
+    'log': math.log,
+    'log10': math.log10,
+    'exp': math.exp,
+    'ceil': math.ceil,
+    'floor': math.floor,
+    'pi': math.pi,
+    'e': math.e,
+}
+
+
+def safe_eval(node):
+    """Recursively evaluate an AST node safely."""
+    if isinstance(node, ast.Expression):
+        return safe_eval(node.body)
+    
+    elif isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, complex)):
+            return node.value
+        raise ValueError(f"Unsupported constant type: {type(node.value)}")
+    
+    elif isinstance(node, ast.BinOp):
+        op_type = type(node.op)
+        if op_type not in ALLOWED_OPERATORS:
+            raise ValueError(f"Unsupported operator: {op_type.__name__}")
+        
+        left = safe_eval(node.left)
+        right = safe_eval(node.right)
+        
+        if op_type == ast.Div and right == 0:
+            raise ValueError("Division by zero")
+        if op_type == ast.FloorDiv and right == 0:
+            raise ValueError("Division by zero")
+        if op_type == ast.Mod and right == 0:
+            raise ValueError("Modulo by zero")
+        
+        return ALLOWED_OPERATORS[op_type](left, right)
+    
+    elif isinstance(node, ast.UnaryOp):
+        op_type = type(node.op)
+        if op_type not in ALLOWED_OPERATORS:
+            raise ValueError(f"Unsupported unary operator: {op_type.__name__}")
+        
+        operand = safe_eval(node.operand)
+        return ALLOWED_OPERATORS[op_type](operand)
+    
+    elif isinstance(node, ast.Call):
+        if not isinstance(node.func, (ast.Name, ast.Attribute)):
+            raise ValueError("Invalid function call")
+        
+        if isinstance(node.func, ast.Name):
+            func_name = node.func.id
+        elif isinstance(node.func, ast.Attribute):
+            if isinstance(node.func.value, ast.Name) and node.func.value.id == 'math':
+                func_name = node.func.attr
+            else:
+                raise ValueError("Only 'math' module functions are allowed")
+        
+        all_functions = {**ALLOWED_FUNCTIONS, **MATH_FUNCTIONS}
+        
+        if func_name not in all_functions:
+            raise ValueError(f"Function '{func_name}' is not allowed")
+        
+        func = all_functions[func_name]
+        
+        if callable(func):
+            args = [safe_eval(arg) for arg in node.args]
+            return func(*args)
+        else:
+            if node.args:
+                raise ValueError(f"'{func_name}' is a constant, not a function")
+            return func
+    
+    elif isinstance(node, ast.Name):
+        constants = {
+            'pi': math.pi,
+            'e': math.e,
+            'inf': math.inf,
+            'nan': math.nan,
+        }
+        if node.id in constants:
+            return constants[node.id]
+        raise ValueError(f"Unknown variable: {node.id}")
+    
+    else:
+        raise ValueError(f"Unsupported AST node type: {type(node).__name__}")
+
+
+def validate_expression(expression: str) -> str:
+    """Validate and sanitize the expression string."""
+    if not expression or not expression.strip():
+        raise ValueError("Expression cannot be empty")
+    
+    expression = expression.strip()
+    
+    if len(expression) > 1000:
+        raise ValueError("Expression is too long (max 1000 characters)")
+    
+    allowed_pattern = r'^[0-9\s\+\-\*\/\(\)\.\,\%\^a-zA-Z_]+$'
+    if not re.match(allowed_pattern, expression):
+        raise ValueError("Expression contains invalid characters")
+    
+    dangerous_keywords = ['import', 'exec', 'eval', 'open', 'file', 'os', 'sys', 
+                         '__', 'lambda', 'class', 'def', 'return', 'yield',
+                         'print', 'input', 'compile', 'globals', 'locals']
+    
+    expression_lower = expression.lower()
+    for keyword in dangerous_keywords:
+        if keyword in expression_lower:
+            raise ValueError(f"Expression contains forbidden keyword: '{keyword}'")
+    
+    expression = expression.replace('^', '**')
+    
+    return expression
+
+
+@app.route('/calculate', methods=['POST'])
+def calculate():
+    """
+    Calculate a mathematical expression safely.
+    
+    Accepts JSON body with 'expression' field or form data.
+    Returns JSON with the result or error message.
+    
+    Example request body:
+    {
+        "expression": "2 + 2 * 3"
+    }
+    
+    Example response:
+    {
+        "expression": "2 + 2 * 3",
+        "result": 8,
+        "success": true
+    }
+    """
+    try:
+        if request.is_json:
+            data = request.get_json()
+            if not data:
+                return jsonify({
+                    'success': False,
+                    'error': 'Invalid JSON body'
+                }), 400
+            expression = data.get('expression', '')
+        else:
+            expression = request.form.get('expression', '') or request.args.get('expression', '')
+        
+        if not expression:
+            return jsonify({
+                'success': False,
+                'error': 'No expression provided. Send JSON with "expression" field.'
+            }), 400
+        
+        validated_expression = validate_expression(expression)
+        
+        tree = ast.parse(validated_expression, mode='eval')
+        
+        result = safe_eval(tree)
+        
+        if isinstance(result, float):
+            if math.isnan(result):
+                return jsonify({
+                    'success': False,
+                    'error': 'Result is NaN (Not a Number)'
+                }), 400
+            if math.isinf(result):
+                return jsonify({
+                    'success': False,
+                    'error': 'Result is infinite'
+                }), 400
+            
+            if result == int(result) and abs(result) < 1e15:
+                result = int(result)
+        
+        return jsonify({
+            'success': True,
+            'expression': expression,
+            'result': result
+        })
+    
+    except ValueError as e:
+        return jsonify({
+            'success': False,
+            'error': str(e),
+            'expression': expression if 'expression' in locals() else None
+        }), 400
+    
+    except SyntaxError as e:
+        return jsonify({
+            'success': False,
+            'error': f'Invalid mathematical expression: {str(e)}',
+            'expression': expression if 'expression' in locals() else None
+        }), 400
+    
+    except ZeroDivisionError:
+        return jsonify({
+            'success': False,
+            'error': 'Division by zero',
+            'expression': expression if 'expression' in locals() else None
+        }), 400
+    
+    except OverflowError:
+        return jsonify({
+            'success': False,
+            'error': 'Result is too large to compute',
+            'expression': expression if 'expression' in locals() else None
+        }), 400
+    
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': f'Calculation error: {str(e)}',
+            'expression': expression if 'expression' in locals() else None
+        }), 500
+
+
+@app.route('/calculate', methods=['GET'])
+def calculate_get():
+    """
+    Calculate a mathematical expression via GET request.
+    
+    Query parameter: expression
+    Example: /calculate?expression=2+2*3
+    """
+    expression = request.args.get('expression', '')
+    
+    if not expression:
+        return jsonify({
+            'success': False,
+            'error': 'No expression provided. Use ?expression=your_expression query parameter.',
+            'examples': [
+                '/calculate?expression=2+2',
+                '/calculate?expression=sqrt(16)',
+                '/calculate?expression=sin(pi/2)',
+                '/calculate?expression=(3+4)*2-1'
+            ]
+        }), 400
+    
+    with app.test_request_context('/calculate', method='POST', 
+                                   json={'expression': expression}):
+        pass
+    
+    try:
+        validated_expression = validate_expression(expression)
+        tree = ast.parse(validated_expression, mode='eval')
+        result = safe_eval(tree)
+        
+        if isinstance(result, float):
+            if math.isnan(result):
+                return jsonify({'success': False, 'error': 'Result is NaN'}), 400
+            if math.isinf(result):
+                return jsonify({'success': False, 'error': 'Result is infinite'}), 400
+            if result == int(result) and abs(result) < 1e15:
+                result = int(result)
+        
+        return jsonify({
+            'success': True,
+            'expression': expression,
+            'result': result
+        })
+    
+    except (ValueError, SyntaxError) as e:
+        return jsonify({'success': False, 'error': str(e), 'expression': expression}), 400
+    except ZeroDivisionError:
+        return jsonify({'success': False, 'error': 'Division by zero', 'expression': expression}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e), 'expression': expression}), 500
+
+
+@app.route('/', methods=['GET'])
+def index():
+    """API documentation endpoint."""
+    return jsonify({
+        'name': 'Safe Math Expression Calculator API',
+        'version': '1.0',
+        'endpoints': {
+            'POST /calculate': {
+                'description': 'Calculate a mathematical expression',
+                'body': {'expression': 'string (required)'},
+                'example': {'expression': '2 + 2 * 3'}
+            },
+            'GET /calculate': {
+                'description': 'Calculate via query parameter',
+                'params': {'expression': 'string (required)'},
+                'example': '/calculate?expression=sqrt(16)'
+            }
+        },
+        'supported_operations': ['+', '-', '*', '/', '//', '%', '** (or ^)'],
+        'supported_functions': list({**ALLOWED_FUNCTIONS, **MATH_FUNCTIONS}.keys()),
+        'supported_constants': ['pi', 'e', 'inf'],
+        'examples': [
+            '2 + 2',
+            '10 * 5 - 3',
+            'sqrt(144)',
+            'sin(pi/2)',
+            'log(e)',
+            '2^10',
+            '(3 + 4) * 2',
+            'abs(-42)',
+            'round(3.14159, 2)'
+        ]
+    })
+
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

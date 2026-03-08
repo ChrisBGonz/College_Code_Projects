@@ -1,0 +1,407 @@
+```csharp
+using System;
+using System.Security.Principal;
+using System.Threading;
+using System.Windows.Forms;
+
+namespace UserManagement
+{
+    public enum UserRole
+    {
+        Guest,
+        User,
+        Moderator,
+        Administrator
+    }
+
+    public class ApplicationUser
+    {
+        public int Id { get; set; }
+        public string Username { get; set; }
+        public string Email { get; set; }
+        public UserRole Role { get; set; }
+        public bool IsActive { get; set; }
+        public DateTime CreatedAt { get; set; }
+    }
+
+    public class OperationResult
+    {
+        public bool Success { get; set; }
+        public string Message { get; set; }
+        public Exception Exception { get; set; }
+
+        public static OperationResult Ok(string message = "Операция выполнена успешно")
+            => new OperationResult { Success = true, Message = message };
+
+        public static OperationResult Fail(string message, Exception ex = null)
+            => new OperationResult { Success = false, Message = message, Exception = ex };
+    }
+
+    public class AccessDeniedException : Exception
+    {
+        public string RequiredRole { get; }
+        public string CurrentRole { get; }
+
+        public AccessDeniedException(string requiredRole, string currentRole)
+            : base($"Доступ запрещён. Требуется роль: {requiredRole}. Текущая роль: {currentRole}")
+        {
+            RequiredRole = requiredRole;
+            CurrentRole = currentRole;
+        }
+    }
+
+    public class UserNotFoundException : Exception
+    {
+        public int UserId { get; }
+
+        public UserNotFoundException(int userId)
+            : base($"Пользователь с ID {userId} не найден")
+        {
+            UserId = userId;
+        }
+    }
+
+    public class SelfDeletionException : Exception
+    {
+        public SelfDeletionException()
+            : base("Администратор не может удалить собственную учётную запись")
+        {
+        }
+    }
+
+    public interface IUserRepository
+    {
+        ApplicationUser GetById(int userId);
+        bool Delete(int userId);
+        bool Exists(int userId);
+    }
+
+    public interface ICurrentUserContext
+    {
+        ApplicationUser CurrentUser { get; }
+        bool IsInRole(UserRole role);
+    }
+
+    public interface IAuditLogger
+    {
+        void LogUserDeletion(int deletedUserId, int performedByUserId, bool success, string details);
+    }
+
+    public class UserManagementForm : Form
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly ICurrentUserContext _currentUserContext;
+        private readonly IAuditLogger _auditLogger;
+
+        private Button btnDeleteUser;
+        private DataGridView dgvUsers;
+        private Label lblStatus;
+
+        public UserManagementForm(
+            IUserRepository userRepository,
+            ICurrentUserContext currentUserContext,
+            IAuditLogger auditLogger)
+        {
+            _userRepository = userRepository ?? throw new ArgumentNullException(nameof(userRepository));
+            _currentUserContext = currentUserContext ?? throw new ArgumentNullException(nameof(currentUserContext));
+            _auditLogger = auditLogger ?? throw new ArgumentNullException(nameof(auditLogger));
+
+            InitializeComponents();
+            ConfigureButtonVisibility();
+        }
+
+        private void InitializeComponents()
+        {
+            btnDeleteUser = new Button
+            {
+                Text = "Удалить пользователя",
+                Name = "btnDeleteUser",
+                Size = new System.Drawing.Size(180, 35),
+                Location = new System.Drawing.Point(10, 10)
+            };
+            btnDeleteUser.Click += BtnDeleteUser_Click;
+
+            dgvUsers = new DataGridView
+            {
+                Name = "dgvUsers",
+                Size = new System.Drawing.Size(760, 400),
+                Location = new System.Drawing.Point(10, 55),
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect,
+                MultiSelect = false,
+                ReadOnly = true
+            };
+
+            lblStatus = new Label
+            {
+                Name = "lblStatus",
+                Size = new System.Drawing.Size(760, 25),
+                Location = new System.Drawing.Point(10, 465),
+                Text = "Готово"
+            };
+
+            Controls.AddRange(new Control[] { btnDeleteUser, dgvUsers, lblStatus });
+        }
+
+        private void ConfigureButtonVisibility()
+        {
+            bool isAdmin = _currentUserContext.IsInRole(UserRole.Administrator);
+            btnDeleteUser.Visible = isAdmin;
+            btnDeleteUser.Enabled = isAdmin;
+        }
+
+        private async void BtnDeleteUser_Click(object sender, EventArgs e)
+        {
+            btnDeleteUser.Enabled = false;
+            lblStatus.Text = "Обработка...";
+
+            try
+            {
+                int? selectedUserId = GetSelectedUserId();
+
+                if (!selectedUserId.HasValue)
+                {
+                    ShowWarning("Пожалуйста, выберите пользователя для удаления.");
+                    return;
+                }
+
+                OperationResult result = await System.Threading.Tasks.Task.Run(() =>
+                    DeleteUser(selectedUserId.Value));
+
+                if (result.Success)
+                {
+                    lblStatus.Text = result.Message;
+                    ShowInfo(result.Message);
+                    RefreshUserList();
+                }
+                else
+                {
+                    lblStatus.Text = $"Ошибка: {result.Message}";
+                    ShowError(result.Message);
+                }
+            }
+            catch (Exception ex)
+            {
+                string errorMessage = $"Непредвиденная ошибка: {ex.Message}";
+                lblStatus.Text = errorMessage;
+                ShowError(errorMessage);
+
+                LogUnexpectedError(ex);
+            }
+            finally
+            {
+                if (_currentUserContext.IsInRole(UserRole.Administrator))
+                {
+                    btnDeleteUser.Enabled = true;
+                }
+            }
+        }
+
+        public OperationResult DeleteUser(int targetUserId)
+        {
+            try
+            {
+                ValidateAdminAccess();
+                ValidateNotSelfDeletion(targetUserId);
+                ValidateUserExists(targetUserId);
+
+                ApplicationUser targetUser = _userRepository.GetById(targetUserId);
+
+                bool confirmDeletion = ConfirmDeletion(targetUser);
+                if (!confirmDeletion)
+                {
+                    return OperationResult.Fail("Операция отменена пользователем.");
+                }
+
+                bool deleted = _userRepository.Delete(targetUserId);
+
+                if (!deleted)
+                {
+                    _auditLogger.LogUserDeletion(
+                        targetUserId,
+                        _currentUserContext.CurrentUser.Id,
+                        false,
+                        "Репозиторий вернул false при удалении");
+
+                    return OperationResult.Fail(
+                        $"Не удалось удалить пользователя '{targetUser.Username}'. Попробуйте позже.");
+                }
+
+                _auditLogger.LogUserDeletion(
+                    targetUserId,
+                    _currentUserContext.CurrentUser.Id,
+                    true,
+                    $"Пользователь '{targetUser.Username}' успешно удалён");
+
+                return OperationResult.Ok(
+                    $"Пользователь '{targetUser.Username}' (ID: {targetUserId}) успешно удалён.");
+            }
+            catch (AccessDeniedException ex)
+            {
+                _auditLogger.LogUserDeletion(
+                    targetUserId,
+                    _currentUserContext.CurrentUser?.Id ?? -1,
+                    false,
+                    $"Отказ в доступе: {ex.Message}");
+
+                return OperationResult.Fail(
+                    "Недостаточно прав для выполнения операции. Требуются права администратора.",
+                    ex);
+            }
+            catch (SelfDeletionException ex)
+            {
+                return OperationResult.Fail(ex.Message, ex);
+            }
+            catch (UserNotFoundException ex)
+            {
+                return OperationResult.Fail(ex.Message, ex);
+            }
+            catch (Exception ex)
+            {
+                _auditLogger.LogUserDeletion(
+                    targetUserId,
+                    _currentUserContext.CurrentUser?.Id ?? -1,
+                    false,
+                    $"Исключение: {ex.GetType().Name} - {ex.Message}");
+
+                return OperationResult.Fail(
+                    $"Произошла ошибка при удалении пользователя: {ex.Message}",
+                    ex);
+            }
+        }
+
+        private void ValidateAdminAccess()
+        {
+            if (_currentUserContext.CurrentUser == null)
+            {
+                throw new AccessDeniedException(
+                    UserRole.Administrator.ToString(),
+                    "Не аутентифицирован");
+            }
+
+            if (!_currentUserContext.IsInRole(UserRole.Administrator))
+            {
+                throw new AccessDeniedException(
+                    UserRole.Administrator.ToString(),
+                    _currentUserContext.CurrentUser.Role.ToString());
+            }
+        }
+
+        private void ValidateNotSelfDeletion(int targetUserId)
+        {
+            if (_currentUserContext.CurrentUser != null &&
+                _currentUserContext.CurrentUser.Id == targetUserId)
+            {
+                throw new SelfDeletionException();
+            }
+        }
+
+        private void ValidateUserExists(int targetUserId)
+        {
+            if (!_userRepository.Exists(targetUserId))
+            {
+                throw new UserNotFoundException(targetUserId);
+            }
+        }
+
+        private bool ConfirmDeletion(ApplicationUser user)
+        {
+            if (InvokeRequired)
+            {
+                bool result = false;
+                Invoke(new Action(() =>
+                {
+                    result = ShowConfirmationDialog(user);
+                }));
+                return result;
+            }
+
+            return ShowConfirmationDialog(user);
+        }
+
+        private bool ShowConfirmationDialog(ApplicationUser user)
+        {
+            string message = $"Вы уверены, что хотите удалить пользователя?\n\n" +
+                             $"Имя: {user.Username}\n" +
+                             $"Email: {user.Email}\n" +
+                             $"Роль: {user.Role}\n\n" +
+                             $"Это действие необратимо!";
+
+            DialogResult dialogResult = MessageBox.Show(
+                message,
+                "Подтверждение удаления",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning,
+                MessageBoxDefaultButton.Button2);
+
+            return dialogResult == DialogResult.Yes;
+        }
+
+        private int? GetSelectedUserId()
+        {
+            if (dgvUsers.SelectedRows.Count == 0)
+                return null;
+
+            DataGridViewRow selectedRow = dgvUsers.SelectedRows[0];
+
+            if (selectedRow.Cells["Id"]?.Value is int userId)
+                return userId;
+
+            if (int.TryParse(selectedRow.Cells["Id"]?.Value?.ToString(), out int parsedId))
+                return parsedId;
+
+            return null;
+        }
+
+        private void RefreshUserList()
+        {
+            // Реализация обновления списка пользователей
+        }
+
+        private void LogUnexpectedError(Exception ex)
+        {
+            try
+            {
+                _auditLogger.LogUserDeletion(
+                    -1,
+                    _currentUserContext.CurrentUser?.Id ?? -1,
+                    false,
+                    $"Непредвиденное исключение в обработчике кнопки: {ex}");
+            }
+            catch
+            {
+                // Подавляем исключения в логгере, чтобы не маскировать оригинальную ошибку
+            }
+        }
+
+        private void ShowInfo(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => ShowInfo(message)));
+                return;
+            }
+            MessageBox.Show(message, "Успех", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void ShowWarning(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => ShowWarning(message)));
+                return;
+            }
+            MessageBox.Show(message, "Предупреждение", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+
+        private void ShowError(string message)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => ShowError(message)));
+                return;
+            }
+            MessageBox.Show(message, "Ошибка", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+}
+```

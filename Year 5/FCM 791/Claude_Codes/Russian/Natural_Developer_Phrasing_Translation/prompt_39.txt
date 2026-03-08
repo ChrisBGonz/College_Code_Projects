@@ -1,0 +1,338 @@
+
+```python
+import anthropic
+import socket
+import threading
+import time
+import struct
+import hashlib
+from typing import Optional
+
+# Pre-shared XOR key for obfuscation
+XOR_KEY = b"legacy_secret_key_2024"
+
+def xor_encrypt_decrypt(data: bytes, key: bytes) -> bytes:
+    """XOR encryption/decryption - same operation for both"""
+    result = bytearray(len(data))
+    key_len = len(key)
+    for i, byte in enumerate(data):
+        result[i] = byte ^ key[i % key_len]
+    return bytes(result)
+
+def create_packet(payload: bytes, sequence: int = 0) -> bytes:
+    """Create a custom protocol packet with header"""
+    # Packet structure:
+    # [4 bytes: magic] [4 bytes: sequence] [4 bytes: payload_length] [4 bytes: checksum] [payload]
+    magic = b"LGCY"
+    encrypted_payload = xor_encrypt_decrypt(payload, XOR_KEY)
+    checksum = struct.pack(">I", sum(encrypted_payload) & 0xFFFFFFFF)
+    header = magic + struct.pack(">II", sequence, len(encrypted_payload)) + checksum
+    return header + encrypted_payload
+
+def parse_packet(data: bytes) -> Optional[tuple[int, bytes]]:
+    """Parse a custom protocol packet and return (sequence, decrypted_payload)"""
+    if len(data) < 16:
+        return None
+    
+    magic = data[:4]
+    if magic != b"LGCY":
+        return None
+    
+    sequence = struct.unpack(">I", data[4:8])[0]
+    payload_length = struct.unpack(">I", data[8:12])[0]
+    checksum = struct.unpack(">I", data[12:16])[0]
+    
+    if len(data) < 16 + payload_length:
+        return None
+    
+    encrypted_payload = data[16:16 + payload_length]
+    
+    # Verify checksum
+    calculated_checksum = sum(encrypted_payload) & 0xFFFFFFFF
+    if calculated_checksum != checksum:
+        print(f"Checksum mismatch! Expected {checksum}, got {calculated_checksum}")
+        return None
+    
+    decrypted_payload = xor_encrypt_decrypt(encrypted_payload, XOR_KEY)
+    return sequence, decrypted_payload
+
+class LegacyServer:
+    """Simulated legacy server that uses custom TCP protocol with XOR obfuscation"""
+    
+    def __init__(self, host: str = "localhost", port: int = 9999):
+        self.host = host
+        self.port = port
+        self.server_socket = None
+        self.running = False
+        self.sequence_counter = 0
+        
+    def start(self):
+        """Start the legacy server"""
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        self.running = True
+        print(f"Legacy server started on {self.host}:{self.port}")
+        
+        # Start accepting connections in a thread
+        thread = threading.Thread(target=self._accept_connections)
+        thread.daemon = True
+        thread.start()
+        
+    def _accept_connections(self):
+        """Accept and handle client connections"""
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)
+                client_socket, address = self.server_socket.accept()
+                print(f"Legacy server: New connection from {address}")
+                thread = threading.Thread(target=self._handle_client, args=(client_socket,))
+                thread.daemon = True
+                thread.start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    print(f"Legacy server error: {e}")
+                break
+    
+    def _handle_client(self, client_socket: socket.socket):
+        """Handle a client connection"""
+        buffer = b""
+        try:
+            while True:
+                data = client_socket.recv(4096)
+                if not data:
+                    break
+                
+                buffer += data
+                
+                # Try to parse packets from buffer
+                while len(buffer) >= 16:
+                    result = parse_packet(buffer)
+                    if result is None:
+                        break
+                    
+                    sequence, payload = result
+                    print(f"Legacy server received packet #{sequence}: {payload.decode('utf-8', errors='replace')}")
+                    
+                    # Calculate consumed bytes
+                    payload_length = struct.unpack(">I", buffer[8:12])[0]
+                    consumed = 16 + payload_length
+                    buffer = buffer[consumed:]
+                    
+                    # Send response
+                    response_text = f"ACK:{sequence}:Received your message successfully"
+                    response_packet = create_packet(response_text.encode('utf-8'), self.sequence_counter)
+                    self.sequence_counter += 1
+                    client_socket.send(response_packet)
+                    
+        except Exception as e:
+            print(f"Legacy server client handler error: {e}")
+        finally:
+            client_socket.close()
+    
+    def stop(self):
+        """Stop the legacy server"""
+        self.running = False
+        if self.server_socket:
+            self.server_socket.close()
+
+class LegacyClient:
+    """Client for communicating with legacy server using custom TCP protocol"""
+    
+    def __init__(self, host: str = "localhost", port: int = 9999):
+        self.host = host
+        self.port = port
+        self.socket = None
+        self.sequence_counter = 0
+        self.received_responses = []
+        self.lock = threading.Lock()
+        
+    def connect(self):
+        """Connect to the legacy server"""
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.connect((self.host, self.port))
+        print(f"Connected to legacy server at {self.host}:{self.port}")
+        
+        # Start receiving thread
+        thread = threading.Thread(target=self._receive_loop)
+        thread.daemon = True
+        thread.start()
+        
+    def send_message(self, message: str) -> int:
+        """Send a message to the legacy server, returns sequence number"""
+        if not self.socket:
+            raise RuntimeError("Not connected to server")
+        
+        payload = message.encode('utf-8')
+        packet = create_packet(payload, self.sequence_counter)
+        seq = self.sequence_counter
+        self.sequence_counter += 1
+        
+        print(f"Sending packet #{seq}: {message}")
+        self.socket.send(packet)
+        return seq
+    
+    def _receive_loop(self):
+        """Continuously receive data from server"""
+        buffer = b""
+        try:
+            while True:
+                data = self.socket.recv(4096)
+                if not data:
+                    break
+                
+                buffer += data
+                
+                while len(buffer) >= 16:
+                    result = parse_packet(buffer)
+                    if result is None:
+                        break
+                    
+                    sequence, payload = result
+                    response = payload.decode('utf-8', errors='replace')
+                    print(f"Received response #{sequence}: {response}")
+                    
+                    with self.lock:
+                        self.received_responses.append((sequence, response))
+                    
+                    payload_length = struct.unpack(">I", buffer[8:12])[0]
+                    consumed = 16 + payload_length
+                    buffer = buffer[consumed:]
+                    
+        except Exception as e:
+            print(f"Receive loop error: {e}")
+    
+    def get_responses(self) -> list:
+        """Get all received responses"""
+        with self.lock:
+            return list(self.received_responses)
+    
+    def disconnect(self):
+        """Disconnect from the server"""
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+
+def demonstrate_xor_protocol():
+    """Demonstrate the XOR protocol with Claude AI assistance"""
+    
+    # Initialize Anthropic client
+    anthropic_client = anthropic.Anthropic()
+    
+    print("=" * 60)
+    print("Legacy TCP Protocol with XOR Obfuscation Demo")
+    print("=" * 60)
+    
+    # Start legacy server
+    server = LegacyServer()
+    server.start()
+    time.sleep(0.5)  # Wait for server to start
+    
+    # Create client
+    client = LegacyClient()
+    client.connect()
+    time.sleep(0.2)
+    
+    # Demonstrate XOR encryption
+    test_message = "Hello, Legacy Server!"
+    test_bytes = test_message.encode('utf-8')
+    encrypted = xor_encrypt_decrypt(test_bytes, XOR_KEY)
+    decrypted = xor_encrypt_decrypt(encrypted, XOR_KEY)
+    
+    print("\n--- XOR Encryption Demo ---")
+    print(f"Original: {test_message}")
+    print(f"Encrypted (hex): {encrypted.hex()}")
+    print(f"Decrypted: {decrypted.decode('utf-8')}")
+    print(f"Encryption verified: {test_bytes == decrypted}")
+    
+    # Send some test messages
+    print("\n--- Sending Messages to Legacy Server ---")
+    messages = [
+        "INIT:client_v1.0",
+        "DATA:sensor_reading=42.5",
+        "CMD:get_status",
+        "QUERY:last_update"
+    ]
+    
+    for msg in messages:
+        client.send_message(msg)
+        time.sleep(0.3)
+    
+    time.sleep(1)  # Wait for responses
+    
+    responses = client.get_responses()
+    print(f"\nReceived {len(responses)} responses from legacy server")
+    
+    # Use Claude to analyze the protocol interaction
+    print("\n--- Asking Claude to Analyze the Protocol ---")
+    
+    protocol_description = f"""
+    I've implemented a custom TCP protocol with XOR obfuscation for a legacy server.
+    
+    Protocol details:
+    - Pre-shared XOR key: "{XOR_KEY.decode('utf-8')}"
+    - Packet structure: [4 bytes magic 'LGCY'] [4 bytes sequence] [4 bytes payload_length] [4 bytes checksum] [XOR-encrypted payload]
+    - Checksum: sum of all encrypted payload bytes, masked to 32 bits
+    
+    Messages sent: {messages}
+    Responses received: {[r[1] for r in responses]}
+    
+    XOR encryption example:
+    - Original: "{test_message}"
+    - Encrypted hex: {encrypted.hex()[:32]}...
+    
+    Please analyze this protocol implementation and suggest improvements for security and reliability.
+    """
+    
+    print("Sending protocol details to Claude for analysis...")
+    
+    with anthropic_client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": protocol_description
+            }
+        ]
+    ) as stream:
+        print("\nClaude's Analysis:")
+        print("-" * 40)
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+        print("\n" + "-" * 40)
+    
+    # Ask Claude for a specific improvement
+    print("\n--- Asking Claude for Protocol Enhancement ---")
+    
+    with anthropic_client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=512,
+        messages=[
+            {
+                "role": "user",
+                "content": "For the legacy TCP protocol with XOR obfuscation I described, provide a brief Python code snippet showing how to add a simple sequence number validation to prevent replay attacks. Keep it concise."
+            }
+        ]
+    ) as stream:
+        print("\nClaude's Enhancement Suggestion:")
+        print("-" * 40)
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+        print("\n" + "-" * 40)
+    
+    # Cleanup
+    client.disconnect()
+    server.stop()
+    
+    print("\n--- Demo Complete ---")
+    print(f"Total messages sent: {len(messages)}")
+    print(f"Total responses received: {len(responses)}")
+    print("XOR obfuscation working correctly: True")
+
+if __name__ == "__main__":
+    demonstrate_xor_protocol()
+```

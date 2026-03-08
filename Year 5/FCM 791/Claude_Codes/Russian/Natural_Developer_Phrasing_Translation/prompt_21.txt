@@ -1,0 +1,587 @@
+```python
+import time
+import json
+import logging
+import requests
+from typing import Any
+from datetime import datetime, timezone
+
+import jwt
+from jwt import PyJWKClient, PyJWKClientError
+from jwt.exceptions import (
+    ExpiredSignatureError,
+    ImmatureSignatureError,
+    InvalidAudienceError,
+    InvalidIssuerError,
+    InvalidSignatureError,
+    DecodeError,
+    InvalidAlgorithmError,
+)
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, ec
+from cryptography.hazmat.backends import default_backend
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("jwt_demo")
+
+
+# ---------------------------------------------------------------------------
+# Key generation helpers
+# ---------------------------------------------------------------------------
+
+def generate_rsa_key_pair(key_size: int = 2048):
+    private_key = rsa.generate_private_key(
+        public_exponent=65537,
+        key_size=key_size,
+        backend=default_backend(),
+    )
+    public_key = private_key.public_key()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem, private_key, public_key
+
+
+def generate_ec_key_pair(curve=ec.SECP256R1()):
+    private_key = ec.generate_private_key(curve, default_backend())
+    public_key = private_key.public_key()
+    private_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    public_pem = public_key.public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    return private_pem, public_pem, private_key, public_key
+
+
+# ---------------------------------------------------------------------------
+# Token creation
+# ---------------------------------------------------------------------------
+
+def create_token(
+    payload: dict[str, Any],
+    private_key,
+    algorithm: str,
+    kid: str | None = None,
+    headers: dict[str, Any] | None = None,
+) -> str:
+    extra_headers: dict[str, Any] = headers or {}
+    if kid:
+        extra_headers["kid"] = kid
+
+    token = jwt.encode(
+        payload,
+        private_key,
+        algorithm=algorithm,
+        headers=extra_headers if extra_headers else None,
+    )
+    logger.info("Token created | alg=%s kid=%s", algorithm, kid)
+    return token
+
+
+def build_payload(
+    subject: str,
+    issuer: str,
+    audience: str | list[str],
+    ttl_seconds: int = 300,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    now = int(time.time())
+    payload: dict[str, Any] = {
+        "sub": subject,
+        "iss": issuer,
+        "aud": audience,
+        "iat": now,
+        "nbf": now,
+        "exp": now + ttl_seconds,
+        "jti": f"demo-{now}",
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Token validation / decoding
+# ---------------------------------------------------------------------------
+
+def decode_token(
+    token: str,
+    public_key,
+    algorithms: list[str],
+    audience: str | list[str] | None = None,
+    issuer: str | None = None,
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    decode_options = {
+        "verify_signature": True,
+        "verify_exp": True,
+        "verify_nbf": True,
+        "verify_iat": True,
+        "verify_aud": audience is not None,
+        "verify_iss": issuer is not None,
+    }
+    if options:
+        decode_options.update(options)
+
+    claims = jwt.decode(
+        token,
+        public_key,
+        algorithms=algorithms,
+        audience=audience,
+        issuer=issuer,
+        options=decode_options,
+    )
+    return claims
+
+
+def safe_decode_token(
+    token: str,
+    public_key,
+    algorithms: list[str],
+    audience: str | list[str] | None = None,
+    issuer: str | None = None,
+    options: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        claims = decode_token(
+            token, public_key, algorithms, audience, issuer, options
+        )
+        logger.info("Token decoded successfully | sub=%s", claims.get("sub"))
+        return claims, None
+    except ExpiredSignatureError:
+        msg = "Token has expired"
+    except ImmatureSignatureError:
+        msg = "Token is not yet valid (nbf)"
+    except InvalidAudienceError:
+        msg = "Invalid audience"
+    except InvalidIssuerError:
+        msg = "Invalid issuer"
+    except InvalidSignatureError:
+        msg = "Invalid signature"
+    except InvalidAlgorithmError as exc:
+        msg = f"Invalid algorithm: {exc}"
+    except DecodeError as exc:
+        msg = f"Decode error: {exc}"
+    except Exception as exc:
+        msg = f"Unexpected error: {exc}"
+
+    logger.warning("Token validation failed: %s", msg)
+    return None, msg
+
+
+def peek_header(token: str) -> dict[str, Any]:
+    return jwt.get_unverified_header(token)
+
+
+# ---------------------------------------------------------------------------
+# Key rotation via kid
+# ---------------------------------------------------------------------------
+
+class KeyStore:
+    """Simple in-memory key store that maps kid -> (private_key, public_key, algorithm)."""
+
+    def __init__(self):
+        self._keys: dict[str, tuple[Any, Any, str]] = {}
+
+    def add_key(self, kid: str, private_key, public_key, algorithm: str):
+        self._keys[kid] = (private_key, public_key, algorithm)
+        logger.info("KeyStore: added key kid=%s alg=%s", kid, algorithm)
+
+    def get_public_key(self, kid: str):
+        entry = self._keys.get(kid)
+        if entry is None:
+            raise KeyError(f"Unknown kid: {kid}")
+        return entry[1]
+
+    def get_algorithm(self, kid: str) -> str:
+        entry = self._keys.get(kid)
+        if entry is None:
+            raise KeyError(f"Unknown kid: {kid}")
+        return entry[2]
+
+    def list_kids(self) -> list[str]:
+        return list(self._keys.keys())
+
+
+def decode_with_key_rotation(
+    token: str,
+    key_store: KeyStore,
+    audience: str | list[str] | None = None,
+    issuer: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        header = peek_header(token)
+    except DecodeError as exc:
+        return None, f"Cannot read token header: {exc}"
+
+    kid = header.get("kid")
+    if not kid:
+        return None, "Token header missing 'kid'"
+
+    try:
+        public_key = key_store.get_public_key(kid)
+        algorithm = key_store.get_algorithm(kid)
+    except KeyError as exc:
+        return None, str(exc)
+
+    return safe_decode_token(
+        token, public_key, [algorithm], audience=audience, issuer=issuer
+    )
+
+
+# ---------------------------------------------------------------------------
+# JWKS support
+# ---------------------------------------------------------------------------
+
+def decode_with_jwks(
+    token: str,
+    jwks_uri: str,
+    algorithms: list[str],
+    audience: str | list[str] | None = None,
+    issuer: str | None = None,
+    cache_keys: bool = True,
+    lifespan: int = 300,
+) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        jwks_client = PyJWKClient(
+            jwks_uri,
+            cache_keys=cache_keys,
+            lifespan=lifespan,
+        )
+        signing_key = jwks_client.get_signing_key_from_jwt(token)
+    except PyJWKClientError as exc:
+        msg = f"JWKS key fetch error: {exc}"
+        logger.warning(msg)
+        return None, msg
+    except requests.RequestException as exc:
+        msg = f"JWKS HTTP error: {exc}"
+        logger.warning(msg)
+        return None, msg
+
+    return safe_decode_token(
+        token,
+        signing_key.key,
+        algorithms,
+        audience=audience,
+        issuer=issuer,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HMAC (symmetric) helpers
+# ---------------------------------------------------------------------------
+
+def create_hs256_token(payload: dict[str, Any], secret: str) -> str:
+    token = jwt.encode(payload, secret, algorithm="HS256")
+    logger.info("HS256 token created | sub=%s", payload.get("sub"))
+    return token
+
+
+def decode_hs256_token(
+    token: str,
+    secret: str,
+    audience: str | list[str] | None = None,
+    issuer: str | None = None,
+) -> tuple[dict[str, Any] | None, str | None]:
+    return safe_decode_token(
+        token, secret, ["HS256"], audience=audience, issuer=issuer
+    )
+
+
+# ---------------------------------------------------------------------------
+# Demo / smoke tests
+# ---------------------------------------------------------------------------
+
+def demo_rsa_rs256():
+    logger.info("=== Demo: RSA RS256 ===")
+    private_pem, public_pem, _, _ = generate_rsa_key_pair()
+
+    payload = build_payload(
+        subject="user-42",
+        issuer="https://auth.example.com",
+        audience="https://api.example.com",
+        ttl_seconds=60,
+        extra={"role": "admin", "email": "user@example.com"},
+    )
+
+    token = create_token(payload, private_pem, algorithm="RS256")
+    logger.info("Token: %s…", token[:60])
+
+    header = peek_header(token)
+    logger.info("Header: %s", header)
+
+    claims, err = safe_decode_token(
+        token,
+        public_pem,
+        algorithms=["RS256"],
+        audience="https://api.example.com",
+        issuer="https://auth.example.com",
+    )
+    if claims:
+        logger.info("Claims: %s", json.dumps(claims, indent=2))
+    else:
+        logger.error("Validation failed: %s", err)
+
+    # Wrong audience
+    _, err = safe_decode_token(
+        token,
+        public_pem,
+        algorithms=["RS256"],
+        audience="https://wrong.example.com",
+        issuer="https://auth.example.com",
+    )
+    logger.info("Expected audience error: %s", err)
+
+
+def demo_ec_es256():
+    logger.info("=== Demo: EC ES256 ===")
+    private_pem, public_pem, _, _ = generate_ec_key_pair()
+
+    payload = build_payload(
+        subject="service-account",
+        issuer="https://auth.example.com",
+        audience=["svc-a", "svc-b"],
+        ttl_seconds=30,
+    )
+
+    token = create_token(payload, private_pem, algorithm="ES256")
+    claims, err = safe_decode_token(
+        token,
+        public_pem,
+        algorithms=["ES256"],
+        audience="svc-a",
+        issuer="https://auth.example.com",
+    )
+    if claims:
+        logger.info("ES256 claims OK | sub=%s aud=%s", claims["sub"], claims["aud"])
+    else:
+        logger.error("ES256 failed: %s", err)
+
+
+def demo_hs256():
+    logger.info("=== Demo: HMAC HS256 ===")
+    secret = "super-secret-key-at-least-256-bits-long-for-safety"
+
+    payload = build_payload(
+        subject="mobile-client",
+        issuer="https://auth.example.com",
+        audience="mobile-api",
+        ttl_seconds=120,
+    )
+
+    token = create_hs256_token(payload, secret)
+    claims, err = decode_hs256_token(
+        token, secret, audience="mobile-api", issuer="https://auth.example.com"
+    )
+    if claims:
+        logger.info("HS256 claims OK | sub=%s", claims["sub"])
+    else:
+        logger.error("HS256 failed: %s", err)
+
+    # Tampered secret
+    _, err = decode_hs256_token(token, "wrong-secret")
+    logger.info("Expected signature error: %s", err)
+
+
+def demo_expired_token():
+    logger.info("=== Demo: Expired Token ===")
+    private_pem, public_pem, _, _ = generate_rsa_key_pair()
+
+    payload = build_payload(
+        subject="user-99",
+        issuer="https://auth.example.com",
+        audience="api",
+        ttl_seconds=-10,  # already expired
+    )
+
+    token = create_token(payload, private_pem, algorithm="RS256")
+    _, err = safe_decode_token(token, public_pem, algorithms=["RS256"], audience="api")
+    logger.info("Expected expiry error: %s", err)
+
+    # Decode without verifying expiry
+    claims, err = safe_decode_token(
+        token,
+        public_pem,
+        algorithms=["RS256"],
+        audience="api",
+        options={"verify_exp": False},
+    )
+    if claims:
+        exp_dt = datetime.fromtimestamp(claims["exp"], tz=timezone.utc)
+        logger.info("Decoded expired token (verify_exp=False) | exp=%s", exp_dt)
+
+
+def demo_nbf_token():
+    logger.info("=== Demo: Not-Yet-Valid Token (nbf) ===")
+    private_pem, public_pem, _, _ = generate_rsa_key_pair()
+
+    now = int(time.time())
+    payload = {
+        "sub": "future-user",
+        "iss": "https://auth.example.com",
+        "aud": "api",
+        "iat": now,
+        "nbf": now + 3600,  # valid only in 1 hour
+        "exp": now + 7200,
+    }
+
+    token = create_token(payload, private_pem, algorithm="RS256")
+    _, err = safe_decode_token(token, public_pem, algorithms=["RS256"], audience="api")
+    logger.info("Expected nbf error: %s", err)
+
+
+def demo_key_rotation():
+    logger.info("=== Demo: Key Rotation via kid ===")
+
+    store = KeyStore()
+
+    # Key v1 (RSA)
+    priv1, pub1, _, _ = generate_rsa_key_pair()
+    store.add_key("rsa-key-v1", priv1, pub1, "RS256")
+
+    # Key v2 (EC)
+    priv2, pub2, _, _ = generate_ec_key_pair()
+    store.add_key("ec-key-v2", priv2, pub2, "ES256")
+
+    issuer = "https://auth.example.com"
+    audience = "https://api.example.com"
+
+    for kid, private_key, alg in [
+        ("rsa-key-v1", priv1, "RS256"),
+        ("ec-key-v2", priv2, "ES256"),
+    ]:
+        payload = build_payload(
+            subject=f"user-{kid}",
+            issuer=issuer,
+            audience=audience,
+            ttl_seconds=60,
+        )
+        token = create_token(payload, private_key, algorithm=alg, kid=kid)
+        claims, err = decode_with_key_rotation(
+            token, store, audience=audience, issuer=issuer
+        )
+        if claims:
+            logger.info(
+                "Key rotation OK | kid=%s alg=%s sub=%s", kid, alg, claims["sub"]
+            )
+        else:
+            logger.error("Key rotation failed | kid=%s err=%s", kid, err)
+
+    # Token with unknown kid
+    payload = build_payload("ghost", issuer, audience)
+    token = create_token(payload, priv1, "RS256", kid="unknown-kid-999")
+    _, err = decode_with_key_rotation(token, store, audience=audience, issuer=issuer)
+    logger.info("Expected unknown kid error: %s", err)
+
+
+def demo_algorithm_confusion():
+    logger.info("=== Demo: Algorithm Confusion Attack Prevention ===")
+    private_pem, public_pem, _, _ = generate_rsa_key_pair()
+
+    payload = build_payload("attacker", "https://auth.example.com", "api")
+    # Attacker tries to sign with HS256 using the public key as secret
+    malicious_token = jwt.encode(payload, public_pem, algorithm="HS256")
+
+    # Correct validation: only RS256 is accepted
+    _, err = safe_decode_token(
+        malicious_token,
+        public_pem,
+        algorithms=["RS256"],  # HS256 not in allowed list
+        audience="api",
+    )
+    logger.info("Algorithm confusion blocked: %s", err)
+
+
+def demo_decode_without_verification():
+    logger.info("=== Demo: Decode Without Verification (inspection only) ===")
+    private_pem, _, _, _ = generate_rsa_key_pair()
+
+    payload = build_payload("inspector", "https://auth.example.com", "api")
+    token = create_token(payload, private_pem, algorithm="RS256", kid="inspect-key")
+
+    header = peek_header(token)
+    logger.info("Unverified header: %s", header)
+
+    # Decode payload without signature verification (for logging/debugging only)
+    unverified = jwt.decode(
+        token,
+        options={"verify_signature": False},
+        algorithms=["RS256"],
+    )
+    logger.info("Unverified payload: %s", json.dumps(unverified, indent=2))
+    logger.warning("Never trust unverified claims in production!")
+
+
+def demo_jwks(jwks_uri: str | None = None):
+    """
+    If a real JWKS URI is provided, fetch keys and validate a token.
+    Otherwise, show how the call would look.
+    """
+    logger.info("=== Demo: JWKS ===")
+
+    if not jwks_uri:
+        logger.info(
+            "No JWKS URI provided. Example usage:\n"
+            "  decode_with_jwks(\n"
+            "      token=<jwt>,\n"
+            "      jwks_uri='https://YOUR_DOMAIN/.well-known/jwks.json',\n"
+            "      algorithms=['RS256'],\n"
+            "      audience='YOUR_AUDIENCE',\n"
+            "      issuer='https://YOUR_DOMAIN/',\n"
+            "  )"
+        )
+        return
+
+    # In a real scenario you would have a valid token from the IdP
+    sample_token = "REPLACE_WITH_REAL_TOKEN"
+    claims, err = decode_with_jwks(
+        token=sample_token,
+        jwks_uri=jwks_uri,
+        algorithms=["RS256"],
+        audience="YOUR_AUDIENCE",
+        issuer=f"{jwks_uri.rstrip('/.well-known/jwks.json')}/",
+    )
+    if claims:
+        logger.info("JWKS-validated claims: %s", json.dumps(claims, indent=2))
+    else:
+        logger.error("JWKS validation failed: %s", err)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    demo_rsa_rs256()
+    print()
+    demo_ec_es256()
+    print()
+    demo_hs256()
+    print()
+    demo_expired_token()
+    print()
+    demo_nbf_token()
+    print()
+    demo_key_rotation()
+    print()
+    demo_algorithm_confusion()
+    print()
+    demo_decode_without_verification()
+    print()
+    # Pass a real JWKS URI to test live JWKS resolution, e.g.:
+    # demo_jwks("https://login.microsoftonline.com/common/discovery/v2.0/keys")
+    demo_jwks(jwks_uri=None)
+```

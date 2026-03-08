@@ -1,0 +1,142 @@
+```yaml
+name: Build and Upload to Storage Bucket
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  ARTIFACT_NAME: app-build
+  BUCKET_NAME: ${{ secrets.STORAGE_BUCKET_NAME }}
+  BUILD_DIR: dist
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build project
+        run: npm run build
+
+      - name: Create artifact archive
+        run: |
+          cd ${{ env.BUILD_DIR }}
+          zip -r ../${{ env.ARTIFACT_NAME }}-${{ github.sha }}.zip .
+          cd ..
+          echo "ARTIFACT_PATH=${{ env.ARTIFACT_NAME }}-${{ github.sha }}.zip" >> $GITHUB_ENV
+
+      - name: Upload artifact (local)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+          retention-days: 7
+
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload to GCS
+        run: |
+          ARTIFACT_FILE=$(ls ${{ env.ARTIFACT_NAME }}-*.zip)
+          gcloud storage cp "$ARTIFACT_FILE" "gs://${{ env.BUCKET_NAME }}/builds/$ARTIFACT_FILE"
+          echo "Artifact uploaded to gs://${{ env.BUCKET_NAME }}/builds/$ARTIFACT_FILE"
+
+      - name: Update latest symlink in GCS
+        run: |
+          ARTIFACT_FILE=$(ls ${{ env.ARTIFACT_NAME }}-*.zip)
+          echo "$ARTIFACT_FILE" | gcloud storage cp - "gs://${{ env.BUCKET_NAME }}/builds/latest.txt"
+          echo "Latest pointer updated"
+
+  upload-to-aws-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload to S3
+        run: |
+          ARTIFACT_FILE=$(ls ${{ env.ARTIFACT_NAME }}-*.zip)
+          aws s3 cp "$ARTIFACT_FILE" "s3://${{ env.BUCKET_NAME }}/builds/$ARTIFACT_FILE" \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build=${{ github.run_number }}"
+          echo "Artifact uploaded to s3://${{ env.BUCKET_NAME }}/builds/$ARTIFACT_FILE"
+
+      - name: Update latest pointer
+        run: |
+          ARTIFACT_FILE=$(ls ${{ env.ARTIFACT_NAME }}-*.zip)
+          echo "$ARTIFACT_FILE" > latest.txt
+          aws s3 cp latest.txt "s3://${{ env.BUCKET_NAME }}/builds/latest.txt"
+
+  notify:
+    name: Notify on completion
+    runs-on: ubuntu-latest
+    needs:
+      - upload-to-gcs
+      - upload-to-aws-s3
+    if: always() && github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Notify success
+        if: needs.upload-to-gcs.result == 'success' || needs.upload-to-aws-s3.result == 'success'
+        run: |
+          echo "Build and upload completed successfully!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Run: ${{ github.run_number }}"
+
+      - name: Notify failure
+        if: needs.upload-to-gcs.result == 'failure' || needs.upload-to-aws-s3.result == 'failure'
+        run: |
+          echo "Build or upload failed!"
+          exit 1
+```

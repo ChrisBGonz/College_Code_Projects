@@ -1,0 +1,338 @@
+
+```python
+import logging
+import time
+from contextlib import asynccontextmanager
+from typing import Any
+
+import uvicorn
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler
+
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("app")
+
+# ---------------------------------------------------------------------------
+# Custom DB-related exceptions
+# ---------------------------------------------------------------------------
+
+
+class DBConnectionError(Exception):
+    """Raised when the application cannot reach the database."""
+
+    def __init__(self, message: str = "Database connection failed", detail: Any = None):
+        super().__init__(message)
+        self.message = message
+        self.detail = detail
+
+
+class DBTimeoutError(DBConnectionError):
+    """Raised when a database operation times out."""
+
+    def __init__(self, message: str = "Database operation timed out", detail: Any = None):
+        super().__init__(message, detail)
+
+
+class DBAuthError(DBConnectionError):
+    """Raised when authentication to the database fails."""
+
+    def __init__(self, message: str = "Database authentication failed", detail: Any = None):
+        super().__init__(message, detail)
+
+
+# ---------------------------------------------------------------------------
+# Fake DB layer (simulates real async DB calls)
+# ---------------------------------------------------------------------------
+
+
+class FakeDatabase:
+    """Simulates an async database client."""
+
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self._connected = False
+
+    async def connect(self) -> None:
+        logger.info("Connecting to database: %s", self.dsn)
+        # Simulate connection delay
+        time.sleep(0.05)
+        self._connected = True
+        logger.info("Database connection established.")
+
+    async def disconnect(self) -> None:
+        logger.info("Closing database connection.")
+        self._connected = False
+
+    async def fetch_users(self) -> list[dict]:
+        if not self._connected:
+            raise DBConnectionError(
+                "Cannot fetch users: database is not connected.",
+                detail={"dsn": self.dsn},
+            )
+        return [
+            {"id": 1, "name": "Alice"},
+            {"id": 2, "name": "Bob"},
+        ]
+
+    async def fetch_user(self, user_id: int) -> dict | None:
+        if not self._connected:
+            raise DBConnectionError(
+                f"Cannot fetch user {user_id}: database is not connected.",
+                detail={"dsn": self.dsn, "user_id": user_id},
+            )
+        if user_id == 99:
+            # Simulate a timeout for a specific ID
+            raise DBTimeoutError(
+                f"Query for user {user_id} timed out.",
+                detail={"dsn": self.dsn, "user_id": user_id, "timeout_ms": 5000},
+            )
+        if user_id == 98:
+            raise DBAuthError(
+                "Database rejected credentials.",
+                detail={"dsn": self.dsn},
+            )
+        if user_id < 1 or user_id > 10:
+            return None
+        return {"id": user_id, "name": f"User-{user_id}"}
+
+    async def create_user(self, name: str) -> dict:
+        if not self._connected:
+            raise DBConnectionError(
+                "Cannot create user: database is not connected.",
+                detail={"dsn": self.dsn},
+            )
+        return {"id": 42, "name": name}
+
+
+# ---------------------------------------------------------------------------
+# Application state / lifespan
+# ---------------------------------------------------------------------------
+
+db = FakeDatabase(dsn="postgresql://user:pass@localhost:5432/mydb")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage startup and shutdown of the database connection."""
+    await db.connect()
+    yield
+    await db.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# FastAPI application
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="FastAPI DB Error Handling Demo",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
+
+
+def _build_error_response(status_code: int, error_type: str, message: str, detail: Any = None) -> JSONResponse:
+    body: dict[str, Any] = {
+        "error": {
+            "type": error_type,
+            "message": message,
+        }
+    }
+    if detail is not None:
+        body["error"]["detail"] = detail
+    return JSONResponse(status_code=status_code, content=body)
+
+
+@app.exception_handler(DBConnectionError)
+async def db_connection_error_handler(request: Request, exc: DBConnectionError) -> JSONResponse:
+    """
+    Handles all DBConnectionError (and its subclasses) exceptions.
+
+    Returns HTTP 503 Service Unavailable so that load-balancers / clients
+    know the service is temporarily unavailable and can retry.
+    """
+    logger.error(
+        "DB connection error on %s %s | %s | detail=%s",
+        request.method,
+        request.url,
+        exc.message,
+        exc.detail,
+        exc_info=True,
+    )
+    return _build_error_response(
+        status_code=503,
+        error_type=type(exc).__name__,
+        message=exc.message,
+        detail=exc.detail,
+    )
+
+
+@app.exception_handler(DBTimeoutError)
+async def db_timeout_error_handler(request: Request, exc: DBTimeoutError) -> JSONResponse:
+    """
+    Handles DBTimeoutError specifically.
+
+    Returns HTTP 504 Gateway Timeout to signal that the upstream DB
+    did not respond in time.
+    """
+    logger.error(
+        "DB timeout on %s %s | %s | detail=%s",
+        request.method,
+        request.url,
+        exc.message,
+        exc.detail,
+        exc_info=True,
+    )
+    return _build_error_response(
+        status_code=504,
+        error_type=type(exc).__name__,
+        message=exc.message,
+        detail=exc.detail,
+    )
+
+
+@app.exception_handler(DBAuthError)
+async def db_auth_error_handler(request: Request, exc: DBAuthError) -> JSONResponse:
+    """
+    Handles DBAuthError specifically.
+
+    Returns HTTP 503 but with a distinct error type so operators can
+    distinguish a misconfiguration from a transient network issue.
+    """
+    logger.critical(
+        "DB authentication failure on %s %s | %s | detail=%s",
+        request.method,
+        request.url,
+        exc.message,
+        exc.detail,
+        exc_info=True,
+    )
+    return _build_error_response(
+        status_code=503,
+        error_type=type(exc).__name__,
+        message=exc.message,
+        detail=exc.detail,
+    )
+
+
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    """Wrap the default HTTP exception handler to add structured logging."""
+    logger.warning(
+        "HTTP %s on %s %s | detail=%s",
+        exc.status_code,
+        request.method,
+        request.url,
+        exc.detail,
+    )
+    return await http_exception_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """Catch-all handler for unexpected errors."""
+    logger.exception(
+        "Unhandled exception on %s %s",
+        request.method,
+        request.url,
+    )
+    return _build_error_response(
+        status_code=500,
+        error_type="InternalServerError",
+        message="An unexpected error occurred. Please try again later.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+
+@app.get("/health", tags=["meta"])
+async def health_check() -> dict:
+    """Simple liveness probe."""
+    return {"status": "ok"}
+
+
+@app.get("/users", tags=["users"])
+async def list_users() -> list[dict]:
+    """
+    Return all users.
+
+    Raises DBConnectionError if the DB is unavailable → 503.
+    """
+    users = await db.fetch_users()
+    return users
+
+
+@app.get("/users/{user_id}", tags=["users"])
+async def get_user(user_id: int) -> dict:
+    """
+    Return a single user by ID.
+
+    Special IDs for demo purposes:
+    - 99  → DBTimeoutError  → 504
+    - 98  → DBAuthError     → 503
+    - >10 → 404 Not Found
+    """
+    user = await db.fetch_user(user_id)
+    if user is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
+    return user
+
+
+@app.post("/users", tags=["users"], status_code=201)
+async def create_user(name: str) -> dict:
+    """
+    Create a new user.
+
+    Raises DBConnectionError if the DB is unavailable → 503.
+    """
+    user = await db.create_user(name)
+    return user
+
+
+@app.get("/simulate/disconnect", tags=["demo"])
+async def simulate_disconnect() -> dict:
+    """
+    Forcefully disconnect the DB to demonstrate error handling on the next request.
+    """
+    await db.disconnect()
+    logger.warning("DB connection forcefully closed via /simulate/disconnect endpoint.")
+    return {"message": "Database disconnected. Next DB call will raise DBConnectionError."}
+
+
+@app.get("/simulate/reconnect", tags=["demo"])
+async def simulate_reconnect() -> dict:
+    """
+    Reconnect the DB after a simulated disconnect.
+    """
+    await db.connect()
+    return {"message": "Database reconnected successfully."}
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="debug",
+    )
+```

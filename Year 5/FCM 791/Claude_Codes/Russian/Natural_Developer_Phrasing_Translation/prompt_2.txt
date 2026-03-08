@@ -1,0 +1,384 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+
+const client = new Anthropic();
+
+// Simulated database of users
+const usersDatabase = {
+  user123: {
+    id: "user123",
+    email: "john.doe@example.com",
+    displayName: "John Doe",
+    createdAt: "2024-01-01T00:00:00Z",
+    updatedAt: "2024-01-01T00:00:00Z",
+  },
+  user456: {
+    id: "user456",
+    email: "jane.smith@example.com",
+    displayName: "Jane Smith",
+    createdAt: "2024-01-02T00:00:00Z",
+    updatedAt: "2024-01-02T00:00:00Z",
+  },
+};
+
+// Tool definitions for profile update operations
+const tools = [
+  {
+    name: "validate_email",
+    description:
+      "Validates if the provided email address is in correct format and not already taken by another user",
+    input_schema: {
+      type: "object",
+      properties: {
+        email: {
+          type: "string",
+          description: "The email address to validate",
+        },
+        userId: {
+          type: "string",
+          description: "The ID of the user making the update (to exclude from duplicate check)",
+        },
+      },
+      required: ["email", "userId"],
+    },
+  },
+  {
+    name: "validate_display_name",
+    description:
+      "Validates if the provided display name meets requirements (2-50 characters, no special characters)",
+    input_schema: {
+      type: "object",
+      properties: {
+        displayName: {
+          type: "string",
+          description: "The display name to validate",
+        },
+      },
+      required: ["displayName"],
+    },
+  },
+  {
+    name: "update_user_profile",
+    description: "Updates the user profile in the database with the provided fields",
+    input_schema: {
+      type: "object",
+      properties: {
+        userId: {
+          type: "string",
+          description: "The ID of the user to update",
+        },
+        email: {
+          type: "string",
+          description: "New email address (optional)",
+        },
+        displayName: {
+          type: "string",
+          description: "New display name (optional)",
+        },
+      },
+      required: ["userId"],
+    },
+  },
+  {
+    name: "get_user_profile",
+    description: "Retrieves the current user profile from the database",
+    input_schema: {
+      type: "object",
+      properties: {
+        userId: {
+          type: "string",
+          description: "The ID of the user to retrieve",
+        },
+      },
+      required: ["userId"],
+    },
+  },
+];
+
+// Tool execution functions
+function validateEmail(email, userId) {
+  // Check email format
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    return { valid: false, error: "Invalid email format" };
+  }
+
+  // Check if email is already taken by another user
+  const existingUser = Object.values(usersDatabase).find(
+    (user) => user.email === email && user.id !== userId
+  );
+
+  if (existingUser) {
+    return { valid: false, error: "Email is already taken by another user" };
+  }
+
+  return { valid: true };
+}
+
+function validateDisplayName(displayName) {
+  if (displayName.length < 2) {
+    return { valid: false, error: "Display name must be at least 2 characters long" };
+  }
+
+  if (displayName.length > 50) {
+    return { valid: false, error: "Display name must not exceed 50 characters" };
+  }
+
+  // Check for special characters (allow letters, numbers, spaces, hyphens, underscores)
+  const nameRegex = /^[a-zA-Z0-9\s\-_]+$/;
+  if (!nameRegex.test(displayName)) {
+    return {
+      valid: false,
+      error: "Display name can only contain letters, numbers, spaces, hyphens, and underscores",
+    };
+  }
+
+  return { valid: true };
+}
+
+function updateUserProfile(userId, email, displayName) {
+  if (!usersDatabase[userId]) {
+    return { success: false, error: "User not found" };
+  }
+
+  const updatedUser = { ...usersDatabase[userId] };
+
+  if (email) {
+    updatedUser.email = email;
+  }
+
+  if (displayName) {
+    updatedUser.displayName = displayName;
+  }
+
+  updatedUser.updatedAt = new Date().toISOString();
+  usersDatabase[userId] = updatedUser;
+
+  return { success: true, user: updatedUser };
+}
+
+function getUserProfile(userId) {
+  const user = usersDatabase[userId];
+  if (!user) {
+    return { found: false, error: "User not found" };
+  }
+  return { found: true, user };
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "validate_email":
+      return validateEmail(toolInput.email, toolInput.userId);
+    case "validate_display_name":
+      return validateDisplayName(toolInput.displayName);
+    case "update_user_profile":
+      return updateUserProfile(toolInput.userId, toolInput.email, toolInput.displayName);
+    case "get_user_profile":
+      return getUserProfile(toolInput.userId);
+    default:
+      return { error: "Unknown tool" };
+  }
+}
+
+// Main handler function for POST /api/user/update-profile
+async function updateProfileHandler(req) {
+  // Simulate extracting user ID from authentication token
+  // In real implementation, this would come from JWT or session
+  const userId = req.headers?.authorization?.replace("Bearer ", "") || "user123";
+
+  const { email, displayName } = req.body || {};
+
+  // Validate that at least one field is provided
+  if (!email && !displayName) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        error: "At least one field (email or displayName) must be provided",
+      },
+    };
+  }
+
+  // Prepare the message for Claude
+  const userMessage = `
+    User ID: ${userId}
+    Request to update profile with:
+    ${email ? `- New email: ${email}` : ""}
+    ${displayName ? `- New display name: ${displayName}` : ""}
+    
+    Please validate the provided fields and update the user profile if validation passes.
+    First get the current user profile, then validate the new values, and finally update if everything is valid.
+  `;
+
+  const messages = [{ role: "user", content: userMessage }];
+
+  let response;
+  let finalResult = null;
+
+  // Agentic loop
+  while (true) {
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Check if we need to process tool calls
+    if (response.stop_reason === "tool_use") {
+      const toolUseBlocks = response.content.filter((block) => block.type === "tool_use");
+      const toolResults = [];
+
+      for (const toolUse of toolUseBlocks) {
+        const result = processToolCall(toolUse.name, toolUse.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result),
+        });
+      }
+
+      // Add assistant response and tool results to messages
+      messages.push({ role: "assistant", content: response.content });
+      messages.push({ role: "user", content: toolResults });
+    } else if (response.stop_reason === "end_turn") {
+      // Extract the final text response
+      const textBlock = response.content.find((block) => block.type === "text");
+      if (textBlock) {
+        // Parse the response to determine success or failure
+        const responseText = textBlock.text.toLowerCase();
+
+        if (
+          responseText.includes("successfully updated") ||
+          responseText.includes("profile has been updated")
+        ) {
+          const updatedUser = usersDatabase[userId];
+          finalResult = {
+            status: 200,
+            body: {
+              success: true,
+              message: "Profile updated successfully",
+              user: {
+                id: updatedUser.id,
+                email: updatedUser.email,
+                displayName: updatedUser.displayName,
+                updatedAt: updatedUser.updatedAt,
+              },
+            },
+          };
+        } else if (
+          responseText.includes("validation failed") ||
+          responseText.includes("invalid") ||
+          responseText.includes("error")
+        ) {
+          finalResult = {
+            status: 400,
+            body: {
+              success: false,
+              error: textBlock.text,
+            },
+          };
+        } else {
+          finalResult = {
+            status: 200,
+            body: {
+              success: true,
+              message: textBlock.text,
+            },
+          };
+        }
+      }
+      break;
+    } else {
+      break;
+    }
+  }
+
+  return (
+    finalResult || {
+      status: 500,
+      body: {
+        success: false,
+        error: "Internal server error",
+      },
+    }
+  );
+}
+
+// Test the handler
+async function testHandler() {
+  console.log("Testing POST /api/user/update-profile endpoint\n");
+  console.log("Initial database state:", JSON.stringify(usersDatabase, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  // Test 1: Valid update
+  console.log("Test 1: Valid email and display name update");
+  const req1 = {
+    headers: { authorization: "Bearer user123" },
+    body: {
+      email: "john.updated@example.com",
+      displayName: "John Updated",
+    },
+  };
+
+  const result1 = await updateProfileHandler(req1);
+  console.log("Response:", JSON.stringify(result1, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  // Test 2: Invalid email format
+  console.log("Test 2: Invalid email format");
+  const req2 = {
+    headers: { authorization: "Bearer user123" },
+    body: {
+      email: "invalid-email",
+    },
+  };
+
+  const result2 = await updateProfileHandler(req2);
+  console.log("Response:", JSON.stringify(result2, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  // Test 3: Email already taken
+  console.log("Test 3: Email already taken by another user");
+  const req3 = {
+    headers: { authorization: "Bearer user123" },
+    body: {
+      email: "jane.smith@example.com",
+    },
+  };
+
+  const result3 = await updateProfileHandler(req3);
+  console.log("Response:", JSON.stringify(result3, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  // Test 4: Display name too short
+  console.log("Test 4: Display name too short");
+  const req4 = {
+    headers: { authorization: "Bearer user456" },
+    body: {
+      displayName: "J",
+    },
+  };
+
+  const result4 = await updateProfileHandler(req4);
+  console.log("Response:", JSON.stringify(result4, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  // Test 5: No fields provided
+  console.log("Test 5: No fields provided");
+  const req5 = {
+    headers: { authorization: "Bearer user123" },
+    body: {},
+  };
+
+  const result5 = await updateProfileHandler(req5);
+  console.log("Response:", JSON.stringify(result5, null, 2));
+  console.log("\n" + "=".repeat(60) + "\n");
+
+  console.log("Final database state:", JSON.stringify(usersDatabase, null, 2));
+}
+
+testHandler().catch(console.error);
+```

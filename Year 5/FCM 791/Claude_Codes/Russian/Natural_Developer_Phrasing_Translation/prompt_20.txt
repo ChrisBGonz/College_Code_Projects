@@ -1,0 +1,191 @@
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+)
+
+// CORSConfig holds the configuration for CORS middleware
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+// DefaultCORSConfig returns a default CORS configuration
+func DefaultCORSConfig() CORSConfig {
+	return CORSConfig{
+		AllowedOrigins:   []string{"https://myapp.com"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
+		ExposedHeaders:   []string{"Content-Length", "X-Request-Id"},
+		AllowCredentials: true,
+		MaxAge:           86400, // 24 hours
+	}
+}
+
+// CORSMiddleware creates a new CORS middleware handler
+func CORSMiddleware(config CORSConfig) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			origin := r.Header.Get("Origin")
+
+			// Check if the origin is allowed
+			if origin != "" && isOriginAllowed(origin, config.AllowedOrigins) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+
+				if config.AllowCredentials {
+					w.Header().Set("Access-Control-Allow-Credentials", "true")
+				}
+
+				// Set exposed headers if any
+				if len(config.ExposedHeaders) > 0 {
+					w.Header().Set("Access-Control-Expose-Headers", joinStrings(config.ExposedHeaders))
+				}
+
+				// Handle preflight OPTIONS request
+				if r.Method == http.MethodOptions {
+					w.Header().Set("Access-Control-Allow-Methods", joinStrings(config.AllowedMethods))
+					w.Header().Set("Access-Control-Allow-Headers", joinStrings(config.AllowedHeaders))
+
+					if config.MaxAge > 0 {
+						w.Header().Set("Access-Control-Max-Age", intToString(config.MaxAge))
+					}
+
+					// Respond to preflight request
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			}
+
+			// Pass to the next handler
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// isOriginAllowed checks if the given origin is in the allowed origins list
+func isOriginAllowed(origin string, allowedOrigins []string) bool {
+	for _, allowed := range allowedOrigins {
+		if allowed == "*" || allowed == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// joinStrings joins a slice of strings with ", "
+func joinStrings(s []string) string {
+	result := ""
+	for i, v := range s {
+		if i > 0 {
+			result += ", "
+		}
+		result += v
+	}
+	return result
+}
+
+// intToString converts an int to string without fmt package
+func intToString(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	result := ""
+	for n > 0 {
+		result = string(rune('0'+n%10)) + result
+		n /= 10
+	}
+	return result
+}
+
+// --- Handlers ---
+
+type Response struct {
+	Message string      `json:"message"`
+	Data    interface{} `json:"data,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(payload)
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, Response{Message: "Server is running"})
+}
+
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		users := []map[string]interface{}{
+			{"id": 1, "name": "Alice", "email": "alice@example.com"},
+			{"id": 2, "name": "Bob", "email": "bob@example.com"},
+		}
+		writeJSON(w, http.StatusOK, Response{Message: "Users retrieved", Data: users})
+
+	case http.MethodPost:
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, Response{Message: "Invalid request body"})
+			return
+		}
+		writeJSON(w, http.StatusCreated, Response{Message: "User created", Data: body})
+
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, Response{Message: "Method not allowed"})
+	}
+}
+
+func protectedHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		writeJSON(w, http.StatusUnauthorized, Response{Message: "Authorization header required"})
+		return
+	}
+	writeJSON(w, http.StatusOK, Response{Message: "Access granted to protected resource"})
+}
+
+// --- Main ---
+
+func main() {
+	corsConfig := DefaultCORSConfig()
+
+	// Uncomment to allow multiple origins:
+	// corsConfig.AllowedOrigins = []string{
+	// 	"https://myapp.com",
+	// 	"https://staging.myapp.com",
+	// 	"http://localhost:3000",
+	// }
+
+	// Uncomment to allow all origins (not recommended for production):
+	// corsConfig.AllowedOrigins = []string{"*"}
+	// corsConfig.AllowCredentials = false // Cannot use credentials with wildcard origin
+
+	corsMiddleware := CORSMiddleware(corsConfig)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/api/users", usersHandler)
+	mux.HandleFunc("/api/protected", protectedHandler)
+
+	// Wrap the entire mux with CORS middleware
+	handler := corsMiddleware(mux)
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: handler,
+	}
+
+	log.Println("Server starting on http://localhost:8080")
+	log.Println("Allowed CORS origins:", corsConfig.AllowedOrigins)
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}

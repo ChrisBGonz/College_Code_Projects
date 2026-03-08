@@ -1,0 +1,327 @@
+
+```python
+import subprocess
+import sys
+import os
+import re
+import xml.etree.ElementTree as ET
+from anthropic import Anthropic
+
+client = Anthropic()
+conversation_history = []
+
+def run_maven_command(command: list[str], cwd: str = None) -> tuple[str, str, int]:
+    """Run a Maven command and return stdout, stderr, and return code."""
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            cwd=cwd
+        )
+        return result.stdout, result.stderr, result.returncode
+    except FileNotFoundError:
+        return "", "Maven not found. Please install Maven.", 1
+
+def get_project_info(pom_path: str) -> str:
+    """Extract project information from pom.xml."""
+    try:
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+        
+        # Handle namespace
+        ns = ''
+        if root.tag.startswith('{'):
+            ns = root.tag.split('}')[0] + '}'
+        
+        info = []
+        
+        # Get project coordinates
+        group_id = root.find(f'{ns}groupId')
+        artifact_id = root.find(f'{ns}artifactId')
+        version = root.find(f'{ns}version')
+        
+        if group_id is not None:
+            info.append(f"GroupId: {group_id.text}")
+        if artifact_id is not None:
+            info.append(f"ArtifactId: {artifact_id.text}")
+        if version is not None:
+            info.append(f"Version: {version.text}")
+        
+        # Get dependencies
+        dependencies = []
+        
+        # Regular dependencies
+        deps_section = root.find(f'{ns}dependencies')
+        if deps_section is not None:
+            for dep in deps_section.findall(f'{ns}dependency'):
+                dep_group = dep.find(f'{ns}groupId')
+                dep_artifact = dep.find(f'{ns}artifactId')
+                dep_version = dep.find(f'{ns}version')
+                
+                if dep_group is not None and dep_artifact is not None:
+                    dep_info = f"{dep_group.text}:{dep_artifact.text}"
+                    if dep_version is not None:
+                        dep_info += f":{dep_version.text}"
+                    dependencies.append(dep_info)
+        
+        # Dependency management
+        dep_mgmt = root.find(f'{ns}dependencyManagement')
+        if dep_mgmt is not None:
+            deps_section = dep_mgmt.find(f'{ns}dependencies')
+            if deps_section is not None:
+                for dep in deps_section.findall(f'{ns}dependency'):
+                    dep_group = dep.find(f'{ns}groupId')
+                    dep_artifact = dep.find(f'{ns}artifactId')
+                    dep_version = dep.find(f'{ns}version')
+                    
+                    if dep_group is not None and dep_artifact is not None:
+                        dep_info = f"[managed] {dep_group.text}:{dep_artifact.text}"
+                        if dep_version is not None:
+                            dep_info += f":{dep_version.text}"
+                        dependencies.append(dep_info)
+        
+        if dependencies:
+            info.append(f"\nDependencies ({len(dependencies)}):")
+            for dep in dependencies:
+                info.append(f"  - {dep}")
+        
+        return "\n".join(info)
+    except Exception as e:
+        return f"Error reading pom.xml: {str(e)}"
+
+def check_updates(project_dir: str) -> str:
+    """Check for available dependency updates using Maven versions plugin."""
+    print("Checking for available updates...")
+    
+    stdout, stderr, returncode = run_maven_command(
+        ["mvn", "versions:display-dependency-updates", "-q"],
+        cwd=project_dir
+    )
+    
+    if returncode != 0:
+        return f"Error checking updates:\n{stderr}"
+    
+    return stdout if stdout else "No updates found or unable to check."
+
+def update_dependencies(project_dir: str) -> str:
+    """Update all dependencies to latest versions."""
+    print("Updating dependencies...")
+    
+    # Update regular dependencies
+    stdout1, stderr1, rc1 = run_maven_command(
+        ["mvn", "versions:use-latest-versions", "-DallowSnapshots=false"],
+        cwd=project_dir
+    )
+    
+    # Update dependency management
+    stdout2, stderr2, rc2 = run_maven_command(
+        ["mvn", "versions:use-latest-versions", "-DprocessDependencyManagement=true", "-DallowSnapshots=false"],
+        cwd=project_dir
+    )
+    
+    result = []
+    if rc1 == 0:
+        result.append("Regular dependencies updated successfully.")
+        if stdout1:
+            result.append(stdout1)
+    else:
+        result.append(f"Error updating regular dependencies:\n{stderr1}")
+    
+    if rc2 == 0:
+        result.append("Managed dependencies updated successfully.")
+        if stdout2:
+            result.append(stdout2)
+    else:
+        result.append(f"Error updating managed dependencies:\n{stderr2}")
+    
+    return "\n".join(result)
+
+def verify_build(project_dir: str) -> str:
+    """Verify the project builds after updates."""
+    print("Verifying build...")
+    
+    stdout, stderr, returncode = run_maven_command(
+        ["mvn", "compile", "-q"],
+        cwd=project_dir
+    )
+    
+    if returncode == 0:
+        return "Build successful after updates!"
+    else:
+        return f"Build failed after updates:\n{stderr}"
+
+def chat_with_claude(user_message: str, project_dir: str = None, pom_path: str = None) -> str:
+    """Send a message to Claude and get a response."""
+    
+    # Add context about the project if available
+    context = ""
+    if pom_path and os.path.exists(pom_path):
+        project_info = get_project_info(pom_path)
+        context = f"\nProject Information:\n{project_info}\n"
+    
+    # Add the user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message + context
+    })
+    
+    # Create system message
+    system_message = """You are an expert Java/Maven dependency management assistant. 
+    You help users update and manage Maven project dependencies.
+    You can analyze pom.xml files, suggest updates, and help resolve dependency conflicts.
+    When asked to perform actions, provide clear instructions and explanations.
+    Always consider compatibility and potential breaking changes when suggesting updates."""
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=system_message,
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def process_user_command(user_input: str, project_dir: str, pom_path: str) -> str:
+    """Process user commands and interact with Claude."""
+    
+    user_input_lower = user_input.lower()
+    
+    # Check for specific commands
+    if any(word in user_input_lower for word in ['check', 'проверить', 'показать обновления', 'show updates']):
+        updates = check_updates(project_dir)
+        claude_response = chat_with_claude(
+            f"I checked for updates and got this output:\n{updates}\n\nPlease analyze this and provide recommendations.",
+            project_dir,
+            pom_path
+        )
+        return f"Update Check Results:\n{updates}\n\nClaude's Analysis:\n{claude_response}"
+    
+    elif any(word in user_input_lower for word in ['update', 'обновить', 'upgrade']):
+        # First check updates
+        updates = check_updates(project_dir)
+        
+        # Ask Claude for advice
+        claude_advice = chat_with_claude(
+            f"I'm about to update all dependencies. Current update check shows:\n{updates}\n\nShould I proceed? What should I be careful about?",
+            project_dir,
+            pom_path
+        )
+        
+        print(f"\nClaude's advice:\n{claude_advice}\n")
+        
+        # Perform the update
+        update_result = update_dependencies(project_dir)
+        
+        # Verify build
+        build_result = verify_build(project_dir)
+        
+        # Get Claude's analysis of the results
+        final_analysis = chat_with_claude(
+            f"Updates were performed with this result:\n{update_result}\n\nBuild verification:\n{build_result}\n\nPlease provide a summary and any recommendations.",
+            project_dir,
+            pom_path
+        )
+        
+        return f"Update Results:\n{update_result}\n\nBuild Verification:\n{build_result}\n\nClaude's Analysis:\n{final_analysis}"
+    
+    elif any(word in user_input_lower for word in ['verify', 'build', 'компилировать', 'проверить сборку']):
+        build_result = verify_build(project_dir)
+        claude_response = chat_with_claude(
+            f"Build verification result:\n{build_result}\n\nPlease analyze this.",
+            project_dir,
+            pom_path
+        )
+        return f"Build Result:\n{build_result}\n\nClaude's Analysis:\n{claude_response}"
+    
+    elif any(word in user_input_lower for word in ['info', 'информация', 'project info', 'show pom']):
+        project_info = get_project_info(pom_path)
+        claude_response = chat_with_claude(
+            f"Here's the project information:\n{project_info}\n\nPlease provide an overview and any observations.",
+            project_dir,
+            pom_path
+        )
+        return f"Project Information:\n{project_info}\n\nClaude's Analysis:\n{claude_response}"
+    
+    else:
+        # General conversation with Claude
+        return chat_with_claude(user_input, project_dir, pom_path)
+
+def main():
+    print("Maven Dependency Updater with Claude AI")
+    print("=" * 50)
+    
+    # Get project directory
+    if len(sys.argv) > 1:
+        project_dir = sys.argv[1]
+    else:
+        project_dir = input("Enter the path to your Maven project (or press Enter for current directory): ").strip()
+        if not project_dir:
+            project_dir = os.getcwd()
+    
+    # Validate project directory
+    if not os.path.exists(project_dir):
+        print(f"Error: Directory '{project_dir}' does not exist.")
+        sys.exit(1)
+    
+    pom_path = os.path.join(project_dir, "pom.xml")
+    if not os.path.exists(pom_path):
+        print(f"Error: No pom.xml found in '{project_dir}'.")
+        sys.exit(1)
+    
+    print(f"\nProject directory: {project_dir}")
+    print(f"POM file: {pom_path}")
+    
+    # Initial project analysis
+    print("\nAnalyzing project...")
+    project_info = get_project_info(pom_path)
+    initial_analysis = chat_with_claude(
+        f"I'm starting to work with a Maven project. Here's the project information:\n{project_info}\n\nPlease provide an initial analysis and suggest what we should do.",
+        project_dir,
+        pom_path
+    )
+    print(f"\nInitial Analysis:\n{initial_analysis}")
+    
+    print("\n" + "=" * 50)
+    print("Available commands:")
+    print("  - 'check' or 'show updates': Check for available updates")
+    print("  - 'update' or 'upgrade': Update all dependencies")
+    print("  - 'verify' or 'build': Verify the build")
+    print("  - 'info': Show project information")
+    print("  - 'exit' or 'quit': Exit the program")
+    print("  - Any other text: Chat with Claude about your project")
+    print("=" * 50)
+    
+    # Main conversation loop
+    while True:
+        try:
+            user_input = input("\nYou: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() in ['exit', 'quit', 'выход']:
+                print("Goodbye!")
+                break
+            
+            response = process_user_command(user_input, project_dir, pom_path)
+            print(f"\nAssistant: {response}")
+            
+        except KeyboardInterrupt:
+            print("\n\nInterrupted by user. Goodbye!")
+            break
+        except Exception as e:
+            print(f"\nError: {str(e)}")
+            print("Please try again.")
+
+if __name__ == "__main__":
+    main()
+```

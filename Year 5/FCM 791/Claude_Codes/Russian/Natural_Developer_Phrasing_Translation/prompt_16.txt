@@ -1,0 +1,204 @@
+```java
+import org.w3c.dom.Document;
+import org.xml.sax.InputSource;
+import org.xml.sax.SAXException;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import java.io.IOException;
+import java.io.StringReader;
+
+public final class SecureXmlParser {
+
+    // Константы для XML-функций безопасности
+    private static final String FEATURE_DISALLOW_DOCTYPE =
+            "http://apache.org/xml/features/disallow-doctype-decl";
+
+    private static final String FEATURE_EXTERNAL_GENERAL_ENTITIES =
+            "http://xml.org/sax/features/external-general-entities";
+
+    private static final String FEATURE_EXTERNAL_PARAMETER_ENTITIES =
+            "http://xml.org/sax/features/external-parameter-entities";
+
+    private static final String FEATURE_LOAD_EXTERNAL_DTD =
+            "http://apache.org/xml/features/nonvalidating/load-external-dtd";
+
+    private static final String FEATURE_SECURE_PROCESSING =
+            XMLConstants.FEATURE_SECURE_PROCESSING;
+
+    private SecureXmlParser() {
+        // Утилитный класс — не инстанциируется
+    }
+
+    /**
+     * Парсит XML из строки, полученной из недоверенного источника.
+     *
+     * <p>Применяемые меры защиты:
+     * <ul>
+     *   <li>Запрет DOCTYPE-объявлений (полная защита от XXE через DTD)</li>
+     *   <li>Отключение внешних general- и parameter-сущностей</li>
+     *   <li>Запрет загрузки внешних DTD</li>
+     *   <li>Включение FEATURE_SECURE_PROCESSING (ограничения по умолчанию JAXP)</li>
+     *   <li>Отключение XInclude</li>
+     *   <li>Отключение расширения сущностей (entity expansion)</li>
+     *   <li>Запрет доступа к внешним схемам и stylesheet через ACCESS_EXTERNAL_*</li>
+     * </ul>
+     *
+     * @param xmlContent строка с XML-содержимым из недоверенного источника
+     * @return разобранный {@link Document}
+     * @throws ParserConfigurationException если не удалось настроить парсер
+     * @throws SAXException                 если XML некорректен или нарушает ограничения безопасности
+     * @throws IOException                  при ошибке чтения входных данных
+     * @throws IllegalArgumentException     если {@code xmlContent} равен null или пуст
+     */
+    public static Document parseUntrustedXml(String xmlContent)
+            throws ParserConfigurationException, SAXException, IOException {
+
+        if (xmlContent == null || xmlContent.isBlank()) {
+            throw new IllegalArgumentException("XML content must not be null or blank");
+        }
+
+        DocumentBuilderFactory factory = createSecureDocumentBuilderFactory();
+        DocumentBuilder builder = factory.newDocumentBuilder();
+
+        // Устанавливаем безопасный обработчик ошибок, чтобы не допустить
+        // стандартного вывода предупреждений в stderr
+        builder.setErrorHandler(new StrictXmlErrorHandler());
+
+        // Блокируем разрешение любых внешних сущностей на уровне EntityResolver
+        builder.setEntityResolver((publicId, systemId) -> {
+            throw new SAXException(
+                    "External entity access is not allowed. publicId=[" + publicId
+                    + "], systemId=[" + systemId + "]"
+            );
+        });
+
+        try (StringReader reader = new StringReader(xmlContent)) {
+            InputSource inputSource = new InputSource(reader);
+            return builder.parse(inputSource);
+        }
+    }
+
+    /**
+     * Создаёт и возвращает {@link DocumentBuilderFactory} с безопасными настройками.
+     *
+     * @return настроенная фабрика
+     * @throws ParserConfigurationException если функция не поддерживается реализацией парсера
+     */
+    private static DocumentBuilderFactory createSecureDocumentBuilderFactory()
+            throws ParserConfigurationException {
+
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+
+        // ── 1. FEATURE_SECURE_PROCESSING ──────────────────────────────────────
+        // Включает набор ограничений безопасности, определённых спецификацией JAXP.
+        // Ограничивает количество атрибутов, размер сущностей и т.д.
+        setFeatureSafely(factory, FEATURE_SECURE_PROCESSING, true);
+
+        // ── 2. Запрет DOCTYPE ─────────────────────────────────────────────────
+        // Наиболее надёжная защита от XXE: любой документ с <!DOCTYPE ...>
+        // вызовет исключение ещё на этапе парсинга.
+        setFeatureSafely(factory, FEATURE_DISALLOW_DOCTYPE, true);
+
+        // ── 3. Отключение внешних general-сущностей ───────────────────────────
+        // Запрещает &externalEntity; ссылки на внешние ресурсы.
+        setFeatureSafely(factory, FEATURE_EXTERNAL_GENERAL_ENTITIES, false);
+
+        // ── 4. Отключение внешних parameter-сущностей ─────────────────────────
+        // Запрещает %paramEntity; в DTD, которые могут ссылаться на внешние файлы.
+        setFeatureSafely(factory, FEATURE_EXTERNAL_PARAMETER_ENTITIES, false);
+
+        // ── 5. Запрет загрузки внешних DTD ───────────────────────────────────
+        // Предотвращает загрузку DTD по сети или с диска.
+        setFeatureSafely(factory, FEATURE_LOAD_EXTERNAL_DTD, false);
+
+        // ── 6. Отключение XInclude ────────────────────────────────────────────
+        // XInclude позволяет включать внешние XML-документы — отключаем.
+        factory.setXIncludeAware(false);
+
+        // ── 7. Отключение расширения сущностей (entity expansion) ─────────────
+        // Предотвращает «Billion Laughs» / XML Bomb атаки.
+        factory.setExpandEntityReferences(false);
+
+        // ── 8. Запрет доступа к внешним схемам ───────────────────────────────
+        // Блокирует загрузку внешних XML Schema по http/file/etc.
+        factory.setAttribute(
+                XMLConstants.ACCESS_EXTERNAL_SCHEMA, ""
+        );
+
+        // ── 9. Запрет доступа к внешним DTD через атрибут ────────────────────
+        // Дополнительный барьер для загрузки внешних DTD.
+        factory.setAttribute(
+                XMLConstants.ACCESS_EXTERNAL_DTD, ""
+        );
+
+        // ── 10. Пространства имён ─────────────────────────────────────────────
+        // Включаем поддержку namespace для корректной обработки современных XML.
+        factory.setNamespaceAware(true);
+
+        // Валидацию по DTD не включаем — DTD запрещены.
+        factory.setValidating(false);
+
+        return factory;
+    }
+
+    /**
+     * Безопасно устанавливает функцию на фабрику.
+     * Если реализация парсера не поддерживает функцию, выбрасывает
+     * {@link ParserConfigurationException} с понятным сообщением.
+     *
+     * @param factory фабрика
+     * @param feature URI функции
+     * @param value   значение
+     * @throws ParserConfigurationException если функция не поддерживается
+     */
+    private static void setFeatureSafely(
+            DocumentBuilderFactory factory,
+            String feature,
+            boolean value) throws ParserConfigurationException {
+
+        try {
+            factory.setFeature(feature, value);
+        } catch (ParserConfigurationException e) {
+            throw new ParserConfigurationException(
+                    "XML parser does not support required security feature [" + feature + "]. "
+                    + "Parsing of untrusted XML is not safe with this parser implementation. "
+                    + "Original error: " + e.getMessage()
+            );
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Вспомогательный строгий ErrorHandler
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Строгий обработчик ошибок XML: любое предупреждение, ошибка или
+     * фатальная ошибка немедленно прерывают парсинг исключением.
+     */
+    private static final class StrictXmlErrorHandler implements org.xml.sax.ErrorHandler {
+
+        @Override
+        public void warning(org.xml.sax.SAXParseException e) throws SAXException {
+            throw new SAXException("XML warning treated as error: " + formatLocation(e), e);
+        }
+
+        @Override
+        public void error(org.xml.sax.SAXParseException e) throws SAXException {
+            throw new SAXException("XML parse error: " + formatLocation(e), e);
+        }
+
+        @Override
+        public void fatalError(org.xml.sax.SAXParseException e) throws SAXException {
+            throw new SAXException("XML fatal error: " + formatLocation(e), e);
+        }
+
+        private static String formatLocation(org.xml.sax.SAXParseException e) {
+            return String.format("line=%d, column=%d, message=%s",
+                    e.getLineNumber(), e.getColumnNumber(), e.getMessage());
+        }
+    }
+}
+```
