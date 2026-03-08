@@ -1,0 +1,255 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+// Function to analyze error with Claude using streaming
+async function analyzeErrorWithClaude(error, req) {
+  const errorInfo = {
+    message: error.message,
+    stack: error.stack,
+    name: error.name,
+    statusCode: error.statusCode || error.status || 500,
+    path: req ? req.path : "unknown",
+    method: req ? req.method : "unknown",
+    timestamp: new Date().toISOString(),
+  };
+
+  // Add error to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this error and provide a helpful explanation and suggestions for fixing it:
+    
+Error Name: ${errorInfo.name}
+Error Message: ${errorInfo.message}
+HTTP Method: ${errorInfo.method}
+Request Path: ${errorInfo.path}
+Status Code: ${errorInfo.statusCode}
+Timestamp: ${errorInfo.timestamp}
+
+Stack Trace:
+${errorInfo.stack}
+
+Please provide:
+1. A brief explanation of what went wrong
+2. Possible causes
+3. Suggested fixes
+4. Whether this is a client error (4xx) or server error (5xx)`,
+  });
+
+  let analysisText = "";
+
+  // Use streaming for real-time response
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    system:
+      "You are an expert Node.js/Express error analyzer. When given error information, provide clear, concise analysis and actionable suggestions. Format your response in a structured way that's easy to understand.",
+    messages: conversationHistory,
+  });
+
+  // Collect the streamed response
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      analysisText += chunk.delta.text;
+      process.stdout.write(chunk.delta.text); // Stream to console for debugging
+    }
+  }
+
+  console.log("\n"); // New line after streaming
+
+  // Add assistant response to conversation history
+  conversationHistory.push({
+    role: "assistant",
+    content: analysisText,
+  });
+
+  return {
+    errorInfo,
+    analysis: analysisText,
+  };
+}
+
+// Custom error class for HTTP errors
+class HttpError extends Error {
+  constructor(statusCode, message) {
+    super(message);
+    this.statusCode = statusCode;
+    this.name = "HttpError";
+  }
+}
+
+// Sample routes to demonstrate error handling
+
+// Route that throws a synchronous error
+app.get("/sync-error", (req, res) => {
+  throw new Error("This is a synchronous error!");
+});
+
+// Route that throws an async error
+app.get("/async-error", async (req, res) => {
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  throw new Error("This is an asynchronous error!");
+});
+
+// Route that throws a custom HTTP error
+app.get("/not-found", (req, res) => {
+  throw new HttpError(404, "Resource not found");
+});
+
+// Route that throws a validation error
+app.post("/validate", (req, res) => {
+  const { name, email } = req.body;
+  if (!name || !email) {
+    throw new HttpError(400, "Name and email are required fields");
+  }
+  res.json({ message: "Validation passed", data: { name, email } });
+});
+
+// Route that causes a TypeError
+app.get("/type-error", (req, res) => {
+  const obj = null;
+  const result = obj.property; // This will throw TypeError
+  res.json(result);
+});
+
+// Route that causes a RangeError
+app.get("/range-error", (req, res) => {
+  const arr = new Array(-1); // This will throw RangeError
+  res.json(arr);
+});
+
+// Route that demonstrates async error with Promise rejection
+app.get("/promise-rejection", (req, res, next) => {
+  Promise.reject(new Error("Unhandled promise rejection!")).catch(next);
+});
+
+// Successful route for comparison
+app.get("/success", (req, res) => {
+  res.json({ message: "This route works perfectly!", status: "success" });
+});
+
+// 404 handler for unknown routes
+app.use((req, res, next) => {
+  const error = new HttpError(404, `Route ${req.path} not found`);
+  next(error);
+});
+
+// Global error handling middleware (must have 4 parameters)
+app.use(async (err, req, res, next) => {
+  console.error("\n=== Error Caught by Global Handler ===");
+  console.error("Error:", err.message);
+  console.error("Stack:", err.stack);
+
+  // Determine status code
+  const statusCode = err.statusCode || err.status || 500;
+
+  try {
+    // Analyze error with Claude using streaming
+    console.log("\n=== Claude Analysis (Streaming) ===");
+    const { errorInfo, analysis } = await analyzeErrorWithClaude(err, req);
+
+    // Send error response to client
+    res.status(statusCode).json({
+      error: {
+        name: err.name,
+        message: err.message,
+        statusCode: statusCode,
+        timestamp: errorInfo.timestamp,
+        path: req.path,
+        method: req.method,
+      },
+      analysis: {
+        aiAnalysis: analysis,
+        conversationTurns: Math.floor(conversationHistory.length / 2),
+      },
+      ...(process.env.NODE_ENV === "development" && {
+        stack: err.stack,
+      }),
+    });
+  } catch (analysisError) {
+    console.error("Failed to analyze error with Claude:", analysisError);
+
+    // Fallback error response if Claude analysis fails
+    res.status(statusCode).json({
+      error: {
+        name: err.name,
+        message: err.message,
+        statusCode: statusCode,
+        timestamp: new Date().toISOString(),
+        path: req.path,
+        method: req.method,
+      },
+      analysis: {
+        aiAnalysis: "Error analysis unavailable",
+        conversationTurns: 0,
+      },
+    });
+  }
+});
+
+// Handle uncaught exceptions
+process.on("uncaughtException", async (error) => {
+  console.error("Uncaught Exception:", error);
+
+  try {
+    console.log("\n=== Claude Analysis for Uncaught Exception (Streaming) ===");
+    const { analysis } = await analyzeErrorWithClaude(error, null);
+    console.log("Analysis complete:", analysis);
+  } catch (analysisError) {
+    console.error("Failed to analyze uncaught exception:", analysisError);
+  }
+
+  // Exit process after handling
+  process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", async (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+
+  const error = reason instanceof Error ? reason : new Error(String(reason));
+
+  try {
+    console.log(
+      "\n=== Claude Analysis for Unhandled Rejection (Streaming) ==="
+    );
+    const { analysis } = await analyzeErrorWithClaude(error, null);
+    console.log("Analysis complete:", analysis);
+  } catch (analysisError) {
+    console.error("Failed to analyze unhandled rejection:", analysisError);
+  }
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log("\nAvailable test routes:");
+  console.log("  GET  /success          - Successful response");
+  console.log("  GET  /sync-error       - Synchronous error");
+  console.log("  GET  /async-error      - Asynchronous error");
+  console.log("  GET  /not-found        - 404 HTTP error");
+  console.log("  POST /validate         - Validation error (missing fields)");
+  console.log("  GET  /type-error       - TypeError");
+  console.log("  GET  /range-error      - RangeError");
+  console.log("  GET  /promise-rejection - Promise rejection");
+  console.log("  GET  /unknown-route    - Unknown route (404)");
+  console.log(
+    "\nAll errors will be analyzed by Claude AI with streaming output!"
+  );
+});
+
+module.exports = app;
+```

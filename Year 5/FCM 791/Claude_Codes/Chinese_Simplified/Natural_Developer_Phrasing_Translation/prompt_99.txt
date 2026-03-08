@@ -1,0 +1,404 @@
+
+```python
+import requests
+from flask import Flask, render_template_string, request, Response
+from requests.exceptions import (
+    ConnectionError,
+    Timeout,
+    TooManyRedirects,
+    InvalidURL,
+    MissingSchema,
+)
+
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>URL 内容查看器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            border-bottom: 2px solid #007bff;
+            padding-bottom: 10px;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        input[type="text"] {
+            width: 70%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .content-frame {
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            background-color: #f9f9f9;
+        }
+        .content-text {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            font-family: monospace;
+            font-size: 14px;
+        }
+        .info-bar {
+            background-color: #e8f4f8;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #555;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🌐 URL 内容查看器</h1>
+        <div class="form-group">
+            <form method="GET" action="/fetch">
+                <input type="text" name="url" placeholder="请输入 URL，例如：https://example.com" 
+                       value="{{ url or '' }}" required>
+                <button type="submit">获取内容</button>
+            </form>
+        </div>
+        
+        {% if url %}
+        <div class="info-bar">
+            <strong>请求 URL：</strong> {{ url }}
+            {% if status_code %}
+            | <strong>状态码：</strong> {{ status_code }}
+            {% endif %}
+            {% if content_type %}
+            | <strong>内容类型：</strong> {{ content_type }}
+            {% endif %}
+        </div>
+        {% endif %}
+        
+        {% if content %}
+        <div class="content-frame">
+            <div class="content-text">{{ content }}</div>
+        </div>
+        {% endif %}
+    </div>
+</body>
+</html>
+"""
+
+ERROR_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>错误 - URL 内容查看器</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .error-container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-left: 5px solid {{ error_color }};
+        }
+        h1 {
+            color: {{ error_color }};
+        }
+        .error-message {
+            color: #555;
+            font-size: 16px;
+            line-height: 1.6;
+        }
+        .back-link {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 10px 20px;
+            background-color: #007bff;
+            color: white;
+            text-decoration: none;
+            border-radius: 4px;
+        }
+        .back-link:hover {
+            background-color: #0056b3;
+        }
+        .error-details {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            margin-top: 15px;
+            font-family: monospace;
+            font-size: 14px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="error-container">
+        <h1>{{ error_icon }} {{ error_title }}</h1>
+        <div class="error-message">{{ error_message }}</div>
+        {% if error_details %}
+        <div class="error-details">{{ error_details }}</div>
+        {% endif %}
+        <a href="/" class="back-link">← 返回首页</a>
+    </div>
+</body>
+</html>
+"""
+
+
+def render_error(
+    error_title,
+    error_message,
+    status_code=500,
+    error_details=None,
+    error_icon="❌",
+    error_color="#dc3545",
+):
+    """渲染错误页面"""
+    html = render_template_string(
+        ERROR_TEMPLATE,
+        error_title=error_title,
+        error_message=error_message,
+        error_details=error_details,
+        error_icon=error_icon,
+        error_color=error_color,
+    )
+    return html, status_code
+
+
+@app.route("/")
+def index():
+    """首页 - 显示 URL 输入表单"""
+    return render_template_string(HTML_TEMPLATE, url=None, content=None)
+
+
+@app.route("/fetch")
+def fetch_url():
+    """获取并展示 URL 内容"""
+    url = request.args.get("url", "").strip()
+
+    if not url:
+        return render_error(
+            error_title="缺少 URL 参数",
+            error_message="请提供一个有效的 URL 地址。",
+            status_code=400,
+            error_icon="⚠️",
+            error_color="#ffc107",
+        )
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (compatible; URLFetcher/1.0)",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+
+        response = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+
+        status_code = response.status_code
+        content_type = response.headers.get("Content-Type", "unknown")
+
+        if status_code == 404:
+            return render_error(
+                error_title="404 - 页面未找到",
+                error_message=f"请求的页面不存在。服务器返回了 404 状态码，表示该资源在目标服务器上无法找到。",
+                status_code=404,
+                error_details=f"请求 URL: {url}",
+                error_icon="🔍",
+                error_color="#dc3545",
+            )
+
+        elif status_code == 403:
+            return render_error(
+                error_title="403 - 访问被拒绝",
+                error_message="服务器拒绝了访问请求。您可能没有权限访问此资源。",
+                status_code=403,
+                error_details=f"请求 URL: {url}",
+                error_icon="🚫",
+                error_color="#dc3545",
+            )
+
+        elif status_code == 401:
+            return render_error(
+                error_title="401 - 需要身份验证",
+                error_message="访问此资源需要身份验证。请确保您有正确的访问凭据。",
+                status_code=401,
+                error_details=f"请求 URL: {url}",
+                error_icon="🔐",
+                error_color="#ffc107",
+            )
+
+        elif status_code == 500:
+            return render_error(
+                error_title="500 - 服务器内部错误",
+                error_message="目标服务器遇到了内部错误，无法完成请求。",
+                status_code=502,
+                error_details=f"请求 URL: {url}",
+                error_icon="💥",
+                error_color="#dc3545",
+            )
+
+        elif status_code >= 400:
+            return render_error(
+                error_title=f"{status_code} - 请求错误",
+                error_message=f"服务器返回了错误状态码 {status_code}。",
+                status_code=status_code,
+                error_details=f"请求 URL: {url}",
+                error_icon="⚠️",
+                error_color="#ffc107",
+            )
+
+        elif status_code >= 300:
+            return render_error(
+                error_title=f"{status_code} - 重定向",
+                error_message=f"请求被重定向（状态码 {status_code}），但重定向未能成功完成。",
+                status_code=status_code,
+                error_details=f"请求 URL: {url}",
+                error_icon="↪️",
+                error_color="#17a2b8",
+            )
+
+        if "text" in content_type or "json" in content_type or "xml" in content_type:
+            try:
+                content = response.text
+            except Exception:
+                content = response.content.decode("utf-8", errors="replace")
+        else:
+            content = f"[二进制内容 - 内容类型: {content_type}，大小: {len(response.content)} 字节]"
+
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            content=content,
+            status_code=status_code,
+            content_type=content_type,
+        )
+
+    except MissingSchema:
+        return render_error(
+            error_title="无效的 URL 格式",
+            error_message="提供的 URL 格式不正确，缺少协议前缀（如 http:// 或 https://）。",
+            status_code=400,
+            error_details=f"输入的 URL: {url}",
+            error_icon="⚠️",
+            error_color="#ffc107",
+        )
+
+    except InvalidURL:
+        return render_error(
+            error_title="无效的 URL",
+            error_message="提供的 URL 格式无效，请检查 URL 是否正确。",
+            status_code=400,
+            error_details=f"输入的 URL: {url}",
+            error_icon="⚠️",
+            error_color="#ffc107",
+        )
+
+    except ConnectionError as e:
+        return render_error(
+            error_title="连接错误",
+            error_message="无法连接到目标服务器。请检查 URL 是否正确，或目标服务器是否可访问。",
+            status_code=503,
+            error_details=f"错误详情: {str(e)[:200]}",
+            error_icon="🔌",
+            error_color="#dc3545",
+        )
+
+    except Timeout:
+        return render_error(
+            error_title="请求超时",
+            error_message="请求超时（超过 10 秒）。目标服务器响应太慢或无法访问。",
+            status_code=504,
+            error_details=f"请求 URL: {url}",
+            error_icon="⏱️",
+            error_color="#ffc107",
+        )
+
+    except TooManyRedirects:
+        return render_error(
+            error_title="重定向次数过多",
+            error_message="请求遇到了太多重定向，可能存在重定向循环。",
+            status_code=400,
+            error_details=f"请求 URL: {url}",
+            error_icon="🔄",
+            error_color="#ffc107",
+        )
+
+    except Exception as e:
+        return render_error(
+            error_title="未知错误",
+            error_message="处理请求时发生了未知错误，请稍后重试。",
+            status_code=500,
+            error_details=f"错误类型: {type(e).__name__}, 错误信息: {str(e)[:200]}",
+            error_icon="❌",
+            error_color="#dc3545",
+        )
+
+
+@app.errorhandler(404)
+def page_not_found(e):
+    """处理 Flask 应用本身的 404 错误"""
+    return render_error(
+        error_title="404 - 页面未找到",
+        error_message="您访问的页面不存在。请检查 URL 是否正确。",
+        status_code=404,
+        error_icon="🔍",
+        error_color="#dc3545",
+    )
+
+
+@app.errorhandler(500)
+def internal_server_error(e):
+    """处理 Flask 应用本身的 500 错误"""
+    return render_error(
+        error_title="500 - 服务器内部错误",
+        error_message="服务器遇到了内部错误，请稍后重试。",
+        status_code=500,
+        error_icon="💥",
+        error_color="#dc3545",
+    )
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

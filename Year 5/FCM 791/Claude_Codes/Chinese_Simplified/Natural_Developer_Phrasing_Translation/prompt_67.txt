@@ -1,0 +1,252 @@
+
+```python
+import hmac
+import struct
+import time
+import base64
+import hashlib
+import anthropic
+
+client = anthropic.Anthropic()
+
+def generate_totp(secret: str, time_step: int = 30, digits: int = 6) -> str:
+    """Generate a TOTP code for testing purposes."""
+    key = base64.b32decode(secret.upper())
+    timestamp = int(time.time() / time_step)
+    msg = struct.pack(">Q", timestamp)
+    h = hmac.new(key, msg, hashlib.sha1).digest()
+    offset = h[-1] & 0x0F
+    code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+    return str(code % (10 ** digits)).zfill(digits)
+
+def verify_totp_with_claude(secret: str, user_provided_code: str) -> dict:
+    """
+    Use Claude with tool use to verify a TOTP code.
+    
+    Args:
+        secret: The TOTP secret key (base32 encoded)
+        user_provided_code: The 6-digit code provided by the user
+    
+    Returns:
+        dict with verification result
+    """
+    
+    tools = [
+        {
+            "name": "generate_totp_code",
+            "description": "Generate the current valid TOTP code based on the secret key and current timestamp. This tool generates the expected TOTP code that should match what the user's authenticator app shows.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "secret": {
+                        "type": "string",
+                        "description": "The base32 encoded TOTP secret key"
+                    },
+                    "time_step": {
+                        "type": "integer",
+                        "description": "Time step in seconds (default: 30)",
+                        "default": 30
+                    },
+                    "digits": {
+                        "type": "integer",
+                        "description": "Number of digits in the TOTP code (default: 6)",
+                        "default": 6
+                    }
+                },
+                "required": ["secret"]
+            }
+        },
+        {
+            "name": "verify_code",
+            "description": "Verify if the user-provided code matches the expected TOTP code. Also checks adjacent time windows to account for clock drift.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "expected_code": {
+                        "type": "string",
+                        "description": "The expected TOTP code generated from the secret"
+                    },
+                    "user_code": {
+                        "type": "string",
+                        "description": "The code provided by the user"
+                    },
+                    "secret": {
+                        "type": "string",
+                        "description": "The base32 encoded TOTP secret key for checking adjacent windows"
+                    }
+                },
+                "required": ["expected_code", "user_code", "secret"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"""Please verify the following 2FA TOTP code:
+            
+Secret Key: {secret}
+User Provided Code: {user_provided_code}
+
+Please:
+1. Generate the current valid TOTP code using the secret key
+2. Verify if the user's code matches (considering a small time window for clock drift)
+3. Return whether the authentication is successful or failed"""
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    if tool_name == "generate_totp_code":
+                        secret_key = tool_input["secret"]
+                        time_step = tool_input.get("time_step", 30)
+                        digits = tool_input.get("digits", 6)
+                        
+                        current_code = generate_totp(secret_key, time_step, digits)
+                        
+                        prev_code = generate_totp(secret_key, time_step, digits)
+                        key = base64.b32decode(secret_key.upper())
+                        timestamp = int(time.time() / time_step) - 1
+                        msg = struct.pack(">Q", timestamp)
+                        h = hmac.new(key, msg, hashlib.sha1).digest()
+                        offset = h[-1] & 0x0F
+                        code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+                        prev_code = str(code % (10 ** digits)).zfill(digits)
+                        
+                        next_timestamp = int(time.time() / time_step) + 1
+                        msg = struct.pack(">Q", next_timestamp)
+                        h = hmac.new(key, msg, hashlib.sha1).digest()
+                        offset = h[-1] & 0x0F
+                        code = struct.unpack(">I", h[offset:offset + 4])[0] & 0x7FFFFFFF
+                        next_code = str(code % (10 ** digits)).zfill(digits)
+                        
+                        tool_result = {
+                            "current_code": current_code,
+                            "previous_code": prev_code,
+                            "next_code": next_code,
+                            "timestamp": int(time.time()),
+                            "time_step": time_step
+                        }
+                        
+                    elif tool_name == "verify_code":
+                        expected_code = tool_input["expected_code"]
+                        user_code = tool_input["user_code"]
+                        secret_key = tool_input["secret"]
+                        
+                        time_step = 30
+                        digits = 6
+                        
+                        valid_codes = []
+                        for offset in [-1, 0, 1]:
+                            key = base64.b32decode(secret_key.upper())
+                            timestamp = int(time.time() / time_step) + offset
+                            msg = struct.pack(">Q", timestamp)
+                            h = hmac.new(key, msg, hashlib.sha1).digest()
+                            offset_byte = h[-1] & 0x0F
+                            code = struct.unpack(">I", h[offset_byte:offset_byte + 4])[0] & 0x7FFFFFFF
+                            valid_codes.append(str(code % (10 ** digits)).zfill(digits))
+                        
+                        is_valid = user_code in valid_codes
+                        
+                        tool_result = {
+                            "is_valid": is_valid,
+                            "user_code": user_code,
+                            "expected_code": expected_code,
+                            "message": "Authentication successful" if is_valid else "Authentication failed - invalid code"
+                        }
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": str(tool_result)
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        elif response.stop_reason == "end_turn":
+            final_text = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_text = content_block.text
+                    break
+            
+            is_authenticated = "successful" in final_text.lower() or "valid" in final_text.lower()
+            if "failed" in final_text.lower() or "invalid" in final_text.lower():
+                is_authenticated = False
+            
+            return {
+                "authenticated": is_authenticated,
+                "message": final_text,
+                "user_code": user_provided_code
+            }
+        else:
+            break
+    
+    return {
+        "authenticated": False,
+        "message": "Verification process failed",
+        "user_code": user_provided_code
+    }
+
+def demo_2fa_login():
+    """Demonstrate the 2FA login flow with TOTP verification."""
+    
+    print("=" * 60)
+    print("2FA Login Flow with TOTP Verification")
+    print("=" * 60)
+    
+    secret = "JBSWY3DPEHPK3PXP"
+    
+    print(f"\nTOTP Secret: {secret}")
+    print("\nSimulating 2FA login flow...")
+    
+    print("\n--- Test 1: Valid TOTP Code ---")
+    valid_code = generate_totp(secret)
+    print(f"Generated valid TOTP code: {valid_code}")
+    
+    result = verify_totp_with_claude(secret, valid_code)
+    print(f"\nVerification Result:")
+    print(f"Authenticated: {result['authenticated']}")
+    print(f"Message: {result['message'][:200]}...")
+    
+    print("\n--- Test 2: Invalid TOTP Code ---")
+    invalid_code = "000000"
+    print(f"Using invalid code: {invalid_code}")
+    
+    result = verify_totp_with_claude(secret, invalid_code)
+    print(f"\nVerification Result:")
+    print(f"Authenticated: {result['authenticated']}")
+    print(f"Message: {result['message'][:200]}...")
+    
+    print("\n--- Test 3: Malformed Code ---")
+    malformed_code = "12345"
+    print(f"Using malformed code (5 digits): {malformed_code}")
+    
+    result = verify_totp_with_claude(secret, malformed_code)
+    print(f"\nVerification Result:")
+    print(f"Authenticated: {result['authenticated']}")
+    print(f"Message: {result['message'][:200]}...")
+    
+    print("\n" + "=" * 60)
+    print("2FA Verification Demo Complete")
+    print("=" * 60)
+
+if __name__ == "__main__":
+    demo_2fa_login()
+```

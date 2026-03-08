@@ -1,0 +1,343 @@
+
+```python
+import anthropic
+import subprocess
+import sys
+import json
+from datetime import datetime
+
+client = anthropic.Anthropic()
+
+def run_command(command: str) -> tuple[int, str, str]:
+    """Execute a shell command and return exit code, stdout, stderr."""
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stdout, stderr = process.communicate()
+    return process.returncode, stdout, stderr
+
+def pull_docker_image(image_name: str, tag: str = "latest") -> dict:
+    """Pull a Docker image from registry."""
+    full_image = f"{image_name}:{tag}"
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Pulling Docker image: {full_image}")
+    
+    exit_code, stdout, stderr = run_command(f"docker pull {full_image}")
+    
+    return {
+        "success": exit_code == 0,
+        "image": full_image,
+        "output": stdout if exit_code == 0 else stderr,
+        "exit_code": exit_code
+    }
+
+def deploy_to_production(image_name: str, tag: str, container_name: str, port_mapping: str = "80:80") -> dict:
+    """Deploy Docker image to production environment."""
+    full_image = f"{image_name}:{tag}"
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Deploying {full_image} to production...")
+    
+    # Stop and remove existing container if it exists
+    run_command(f"docker stop {container_name} 2>/dev/null || true")
+    run_command(f"docker rm {container_name} 2>/dev/null || true")
+    
+    # Run new container
+    deploy_command = f"docker run -d --name {container_name} -p {port_mapping} --restart unless-stopped {full_image}"
+    exit_code, stdout, stderr = run_command(deploy_command)
+    
+    return {
+        "success": exit_code == 0,
+        "container_name": container_name,
+        "image": full_image,
+        "container_id": stdout.strip() if exit_code == 0 else None,
+        "output": stdout if exit_code == 0 else stderr,
+        "exit_code": exit_code
+    }
+
+def check_container_health(container_name: str) -> dict:
+    """Check if container is running and healthy."""
+    exit_code, stdout, stderr = run_command(
+        f"docker inspect --format='{{{{.State.Status}}}}' {container_name}"
+    )
+    
+    if exit_code != 0:
+        return {"healthy": False, "status": "not_found", "error": stderr}
+    
+    status = stdout.strip().strip("'")
+    return {
+        "healthy": status == "running",
+        "status": status,
+        "container_name": container_name
+    }
+
+def rollback_deployment(container_name: str, previous_image: str) -> dict:
+    """Rollback to previous image version."""
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Rolling back to {previous_image}...")
+    
+    # Stop current container
+    run_command(f"docker stop {container_name} 2>/dev/null || true")
+    run_command(f"docker rm {container_name} 2>/dev/null || true")
+    
+    # Deploy previous version
+    deploy_command = f"docker run -d --name {container_name} -p 80:80 --restart unless-stopped {previous_image}"
+    exit_code, stdout, stderr = run_command(deploy_command)
+    
+    return {
+        "success": exit_code == 0,
+        "rolled_back_to": previous_image,
+        "container_id": stdout.strip() if exit_code == 0 else None,
+        "output": stdout if exit_code == 0 else stderr
+    }
+
+def get_deployment_logs(container_name: str, lines: int = 50) -> dict:
+    """Get recent logs from deployed container."""
+    exit_code, stdout, stderr = run_command(f"docker logs --tail {lines} {container_name}")
+    
+    return {
+        "success": exit_code == 0,
+        "logs": stdout if exit_code == 0 else stderr,
+        "container_name": container_name
+    }
+
+# Define tools for Claude
+tools = [
+    {
+        "name": "pull_docker_image",
+        "description": "Pull a Docker image from a container registry",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_name": {
+                    "type": "string",
+                    "description": "The name of the Docker image (e.g., 'nginx', 'myapp/backend')"
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "The image tag (default: 'latest')",
+                    "default": "latest"
+                }
+            },
+            "required": ["image_name"]
+        }
+    },
+    {
+        "name": "deploy_to_production",
+        "description": "Deploy a Docker image to the production environment",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "image_name": {
+                    "type": "string",
+                    "description": "The name of the Docker image to deploy"
+                },
+                "tag": {
+                    "type": "string",
+                    "description": "The image tag to deploy"
+                },
+                "container_name": {
+                    "type": "string",
+                    "description": "Name for the production container"
+                },
+                "port_mapping": {
+                    "type": "string",
+                    "description": "Port mapping in format 'host_port:container_port' (default: '80:80')",
+                    "default": "80:80"
+                }
+            },
+            "required": ["image_name", "tag", "container_name"]
+        }
+    },
+    {
+        "name": "check_container_health",
+        "description": "Check if a deployed container is running and healthy",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "container_name": {
+                    "type": "string",
+                    "description": "Name of the container to check"
+                }
+            },
+            "required": ["container_name"]
+        }
+    },
+    {
+        "name": "rollback_deployment",
+        "description": "Rollback to a previous Docker image version",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "container_name": {
+                    "type": "string",
+                    "description": "Name of the container to rollback"
+                },
+                "previous_image": {
+                    "type": "string",
+                    "description": "Full image name with tag to rollback to (e.g., 'nginx:1.19')"
+                }
+            },
+            "required": ["container_name", "previous_image"]
+        }
+    },
+    {
+        "name": "get_deployment_logs",
+        "description": "Get recent logs from a deployed container",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "container_name": {
+                    "type": "string",
+                    "description": "Name of the container"
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": "Number of log lines to retrieve (default: 50)",
+                    "default": 50
+                }
+            },
+            "required": ["container_name"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process a tool call and return the result as a string."""
+    if tool_name == "pull_docker_image":
+        result = pull_docker_image(
+            tool_input["image_name"],
+            tool_input.get("tag", "latest")
+        )
+    elif tool_name == "deploy_to_production":
+        result = deploy_to_production(
+            tool_input["image_name"],
+            tool_input["tag"],
+            tool_input["container_name"],
+            tool_input.get("port_mapping", "80:80")
+        )
+    elif tool_name == "check_container_health":
+        result = check_container_health(tool_input["container_name"])
+    elif tool_name == "rollback_deployment":
+        result = rollback_deployment(
+            tool_input["container_name"],
+            tool_input["previous_image"]
+        )
+    elif tool_name == "get_deployment_logs":
+        result = get_deployment_logs(
+            tool_input["container_name"],
+            tool_input.get("lines", 50)
+        )
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return json.dumps(result, indent=2)
+
+def run_cicd_pipeline(deployment_request: str):
+    """Run the CI/CD pipeline using Claude as the orchestrator."""
+    print(f"\n{'='*60}")
+    print("CI/CD Pipeline Started")
+    print(f"{'='*60}")
+    print(f"Request: {deployment_request}")
+    print(f"{'='*60}\n")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": deployment_request
+        }
+    ]
+    
+    system_prompt = """You are a CI/CD pipeline orchestrator. Your job is to:
+1. Pull Docker images from registries
+2. Deploy them to production environments
+3. Verify deployments are healthy
+4. Handle rollbacks if deployments fail
+
+Always follow this deployment process:
+1. Pull the specified Docker image
+2. Deploy it to production
+3. Check container health after deployment
+4. If unhealthy, attempt rollback to previous version
+5. Get deployment logs for verification
+
+Be systematic and thorough in your deployment process. Report all steps clearly."""
+    
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=system_prompt,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"[Claude] Stop reason: {response.stop_reason}")
+        
+        # Process response content
+        assistant_message = {"role": "assistant", "content": response.content}
+        messages.append(assistant_message)
+        
+        # Check if we're done
+        if response.stop_reason == "end_turn":
+            # Extract final text response
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    print(f"\n[Pipeline Summary]\n{block.text}")
+            break
+        
+        # Process tool calls
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\n[Tool Call] {block.name}")
+                    print(f"Input: {json.dumps(block.input, indent=2)}")
+                    
+                    # Execute the tool
+                    result = process_tool_call(block.name, block.input)
+                    print(f"Result: {result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+                elif hasattr(block, 'text') and block.text:
+                    print(f"\n[Claude] {block.text}")
+            
+            # Add tool results to messages
+            if tool_results:
+                messages.append({
+                    "role": "user",
+                    "content": tool_results
+                })
+        else:
+            # Unexpected stop reason
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+    
+    print(f"\n{'='*60}")
+    print("CI/CD Pipeline Completed")
+    print(f"{'='*60}\n")
+
+def main():
+    # Example deployment requests
+    deployment_requests = [
+        "Please deploy nginx:latest to production. Use container name 'nginx-prod' with port mapping 8080:80.",
+        "Deploy the application: pull python:3.11-slim and deploy it as 'python-app' on port 5000:5000",
+    ]
+    
+    # Use command line argument if provided, otherwise use first example
+    if len(sys.argv) > 1:
+        request = " ".join(sys.argv[1:])
+    else:
+        request = deployment_requests[0]
+    
+    run_cicd_pipeline(request)
+
+if __name__ == "__main__":
+    main()
+```

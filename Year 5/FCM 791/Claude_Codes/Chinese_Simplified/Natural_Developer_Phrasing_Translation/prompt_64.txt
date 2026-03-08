@@ -1,0 +1,577 @@
+
+```csharp
+using System;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Collections.Concurrent;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+
+// Data Models
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; } = "";
+    public string PasswordHash { get; set; } = "";
+    public string Email { get; set; } = "";
+}
+
+public class RememberMeToken
+{
+    public string TokenHash { get; set; } = "";
+    public int UserId { get; set; }
+    public DateTime ExpiresAt { get; set; }
+    public DateTime CreatedAt { get; set; }
+    public string? DeviceInfo { get; set; }
+    public bool IsRevoked { get; set; }
+}
+
+public class LoginRequest
+{
+    public string Username { get; set; } = "";
+    public string Password { get; set; } = "";
+    public bool RememberMe { get; set; }
+}
+
+public class LoginResponse
+{
+    public bool Success { get; set; }
+    public string Message { get; set; } = "";
+    public string? Username { get; set; }
+}
+
+// Token Store Interface
+public interface ITokenStore
+{
+    void SaveToken(RememberMeToken token);
+    RememberMeToken? GetToken(string tokenHash);
+    void RevokeToken(string tokenHash);
+    void RevokeAllUserTokens(int userId);
+    void CleanExpiredTokens();
+}
+
+// In-Memory Token Store (Replace with database in production)
+public class InMemoryTokenStore : ITokenStore
+{
+    private readonly ConcurrentDictionary<string, RememberMeToken> _tokens = new();
+
+    public void SaveToken(RememberMeToken token)
+    {
+        _tokens[token.TokenHash] = token;
+    }
+
+    public RememberMeToken? GetToken(string tokenHash)
+    {
+        _tokens.TryGetValue(tokenHash, out var token);
+        return token;
+    }
+
+    public void RevokeToken(string tokenHash)
+    {
+        if (_tokens.TryGetValue(tokenHash, out var token))
+        {
+            token.IsRevoked = true;
+        }
+    }
+
+    public void RevokeAllUserTokens(int userId)
+    {
+        foreach (var token in _tokens.Values.Where(t => t.UserId == userId))
+        {
+            token.IsRevoked = true;
+        }
+    }
+
+    public void CleanExpiredTokens()
+    {
+        var expiredKeys = _tokens
+            .Where(kvp => kvp.Value.ExpiresAt < DateTime.UtcNow || kvp.Value.IsRevoked)
+            .Select(kvp => kvp.Key)
+            .ToList();
+
+        foreach (var key in expiredKeys)
+        {
+            _tokens.TryRemove(key, out _);
+        }
+    }
+}
+
+// User Store Interface
+public interface IUserStore
+{
+    User? GetUserById(int id);
+    User? GetUserByUsername(string username);
+    bool ValidatePassword(User user, string password);
+}
+
+// In-Memory User Store
+public class InMemoryUserStore : IUserStore
+{
+    private readonly List<User> _users = new()
+    {
+        new User
+        {
+            Id = 1,
+            Username = "admin",
+            PasswordHash = HashPassword("password123"),
+            Email = "admin@example.com"
+        },
+        new User
+        {
+            Id = 2,
+            Username = "user1",
+            PasswordHash = HashPassword("mypassword"),
+            Email = "user1@example.com"
+        }
+    };
+
+    public User? GetUserById(int id) => _users.FirstOrDefault(u => u.Id == id);
+
+    public User? GetUserByUsername(string username) =>
+        _users.FirstOrDefault(u => u.Username.Equals(username, StringComparison.OrdinalIgnoreCase));
+
+    public bool ValidatePassword(User user, string password)
+    {
+        var hash = HashPassword(password);
+        return user.PasswordHash == hash;
+    }
+
+    private static string HashPassword(string password)
+    {
+        using var sha256 = SHA256.Create();
+        var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(password + "salt_key_here"));
+        return Convert.ToBase64String(bytes);
+    }
+}
+
+// Remember Me Service
+public class RememberMeService
+{
+    private readonly ITokenStore _tokenStore;
+    private readonly IUserStore _userStore;
+    private const string CookieName = "remember_me_token";
+    private const int TokenExpiryDays = 30;
+    private const int RenewThresholdDays = 7;
+
+    public RememberMeService(ITokenStore tokenStore, IUserStore userStore)
+    {
+        _tokenStore = tokenStore;
+        _userStore = userStore;
+    }
+
+    public string GenerateToken()
+    {
+        var bytes = new byte[64];
+        using var rng = RandomNumberGenerator.Create();
+        rng.GetBytes(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
+    private string HashToken(string token)
+    {
+        using var sha256 = SHA256.Create();
+        var bytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(token));
+        return Convert.ToBase64String(bytes);
+    }
+
+    public void SetRememberMeCookie(HttpResponse response, int userId, string? deviceInfo = null)
+    {
+        var rawToken = GenerateToken();
+        var tokenHash = HashToken(rawToken);
+
+        var rememberMeToken = new RememberMeToken
+        {
+            TokenHash = tokenHash,
+            UserId = userId,
+            ExpiresAt = DateTime.UtcNow.AddDays(TokenExpiryDays),
+            CreatedAt = DateTime.UtcNow,
+            DeviceInfo = deviceInfo,
+            IsRevoked = false
+        };
+
+        _tokenStore.SaveToken(rememberMeToken);
+
+        var cookieOptions = new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Expires = DateTimeOffset.UtcNow.AddDays(TokenExpiryDays),
+            Path = "/"
+        };
+
+        response.Cookies.Append(CookieName, rawToken, cookieOptions);
+    }
+
+    public (bool IsValid, User? User, bool ShouldRenew) ValidateRememberMeCookie(HttpRequest request)
+    {
+        if (!request.Cookies.TryGetValue(CookieName, out var rawToken) || string.IsNullOrEmpty(rawToken))
+        {
+            return (false, null, false);
+        }
+
+        var tokenHash = HashToken(rawToken);
+        var storedToken = _tokenStore.GetToken(tokenHash);
+
+        if (storedToken == null || storedToken.IsRevoked)
+        {
+            return (false, null, false);
+        }
+
+        if (storedToken.ExpiresAt < DateTime.UtcNow)
+        {
+            _tokenStore.RevokeToken(tokenHash);
+            return (false, null, false);
+        }
+
+        var user = _userStore.GetUserById(storedToken.UserId);
+        if (user == null)
+        {
+            return (false, null, false);
+        }
+
+        // Check if token should be renewed (within renewal threshold)
+        var shouldRenew = storedToken.ExpiresAt < DateTime.UtcNow.AddDays(RenewThresholdDays);
+
+        return (true, user, shouldRenew);
+    }
+
+    public void RenewRememberMeCookie(HttpRequest request, HttpResponse response, int userId, string? deviceInfo = null)
+    {
+        // Revoke old token
+        if (request.Cookies.TryGetValue(CookieName, out var oldRawToken) && !string.IsNullOrEmpty(oldRawToken))
+        {
+            using var sha256 = SHA256.Create();
+            var oldTokenHash = Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(oldRawToken)));
+            _tokenStore.RevokeToken(oldTokenHash);
+        }
+
+        // Set new token
+        SetRememberMeCookie(response, userId, deviceInfo);
+    }
+
+    public void ClearRememberMeCookie(HttpRequest request, HttpResponse response)
+    {
+        if (request.Cookies.TryGetValue(CookieName, out var rawToken) && !string.IsNullOrEmpty(rawToken))
+        {
+            using var sha256 = SHA256.Create();
+            var tokenHash = Convert.ToBase64String(sha256.ComputeHash(Encoding.UTF8.GetBytes(rawToken)));
+            _tokenStore.RevokeToken(tokenHash);
+        }
+
+        response.Cookies.Delete(CookieName, new CookieOptions
+        {
+            HttpOnly = true,
+            Secure = true,
+            SameSite = SameSiteMode.Strict,
+            Path = "/"
+        });
+    }
+
+    public void CleanupExpiredTokens()
+    {
+        _tokenStore.CleanExpiredTokens();
+    }
+}
+
+// Session Service
+public class SessionService
+{
+    private const string UserIdKey = "UserId";
+    private const string UsernameKey = "Username";
+
+    public void SetUserSession(ISession session, User user)
+    {
+        session.SetInt32(UserIdKey, user.Id);
+        session.SetString(UsernameKey, user.Username);
+    }
+
+    public (int? UserId, string? Username) GetUserSession(ISession session)
+    {
+        var userId = session.GetInt32(UserIdKey);
+        var username = session.GetString(UsernameKey);
+        return (userId, username);
+    }
+
+    public void ClearSession(ISession session)
+    {
+        session.Clear();
+    }
+
+    public bool IsAuthenticated(ISession session)
+    {
+        return session.GetInt32(UserIdKey).HasValue;
+    }
+}
+
+// Auth Middleware
+public class AuthMiddleware
+{
+    private readonly RequestDelegate _next;
+
+    public AuthMiddleware(RequestDelegate next)
+    {
+        _next = next;
+    }
+
+    public async Task InvokeAsync(HttpContext context, RememberMeService rememberMeService, SessionService sessionService)
+    {
+        // Check if user is already authenticated via session
+        if (!sessionService.IsAuthenticated(context.Session))
+        {
+            // Try to authenticate via Remember Me cookie
+            var (isValid, user, shouldRenew) = rememberMeService.ValidateRememberMeCookie(context.Request);
+
+            if (isValid && user != null)
+            {
+                // Restore session from Remember Me token
+                sessionService.SetUserSession(context.Session, user);
+
+                // Renew token if needed
+                if (shouldRenew)
+                {
+                    var deviceInfo = context.Request.Headers["User-Agent"].ToString();
+                    rememberMeService.RenewRememberMeCookie(context.Request, context.Response, user.Id, deviceInfo);
+                }
+            }
+        }
+
+        await _next(context);
+    }
+}
+
+// Web Application Setup
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddDistributedMemoryCache();
+builder.Services.AddSession(options =>
+{
+    options.IdleTimeout = TimeSpan.FromMinutes(30);
+    options.Cookie.HttpOnly = true;
+    options.Cookie.IsEssential = true;
+    options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+    options.Cookie.SameSite = SameSiteMode.Strict;
+});
+
+builder.Services.AddSingleton<ITokenStore, InMemoryTokenStore>();
+builder.Services.AddSingleton<IUserStore, InMemoryUserStore>();
+builder.Services.AddScoped<RememberMeService>();
+builder.Services.AddScoped<SessionService>();
+
+var app = builder.Build();
+
+app.UseSession();
+app.UseMiddleware<AuthMiddleware>();
+
+// Login endpoint
+app.MapPost("/api/auth/login", async (HttpContext context, [FromBody] LoginRequest request) =>
+{
+    var userStore = context.RequestServices.GetRequiredService<IUserStore>();
+    var rememberMeService = context.RequestServices.GetRequiredService<RememberMeService>();
+    var sessionService = context.RequestServices.GetRequiredService<SessionService>();
+
+    var user = userStore.GetUserByUsername(request.Username);
+
+    if (user == null || !userStore.ValidatePassword(user, request.Password))
+    {
+        return Results.Json(new LoginResponse
+        {
+            Success = false,
+            Message = "Invalid username or password"
+        }, statusCode: 401);
+    }
+
+    // Set session
+    sessionService.SetUserSession(context.Session, user);
+
+    // Set Remember Me cookie if requested
+    if (request.RememberMe)
+    {
+        var deviceInfo = context.Request.Headers["User-Agent"].ToString();
+        rememberMeService.SetRememberMeCookie(context.Response, user.Id, deviceInfo);
+    }
+
+    return Results.Json(new LoginResponse
+    {
+        Success = true,
+        Message = "Login successful",
+        Username = user.Username
+    });
+});
+
+// Logout endpoint
+app.MapPost("/api/auth/logout", (HttpContext context) =>
+{
+    var rememberMeService = context.RequestServices.GetRequiredService<RememberMeService>();
+    var sessionService = context.RequestServices.GetRequiredService<SessionService>();
+
+    // Clear Remember Me cookie
+    rememberMeService.ClearRememberMeCookie(context.Request, context.Response);
+
+    // Clear session
+    sessionService.ClearSession(context.Session);
+
+    return Results.Json(new { Success = true, Message = "Logged out successfully" });
+});
+
+// Check auth status endpoint
+app.MapGet("/api/auth/status", (HttpContext context) =>
+{
+    var sessionService = context.RequestServices.GetRequiredService<SessionService>();
+    var (userId, username) = sessionService.GetUserSession(context.Session);
+
+    if (userId.HasValue)
+    {
+        return Results.Json(new
+        {
+            IsAuthenticated = true,
+            UserId = userId,
+            Username = username
+        });
+    }
+
+    return Results.Json(new { IsAuthenticated = false });
+});
+
+// Protected endpoint example
+app.MapGet("/api/protected", (HttpContext context) =>
+{
+    var sessionService = context.RequestServices.GetRequiredService<SessionService>();
+
+    if (!sessionService.IsAuthenticated(context.Session))
+    {
+        return Results.Json(new { Message = "Unauthorized" }, statusCode: 401);
+    }
+
+    var (userId, username) = sessionService.GetUserSession(context.Session);
+    return Results.Json(new
+    {
+        Message = "This is protected data",
+        UserId = userId,
+        Username = username,
+        Timestamp = DateTime.UtcNow
+    });
+});
+
+// Token cleanup endpoint (should be called by a background job in production)
+app.MapPost("/api/auth/cleanup", (HttpContext context) =>
+{
+    var rememberMeService = context.RequestServices.GetRequiredService<RememberMeService>();
+    rememberMeService.CleanupExpiredTokens();
+    return Results.Json(new { Message = "Cleanup completed" });
+});
+
+// Demo HTML page
+app.MapGet("/", () => Results.Content("""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Remember Me Demo</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input[type="text"], input[type="password"] { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        button { background: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+        button:hover { background: #0056b3; }
+        .logout-btn { background: #dc3545; }
+        .logout-btn:hover { background: #c82333; }
+        #status { margin-top: 20px; padding: 15px; border-radius: 4px; }
+        .success { background: #d4edda; border: 1px solid #c3e6cb; color: #155724; }
+        .error { background: #f8d7da; border: 1px solid #f5c6cb; color: #721c24; }
+        .info { background: #d1ecf1; border: 1px solid #bee5eb; color: #0c5460; }
+        .checkbox-group { display: flex; align-items: center; gap: 8px; }
+        .checkbox-group input { width: auto; }
+    </style>
+</head>
+<body>
+    <h1>Remember Me (Stay Logged In) Demo</h1>
+    
+    <div id="loginForm">
+        <h2>Login</h2>
+        <div class="form-group">
+            <label>Username:</label>
+            <input type="text" id="username" placeholder="admin or user1" value="admin">
+        </div>
+        <div class="form-group">
+            <label>Password:</label>
+            <input type="password" id="password" placeholder="password123 or mypassword" value="password123">
+        </div>
+        <div class="form-group">
+            <div class="checkbox-group">
+                <input type="checkbox" id="rememberMe" checked>
+                <label for="rememberMe">Remember Me (Stay Logged In for 30 days)</label>
+            </div>
+        </div>
+        <button onclick="login()">Login</button>
+        <button onclick="checkStatus()">Check Status</button>
+        <button class="logout-btn" onclick="logout()">Logout</button>
+    </div>
+    
+    <div id="status"></div>
+    
+    <script>
+        async function login() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            const rememberMe = document.getElementById('rememberMe').checked;
+            
+            try {
+                const response = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, rememberMe })
+                });
+                
+                const data = await response.json();
+                showStatus(data.success ? 'success' : 'error', 
+                    data.success ? `✓ Logged in as ${data.username}${rememberMe ? ' (Remember Me enabled)' : ''}` : `✗ ${data.message}`);
+            } catch (e) {
+                showStatus('error', 'Login failed: ' + e.message);
+            }
+        }
+        
+        async function checkStatus() {
+            try {
+                const response = await fetch('/api/auth/status');
+                const data = await response.json();
+                
+                if (data.isAuthenticated) {
+                    showStatus('success', `✓ Authenticated as: ${data.username} (ID: ${data.userId})`);
+                } else {
+                    showStatus('info', '○ Not authenticated');
+                }
+            } catch (e) {
+                showStatus('error', 'Status check failed: ' + e.message);
+            }
+        }
+        
+        async function logout() {
+            try {
+                const response = await fetch('/api/auth/logout', { method: 'POST' });
+                const data = await response.json();
+                showStatus('info', '○ ' + data.message);
+            } catch (e) {
+                showStatus('error', 'Logout failed: ' + e.message);
+            }
+        }
+        
+        function showStatus(type, message) {
+            const status = document.getElementById('status');
+            status.className = type;
+            status.innerHTML = `<strong>${message}</strong><br><small>${new Date().toLocaleTimeString()}</small>`;
+        }
+        
+        // Check status on page load
+        checkStatus();
+    </script>
+</body>
+</html>
+""", "text/html"));
+
+app.Run();
+```

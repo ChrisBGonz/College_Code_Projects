@@ -1,0 +1,231 @@
+
+```python
+import anthropic
+import time
+import re
+import os
+import tempfile
+import threading
+from datetime import datetime
+from collections import deque
+
+client = anthropic.Anthropic()
+
+log_file_path = None
+failed_login_timestamps = deque()
+alert_count = 0
+monitoring = True
+
+
+def write_test_logs():
+    """Write test log entries to simulate failed logins"""
+    global log_file_path
+    
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.log', delete=False) as f:
+        log_file_path = f.name
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO: System started\n")
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] INFO: Service running\n")
+    
+    print(f"Created test log file: {log_file_path}")
+    
+    def add_failed_logins():
+        time.sleep(2)
+        print("\nSimulating failed login attempts...")
+        
+        for i in range(12):
+            with open(log_file_path, 'a') as f:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                f.write(f"[{timestamp}] ERROR: Failed Login attempt #{i+1} from IP 192.168.1.{i+1}\n")
+            time.sleep(0.3)
+        
+        time.sleep(5)
+        print("\nSimulating normal activity...")
+        for i in range(3):
+            with open(log_file_path, 'a') as f:
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                f.write(f"[{timestamp}] INFO: User logged in successfully\n")
+            time.sleep(1)
+    
+    thread = threading.Thread(target=add_failed_logins, daemon=True)
+    thread.start()
+
+
+def analyze_logs_with_claude(log_content: str, window_minutes: int = 1) -> dict:
+    """Use Claude to analyze log content for security threats"""
+    
+    prompt = f"""Analyze the following log entries and detect security threats.
+
+Log content:
+{log_content}
+
+Please analyze these logs and:
+1. Count the number of "Failed Login" entries in the last {window_minutes} minute(s)
+2. Identify if there are more than 10 failed login attempts in any 1-minute window
+3. Extract the timestamps of failed login attempts
+4. Provide a security assessment
+
+Return your analysis in this exact format:
+FAILED_LOGIN_COUNT: <number>
+ALERT_TRIGGERED: <YES/NO>
+TIMESTAMPS: <comma-separated list of timestamps or NONE>
+ASSESSMENT: <brief security assessment>
+RECOMMENDATION: <security recommendation>"""
+
+    analysis_result = {
+        "failed_count": 0,
+        "alert_triggered": False,
+        "timestamps": [],
+        "assessment": "",
+        "recommendation": ""
+    }
+    
+    full_response = ""
+    
+    print("\n[Claude Analysis] Analyzing log patterns...", end="", flush=True)
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            full_response += text
+            print(".", end="", flush=True)
+    
+    print(" Done!")
+    
+    lines = full_response.strip().split('\n')
+    for line in lines:
+        if line.startswith("FAILED_LOGIN_COUNT:"):
+            try:
+                count_str = line.split(":", 1)[1].strip()
+                analysis_result["failed_count"] = int(count_str)
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("ALERT_TRIGGERED:"):
+            value = line.split(":", 1)[1].strip().upper()
+            analysis_result["alert_triggered"] = value == "YES"
+        elif line.startswith("TIMESTAMPS:"):
+            timestamps_str = line.split(":", 1)[1].strip()
+            if timestamps_str != "NONE":
+                analysis_result["timestamps"] = [t.strip() for t in timestamps_str.split(",")]
+        elif line.startswith("ASSESSMENT:"):
+            analysis_result["assessment"] = line.split(":", 1)[1].strip()
+        elif line.startswith("RECOMMENDATION:"):
+            analysis_result["recommendation"] = line.split(":", 1)[1].strip()
+    
+    return analysis_result
+
+
+def monitor_log_file(file_path: str, check_interval: int = 5):
+    """Monitor log file for failed login attempts"""
+    global monitoring, alert_count
+    
+    print(f"\n{'='*60}")
+    print(f"Starting log file monitoring: {file_path}")
+    print(f"Check interval: {check_interval} seconds")
+    print(f"Alert threshold: >10 Failed Login attempts per minute")
+    print(f"{'='*60}\n")
+    
+    last_position = 0
+    recent_logs = deque(maxlen=1000)
+    
+    while monitoring:
+        try:
+            if not os.path.exists(file_path):
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Waiting for log file...")
+                time.sleep(check_interval)
+                continue
+            
+            with open(file_path, 'r') as f:
+                f.seek(last_position)
+                new_content = f.read()
+                last_position = f.tell()
+            
+            if new_content:
+                new_lines = new_content.strip().split('\n')
+                for line in new_lines:
+                    if line:
+                        recent_logs.append(line)
+                        if "Failed Login" in line:
+                            print(f"[{datetime.now().strftime('%H:%M:%S')}] Detected: {line}")
+                
+                if any("Failed Login" in line for line in new_lines):
+                    current_time = datetime.now()
+                    
+                    recent_content = '\n'.join(list(recent_logs)[-100:])
+                    
+                    print(f"\n[{current_time.strftime('%H:%M:%S')}] Analyzing logs with Claude AI...")
+                    
+                    analysis = analyze_logs_with_claude(recent_content)
+                    
+                    print(f"\n{'='*60}")
+                    print(f"SECURITY ANALYSIS REPORT - {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    print(f"{'='*60}")
+                    print(f"Failed Login Count (last minute): {analysis['failed_count']}")
+                    print(f"Alert Triggered: {analysis['alert_triggered']}")
+                    
+                    if analysis['timestamps']:
+                        print(f"Failed Login Timestamps: {', '.join(analysis['timestamps'][:5])}")
+                        if len(analysis['timestamps']) > 5:
+                            print(f"  ... and {len(analysis['timestamps']) - 5} more")
+                    
+                    print(f"\nAssessment: {analysis['assessment']}")
+                    print(f"Recommendation: {analysis['recommendation']}")
+                    
+                    if analysis['alert_triggered'] or analysis['failed_count'] > 10:
+                        alert_count += 1
+                        print(f"\n{'!'*60}")
+                        print(f"⚠️  SECURITY ALERT #{alert_count} ⚠️")
+                        print(f"{'!'*60}")
+                        print(f"CRITICAL: More than 10 failed login attempts detected!")
+                        print(f"Failed attempts in last minute: {analysis['failed_count']}")
+                        print(f"Time: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        print(f"Action Required: Investigate potential brute force attack!")
+                        print(f"{'!'*60}\n")
+                    
+                    print(f"{'='*60}\n")
+            
+            time.sleep(check_interval)
+            
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped by user")
+            monitoring = False
+            break
+        except Exception as e:
+            print(f"Error monitoring log file: {e}")
+            time.sleep(check_interval)
+
+
+def main():
+    """Main function to run the log monitoring system"""
+    global log_file_path, monitoring
+    
+    print("Log File Security Monitor with Claude AI")
+    print("=========================================")
+    
+    write_test_logs()
+    
+    time.sleep(1)
+    
+    try:
+        monitor_log_file(log_file_path, check_interval=3)
+    except KeyboardInterrupt:
+        print("\nShutting down monitor...")
+        monitoring = False
+    finally:
+        if log_file_path and os.path.exists(log_file_path):
+            os.unlink(log_file_path)
+            print(f"Cleaned up test log file: {log_file_path}")
+        
+        print(f"\nMonitoring session ended. Total alerts triggered: {alert_count}")
+
+
+if __name__ == "__main__":
+    main()
+```

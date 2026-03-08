@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+File integrity checker: compare local files against a manifest of expected hashes.
+
+Manifest format (one entry per line):
+    <hash>  <relative/path/to/file>
+
+Lines starting with '#' or empty lines are ignored.
+
+Supported hash algorithms: md5, sha1, sha224, sha256, sha384, sha512
+The algorithm is auto-detected from the hash length, or can be specified
+via --algorithm / -a flag.
+
+Exit codes:
+    0  - all files match
+    1  - one or more mismatches, missing, or extra files detected
+    2  - usage / argument error
+    3  - manifest file not found or unreadable
+"""
+
+import argparse
+import hashlib
+import os
+import sys
+from pathlib import Path
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────────────────────────────────────
+
+HASH_LENGTH_MAP: Dict[int, str] = {
+    32: "md5",
+    40: "sha1",
+    56: "sha224",
+    64: "sha256",
+    96: "sha384",
+    128: "sha512",
+}
+
+SUPPORTED_ALGORITHMS = set(HASH_LENGTH_MAP.values())
+
+READ_CHUNK = 1 << 20  # 1 MiB
+
+# ANSI colours (disabled automatically when not a TTY)
+_USE_COLOR = sys.stdout.isatty()
+
+COLOR_RESET  = "\033[0m"  if _USE_COLOR else ""
+COLOR_GREEN  = "\033[32m" if _USE_COLOR else ""
+COLOR_RED    = "\033[31m" if _USE_COLOR else ""
+COLOR_YELLOW = "\033[33m" if _USE_COLOR else ""
+COLOR_CYAN   = "\033[36m" if _USE_COLOR else ""
+COLOR_BOLD   = "\033[1m"  if _USE_COLOR else ""
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Data types
+# ──────────────────────────────────────────────────────────────────────────────
+
+class ManifestEntry(NamedTuple):
+    path: str          # relative path as written in the manifest
+    expected_hash: str # lower-cased hex digest
+    algorithm: str     # detected or specified algorithm name
+
+
+class CheckResult(NamedTuple):
+    path: str
+    status: str        # "MATCH" | "MISMATCH" | "MISSING" | "EXTRA"
+    expected: Optional[str] = None
+    actual: Optional[str]   = None
+    algorithm: Optional[str] = None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Manifest parsing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def detect_algorithm(hex_digest: str) -> str:
+    """Detect hash algorithm from digest length."""
+    length = len(hex_digest)
+    algo = HASH_LENGTH_MAP.get(length)
+    if algo is None:
+        raise ValueError(
+            f"Cannot detect algorithm from digest of length {length}. "
+            f"Supported lengths: {sorted(HASH_LENGTH_MAP.keys())}"
+        )
+    return algo
+
+
+def parse_manifest(
+    manifest_path: Path,
+    forced_algorithm: Optional[str] = None,
+) -> List[ManifestEntry]:
+    """
+    Parse a manifest file and return a list of ManifestEntry objects.
+
+    Accepted line formats:
+        <hash>  <path>          (two-space separator, as produced by sha256sum etc.)
+        <hash> <path>           (single space)
+        <hash>\t<path>          (tab)
+        <hash>,<path>           (CSV-ish)
+    """
+    entries: List[ManifestEntry] = []
+    seen_paths: Dict[str, int] = {}
+
+    try:
+        text = manifest_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        print(f"{COLOR_RED}ERROR{COLOR_RESET} Cannot read manifest: {exc}", file=sys.stderr)
+        sys.exit(3)
+
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+
+        # Skip comments and blank lines
+        if not line or line.startswith("#"):
+            continue
+
+        # Split on whitespace or comma
+        parts = line.split(None, 1) if "," not in line else line.split(",", 1)
+
+        if len(parts) != 2:
+            print(
+                f"{COLOR_YELLOW}WARN{COLOR_RESET}  "
+                f"manifest line {lineno}: cannot parse → {raw_line!r}",
+                file=sys.stderr,
+            )
+            continue
+
+        hex_digest, rel_path = parts[0].strip().lower(), parts[1].strip()
+
+        # Validate hex characters
+        if not all(c in "0123456789abcdef" for c in hex_digest):
+            print(
+                f"{COLOR_YELLOW}WARN{COLOR_RESET}  "
+                f"manifest line {lineno}: invalid hex digest '{hex_digest}'",
+                file=sys.stderr,
+            )
+            continue
+
+        # Determine algorithm
+        try:
+            algorithm = forced_algorithm or detect_algorithm(hex_digest)
+        except ValueError as exc:
+            print(
+                f"{COLOR_YELLOW}WARN{COLOR_RESET}  "
+                f"manifest line {lineno}: {exc}",
+                file=sys.stderr,
+            )
+            continue
+
+        # Warn about duplicate paths
+        if rel_path in seen_paths:
+            print(
+                f"{COLOR_YELLOW}WARN{COLOR_RESET}  "
+                f"manifest line {lineno}: duplicate path '{rel_path}' "
+                f"(first seen at line {seen_paths[rel_path]})",
+                file=sys.stderr,
+            )
+        seen_paths[rel_path] = lineno
+
+        entries.append(ManifestEntry(path=rel_path, expected_hash=hex_digest, algorithm=algorithm))
+
+    return entries
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Hashing
+# ──────────────────────────────────────────────────────────────────────────────
+
+def hash_file(file_path: Path, algorithm: str) -> str:
+    """Compute the hex digest of a file using the given algorithm."""
+    h = hashlib.new(algorithm)
+    with file_path.open("rb") as fh:
+        while True:
+            chunk = fh.read(READ_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Discovery of extra files
+# ──────────────────────────────────────────────────────────────────────────────
+
+def collect_local_files(base_dir: Path, exclude_patterns: List[str]) -> List[str]:
+    """
+    Walk base_dir and return all relative file paths (POSIX style).
+    Directories / files matching any exclude_pattern glob are skipped.
+    """
+    import fnmatch
+
+    result: List[str] = []
+    for root, dirs, files in os.walk(base_dir):
+        rel_root = Path(root).relative_to(base_dir)
+
+        # Prune excluded directories in-place
+        dirs[:] = [
+            d for d in dirs
+            if not any(
+                fnmatch.fnmatch(str(rel_root / d), pat) or fnmatch.fnmatch(d, pat)
+                for pat in exclude_patterns
+            )
+        ]
+
+        for fname in files:
+            rel_path = (rel_root / fname).as_posix()
+            if any(
+                fnmatch.fnmatch(rel_path, pat) or fnmatch.fnmatch(fname, pat)
+                for pat in exclude_patterns
+            ):
+                continue
+            result.append(rel_path)
+
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core verification logic
+# ──────────────────────────────────────────────────────────────────────────────
+
+def verify(
+    entries: List[ManifestEntry],
+    base_dir: Path,
+    check_extra: bool,
+    exclude_patterns: List[str],
+) -> List[CheckResult]:
+    """
+    Verify each manifest entry against the filesystem.
+    Optionally detect extra files not listed in the manifest.
+    """
+    results: List[CheckResult] = []
+    manifest_paths = {e.path for e in entries}
+
+    # ── Check every manifest entry ──────────────────────────────────────────
+    for entry in entries:
+        abs_path = base_dir / entry.path
+
+        if not abs_path.exists():
+            results.append(CheckResult(
+                path=entry.path,
+                status="MISSING",
+                expected=entry.expected_hash,
+                algorithm=entry.algorithm,
+            ))
+            continue
+
+        if not abs_path.is_file():
+            results.append(CheckResult(
+                path=entry.path,
+                status="MISSING",
+                expected=entry.expected_hash,
+                algorithm=entry.algorithm,
+            ))
+            continue
+
+        try:
+            actual = hash_file(abs_path, entry.algorithm)
+        except OSError as exc:
+            print(
+                f"{COLOR_YELLOW}WARN{COLOR_RESET}  "
+                f"Cannot read '{entry.path}': {exc}",
+                file=sys.stderr,
+            )
+            results.append(CheckResult(
+                path=entry.path,
+                status="MISSING",
+                expected=entry.expected_hash,
+                algorithm=entry.algorithm,
+            ))
+            continue
+
+        status = "MATCH" if actual == entry.expected_hash else "MISMATCH"
+        results.append(CheckResult(
+            path=entry.path,
+            status=status,
+            expected=entry.expected_hash,
+            actual=actual,
+            algorithm=entry.algorithm,
+        ))
+
+    # ── Detect extra files ──────────────────────────────────────────────────
+    if check_extra:
+        local_files = collect_local_files(base_dir, exclude_patterns)
+        for rel_path in sorted(local_files):
+            if rel_path not in manifest_paths:
+                results.append(CheckResult(path=rel_path, status="EXTRA"))
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Reporting
+# ──────────────────────────────────────────────────────────────────────────────
+
+STATUS_COLOR = {
+    "MATCH":    COLOR_GREEN,
+    "MISMATCH": COLOR_RED,
+    "MISSING":  COLOR_RED,
+    "EXTRA":    COLOR_YELLOW,
+}
+
+STATUS_SYMBOL = {
+    "MATCH":    "✔",
+    "MISMATCH": "✘",
+    "MISSING":  "?",
+    "EXTRA":    "+",
+}
+
+
+def format_result_line(r: CheckResult, verbose: bool) -> str:
+    color  = STATUS_COLOR[r.status]
+    symbol = STATUS_SYMBOL[r.status]
+    tag    = f"{color}{COLOR_BOLD}[{r.status:<8}]{COLOR_RESET}"
+    line   = f"{tag} {r.path}"
+
+    if verbose:
+        if r.status == "MISMATCH":
+            line += (
+                f"\n          expected : {r.expected}"
+                f"\n          actual   : {r.actual}"
+                f"\n          algorithm: {r.algorithm}"
+            )
+        elif r.status == "MISSING":
+            line += f"\n          expected : {r.expected}  [{r.algorithm}]"
+
+    return line
+
+
+def print_summary(
+    results: List[CheckResult],
+    verbose: bool,
+    quiet: bool,
+) -> None:
+    counts: Dict[str, int] = {"MATCH": 0, "MISMATCH": 0, "MISSING": 0, "EXTRA": 0}
+
+    for r in results:
+        counts[r.status] += 1
+        if quiet and r.status == "MATCH":
+            continue
+        print(format_result_line(r, verbose))
+
+    total = sum(counts.values())
+    print()
+    print(
+        f"{COLOR_BOLD}Summary:{COLOR_RESET} "
+        f"{total} file(s) checked — "
+        f"{COLOR_GREEN}{counts['MATCH']} match{COLOR_RESET}, "
+        f"{COLOR_RED}{counts['MISMATCH']} mismatch{COLOR_RESET}, "
+        f"{COLOR_RED}{counts['MISSING']} missing{COLOR_RESET}, "
+        f"{COLOR_YELLOW}{counts['EXTRA']} extra{COLOR_RESET}"
+    )
+
+
+def generate_report(
+    results: List[CheckResult],
+    report_path: Path,
+) -> None:
+    """Write a machine-readable TSV report."""
+    lines = ["status\tpath\texpected\tactual\talgorithm"]
+    for r in results:
+        lines.append(
+            f"{r.status}\t{r.path}\t{r.expected or ''}\t{r.actual or ''}\t{r.algorithm or ''}"
+        )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    print(f"\n{COLOR_CYAN}Report written to:{COLOR_RESET} {report_path}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="check_manifest",
+        description=(
+            "Verify local files against a hash manifest.\n\n"
+            "Manifest line format:\n"
+            "  <hex-digest>  <relative/path/to/file>\n\n"
+            "Supported algorithms (auto-detected from digest length):\n"
+            "  md5, sha1, sha224, sha256, sha384, sha512"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    parser.add_argument(
+        "manifest",
+        metavar="MANIFEST",
+        help="Path to the manifest file.",
+    )
+    parser.add_argument(
+        "-d", "--dir",
+        metavar="DIR",
+        default=".",
+        help="Base directory for resolving relative paths (default: current directory).",
+    )
+    parser.add_argument(
+        "-a", "--algorithm",
+        metavar="ALGO",
+        choices=sorted(SUPPORTED_ALGORITHMS),
+        default=None,
+        help=(
+            "Force a specific hash algorithm instead of auto-detecting from digest length. "
+            f"Choices: {', '.join(sorted(SUPPORTED_ALGORITHMS))}."
+        ),
+    )
+    parser.add_argument(
+        "--extra",
+        action="store_true",
+        default=False,
+        help="Report files present on disk but not listed in the manifest.",
+    )
+    parser.add_argument(
+        "--exclude",
+        metavar="PATTERN",
+        action="append",
+        default=[],
+        help=(
+            "Glob pattern to exclude when scanning for extra files "
+            "(can be repeated, e.g. --exclude '*.pyc' --exclude '.git')."
+        ),
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        default=False,
+        help="Show expected/actual hashes for mismatches.",
+    )
+    parser.add_argument(
+        "-q", "--quiet",
+        action="store_true",
+        default=False,
+        help="Suppress MATCH lines; only show problems.",
+    )
+    parser.add_argument(
+        "--report",
+        metavar="FILE",
+        default=None,
+        help="Write a TSV report to FILE.",
+    )
+    parser.add_argument(
+        "--fail-on-extra",
+        action="store_true",
+        default=False,
+        help="Treat EXTRA files as failures (non-zero exit code). Implies --extra.",
+    )
+
+    return parser
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    # Resolve paths
+    manifest_path = Path(args.manifest)
+    base_dir      = Path(args.dir).resolve()
+
+    if not manifest_path.exists():
+        print(
+            f"{COLOR_RED}ERROR{COLOR_RESET} Manifest not found: {manifest_path}",
+            file=sys.stderr,
+        )
+        return 3
+
+    if not base_dir.is_dir():
+        print(
+            f"{COLOR_RED}ERROR{COLOR_RESET} Base directory not found: {base_dir}",
+            file=sys.stderr,
+        )
+        return 2
+
+    # --fail-on-extra implies --extra
+    check_extra = args.extra or args.fail_on_extra
+
+    # Parse manifest
+    entries = parse_manifest(manifest_path, forced_algorithm=args.algorithm)
+
+    if not entries:
+        print(f"{COLOR_YELLOW}WARN{COLOR_RESET}  Manifest is empty or contains no valid entries.")
+        return 0
+
+    print(
+        f"{COLOR_BOLD}Manifest:{COLOR_RESET} {manifest_path}  "
+        f"({len(entries)} entries)\n"
+        f"{COLOR_BOLD}Base dir:{COLOR_RESET} {base_dir}\n"
+    )
+
+    # Run verification
+    results = verify(
+        entries=entries,
+        base_dir=base_dir,
+        check_extra=check_extra,
+        exclude_patterns=args.exclude,
+    )
+
+    # Print results
+    print_summary(results, verbose=args.verbose, quiet=args.quiet)
+
+    # Optional TSV report
+    if args.report:
+        generate_report(results, Path(args.report))
+
+    # Determine exit code
+    has_failure = any(r.status in ("MISMATCH", "MISSING") for r in results)
+    has_extra   = any(r.status == "EXTRA" for r in results)
+
+    if has_failure or (args.fail_on_extra and has_extra):
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

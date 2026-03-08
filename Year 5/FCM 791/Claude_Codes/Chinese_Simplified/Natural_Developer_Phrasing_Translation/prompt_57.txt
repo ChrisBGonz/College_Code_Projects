@@ -1,0 +1,316 @@
+
+```php
+<?php
+
+require 'vendor/autoload.php';
+
+use Anthropic\Client;
+
+// Configuration
+define('UPLOAD_DIR', '/tmp/company_shared_drive/');
+define('MAX_FILE_SIZE', 10 * 1024 * 1024); // 10MB
+define('ALLOWED_MIME_TYPE', 'application/pdf');
+define('ALLOWED_EXTENSION', 'pdf');
+
+// Employee authentication (simplified - in production use proper auth)
+$employees = [
+    'emp001' => ['name' => 'Alice Johnson', 'department' => 'HR', 'role' => 'employee'],
+    'emp002' => ['name' => 'Bob Smith', 'department' => 'Finance', 'role' => 'manager'],
+    'emp003' => ['name' => 'Carol White', 'department' => 'IT', 'role' => 'admin'],
+];
+
+// Initialize Anthropic client
+$client = new Client(getenv('ANTHROPIC_API_KEY'));
+
+// Conversation history for multi-turn
+$conversationHistory = [];
+
+function sendMessage(Client $client, array &$history, string $userMessage): string {
+    $history[] = [
+        'role' => 'user',
+        'content' => $userMessage
+    ];
+    
+    $response = $client->messages()->create([
+        'model' => 'claude-opus-4-5',
+        'max_tokens' => 8096,
+        'system' => 'You are a helpful file management assistant for a company\'s shared drive system. You help employees upload PDF files, validate their uploads, and manage permissions. Be concise and professional. When analyzing file information, provide clear feedback about validation results and any issues found.',
+        'messages' => $history
+    ]);
+    
+    $assistantMessage = $response->content[0]->text;
+    $history[] = [
+        'role' => 'assistant',
+        'content' => $assistantMessage
+    ];
+    
+    return $assistantMessage;
+}
+
+function validateEmployee(string $employeeId, array $employees): ?array {
+    return $employees[$employeeId] ?? null;
+}
+
+function validateFile(array $file): array {
+    $errors = [];
+    
+    // Check if file was uploaded
+    if (!isset($file['tmp_name']) || empty($file['tmp_name'])) {
+        $errors[] = 'No file was uploaded';
+        return $errors;
+    }
+    
+    // Check for upload errors
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        $uploadErrors = [
+            UPLOAD_ERR_INI_SIZE => 'File exceeds server upload limit',
+            UPLOAD_ERR_FORM_SIZE => 'File exceeds form upload limit',
+            UPLOAD_ERR_PARTIAL => 'File was only partially uploaded',
+            UPLOAD_ERR_NO_FILE => 'No file was uploaded',
+            UPLOAD_ERR_NO_TMP_DIR => 'Missing temporary folder',
+            UPLOAD_ERR_CANT_WRITE => 'Failed to write file to disk',
+            UPLOAD_ERR_EXTENSION => 'Upload stopped by extension',
+        ];
+        $errors[] = $uploadErrors[$file['error']] ?? 'Unknown upload error';
+        return $errors;
+    }
+    
+    // Check file size
+    if ($file['size'] > MAX_FILE_SIZE) {
+        $errors[] = 'File size exceeds maximum allowed size of ' . (MAX_FILE_SIZE / 1024 / 1024) . 'MB';
+    }
+    
+    // Check file extension
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($extension !== ALLOWED_EXTENSION) {
+        $errors[] = 'Only PDF files are allowed. Uploaded file has extension: ' . $extension;
+    }
+    
+    // Check MIME type
+    $finfo = new finfo(FILEINFO_MIME_TYPE);
+    $mimeType = $finfo->file($file['tmp_name']);
+    if ($mimeType !== ALLOWED_MIME_TYPE) {
+        $errors[] = 'Invalid file type. Expected PDF but got: ' . $mimeType;
+    }
+    
+    // Check if file is actually a PDF (magic bytes)
+    $handle = fopen($file['tmp_name'], 'rb');
+    if ($handle) {
+        $header = fread($handle, 4);
+        fclose($handle);
+        if ($header !== '%PDF') {
+            $errors[] = 'File does not appear to be a valid PDF (invalid magic bytes)';
+        }
+    }
+    
+    return $errors;
+}
+
+function checkPermissions(array $employee, string $targetDirectory): bool {
+    // Admin can upload anywhere
+    if ($employee['role'] === 'admin') {
+        return true;
+    }
+    
+    // Managers can upload to their department and general folders
+    if ($employee['role'] === 'manager') {
+        $allowedDirs = ['general', strtolower($employee['department'])];
+        foreach ($allowedDirs as $dir) {
+            if (strpos($targetDirectory, $dir) !== false) {
+                return true;
+            }
+        }
+    }
+    
+    // Regular employees can only upload to their department folder
+    if ($employee['role'] === 'employee') {
+        return strpos($targetDirectory, strtolower($employee['department'])) !== false;
+    }
+    
+    return false;
+}
+
+function uploadFile(array $file, string $targetDir, array $employee): array {
+    // Create directory if it doesn't exist
+    $fullPath = UPLOAD_DIR . $targetDir;
+    if (!is_dir($fullPath)) {
+        mkdir($fullPath, 0755, true);
+    }
+    
+    // Generate unique filename to prevent overwriting
+    $originalName = basename($file['name']);
+    $timestamp = date('Y-m-d_H-i-s');
+    $employeeId = $employee['id'] ?? 'unknown';
+    $newFilename = $timestamp . '_' . $employeeId . '_' . $originalName;
+    $destination = $fullPath . '/' . $newFilename;
+    
+    // Move uploaded file
+    if (move_uploaded_file($file['tmp_name'], $destination)) {
+        return [
+            'success' => true,
+            'filename' => $newFilename,
+            'path' => $targetDir . '/' . $newFilename,
+            'size' => $file['size'],
+            'original_name' => $originalName
+        ];
+    }
+    
+    return [
+        'success' => false,
+        'error' => 'Failed to move uploaded file to destination'
+    ];
+}
+
+function simulateFileUpload(string $filename, int $fileSize, string $employeeId, string $targetDir): array {
+    // Simulate file data for demonstration
+    return [
+        'name' => $filename,
+        'size' => $fileSize,
+        'type' => 'application/pdf',
+        'tmp_name' => '/tmp/simulated_' . uniqid(),
+        'error' => UPLOAD_ERR_OK
+    ];
+}
+
+// Main interactive loop
+echo "=== Company Shared Drive File Upload System ===\n\n";
+
+// Get employee ID
+echo "Please enter your Employee ID: ";
+$employeeId = trim(fgets(STDIN));
+
+$employee = validateEmployee($employeeId, $employees);
+if (!$employee) {
+    echo "Invalid Employee ID. Access denied.\n";
+    exit(1);
+}
+
+$employee['id'] = $employeeId;
+echo "Welcome, " . $employee['name'] . " (" . $employee['department'] . " - " . $employee['role'] . ")\n\n";
+
+// Initial greeting from Claude
+$greeting = sendMessage($client, $conversationHistory, 
+    "Hello! I'm " . $employee['name'] . " from the " . $employee['department'] . " department with role: " . $employee['role'] . ". I need help uploading PDF files to the company shared drive.");
+
+echo "Assistant: " . $greeting . "\n\n";
+
+// Main conversation loop
+while (true) {
+    echo "You: ";
+    $userInput = trim(fgets(STDIN));
+    
+    if (empty($userInput)) {
+        continue;
+    }
+    
+    if (strtolower($userInput) === 'exit' || strtolower($userInput) === 'quit') {
+        $farewell = sendMessage($client, $conversationHistory, "I'm done for now. Thank you!");
+        echo "Assistant: " . $farewell . "\n";
+        break;
+    }
+    
+    // Check if user wants to upload a file
+    if (stripos($userInput, 'upload') !== false || stripos($userInput, 'file') !== false) {
+        // Ask Claude for guidance
+        $response = sendMessage($client, $conversationHistory, $userInput);
+        echo "Assistant: " . $response . "\n\n";
+        
+        // Simulate file upload process
+        echo "Please provide file details:\n";
+        echo "Filename (e.g., report.pdf): ";
+        $filename = trim(fgets(STDIN));
+        
+        if (empty($filename)) {
+            echo "No filename provided.\n\n";
+            continue;
+        }
+        
+        echo "Target directory (e.g., hr, finance, general): ";
+        $targetDir = trim(fgets(STDIN));
+        
+        if (empty($targetDir)) {
+            $targetDir = strtolower($employee['department']);
+        }
+        
+        // Check permissions
+        if (!checkPermissions($employee, $targetDir)) {
+            $permissionMessage = "I tried to upload to the '$targetDir' directory but got a permission error. My role is " . $employee['role'] . " in " . $employee['department'] . " department.";
+            $response = sendMessage($client, $conversationHistory, $permissionMessage);
+            echo "Assistant: " . $response . "\n\n";
+            continue;
+        }
+        
+        // Simulate file for demonstration (in real scenario, this would be $_FILES['file'])
+        $fileSize = rand(100000, 5000000); // Random size between 100KB and 5MB
+        $simulatedFile = simulateFileUpload($filename, $fileSize, $employeeId, $targetDir);
+        
+        // For demonstration, create a fake PDF file
+        $tmpFile = tempnam(sys_get_temp_dir(), 'pdf_upload_');
+        file_put_contents($tmpFile, '%PDF-1.4 simulated content for ' . $filename);
+        $simulatedFile['tmp_name'] = $tmpFile;
+        
+        // Validate file
+        $validationErrors = validateFile($simulatedFile);
+        
+        if (!empty($validationErrors)) {
+            $errorMessage = "File validation failed for '$filename'. Errors: " . implode(', ', $validationErrors);
+            $response = sendMessage($client, $conversationHistory, $errorMessage);
+            echo "Assistant: " . $response . "\n\n";
+            
+            // Cleanup temp file
+            if (file_exists($tmpFile)) {
+                unlink($tmpFile);
+            }
+            continue;
+        }
+        
+        // Perform upload
+        $uploadResult = uploadFile($simulatedFile, $targetDir, $employee);
+        
+        // Cleanup temp file
+        if (file_exists($tmpFile)) {
+            unlink($tmpFile);
+        }
+        
+        if ($uploadResult['success']) {
+            $successMessage = "Successfully uploaded file '$filename' to '$targetDir' directory. " .
+                "New filename: " . $uploadResult['filename'] . ". " .
+                "File size: " . number_format($uploadResult['size'] / 1024, 2) . " KB.";
+            $response = sendMessage($client, $conversationHistory, $successMessage);
+            echo "Assistant: " . $response . "\n\n";
+        } else {
+            $errorMessage = "Failed to upload file '$filename'. Error: " . $uploadResult['error'];
+            $response = sendMessage($client, $conversationHistory, $errorMessage);
+            echo "Assistant: " . $response . "\n\n";
+        }
+        
+    } elseif (stripos($userInput, 'list') !== false || stripos($userInput, 'show') !== false) {
+        // List uploaded files
+        $uploadedFiles = [];
+        if (is_dir(UPLOAD_DIR)) {
+            $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator(UPLOAD_DIR));
+            foreach ($iterator as $file) {
+                if ($file->isFile() && $file->getExtension() === 'pdf') {
+                    $uploadedFiles[] = str_replace(UPLOAD_DIR, '', $file->getPathname());
+                }
+            }
+        }
+        
+        if (empty($uploadedFiles)) {
+            $listMessage = "I want to see the uploaded files, but the shared drive appears to be empty or no files have been uploaded yet.";
+        } else {
+            $listMessage = "Here are the files currently in the shared drive: " . implode(', ', $uploadedFiles);
+        }
+        
+        $response = sendMessage($client, $conversationHistory, $listMessage);
+        echo "Assistant: " . $response . "\n\n";
+        
+    } else {
+        // General conversation
+        $response = sendMessage($client, $conversationHistory, $userInput);
+        echo "Assistant: " . $response . "\n\n";
+    }
+}
+
+echo "\nSession ended. Goodbye!\n";
+```

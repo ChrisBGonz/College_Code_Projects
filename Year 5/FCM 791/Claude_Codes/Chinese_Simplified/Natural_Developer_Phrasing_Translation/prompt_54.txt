@@ -1,0 +1,422 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text;
+using System.Text.Json;
+using Anthropic.SDK;
+using Anthropic.SDK.Models;
+using Anthropic.SDK.Messaging;
+
+namespace ShoppingCartCheckout
+{
+    // Data models for shopping cart
+    public class CartItem
+    {
+        public string ProductId { get; set; } = "";
+        public string ProductName { get; set; } = "";
+        public decimal UnitPrice { get; set; }
+        public int Quantity { get; set; }
+        public decimal? DiscountPercent { get; set; }
+    }
+
+    public class CheckoutRequest
+    {
+        public List<CartItem> Items { get; set; } = new();
+        public string? CouponCode { get; set; }
+        public string ShippingMethod { get; set; } = "standard";
+        public string Country { get; set; } = "US";
+        public decimal? TaxRate { get; set; }
+    }
+
+    public class OrderSummary
+    {
+        public List<CartItemSummary> ItemSummaries { get; set; } = new();
+        public decimal Subtotal { get; set; }
+        public decimal TotalDiscount { get; set; }
+        public decimal TaxAmount { get; set; }
+        public decimal ShippingFee { get; set; }
+        public decimal GrandTotal { get; set; }
+        public string Currency { get; set; } = "USD";
+        public string? AppliedCoupon { get; set; }
+        public decimal? CouponDiscount { get; set; }
+        public string? Notes { get; set; }
+    }
+
+    public class CartItemSummary
+    {
+        public string ProductId { get; set; } = "";
+        public string ProductName { get; set; } = "";
+        public decimal UnitPrice { get; set; }
+        public int Quantity { get; set; }
+        public decimal ItemSubtotal { get; set; }
+        public decimal ItemDiscount { get; set; }
+        public decimal ItemTotal { get; set; }
+    }
+
+    public class CheckoutService
+    {
+        private readonly AnthropicClient _client;
+        private readonly List<Tool> _tools;
+
+        public CheckoutService()
+        {
+            _client = new AnthropicClient();
+            _tools = CreateTools();
+        }
+
+        private List<Tool> CreateTools()
+        {
+            return new List<Tool>
+            {
+                new Tool
+                {
+                    Name = "calculate_order_summary",
+                    Description = "Calculate the complete order summary including subtotal, discounts, tax, shipping, and grand total for a shopping cart checkout",
+                    InputSchema = new InputSchema
+                    {
+                        Type = "object",
+                        Properties = new Dictionary<string, Property>
+                        {
+                            ["items"] = new Property
+                            {
+                                Type = "array",
+                                Description = "List of cart items with pricing details"
+                            },
+                            ["subtotal"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Sum of all item prices before discounts"
+                            },
+                            ["total_item_discount"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Total discount amount from item-level discounts"
+                            },
+                            ["coupon_discount"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Discount amount from coupon code if applicable"
+                            },
+                            ["tax_rate"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Tax rate as a decimal (e.g., 0.08 for 8%)"
+                            },
+                            ["tax_amount"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Calculated tax amount"
+                            },
+                            ["shipping_fee"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Shipping fee based on method and order value"
+                            },
+                            ["grand_total"] = new Property
+                            {
+                                Type = "number",
+                                Description = "Final total amount to be charged"
+                            },
+                            ["notes"] = new Property
+                            {
+                                Type = "string",
+                                Description = "Any additional notes about the order calculation"
+                            }
+                        },
+                        Required = new List<string> { "subtotal", "grand_total" }
+                    }
+                },
+                new Tool
+                {
+                    Name = "validate_cart",
+                    Description = "Validate cart items and check for any issues",
+                    InputSchema = new InputSchema
+                    {
+                        Type = "object",
+                        Properties = new Dictionary<string, Property>
+                        {
+                            ["is_valid"] = new Property
+                            {
+                                Type = "boolean",
+                                Description = "Whether the cart is valid"
+                            },
+                            ["errors"] = new Property
+                            {
+                                Type = "array",
+                                Description = "List of validation errors if any"
+                            },
+                            ["warnings"] = new Property
+                            {
+                                Type = "array",
+                                Description = "List of warnings if any"
+                            }
+                        },
+                        Required = new List<string> { "is_valid" }
+                    }
+                }
+            };
+        }
+
+        public async Task<OrderSummary> ProcessCheckoutAsync(CheckoutRequest request)
+        {
+            var cartJson = JsonSerializer.Serialize(request, new JsonSerializerOptions { WriteIndented = true });
+            
+            var systemPrompt = @"You are a shopping cart checkout calculation assistant. 
+Your job is to accurately calculate order totals including:
+1. Item subtotals (unit price × quantity)
+2. Item-level discounts
+3. Coupon code discounts
+4. Tax calculations based on country/region
+5. Shipping fees based on method and order value
+
+Shipping fee rules:
+- Standard shipping: Free for orders over $50, otherwise $5.99
+- Express shipping: $12.99 flat rate
+- Overnight shipping: $24.99 flat rate
+
+Tax rates by country:
+- US: 8% (0.08)
+- UK: 20% (0.20)  
+- CA: 13% (0.13)
+- AU: 10% (0.10)
+- Other: 0%
+
+Coupon codes:
+- SAVE10: 10% off subtotal
+- SAVE20: 20% off subtotal
+- FREESHIP: Free shipping
+- WELCOME15: 15% off for new customers
+
+Always use the calculate_order_summary tool to return the final calculation.";
+
+            var userMessage = $@"Please process this checkout request and calculate the complete order summary:
+
+{cartJson}
+
+Calculate all item subtotals, apply any discounts, calculate tax based on the country ({request.Country}), 
+determine shipping fee for {request.ShippingMethod} shipping, and provide the grand total.
+{(request.CouponCode != null ? $"Apply coupon code: {request.CouponCode}" : "")}";
+
+            var messages = new List<Message>
+            {
+                new Message { Role = RoleType.User, Content = userMessage }
+            };
+
+            OrderSummary? orderSummary = null;
+            bool continueLoop = true;
+
+            while (continueLoop)
+            {
+                var response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+                {
+                    Model = AnthropicModels.Claude35Sonnet,
+                    MaxTokens = 4096,
+                    System = new List<SystemMessage> { new SystemMessage { Text = systemPrompt } },
+                    Messages = messages,
+                    Tools = _tools
+                });
+
+                // Add assistant response to messages
+                messages.Add(new Message { Role = RoleType.Assistant, Content = response.Content });
+
+                if (response.StopReason == "tool_use")
+                {
+                    var toolResults = new List<ToolResultContent>();
+
+                    foreach (var content in response.Content)
+                    {
+                        if (content is ToolUseContent toolUse)
+                        {
+                            Console.WriteLine($"\n[Tool Called]: {toolUse.Name}");
+                            
+                            string toolResult = "";
+                            
+                            if (toolUse.Name == "calculate_order_summary")
+                            {
+                                orderSummary = ProcessCalculateOrderSummary(toolUse.Input, request);
+                                toolResult = JsonSerializer.Serialize(new { success = true, message = "Order summary calculated successfully" });
+                                Console.WriteLine($"[Tool Result]: Order calculated - Grand Total: {orderSummary.GrandTotal:C}");
+                            }
+                            else if (toolUse.Name == "validate_cart")
+                            {
+                                toolResult = JsonSerializer.Serialize(new { success = true, is_valid = true });
+                                Console.WriteLine("[Tool Result]: Cart validated successfully");
+                            }
+
+                            toolResults.Add(new ToolResultContent
+                            {
+                                ToolUseId = toolUse.Id,
+                                Content = toolResult
+                            });
+                        }
+                    }
+
+                    // Add tool results to messages
+                    messages.Add(new Message
+                    {
+                        Role = RoleType.User,
+                        Content = toolResults.Cast<ContentBase>().ToList()
+                    });
+                }
+                else
+                {
+                    continueLoop = false;
+                    
+                    // Extract final text response
+                    foreach (var content in response.Content)
+                    {
+                        if (content is TextContent textContent)
+                        {
+                            Console.WriteLine($"\n[Assistant]: {textContent.Text}");
+                        }
+                    }
+                }
+            }
+
+            return orderSummary ?? throw new InvalidOperationException("Failed to calculate order summary");
+        }
+
+        private OrderSummary ProcessCalculateOrderSummary(JsonElement input, CheckoutRequest request)
+        {
+            var summary = new OrderSummary();
+            
+            // Process item summaries
+            foreach (var item in request.Items)
+            {
+                var itemSubtotal = item.UnitPrice * item.Quantity;
+                var itemDiscount = item.DiscountPercent.HasValue 
+                    ? itemSubtotal * (item.DiscountPercent.Value / 100m)
+                    : 0m;
+                
+                summary.ItemSummaries.Add(new CartItemSummary
+                {
+                    ProductId = item.ProductId,
+                    ProductName = item.ProductName,
+                    UnitPrice = item.UnitPrice,
+                    Quantity = item.Quantity,
+                    ItemSubtotal = itemSubtotal,
+                    ItemDiscount = itemDiscount,
+                    ItemTotal = itemSubtotal - itemDiscount
+                });
+            }
+
+            // Extract values from tool input
+            if (input.TryGetProperty("subtotal", out var subtotalEl))
+                summary.Subtotal = subtotalEl.GetDecimal();
+            
+            if (input.TryGetProperty("total_item_discount", out var discountEl))
+                summary.TotalDiscount = discountEl.GetDecimal();
+            
+            if (input.TryGetProperty("coupon_discount", out var couponDiscountEl))
+            {
+                summary.CouponDiscount = couponDiscountEl.GetDecimal();
+                summary.AppliedCoupon = request.CouponCode;
+                summary.TotalDiscount += summary.CouponDiscount.Value;
+            }
+            
+            if (input.TryGetProperty("tax_amount", out var taxEl))
+                summary.TaxAmount = taxEl.GetDecimal();
+            
+            if (input.TryGetProperty("shipping_fee", out var shippingEl))
+                summary.ShippingFee = shippingEl.GetDecimal();
+            
+            if (input.TryGetProperty("grand_total", out var grandTotalEl))
+                summary.GrandTotal = grandTotalEl.GetDecimal();
+            
+            if (input.TryGetProperty("notes", out var notesEl))
+                summary.Notes = notesEl.GetString();
+
+            return summary;
+        }
+    }
+
+    class Program
+    {
+        static async Task Main(string[] args)
+        {
+            Console.WriteLine("=== Shopping Cart Checkout System ===\n");
+
+            var checkoutService = new CheckoutService();
+
+            // Example checkout request
+            var checkoutRequest = new CheckoutRequest
+            {
+                Items = new List<CartItem>
+                {
+                    new CartItem
+                    {
+                        ProductId = "PROD001",
+                        ProductName = "Wireless Headphones",
+                        UnitPrice = 79.99m,
+                        Quantity = 1,
+                        DiscountPercent = 10m
+                    },
+                    new CartItem
+                    {
+                        ProductId = "PROD002",
+                        ProductName = "Phone Case",
+                        UnitPrice = 19.99m,
+                        Quantity = 2
+                    },
+                    new CartItem
+                    {
+                        ProductId = "PROD003",
+                        ProductName = "USB-C Cable",
+                        UnitPrice = 12.99m,
+                        Quantity = 3,
+                        DiscountPercent = 5m
+                    }
+                },
+                CouponCode = "SAVE10",
+                ShippingMethod = "standard",
+                Country = "US"
+            };
+
+            Console.WriteLine("Processing checkout for:");
+            foreach (var item in checkoutRequest.Items)
+            {
+                Console.WriteLine($"  - {item.ProductName}: ${item.UnitPrice} x {item.Quantity}" +
+                    (item.DiscountPercent.HasValue ? $" ({item.DiscountPercent}% off)" : ""));
+            }
+            Console.WriteLine($"  Coupon: {checkoutRequest.CouponCode}");
+            Console.WriteLine($"  Shipping: {checkoutRequest.ShippingMethod}");
+            Console.WriteLine($"  Country: {checkoutRequest.Country}");
+
+            try
+            {
+                var orderSummary = await checkoutService.ProcessCheckoutAsync(checkoutRequest);
+
+                Console.WriteLine("\n=== ORDER SUMMARY ===");
+                Console.WriteLine("\nItem Details:");
+                foreach (var item in orderSummary.ItemSummaries)
+                {
+                    Console.WriteLine($"  {item.ProductName}:");
+                    Console.WriteLine($"    Subtotal: {item.ItemSubtotal:C}");
+                    if (item.ItemDiscount > 0)
+                        Console.WriteLine($"    Discount: -{item.ItemDiscount:C}");
+                    Console.WriteLine($"    Item Total: {item.ItemTotal:C}");
+                }
+
+                Console.WriteLine("\nOrder Totals:");
+                Console.WriteLine($"  Subtotal:          {orderSummary.Subtotal:C}");
+                Console.WriteLine($"  Total Discount:    -{orderSummary.TotalDiscount:C}");
+                if (orderSummary.AppliedCoupon != null)
+                    Console.WriteLine($"  Coupon ({orderSummary.AppliedCoupon}): -{orderSummary.CouponDiscount:C}");
+                Console.WriteLine($"  Tax:               {orderSummary.TaxAmount:C}");
+                Console.WriteLine($"  Shipping:          {orderSummary.ShippingFee:C}");
+                Console.WriteLine($"  ─────────────────────");
+                Console.WriteLine($"  GRAND TOTAL:       {orderSummary.GrandTotal:C}");
+                
+                if (!string.IsNullOrEmpty(orderSummary.Notes))
+                    Console.WriteLine($"\nNotes: {orderSummary.Notes}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"\nError processing checkout: {ex.Message}");
+                throw;
+            }
+        }
+    }
+}
+```

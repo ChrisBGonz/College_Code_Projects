@@ -1,0 +1,909 @@
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"log"
+	"math"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ConfigTag defines the struct tag name used for field mapping
+const ConfigTag = "config"
+
+// DefaultTag defines the struct tag name used for default values
+const DefaultTag = "default"
+
+// Config holds the raw configuration data
+type Config struct {
+	mu   sync.RWMutex
+	data map[string]interface{}
+}
+
+// NewConfig creates a new empty Config
+func NewConfig() *Config {
+	return &Config{
+		data: make(map[string]interface{}),
+	}
+}
+
+// LoadFromFile reads and parses a JSON config file
+func LoadFromFile(filePath string) (*Config, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file %s: %w", filePath, err)
+	}
+	defer file.Close()
+
+	cfg := NewConfig()
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&cfg.data); err != nil {
+		return nil, fmt.Errorf("failed to decode config file %s: %w", filePath, err)
+	}
+
+	return cfg, nil
+}
+
+// LoadFromBytes parses JSON config from byte slice
+func LoadFromBytes(data []byte) (*Config, error) {
+	cfg := NewConfig()
+	if err := json.Unmarshal(data, &cfg.data); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal config data: %w", err)
+	}
+	return cfg, nil
+}
+
+// Get retrieves a value by dot-separated key path
+func (c *Config) Get(keyPath string) (interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	keys := strings.Split(keyPath, ".")
+	current := interface{}(c.data)
+
+	for _, key := range keys {
+		switch v := current.(type) {
+		case map[string]interface{}:
+			val, ok := v[key]
+			if !ok {
+				return nil, false
+			}
+			current = val
+		default:
+			return nil, false
+		}
+	}
+
+	return current, true
+}
+
+// Set sets a value by dot-separated key path
+func (c *Config) Set(keyPath string, value interface{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	keys := strings.Split(keyPath, ".")
+	current := c.data
+
+	for i, key := range keys {
+		if i == len(keys)-1 {
+			current[key] = value
+			return
+		}
+
+		next, ok := current[key]
+		if !ok {
+			newMap := make(map[string]interface{})
+			current[key] = newMap
+			current = newMap
+			continue
+		}
+
+		nextMap, ok := next.(map[string]interface{})
+		if !ok {
+			newMap := make(map[string]interface{})
+			current[key] = newMap
+			current = newMap
+			continue
+		}
+		current = nextMap
+	}
+}
+
+// Merge merges another config into this one
+func (c *Config) Merge(other *Config) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	other.mu.RLock()
+	defer other.mu.RUnlock()
+
+	mergeMap(c.data, other.data)
+}
+
+func mergeMap(dst, src map[string]interface{}) {
+	for k, v := range src {
+		if srcMap, ok := v.(map[string]interface{}); ok {
+			if dstMap, ok := dst[k].(map[string]interface{}); ok {
+				mergeMap(dstMap, srcMap)
+				continue
+			}
+		}
+		dst[k] = v
+	}
+}
+
+// Injector handles dynamic injection of config values into objects
+type Injector struct {
+	config          *Config
+	typeConverters  map[reflect.Type]TypeConverter
+	errorOnMissing  bool
+	errorOnTypeFail bool
+}
+
+// TypeConverter is a function that converts a raw value to a target type
+type TypeConverter func(value interface{}, targetType reflect.Type) (reflect.Value, error)
+
+// InjectorOption configures the Injector
+type InjectorOption func(*Injector)
+
+// WithErrorOnMissing makes the injector return an error when a required field is missing
+func WithErrorOnMissing() InjectorOption {
+	return func(i *Injector) {
+		i.errorOnMissing = true
+	}
+}
+
+// WithErrorOnTypeFail makes the injector return an error on type conversion failure
+func WithErrorOnTypeFail() InjectorOption {
+	return func(i *Injector) {
+		i.errorOnTypeFail = true
+	}
+}
+
+// WithTypeConverter registers a custom type converter
+func WithTypeConverter(t reflect.Type, converter TypeConverter) InjectorOption {
+	return func(i *Injector) {
+		i.typeConverters[t] = converter
+	}
+}
+
+// NewInjector creates a new Injector with the given config
+func NewInjector(cfg *Config, opts ...InjectorOption) *Injector {
+	inj := &Injector{
+		config:         cfg,
+		typeConverters: make(map[reflect.Type]TypeConverter),
+	}
+
+	// Register built-in time.Duration converter
+	inj.typeConverters[reflect.TypeOf(time.Duration(0))] = func(value interface{}, targetType reflect.Type) (reflect.Value, error) {
+		str := fmt.Sprintf("%v", value)
+		d, err := time.ParseDuration(str)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot parse duration %q: %w", str, err)
+		}
+		return reflect.ValueOf(d), nil
+	}
+
+	// Register time.Time converter
+	inj.typeConverters[reflect.TypeOf(time.Time{})] = func(value interface{}, targetType reflect.Type) (reflect.Value, error) {
+		str := fmt.Sprintf("%v", value)
+		formats := []string{
+			time.RFC3339,
+			"2006-01-02T15:04:05",
+			"2006-01-02 15:04:05",
+			"2006-01-02",
+		}
+		for _, format := range formats {
+			t, err := time.Parse(format, str)
+			if err == nil {
+				return reflect.ValueOf(t), nil
+			}
+		}
+		return reflect.Value{}, fmt.Errorf("cannot parse time %q", str)
+	}
+
+	for _, opt := range opts {
+		opt(inj)
+	}
+
+	return inj
+}
+
+// Inject injects config values into the target object
+// target must be a pointer to a struct
+func (inj *Injector) Inject(target interface{}) error {
+	return inj.InjectWithPrefix(target, "")
+}
+
+// InjectWithPrefix injects config values with a key prefix into the target object
+func (inj *Injector) InjectWithPrefix(target interface{}, prefix string) error {
+	rv := reflect.ValueOf(target)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer, got %T", target)
+	}
+
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("target must point to a struct, got %s", rv.Kind())
+	}
+
+	return inj.injectStruct(rv, prefix)
+}
+
+// InjectMap injects config values into a map[string]interface{}
+func (inj *Injector) InjectMap(target map[string]interface{}, prefix string) error {
+	inj.config.mu.RLock()
+	defer inj.config.mu.RUnlock()
+
+	var source map[string]interface{}
+	if prefix == "" {
+		source = inj.config.data
+	} else {
+		val, ok := inj.config.Get(prefix)
+		if !ok {
+			return nil
+		}
+		var isMap bool
+		source, isMap = val.(map[string]interface{})
+		if !isMap {
+			return fmt.Errorf("config key %q is not a map", prefix)
+		}
+	}
+
+	for k, v := range source {
+		target[k] = v
+	}
+	return nil
+}
+
+func (inj *Injector) injectStruct(rv reflect.Value, prefix string) error {
+	rt := rv.Type()
+
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		fieldVal := rv.Field(i)
+
+		// Skip unexported fields
+		if !fieldVal.CanSet() {
+			continue
+		}
+
+		// Determine config key
+		configKey := inj.resolveConfigKey(field, prefix)
+
+		// Handle nested structs
+		if field.Type.Kind() == reflect.Struct {
+			// Check for custom type converter first
+			if _, hasConverter := inj.typeConverters[field.Type]; !hasConverter {
+				if err := inj.injectStruct(fieldVal, configKey); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		// Handle pointer to struct
+		if field.Type.Kind() == reflect.Ptr && field.Type.Elem().Kind() == reflect.Struct {
+			if _, hasConverter := inj.typeConverters[field.Type]; !hasConverter {
+				if fieldVal.IsNil() {
+					newVal := reflect.New(field.Type.Elem())
+					if err := inj.injectStruct(newVal.Elem(), configKey); err != nil {
+						return err
+					}
+					fieldVal.Set(newVal)
+				} else {
+					if err := inj.injectStruct(fieldVal.Elem(), configKey); err != nil {
+						return err
+					}
+				}
+				continue
+			}
+		}
+
+		// Get value from config
+		rawVal, found := inj.config.Get(configKey)
+
+		if !found {
+			// Try default value
+			defaultStr, hasDefault := field.Tag.Lookup(DefaultTag)
+			if hasDefault {
+				if err := inj.setFieldFromString(fieldVal, field.Type, defaultStr); err != nil {
+					if inj.errorOnTypeFail {
+						return fmt.Errorf("field %s: failed to set default value %q: %w", field.Name, defaultStr, err)
+					}
+					log.Printf("Warning: field %s: failed to set default value %q: %v", field.Name, defaultStr, err)
+				}
+			} else if inj.errorOnMissing {
+				return fmt.Errorf("required config key %q not found for field %s", configKey, field.Name)
+			}
+			continue
+		}
+
+		// Convert and set value
+		if err := inj.setField(fieldVal, field.Type, rawVal); err != nil {
+			if inj.errorOnTypeFail {
+				return fmt.Errorf("field %s (key %q): %w", field.Name, configKey, err)
+			}
+			log.Printf("Warning: field %s (key %q): %v", field.Name, configKey, err)
+		}
+	}
+
+	return nil
+}
+
+func (inj *Injector) resolveConfigKey(field reflect.StructField, prefix string) string {
+	tag := field.Tag.Get(ConfigTag)
+	var key string
+
+	if tag != "" && tag != "-" {
+		// Support tag options like `config:"name,omitempty"`
+		parts := strings.Split(tag, ",")
+		key = parts[0]
+	} else if tag == "-" {
+		return ""
+	} else {
+		// Default: use lowercase field name
+		key = strings.ToLower(field.Name)
+	}
+
+	if prefix != "" {
+		return prefix + "." + key
+	}
+	return key
+}
+
+func (inj *Injector) setField(fieldVal reflect.Value, fieldType reflect.Type, rawVal interface{}) error {
+	// Check for custom type converter
+	if converter, ok := inj.typeConverters[fieldType]; ok {
+		converted, err := converter(rawVal, fieldType)
+		if err != nil {
+			return err
+		}
+		if converted.Type().AssignableTo(fieldType) {
+			fieldVal.Set(converted)
+			return nil
+		}
+		return fmt.Errorf("converter returned %s, expected %s", converted.Type(), fieldType)
+	}
+
+	// Handle pointer types
+	if fieldType.Kind() == reflect.Ptr {
+		if rawVal == nil {
+			fieldVal.Set(reflect.Zero(fieldType))
+			return nil
+		}
+		newVal := reflect.New(fieldType.Elem())
+		if err := inj.setField(newVal.Elem(), fieldType.Elem(), rawVal); err != nil {
+			return err
+		}
+		fieldVal.Set(newVal)
+		return nil
+	}
+
+	// Handle slice types
+	if fieldType.Kind() == reflect.Slice {
+		return inj.setSliceField(fieldVal, fieldType, rawVal)
+	}
+
+	// Handle map types
+	if fieldType.Kind() == reflect.Map {
+		return inj.setMapField(fieldVal, fieldType, rawVal)
+	}
+
+	// Convert raw value to reflect.Value
+	converted, err := convertValue(rawVal, fieldType)
+	if err != nil {
+		return err
+	}
+
+	fieldVal.Set(converted)
+	return nil
+}
+
+func (inj *Injector) setFieldFromString(fieldVal reflect.Value, fieldType reflect.Type, str string) error {
+	// Handle pointer types
+	if fieldType.Kind() == reflect.Ptr {
+		newVal := reflect.New(fieldType.Elem())
+		if err := inj.setFieldFromString(newVal.Elem(), fieldType.Elem(), str); err != nil {
+			return err
+		}
+		fieldVal.Set(newVal)
+		return nil
+	}
+
+	// Check for custom type converter
+	if converter, ok := inj.typeConverters[fieldType]; ok {
+		converted, err := converter(str, fieldType)
+		if err != nil {
+			return err
+		}
+		fieldVal.Set(converted)
+		return nil
+	}
+
+	return inj.setField(fieldVal, fieldType, str)
+}
+
+func (inj *Injector) setSliceField(fieldVal reflect.Value, fieldType reflect.Type, rawVal interface{}) error {
+	rv := reflect.ValueOf(rawVal)
+	if rv.Kind() != reflect.Slice {
+		// Try to handle JSON array stored as interface{}
+		if arr, ok := rawVal.([]interface{}); ok {
+			rv = reflect.ValueOf(arr)
+		} else {
+			return fmt.Errorf("expected slice, got %T", rawVal)
+		}
+	}
+
+	elemType := fieldType.Elem()
+	slice := reflect.MakeSlice(fieldType, rv.Len(), rv.Len())
+
+	for i := 0; i < rv.Len(); i++ {
+		elem := slice.Index(i)
+		if err := inj.setField(elem, elemType, rv.Index(i).Interface()); err != nil {
+			return fmt.Errorf("slice element %d: %w", i, err)
+		}
+	}
+
+	fieldVal.Set(slice)
+	return nil
+}
+
+func (inj *Injector) setMapField(fieldVal reflect.Value, fieldType reflect.Type, rawVal interface{}) error {
+	rv := reflect.ValueOf(rawVal)
+	if rv.Kind() != reflect.Map {
+		if m, ok := rawVal.(map[string]interface{}); ok {
+			rv = reflect.ValueOf(m)
+		} else {
+			return fmt.Errorf("expected map, got %T", rawVal)
+		}
+	}
+
+	keyType := fieldType.Key()
+	valType := fieldType.Elem()
+	newMap := reflect.MakeMap(fieldType)
+
+	for _, k := range rv.MapKeys() {
+		convertedKey, err := convertValue(k.Interface(), keyType)
+		if err != nil {
+			return fmt.Errorf("map key conversion: %w", err)
+		}
+
+		convertedVal := reflect.New(valType).Elem()
+		if err := inj.setField(convertedVal, valType, rv.MapIndex(k).Interface()); err != nil {
+			return fmt.Errorf("map value for key %v: %w", k.Interface(), err)
+		}
+
+		newMap.SetMapIndex(convertedKey, convertedVal)
+	}
+
+	fieldVal.Set(newMap)
+	return nil
+}
+
+// convertValue converts a raw interface{} value to the target reflect.Type
+func convertValue(rawVal interface{}, targetType reflect.Type) (reflect.Value, error) {
+	if rawVal == nil {
+		return reflect.Zero(targetType), nil
+	}
+
+	rv := reflect.ValueOf(rawVal)
+
+	// Direct assignment if types match
+	if rv.Type().AssignableTo(targetType) {
+		return rv, nil
+	}
+
+	// Try direct conversion
+	if rv.Type().ConvertibleTo(targetType) {
+		return rv.Convert(targetType), nil
+	}
+
+	// Handle string source
+	if rv.Kind() == reflect.String {
+		return convertFromString(rv.String(), targetType)
+	}
+
+	// Handle numeric conversions (JSON numbers are float64 by default)
+	switch targetType.Kind() {
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := toInt64(rawVal)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetInt(n)
+		return v, nil
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := toUint64(rawVal)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetUint(n)
+		return v, nil
+
+	case reflect.Float32, reflect.Float64:
+		n, err := toFloat64(rawVal)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetFloat(n)
+		return v, nil
+
+	case reflect.Bool:
+		b, err := toBool(rawVal)
+		if err != nil {
+			return reflect.Value{}, err
+		}
+		return reflect.ValueOf(b).Convert(targetType), nil
+
+	case reflect.String:
+		return reflect.ValueOf(fmt.Sprintf("%v", rawVal)).Convert(targetType), nil
+
+	case reflect.Interface:
+		return rv, nil
+	}
+
+	return reflect.Value{}, fmt.Errorf("cannot convert %T to %s", rawVal, targetType)
+}
+
+func convertFromString(s string, targetType reflect.Type) (reflect.Value, error) {
+	switch targetType.Kind() {
+	case reflect.String:
+		return reflect.ValueOf(s).Convert(targetType), nil
+
+	case reflect.Bool:
+		b, err := strconv.ParseBool(s)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot parse bool from %q: %w", s, err)
+		}
+		return reflect.ValueOf(b).Convert(targetType), nil
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			// Try float then truncate
+			f, ferr := strconv.ParseFloat(s, 64)
+			if ferr != nil {
+				return reflect.Value{}, fmt.Errorf("cannot parse int from %q: %w", s, err)
+			}
+			n = int64(f)
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetInt(n)
+		return v, nil
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		n, err := strconv.ParseUint(s, 10, 64)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot parse uint from %q: %w", s, err)
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetUint(n)
+		return v, nil
+
+	case reflect.Float32, reflect.Float64:
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot parse float from %q: %w", s, err)
+		}
+		v := reflect.New(targetType).Elem()
+		v.SetFloat(f)
+		return v, nil
+
+	case reflect.Slice:
+		if targetType.Elem().Kind() == reflect.Uint8 {
+			// []byte
+			return reflect.ValueOf([]byte(s)).Convert(targetType), nil
+		}
+		// Try JSON unmarshal for other slice types
+		var arr []interface{}
+		if err := json.Unmarshal([]byte(s), &arr); err != nil {
+			return reflect.Value{}, fmt.Errorf("cannot parse slice from %q: %w", s, err)
+		}
+		return convertValue(arr, targetType)
+	}
+
+	return reflect.Value{}, fmt.Errorf("cannot convert string %q to %s", s, targetType)
+}
+
+func toInt64(v interface{}) (int64, error) {
+	switch n := v.(type) {
+	case int:
+		return int64(n), nil
+	case int8:
+		return int64(n), nil
+	case int16:
+		return int64(n), nil
+	case int32:
+		return int64(n), nil
+	case int64:
+		return n, nil
+	case uint:
+		return int64(n), nil
+	case uint8:
+		return int64(n), nil
+	case uint16:
+		return int64(n), nil
+	case uint32:
+		return int64(n), nil
+	case uint64:
+		if n > math.MaxInt64 {
+			return 0, fmt.Errorf("uint64 value %d overflows int64", n)
+		}
+		return int64(n), nil
+	case float32:
+		return int64(n), nil
+	case float64:
+		return int64(n), nil
+	case string:
+		return strconv.ParseInt(n, 10, 64)
+	case bool:
+		if n {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	return 0, fmt.Errorf("cannot convert %T to int64", v)
+}
+
+func toUint64(v interface{}) (uint64, error) {
+	switch n := v.(type) {
+	case uint:
+		return uint64(n), nil
+	case uint8:
+		return uint64(n), nil
+	case uint16:
+		return uint64(n), nil
+	case uint32:
+		return uint64(n), nil
+	case uint64:
+		return n, nil
+	case int:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value %d cannot be uint64", n)
+		}
+		return uint64(n), nil
+	case int64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value %d cannot be uint64", n)
+		}
+		return uint64(n), nil
+	case float64:
+		if n < 0 {
+			return 0, fmt.Errorf("negative value %f cannot be uint64", n)
+		}
+		return uint64(n), nil
+	case string:
+		return strconv.ParseUint(n, 10, 64)
+	}
+	return 0, fmt.Errorf("cannot convert %T to uint64", v)
+}
+
+func toFloat64(v interface{}) (float64, error) {
+	switch n := v.(type) {
+	case float32:
+		return float64(n), nil
+	case float64:
+		return n, nil
+	case int:
+		return float64(n), nil
+	case int64:
+		return float64(n), nil
+	case uint64:
+		return float64(n), nil
+	case string:
+		return strconv.ParseFloat(n, 64)
+	}
+	return 0, fmt.Errorf("cannot convert %T to float64", v)
+}
+
+func toBool(v interface{}) (bool, error) {
+	switch b := v.(type) {
+	case bool:
+		return b, nil
+	case int, int8, int16, int32, int64:
+		n, _ := toInt64(v)
+		return n != 0, nil
+	case float64:
+		return b != 0, nil
+	case string:
+		return strconv.ParseBool(b)
+	}
+	return false, fmt.Errorf("cannot convert %T to bool", v)
+}
+
+// FieldMapper provides explicit key-to-field mapping
+type FieldMapper struct {
+	mappings map[string]string // config key -> field name
+}
+
+// NewFieldMapper creates a new FieldMapper
+func NewFieldMapper() *FieldMapper {
+	return &FieldMapper{
+		mappings: make(map[string]string),
+	}
+}
+
+// Map adds a mapping from config key to field name
+func (fm *FieldMapper) Map(configKey, fieldName string) *FieldMapper {
+	fm.mappings[configKey] = fieldName
+	return fm
+}
+
+// Apply applies the field mappings to the target struct using the config
+func (fm *FieldMapper) Apply(target interface{}, cfg *Config) error {
+	rv := reflect.ValueOf(target)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("target must be a non-nil pointer")
+	}
+	rv = rv.Elem()
+	if rv.Kind() != reflect.Struct {
+		return fmt.Errorf("target must point to a struct")
+	}
+
+	inj := NewInjector(cfg)
+
+	for configKey, fieldName := range fm.mappings {
+		rawVal, found := cfg.Get(configKey)
+		if !found {
+			continue
+		}
+
+		fieldVal := rv.FieldByName(fieldName)
+		if !fieldVal.IsValid() {
+			return fmt.Errorf("field %q not found in struct", fieldName)
+		}
+		if !fieldVal.CanSet() {
+			return fmt.Errorf("field %q cannot be set (unexported?)", fieldName)
+		}
+
+		if err := inj.setField(fieldVal, fieldVal.Type(), rawVal); err != nil {
+			return fmt.Errorf("field %q (config key %q): %w", fieldName, configKey, err)
+		}
+	}
+
+	return nil
+}
+
+// Update updates only the fields that exist in the config (partial update)
+func (inj *Injector) Update(target interface{}, updates map[string]interface{}) error {
+	// Create a temporary config with just the updates
+	tmpCfg := NewConfig()
+	tmpCfg.data = updates
+
+	tmpInj := &Injector{
+		config:          tmpCfg,
+		typeConverters:  inj.typeConverters,
+		errorOnMissing:  false,
+		errorOnTypeFail: inj.errorOnTypeFail,
+	}
+
+	return tmpInj.Inject(target)
+}
+
+// ==================== Demo Structures ====================
+
+// DatabaseConfig represents database connection settings
+type DatabaseConfig struct {
+	Host            string        `config:"host" default:"localhost"`
+	Port            int           `config:"port" default:"5432"`
+	Name            string        `config:"name" default:"mydb"`
+	User            string        `config:"user" default:"admin"`
+	Password        string        `config:"password"`
+	MaxConnections  int           `config:"max_connections" default:"10"`
+	ConnectTimeout  time.Duration `config:"connect_timeout" default:"30s"`
+	EnableSSL       bool          `config:"enable_ssl" default:"false"`
+	Tags            []string      `config:"tags"`
+	Options         map[string]string `config:"options"`
+}
+
+// CacheConfig represents cache settings
+type CacheConfig struct {
+	Enabled    bool          `config:"enabled" default:"true"`
+	TTL        time.Duration `config:"ttl" default:"5m"`
+	MaxSize     int64         `config:"max_size" default:"104857600"`
+	Prefix      string        `config:"prefix" default:"cache:"`
+}
+
+// ServerConfig represents HTTP server settings
+type ServerConfig struct {
+	Host         string        `config:"host" default:"0.0.0.0"`
+	Port         int           `config:"port" default:"8080"`
+	ReadTimeout  time.Duration `config:"read_timeout" default:"10s"`
+	WriteTimeout time.Duration `config:"write_timeout" default:"10s"`
+	Debug        bool          `config:"debug" default:"false"`
+	Database     DatabaseConfig `config:"database"`
+	Cache        CacheConfig    `config:"cache"`
+}
+
+// AppConfig is the top-level application configuration
+type AppConfig struct {
+	AppName     string       `config:"app_name" default:"MyApp"`
+	Version     string       `config:"version" default:"1.0.0"`
+	Environment string       `config:"environment" default:"development"`
+	LogLevel    string       `config:"log_level" default:"info"`
+	Server      ServerConfig `config:"server"`
+	Features    map[string]bool `config:"features"`
+}
+
+// ==================== Main Demo ====================
+
+func main() {
+	// Create a sample JSON config file
+	sampleConfig := `{
+		"app_name": "DemoApp",
+		"version": "2.1.0",
+		"environment": "production",
+		"log_level": "warn",
+		"server": {
+			"host": "0.0.0.0",
+			"port": 9090,
+			"read_timeout": "15s",
+			"write_timeout": "20s",
+			"debug": false,
+			"database": {
+				"host": "db.example.com",
+				"port": 5432,
+				"name": "production_db",
+				"user": "prod_user",
+				"password": "secret123",
+				"max_connections": 50,
+				"connect_timeout": "5s",
+				"enable_ssl": true,
+				"tags": ["primary", "read-write"],
+				"options": {
+					"sslmode": "require",
+					"application_name": "DemoApp"
+				}
+			},
+			"cache": {
+				"enabled": true,
+				"ttl": "10m",
+				"max_size": 209715200,
+				"prefix": "prod:"
+			}
+		},
+		"features": {
+			"new_ui": true,
+			"beta_api": false,
+			"analytics": true
+		}
+	}`
+
+	// Write sample config to temp file
+	tmpFile, err := os.CreateTemp("", "config-*.json")
+	if err != nil {
+		log.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	if _, err := tmpFile.WriteString(sampleConfig); err != nil {
+		log.Fatalf("Failed to write config: %v", err)
+	}
+	tmpFile.Close()
+
+	fmt.Println("=== Dynamic Config Injection Demo ===\n")
+
+	// ---- Demo 1: Load from file and inject into struct ----
+	fmt.Println("--- Demo 1: Load from file and inject into struct ---")
+
+	cfg, err := LoadFromFile(tmpFile.Name())
+	if err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
+	inj := NewInjector(cfg)
+
+	var appCfg AppConfig
+	if err := inj.Inject(&appCfg); err != nil {
+		log.Fatalf("Failed

@@ -1,0 +1,237 @@
+```java
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+public class DatabaseAccessExample {
+
+    private static final Logger LOGGER = Logger.getLogger(DatabaseAccessExample.class.getName());
+
+    // -------------------------------------------------------------------------
+    // Custom Exception
+    // -------------------------------------------------------------------------
+
+    public static class DataAccessException extends RuntimeException {
+
+        private final int errorCode;
+        private final String sqlState;
+
+        public DataAccessException(String message, Throwable cause) {
+            super(message, cause);
+            if (cause instanceof SQLException) {
+                this.errorCode = ((SQLException) cause).getErrorCode();
+                this.sqlState  = ((SQLException) cause).getSQLState();
+            } else {
+                this.errorCode = -1;
+                this.sqlState  = null;
+            }
+        }
+
+        public DataAccessException(String message, Throwable cause, int errorCode, String sqlState) {
+            super(message, cause);
+            this.errorCode = errorCode;
+            this.sqlState  = sqlState;
+        }
+
+        public int getErrorCode() {
+            return errorCode;
+        }
+
+        public String getSqlState() {
+            return sqlState;
+        }
+
+        @Override
+        public String toString() {
+            return String.format(
+                "DataAccessException{message='%s', errorCode=%d, sqlState='%s', cause=%s}",
+                getMessage(), errorCode, sqlState, getCause()
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Database helper – wraps every SQLException
+    // -------------------------------------------------------------------------
+
+    /**
+     * Queries users by status, wraps any {@link SQLException} into a
+     * {@link DataAccessException} while preserving the original exception as
+     * the cause.
+     *
+     * @param connection an active JDBC connection
+     * @param status     the status value to filter on
+     * @return list of user names matching the given status
+     * @throws DataAccessException if a database error occurs
+     */
+    public List<String> findUsersByStatus(Connection connection, String status) {
+        final String sql = "SELECT username FROM users WHERE status = ?";
+        List<String> users = new ArrayList<>();
+
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+
+            stmt.setString(1, status);
+
+            try (ResultSet rs = stmt.executeQuery()) {
+                while (rs.next()) {
+                    users.add(rs.getString("username"));
+                }
+            }
+
+        } catch (SQLException e) {
+            // ----------------------------------------------------------------
+            // 1. Log all available details from the SQLException
+            // ----------------------------------------------------------------
+            LOGGER.log(
+                Level.SEVERE,
+                "Database error while querying users by status."
+                    + " Message   : " + e.getMessage()
+                    + " | SQLState : " + e.getSQLState()
+                    + " | ErrorCode: " + e.getErrorCode()
+                    + " | SQL      : " + sql,
+                e   // attaches the full stack trace to the log record
+            );
+
+            // Log chained exceptions (if any)
+            SQLException next = e.getNextException();
+            while (next != null) {
+                LOGGER.log(Level.SEVERE,
+                    "Chained SQLException – Message: " + next.getMessage()
+                        + " | SQLState: " + next.getSQLState()
+                        + " | ErrorCode: " + next.getErrorCode(),
+                    next);
+                next = next.getNextException();
+            }
+
+            // ----------------------------------------------------------------
+            // 2. Wrap and re-throw as DataAccessException, keeping e as cause
+            // ----------------------------------------------------------------
+            throw new DataAccessException(
+                "Failed to retrieve users with status='" + status + "': " + e.getMessage(),
+                e   // <-- original SQLException preserved as cause
+            );
+        }
+
+        return users;
+    }
+
+    /**
+     * Inserts a new user record, demonstrating the same pattern inside a
+     * transaction with explicit rollback handling.
+     *
+     * @param connection an active JDBC connection
+     * @param username   the new user's name
+     * @param email      the new user's e-mail
+     * @throws DataAccessException if a database error occurs
+     */
+    public void insertUser(Connection connection, String username, String email) {
+        final String sql = "INSERT INTO users (username, email, status) VALUES (?, ?, 'ACTIVE')";
+
+        boolean autoCommit = true;
+        try {
+            autoCommit = connection.getAutoCommit();
+            connection.setAutoCommit(false);
+
+            try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+                stmt.setString(1, username);
+                stmt.setString(2, email);
+                stmt.executeUpdate();
+            }
+
+            connection.commit();
+            LOGGER.info("User '" + username + "' inserted successfully.");
+
+        } catch (SQLException e) {
+            // ----------------------------------------------------------------
+            // 1. Log the error
+            // ----------------------------------------------------------------
+            LOGGER.log(
+                Level.SEVERE,
+                String.format(
+                    "Failed to insert user '%s'. Message: %s | SQLState: %s | ErrorCode: %d",
+                    username, e.getMessage(), e.getSQLState(), e.getErrorCode()
+                ),
+                e
+            );
+
+            // Attempt rollback – log but do not swallow any secondary exception
+            try {
+                connection.rollback();
+                LOGGER.warning("Transaction rolled back for user insertion: " + username);
+            } catch (SQLException rollbackEx) {
+                LOGGER.log(Level.SEVERE,
+                    "Rollback failed! Message: " + rollbackEx.getMessage(), rollbackEx);
+            }
+
+            // ----------------------------------------------------------------
+            // 2. Re-throw as DataAccessException with original cause
+            // ----------------------------------------------------------------
+            throw new DataAccessException(
+                "Could not insert user '" + username + "': " + e.getMessage(),
+                e
+            );
+
+        } finally {
+            // Restore original auto-commit setting
+            try {
+                connection.setAutoCommit(autoCommit);
+            } catch (SQLException ex) {
+                LOGGER.log(Level.WARNING, "Could not restore auto-commit state.", ex);
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Demo main
+    // -------------------------------------------------------------------------
+
+    public static void main(String[] args) {
+        DatabaseAccessExample dao = new DatabaseAccessExample();
+
+        // Replace with real JDBC URL / credentials to run against an actual DB.
+        String jdbcUrl  = "jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1";
+        String user     = "sa";
+        String password = "";
+
+        try (Connection conn = DriverManager.getConnection(jdbcUrl, user, password)) {
+
+            // Create a minimal table for the demo
+            conn.createStatement().execute(
+                "CREATE TABLE IF NOT EXISTS users ("
+                    + "id       INT AUTO_INCREMENT PRIMARY KEY,"
+                    + "username VARCHAR(100) NOT NULL,"
+                    + "email    VARCHAR(200),"
+                    + "status   VARCHAR(50)"
+                    + ")"
+            );
+
+            // Insert a record
+            dao.insertUser(conn, "alice", "alice@example.com");
+
+            // Query records
+            List<String> activeUsers = dao.findUsersByStatus(conn, "ACTIVE");
+            System.out.println("Active users: " + activeUsers);
+
+            // Trigger a DataAccessException by querying a non-existent table
+            try {
+                conn.createStatement().execute("DROP TABLE users");
+                dao.findUsersByStatus(conn, "ACTIVE"); // table gone → SQLException
+            } catch (DataAccessException dae) {
+                System.err.println("Caught DataAccessException: " + dae.getMessage());
+                System.err.println("  errorCode : " + dae.getErrorCode());
+                System.err.println("  sqlState  : " + dae.getSqlState());
+                System.err.println("  cause     : " + dae.getCause().getClass().getName());
+            }
+
+        } catch (SQLException e) {
+            LOGGER.log(Level.SEVERE, "Connection setup failed: " + e.getMessage(), e);
+        }
+    }
+}
+```

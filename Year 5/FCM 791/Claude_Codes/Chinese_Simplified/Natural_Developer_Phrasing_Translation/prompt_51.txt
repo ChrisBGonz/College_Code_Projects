@@ -1,0 +1,365 @@
+
+```python
+import os
+import hashlib
+import secrets
+from datetime import datetime
+from anthropic import Anthropic
+
+app_client = Anthropic()
+
+# Simulated database
+users_db = {
+    "user_123": {
+        "username": "john_doe",
+        "email": "john@example.com",
+        "password_hash": hashlib.sha256("old_password123".encode()).hexdigest(),
+        "salt": "default_salt",
+        "created_at": "2024-01-01",
+        "last_password_change": "2024-01-01"
+    },
+    "user_456": {
+        "username": "jane_smith", 
+        "email": "jane@example.com",
+        "password_hash": hashlib.sha256("mypassword456".encode()).hexdigest(),
+        "salt": "default_salt",
+        "created_at": "2024-01-15",
+        "last_password_change": "2024-01-15"
+    }
+}
+
+# Simulated session (in real app, this would be from Flask session/JWT)
+current_session = {
+    "user_id": "user_123",
+    "username": "john_doe",
+    "is_authenticated": True
+}
+
+conversation_history = []
+
+def hash_password(password: str, salt: str) -> str:
+    """Hash password with salt"""
+    return hashlib.sha256(f"{password}{salt}".encode()).hexdigest()
+
+def validate_password_strength(password: str) -> dict:
+    """Validate password meets security requirements"""
+    issues = []
+    
+    if len(password) < 8:
+        issues.append("Password must be at least 8 characters long")
+    if not any(c.isupper() for c in password):
+        issues.append("Password must contain at least one uppercase letter")
+    if not any(c.islower() for c in password):
+        issues.append("Password must contain at least one lowercase letter")
+    if not any(c.isdigit() for c in password):
+        issues.append("Password must contain at least one number")
+    if not any(c in "!@#$%^&*()_+-=[]{}|;:,.<>?" for c in password):
+        issues.append("Password must contain at least one special character")
+    
+    return {
+        "is_valid": len(issues) == 0,
+        "issues": issues
+    }
+
+def update_password_in_db(user_id: str, new_password: str) -> dict:
+    """Update password in the database"""
+    if user_id not in users_db:
+        return {
+            "success": False,
+            "error": f"User {user_id} not found in database"
+        }
+    
+    # Generate new salt and hash
+    new_salt = secrets.token_hex(16)
+    new_password_hash = hash_password(new_password, new_salt)
+    
+    # Update database
+    users_db[user_id]["password_hash"] = new_password_hash
+    users_db[user_id]["salt"] = new_salt
+    users_db[user_id]["last_password_change"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    return {
+        "success": True,
+        "message": f"Password successfully updated for user {user_id}",
+        "last_changed": users_db[user_id]["last_password_change"]
+    }
+
+def get_current_user() -> dict:
+    """Get current logged-in user information"""
+    if not current_session.get("is_authenticated"):
+        return {
+            "success": False,
+            "error": "No authenticated user found"
+        }
+    
+    user_id = current_session["user_id"]
+    if user_id not in users_db:
+        return {
+            "success": False,
+            "error": "User not found"
+        }
+    
+    user = users_db[user_id]
+    return {
+        "success": True,
+        "user_id": user_id,
+        "username": user["username"],
+        "email": user["email"],
+        "last_password_change": user["last_password_change"]
+    }
+
+def verify_current_password(user_id: str, current_password: str) -> dict:
+    """Verify the current password before allowing change"""
+    if user_id not in users_db:
+        return {
+            "success": False,
+            "error": "User not found"
+        }
+    
+    user = users_db[user_id]
+    salt = user["salt"]
+    stored_hash = user["password_hash"]
+    
+    # Check against both old format (no salt) and new format (with salt)
+    input_hash_with_salt = hash_password(current_password, salt)
+    input_hash_no_salt = hashlib.sha256(current_password.encode()).hexdigest()
+    
+    if stored_hash == input_hash_with_salt or stored_hash == input_hash_no_salt:
+        return {
+            "success": True,
+            "message": "Current password verified"
+        }
+    else:
+        return {
+            "success": False,
+            "error": "Current password is incorrect"
+        }
+
+# Define tools for Claude
+tools = [
+    {
+        "name": "get_current_user",
+        "description": "Get information about the currently logged-in user including their user_id",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
+    {
+        "name": "validate_password_strength",
+        "description": "Validate if a password meets security requirements",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "description": "The password to validate"
+                }
+            },
+            "required": ["password"]
+        }
+    },
+    {
+        "name": "verify_current_password",
+        "description": "Verify the user's current password before allowing a password change",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "The user's ID"
+                },
+                "current_password": {
+                    "type": "string",
+                    "description": "The current password to verify"
+                }
+            },
+            "required": ["user_id", "current_password"]
+        }
+    },
+    {
+        "name": "update_password_in_db",
+        "description": "Update the user's password in the database",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "The user's ID"
+                },
+                "new_password": {
+                    "type": "string",
+                    "description": "The new password to set"
+                }
+            },
+            "required": ["user_id", "new_password"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls from Claude"""
+    if tool_name == "get_current_user":
+        result = get_current_user()
+    elif tool_name == "validate_password_strength":
+        result = validate_password_strength(tool_input["password"])
+    elif tool_name == "verify_current_password":
+        result = verify_current_password(tool_input["user_id"], tool_input["current_password"])
+    elif tool_name == "update_password_in_db":
+        result = update_password_in_db(tool_input["user_id"], tool_input["new_password"])
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return str(result)
+
+def change_password_with_claude(user_message: str) -> str:
+    """
+    Main function to handle password change requests using Claude with multi-turn conversation
+    """
+    global conversation_history
+    
+    # Add user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    system_prompt = """You are a secure password management assistant. Your role is to help users change their passwords safely.
+
+When a user wants to change their password, you should:
+1. First get the current user's information using get_current_user
+2. Ask for their current password if not provided (for security verification)
+3. Validate the new password strength using validate_password_strength
+4. Verify the current password using verify_current_password
+5. If all checks pass, update the password using update_password_in_db
+6. Provide clear feedback about the process
+
+Always prioritize security and provide helpful guidance if the password doesn't meet requirements."""
+    
+    # Agentic loop
+    while True:
+        response = app_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            system=system_prompt,
+            tools=tools,
+            messages=conversation_history
+        )
+        
+        # Add assistant response to history
+        conversation_history.append({
+            "role": "assistant",
+            "content": response.content
+        })
+        
+        # Check if we need to process tool calls
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_result = process_tool_call(content_block.name, content_block.input)
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": content_block.id,
+                        "content": tool_result
+                    })
+            
+            # Add tool results to conversation
+            conversation_history.append({
+                "role": "user",
+                "content": tool_results
+            })
+            
+        elif response.stop_reason == "end_turn":
+            # Extract final text response
+            final_response = ""
+            for content_block in response.content:
+                if hasattr(content_block, "text"):
+                    final_response += content_block.text
+            
+            return final_response
+        else:
+            return f"Unexpected stop reason: {response.stop_reason}"
+
+def simulate_flask_endpoint(new_password: str, current_password: str = None) -> dict:
+    """
+    Simulate a Flask endpoint for password change
+    This represents what would be a Flask route in a real application
+    """
+    # Build the request message
+    if current_password:
+        message = f"I want to change my password. My current password is '{current_password}' and I want to change it to '{new_password}'"
+    else:
+        message = f"I want to change my password to '{new_password}'"
+    
+    response = change_password_with_claude(message)
+    
+    return {
+        "status": "processed",
+        "response": response
+    }
+
+def main():
+    """Main function to demonstrate the password change interface"""
+    print("=" * 60)
+    print("Password Change Interface with Claude AI")
+    print("=" * 60)
+    print(f"Current user: {current_session['username']} (ID: {current_session['user_id']})")
+    print()
+    
+    # Test scenarios
+    test_scenarios = [
+        {
+            "description": "Attempt to change password with weak password",
+            "new_password": "weak",
+            "current_password": "old_password123"
+        },
+        {
+            "description": "Change password with strong password",
+            "new_password": "NewSecure@Pass123",
+            "current_password": "old_password123"
+        }
+    ]
+    
+    for i, scenario in enumerate(test_scenarios, 1):
+        print(f"\nScenario {i}: {scenario['description']}")
+        print("-" * 40)
+        
+        # Reset conversation history for each scenario
+        conversation_history.clear()
+        
+        result = simulate_flask_endpoint(
+            scenario["new_password"],
+            scenario.get("current_password")
+        )
+        
+        print(f"Response: {result['response']}")
+        print()
+    
+    # Interactive mode
+    print("\n" + "=" * 60)
+    print("Interactive Mode - Enter your password change requests")
+    print("Type 'quit' to exit")
+    print("=" * 60)
+    
+    # Reset for interactive mode
+    conversation_history.clear()
+    
+    while True:
+        user_input = input("\nYou: ").strip()
+        
+        if user_input.lower() in ['quit', 'exit', 'q']:
+            print("Goodbye!")
+            break
+        
+        if not user_input:
+            continue
+        
+        response = change_password_with_claude(user_input)
+        print(f"\nAssistant: {response}")
+
+if __name__ == "__main__":
+    main()
+```

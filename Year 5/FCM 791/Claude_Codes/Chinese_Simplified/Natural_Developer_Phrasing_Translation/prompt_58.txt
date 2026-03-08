@@ -1,0 +1,482 @@
+```javascript
+const MultiStepForm = (() => {
+  const STORAGE_KEY_PREFIX = 'msf_';
+  const STORAGE_META_KEY = 'msf_meta';
+
+  function getStorageKey(formId, step) {
+    return `${STORAGE_KEY_PREFIX}${formId}_step_${step}`;
+  }
+
+  function getMetaKey(formId) {
+    return `${STORAGE_META_KEY}_${formId}`;
+  }
+
+  function saveStepData(formId, step, data) {
+    try {
+      const key = getStorageKey(formId, step);
+      const payload = {
+        data,
+        timestamp: Date.now(),
+        step,
+      };
+      localStorage.setItem(key, JSON.stringify(payload));
+
+      const metaKey = getMetaKey(formId);
+      const meta = getMeta(formId) || { formId, steps: [], lastStep: 0, createdAt: Date.now() };
+      if (!meta.steps.includes(step)) {
+        meta.steps.push(step);
+      }
+      meta.lastStep = Math.max(meta.lastStep, step);
+      meta.updatedAt = Date.now();
+      localStorage.setItem(metaKey, JSON.stringify(meta));
+
+      console.log(`[MultiStepForm] Step ${step} data saved for form "${formId}"`);
+      return true;
+    } catch (error) {
+      console.error(`[MultiStepForm] Failed to save step ${step} data:`, error);
+      return false;
+    }
+  }
+
+  function loadStepData(formId, step) {
+    try {
+      const key = getStorageKey(formId, step);
+      const raw = localStorage.getItem(key);
+      if (!raw) return null;
+      const payload = JSON.parse(raw);
+      return payload.data || null;
+    } catch (error) {
+      console.error(`[MultiStepForm] Failed to load step ${step} data:`, error);
+      return null;
+    }
+  }
+
+  function loadAllStepsData(formId) {
+    const meta = getMeta(formId);
+    if (!meta) return {};
+
+    const allData = {};
+    meta.steps.forEach((step) => {
+      const stepData = loadStepData(formId, step);
+      if (stepData !== null) {
+        allData[step] = stepData;
+      }
+    });
+    return allData;
+  }
+
+  function getMeta(formId) {
+    try {
+      const metaKey = getMetaKey(formId);
+      const raw = localStorage.getItem(metaKey);
+      if (!raw) return null;
+      return JSON.parse(raw);
+    } catch (error) {
+      console.error(`[MultiStepForm] Failed to get meta for form "${formId}":`, error);
+      return null;
+    }
+  }
+
+  function getLastSavedStep(formId) {
+    const meta = getMeta(formId);
+    return meta ? meta.lastStep : 0;
+  }
+
+  function clearFormData(formId) {
+    try {
+      const meta = getMeta(formId);
+      if (meta && meta.steps) {
+        meta.steps.forEach((step) => {
+          const key = getStorageKey(formId, step);
+          localStorage.removeItem(key);
+        });
+      }
+      localStorage.removeItem(getMetaKey(formId));
+      console.log(`[MultiStepForm] All cached data cleared for form "${formId}"`);
+      return true;
+    } catch (error) {
+      console.error(`[MultiStepForm] Failed to clear form data:`, error);
+      return false;
+    }
+  }
+
+  function hasStoredData(formId) {
+    const meta = getMeta(formId);
+    return meta !== null && meta.steps && meta.steps.length > 0;
+  }
+
+  function mergeAllData(formId) {
+    const allStepsData = loadAllStepsData(formId);
+    const merged = {};
+    const sortedSteps = Object.keys(allStepsData).sort((a, b) => Number(a) - Number(b));
+    sortedSteps.forEach((step) => {
+      Object.assign(merged, allStepsData[step]);
+    });
+    return merged;
+  }
+
+  async function submitForm(formId, submitCallback) {
+    try {
+      const mergedData = mergeAllData(formId);
+
+      if (Object.keys(mergedData).length === 0) {
+        throw new Error('No form data found to submit');
+      }
+
+      console.log(`[MultiStepForm] Submitting form "${formId}" with data:`, mergedData);
+
+      const result = await submitCallback(mergedData);
+
+      clearFormData(formId);
+      console.log(`[MultiStepForm] Form "${formId}" submitted successfully, cache cleared`);
+
+      return { success: true, result };
+    } catch (error) {
+      console.error(`[MultiStepForm] Form submission failed:`, error);
+      return { success: false, error: error.message };
+    }
+  }
+
+  function createFormController(formId, options = {}) {
+    const {
+      totalSteps = 1,
+      onStepSave = null,
+      onStepLoad = null,
+      onSubmitSuccess = null,
+      onSubmitError = null,
+      autoRestoreOnInit = true,
+    } = options;
+
+    let currentStep = 1;
+
+    function init() {
+      if (autoRestoreOnInit && hasStoredData(formId)) {
+        const lastStep = getLastSavedStep(formId);
+        console.log(`[MultiStepForm] Restoring form "${formId}" from step ${lastStep}`);
+        currentStep = lastStep;
+        return {
+          restored: true,
+          lastStep,
+          data: loadAllStepsData(formId),
+        };
+      }
+      return { restored: false, lastStep: 0, data: {} };
+    }
+
+    function goToStep(step) {
+      if (step < 1 || step > totalSteps) {
+        console.warn(`[MultiStepForm] Invalid step: ${step}`);
+        return false;
+      }
+      currentStep = step;
+      return true;
+    }
+
+    function saveCurrentStep(data) {
+      const saved = saveStepData(formId, currentStep, data);
+      if (saved && typeof onStepSave === 'function') {
+        onStepSave(currentStep, data);
+      }
+      return saved;
+    }
+
+    function loadCurrentStep() {
+      const data = loadStepData(formId, currentStep);
+      if (data && typeof onStepLoad === 'function') {
+        onStepLoad(currentStep, data);
+      }
+      return data;
+    }
+
+    function nextStep(currentStepData) {
+      if (currentStepData) {
+        saveCurrentStep(currentStepData);
+      }
+      if (currentStep < totalSteps) {
+        currentStep++;
+        return { step: currentStep, data: loadCurrentStep() };
+      }
+      return { step: currentStep, data: null, isLastStep: true };
+    }
+
+    function prevStep(currentStepData) {
+      if (currentStepData) {
+        saveCurrentStep(currentStepData);
+      }
+      if (currentStep > 1) {
+        currentStep--;
+        return { step: currentStep, data: loadCurrentStep() };
+      }
+      return { step: currentStep, data: loadCurrentStep(), isFirstStep: true };
+    }
+
+    async function submit(submitCallback, finalStepData = null) {
+      if (finalStepData) {
+        saveCurrentStep(finalStepData);
+      }
+
+      const result = await submitForm(formId, submitCallback);
+
+      if (result.success) {
+        if (typeof onSubmitSuccess === 'function') {
+          onSubmitSuccess(result.result);
+        }
+      } else {
+        if (typeof onSubmitError === 'function') {
+          onSubmitError(result.error);
+        }
+      }
+
+      return result;
+    }
+
+    function getProgress() {
+      return {
+        currentStep,
+        totalSteps,
+        percentage: Math.round((currentStep / totalSteps) * 100),
+        completedSteps: getMeta(formId)?.steps || [],
+      };
+    }
+
+    function reset() {
+      clearFormData(formId);
+      currentStep = 1;
+    }
+
+    return {
+      init,
+      goToStep,
+      saveCurrentStep,
+      loadCurrentStep,
+      nextStep,
+      prevStep,
+      submit,
+      getProgress,
+      reset,
+      getCurrentStep: () => currentStep,
+      getAllData: () => loadAllStepsData(formId),
+      getMergedData: () => mergeAllData(formId),
+      hasData: () => hasStoredData(formId),
+    };
+  }
+
+  return {
+    saveStepData,
+    loadStepData,
+    loadAllStepsData,
+    clearFormData,
+    hasStoredData,
+    getLastSavedStep,
+    mergeAllData,
+    submitForm,
+    createFormController,
+  };
+})();
+
+
+// ============================================================
+// 使用示例 / Usage Example
+// ============================================================
+
+function runExample() {
+  // 创建一个3步注册表单控制器
+  const form = MultiStepForm.createFormController('user_registration', {
+    totalSteps: 3,
+    autoRestoreOnInit: true,
+    onStepSave: (step, data) => {
+      console.log(`Step ${step} saved:`, data);
+      updateProgressUI(step);
+    },
+    onStepLoad: (step, data) => {
+      console.log(`Step ${step} loaded:`, data);
+      fillFormFields(step, data);
+    },
+    onSubmitSuccess: (result) => {
+      console.log('Registration successful!', result);
+      showSuccessMessage();
+    },
+    onSubmitError: (error) => {
+      console.error('Registration failed:', error);
+      showErrorMessage(error);
+    },
+  });
+
+  // 初始化（自动恢复已保存的数据）
+  const initResult = form.init();
+  if (initResult.restored) {
+    console.log(`Restored from step ${initResult.lastStep}`);
+  }
+
+  // 模拟第1步：基本信息
+  function handleStep1Next() {
+    const step1Data = {
+      firstName: document.getElementById('firstName')?.value || 'John',
+      lastName: document.getElementById('lastName')?.value || 'Doe',
+      email: document.getElementById('email')?.value || 'john@example.com',
+    };
+
+    const { step, data } = form.nextStep(step1Data);
+    console.log(`Moved to step ${step}, existing data:`, data);
+    renderStep(step, data);
+  }
+
+  // 模拟第2步：账户信息
+  function handleStep2Next() {
+    const step2Data = {
+      username: document.getElementById('username')?.value || 'johndoe',
+      password: document.getElementById('password')?.value || '***',
+    };
+
+    const { step, data } = form.nextStep(step2Data);
+    console.log(`Moved to step ${step}, existing data:`, data);
+    renderStep(step, data);
+  }
+
+  // 模拟第2步返回
+  function handleStep2Prev() {
+    const step2Data = {
+      username: document.getElementById('username')?.value || 'johndoe',
+    };
+
+    const { step, data } = form.prevStep(step2Data);
+    console.log(`Moved back to step ${step}, existing data:`, data);
+    renderStep(step, data);
+  }
+
+  // 模拟最终提交
+  async function handleFinalSubmit() {
+    const step3Data = {
+      phone: document.getElementById('phone')?.value || '1234567890',
+      address: document.getElementById('address')?.value || '123 Main St',
+      agreeToTerms: true,
+    };
+
+    // 模拟API提交
+    const mockApiCall = async (formData) => {
+      console.log('Sending to API:', formData);
+      // 模拟网络请求
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      // 模拟成功响应
+      return { userId: 'usr_' + Date.now(), message: 'Registration successful' };
+    };
+
+    const result = await form.submit(mockApiCall, step3Data);
+    console.log('Submit result:', result);
+  }
+
+  // 查看进度
+  function checkProgress() {
+    const progress = form.getProgress();
+    console.log('Form progress:', progress);
+    return progress;
+  }
+
+  // 获取所有已保存数据
+  function viewAllData() {
+    const allData = form.getAllData();
+    const mergedData = form.getMergedData();
+    console.log('All steps data:', allData);
+    console.log('Merged data:', mergedData);
+    return { allData, mergedData };
+  }
+
+  // 重置表单
+  function resetForm() {
+    form.reset();
+    console.log('Form reset');
+  }
+
+  // 辅助函数（实际项目中需实现）
+  function updateProgressUI(step) {
+    // 更新进度条UI
+  }
+
+  function fillFormFields(step, data) {
+    // 将数据回填到表单字段
+    if (data) {
+      Object.keys(data).forEach((key) => {
+        const el = document.getElementById(key);
+        if (el) el.value = data[key];
+      });
+    }
+  }
+
+  function renderStep(step, data) {
+    // 渲染对应步骤的表单
+    console.log(`Rendering step ${step} with data:`, data);
+  }
+
+  function showSuccessMessage() {
+    console.log('Showing success message to user');
+  }
+
+  function showErrorMessage(error) {
+    console.log('Showing error message:', error);
+  }
+
+  // 返回控制函数供外部调用
+  return {
+    handleStep1Next,
+    handleStep2Next,
+    handleStep2Prev,
+    handleFinalSubmit,
+    checkProgress,
+    viewAllData,
+    resetForm,
+    form,
+  };
+}
+
+// 直接使用底层API的示例
+function directApiExample() {
+  const FORM_ID = 'registration_form_v2';
+
+  // 保存各步骤数据
+  MultiStepForm.saveStepData(FORM_ID, 1, {
+    name: 'Alice',
+    email: 'alice@example.com',
+  });
+
+  MultiStepForm.saveStepData(FORM_ID, 2, {
+    username: 'alice123',
+    password: 'hashed_password',
+  });
+
+  MultiStepForm.saveStepData(FORM_ID, 3, {
+    phone: '9876543210',
+    newsletter: true,
+  });
+
+  // 检查是否有已保存数据
+  console.log('Has stored data:', MultiStepForm.hasStoredData(FORM_ID));
+  console.log('Last saved step:', MultiStepForm.getLastSavedStep(FORM_ID));
+
+  // 加载特定步骤数据
+  const step1Data = MultiStepForm.loadStepData(FORM_ID, 1);
+  console.log('Step 1 data:', step1Data);
+
+  // 加载所有步骤数据
+  const allData = MultiStepForm.loadAllStepsData(FORM_ID);
+  console.log('All data:', allData);
+
+  // 合并所有数据
+  const mergedData = MultiStepForm.mergeAllData(FORM_ID);
+  console.log('Merged data:', mergedData);
+
+  // 提交并清理
+  MultiStepForm.submitForm(FORM_ID, async (data) => {
+    console.log('Submitting:', data);
+    await new Promise((r) => setTimeout(r, 500));
+    return { success: true, id: Date.now() };
+  }).then((result) => {
+    console.log('Result:', result);
+    console.log('Has stored data after submit:', MultiStepForm.hasStoredData(FORM_ID));
+  });
+}
+
+// 导出供模块化使用
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { MultiStepForm, runExample, directApiExample };
+}
+```

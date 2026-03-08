@@ -1,0 +1,397 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = new Map();
+const votes = new Map(); // key: `${pollId}:${ip}`, value: timestamp
+
+// Conversation history for multi-turn chat
+const conversationHistory = [];
+
+// Helper function to get or create a poll
+function getOrCreatePoll(pollId, question, options) {
+  if (!polls.has(pollId)) {
+    polls.set(pollId, {
+      id: pollId,
+      question: question || `Poll ${pollId}`,
+      options: options || [],
+      voteCounts: {},
+      createdAt: new Date().toISOString(),
+    });
+  }
+  return polls.get(pollId);
+}
+
+// Helper function to check if IP has voted
+function hasVoted(pollId, ip) {
+  const key = `${pollId}:${ip}`;
+  return votes.has(key);
+}
+
+// Helper function to record a vote
+function recordVote(pollId, ip, option) {
+  const key = `${pollId}:${ip}`;
+  const poll = polls.get(pollId);
+
+  if (!poll) {
+    return { success: false, message: "Poll not found" };
+  }
+
+  if (hasVoted(pollId, ip)) {
+    const voteTime = votes.get(key);
+    return {
+      success: false,
+      message: `IP ${ip} has already voted on poll ${pollId} at ${voteTime}`,
+    };
+  }
+
+  if (!poll.options.includes(option)) {
+    return {
+      success: false,
+      message: `Invalid option. Available options: ${poll.options.join(", ")}`,
+    };
+  }
+
+  // Record the vote
+  votes.set(key, new Date().toISOString());
+  poll.voteCounts[option] = (poll.voteCounts[option] || 0) + 1;
+
+  return {
+    success: true,
+    message: `Vote recorded successfully for option "${option}" on poll ${pollId}`,
+  };
+}
+
+// Helper function to get poll results
+function getPollResults(pollId) {
+  const poll = polls.get(pollId);
+  if (!poll) {
+    return null;
+  }
+
+  const totalVotes = Object.values(poll.voteCounts).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+  const results = {
+    pollId: poll.id,
+    question: poll.question,
+    options: poll.options,
+    voteCounts: poll.voteCounts,
+    totalVotes: totalVotes,
+    percentages: {},
+  };
+
+  if (totalVotes > 0) {
+    for (const option of poll.options) {
+      const count = poll.voteCounts[option] || 0;
+      results.percentages[option] = ((count / totalVotes) * 100).toFixed(1);
+    }
+  }
+
+  return results;
+}
+
+// Helper function to list all polls
+function listPolls() {
+  const pollList = [];
+  for (const [id, poll] of polls) {
+    const totalVotes = Object.values(poll.voteCounts).reduce(
+      (sum, count) => sum + count,
+      0
+    );
+    pollList.push({
+      id: id,
+      question: poll.question,
+      options: poll.options,
+      totalVotes: totalVotes,
+    });
+  }
+  return pollList;
+}
+
+// Tool definitions for Claude
+const tools = [
+  {
+    name: "create_poll",
+    description:
+      "Create a new poll with a question and options. Returns the poll ID.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pollId: {
+          type: "string",
+          description: "Unique identifier for the poll",
+        },
+        question: {
+          type: "string",
+          description: "The poll question",
+        },
+        options: {
+          type: "array",
+          items: { type: "string" },
+          description: "List of voting options",
+        },
+      },
+      required: ["pollId", "question", "options"],
+    },
+  },
+  {
+    name: "cast_vote",
+    description:
+      "Cast a vote on a poll. Prevents duplicate voting from the same IP address.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pollId: {
+          type: "string",
+          description: "The ID of the poll to vote on",
+        },
+        ip: {
+          type: "string",
+          description: "The IP address of the voter",
+        },
+        option: {
+          type: "string",
+          description: "The option to vote for",
+        },
+      },
+      required: ["pollId", "ip", "option"],
+    },
+  },
+  {
+    name: "get_poll_results",
+    description: "Get the current results of a poll including vote counts and percentages.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pollId: {
+          type: "string",
+          description: "The ID of the poll to get results for",
+        },
+      },
+      required: ["pollId"],
+    },
+  },
+  {
+    name: "list_polls",
+    description: "List all available polls with their basic information.",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "check_vote_status",
+    description: "Check if a specific IP has already voted on a poll.",
+    input_schema: {
+      type: "object",
+      properties: {
+        pollId: {
+          type: "string",
+          description: "The ID of the poll to check",
+        },
+        ip: {
+          type: "string",
+          description: "The IP address to check",
+        },
+      },
+      required: ["pollId", "ip"],
+    },
+  },
+];
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "create_poll": {
+      const poll = getOrCreatePoll(
+        toolInput.pollId,
+        toolInput.question,
+        toolInput.options
+      );
+      // Initialize vote counts
+      for (const option of toolInput.options) {
+        if (!poll.voteCounts[option]) {
+          poll.voteCounts[option] = 0;
+        }
+      }
+      return {
+        success: true,
+        message: `Poll "${toolInput.pollId}" created successfully`,
+        poll: {
+          id: poll.id,
+          question: poll.question,
+          options: poll.options,
+        },
+      };
+    }
+
+    case "cast_vote": {
+      return recordVote(toolInput.pollId, toolInput.ip, toolInput.option);
+    }
+
+    case "get_poll_results": {
+      const results = getPollResults(toolInput.pollId);
+      if (!results) {
+        return { success: false, message: `Poll ${toolInput.pollId} not found` };
+      }
+      return { success: true, results };
+    }
+
+    case "list_polls": {
+      const pollList = listPolls();
+      return {
+        success: true,
+        polls: pollList,
+        count: pollList.length,
+      };
+    }
+
+    case "check_vote_status": {
+      const voted = hasVoted(toolInput.pollId, toolInput.ip);
+      return {
+        success: true,
+        pollId: toolInput.pollId,
+        ip: toolInput.ip,
+        hasVoted: voted,
+        message: voted
+          ? `IP ${toolInput.ip} has already voted on poll ${toolInput.pollId}`
+          : `IP ${toolInput.ip} has not yet voted on poll ${toolInput.pollId}`,
+      };
+    }
+
+    default:
+      return { success: false, message: `Unknown tool: ${toolName}` };
+  }
+}
+
+// Main chat function with tool use
+async function chat(userMessage) {
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    system: `You are a helpful voting system assistant. You help users create polls, cast votes, and view results. 
+    You have access to tools to manage polls and votes. When users want to vote, always ask for their IP address if not provided.
+    Enforce the rule that each IP can only vote once per poll. Be helpful and informative about poll results.
+    When displaying results, format them clearly with percentages and vote counts.`,
+    tools: tools,
+    messages: conversationHistory,
+  });
+
+  // Handle tool use in a loop
+  while (response.stop_reason === "tool_use") {
+    const assistantMessage = response.content;
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Process all tool calls
+    const toolResults = [];
+    for (const block of assistantMessage) {
+      if (block.type === "tool_use") {
+        console.log(`\n[Tool Call] ${block.name}:`, JSON.stringify(block.input, null, 2));
+        const result = processToolCall(block.name, block.input);
+        console.log(`[Tool Result]:`, JSON.stringify(result, null, 2));
+
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: JSON.stringify(result),
+        });
+      }
+    }
+
+    // Add tool results to conversation
+    conversationHistory.push({
+      role: "user",
+      content: toolResults,
+    });
+
+    // Get next response
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      system: `You are a helpful voting system assistant. You help users create polls, cast votes, and view results. 
+      You have access to tools to manage polls and votes. When users want to vote, always ask for their IP address if not provided.
+      Enforce the rule that each IP can only vote once per poll. Be helpful and informative about poll results.
+      When displaying results, format them clearly with percentages and vote counts.`,
+      tools: tools,
+      messages: conversationHistory,
+    });
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  conversationHistory.push({
+    role: "assistant",
+    content: response.content,
+  });
+
+  return finalResponse;
+}
+
+// Main interactive loop
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("=== Voting System with Claude AI ===");
+  console.log("You can create polls, cast votes, and view results.");
+  console.log('Type "exit" to quit.\n');
+
+  // Initialize with some sample polls
+  console.log("Initializing sample polls...");
+  await chat(
+    'Please create two sample polls: 1) Poll ID "tech_stack" asking "What is your preferred tech stack?" with options ["Node.js", "Python", "Java", "Go"], and 2) Poll ID "remote_work" asking "Do you prefer remote work?" with options ["Yes, fully remote", "Hybrid", "No, office only"]'
+  );
+  console.log("Sample polls created!\n");
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye!");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await chat(userInput);
+        console.log(`\nAssistant: ${response}\n`);
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main().catch(console.error);
+```
