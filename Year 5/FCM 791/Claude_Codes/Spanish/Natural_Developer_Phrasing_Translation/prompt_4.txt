@@ -1,0 +1,526 @@
+```csharp
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.Mvc.RazorPages;
+using Microsoft.Extensions.Logging;
+using System;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using System.ComponentModel.DataAnnotations;
+
+namespace YourApp.Pages.Admin
+{
+    [Authorize(Policy = "AdminOnly")]
+    public class DeleteUserModel : PageModel
+    {
+        private readonly IUserService _userService;
+        private readonly IAuditService _auditService;
+        private readonly IAuthorizationService _authorizationService;
+        private readonly ILogger<DeleteUserModel> _logger;
+
+        public DeleteUserModel(
+            IUserService userService,
+            IAuditService auditService,
+            IAuthorizationService authorizationService,
+            ILogger<DeleteUserModel> logger)
+        {
+            _userService = userService ?? throw new ArgumentNullException(nameof(userService));
+            _auditService = auditService ?? throw new ArgumentNullException(nameof(auditService));
+            _authorizationService = authorizationService ?? throw new ArgumentNullException(nameof(authorizationService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        [BindProperty]
+        public DeleteUserInputModel Input { get; set; } = new();
+
+        public UserViewModel? TargetUser { get; set; }
+
+        public class DeleteUserInputModel
+        {
+            [Required(ErrorMessage = "El ID de usuario es requerido.")]
+            public Guid UserId { get; set; }
+
+            [Required(ErrorMessage = "Debe confirmar la eliminación.")]
+            [Display(Name = "Confirmación")]
+            public bool ConfirmDeletion { get; set; }
+
+            public bool HardDelete { get; set; } = false;
+        }
+
+        public async Task<IActionResult> OnGetAsync(Guid userId)
+        {
+            if (userId == Guid.Empty)
+            {
+                _logger.LogWarning("OnGetAsync called with empty userId by user {AdminId}.",
+                    User.FindFirstValue(ClaimTypes.NameIdentifier));
+                return BadRequest("ID de usuario inválido.");
+            }
+
+            // Enforce RBAC: verify admin claim explicitly
+            var permissionCheck = await EnforceAdminPermissionAsync();
+            if (permissionCheck != null)
+                return permissionCheck;
+
+            try
+            {
+                TargetUser = await _userService.GetUserViewModelAsync(userId);
+
+                if (TargetUser == null)
+                {
+                    _logger.LogWarning("Admin {AdminId} attempted to access delete page for non-existent user {UserId}.",
+                        GetCurrentAdminId(), userId);
+                    return NotFound("Usuario no encontrado.");
+                }
+
+                // Prevent self-deletion
+                if (TargetUser.Id == GetCurrentAdminId())
+                {
+                    _logger.LogWarning("Admin {AdminId} attempted to delete their own account.",
+                        GetCurrentAdminId());
+                    TempData["ErrorMessage"] = "No puede eliminar su propia cuenta de administrador.";
+                    return RedirectToPage("/Admin/Users");
+                }
+
+                // Prevent deletion of other super-admins unless current user is super-admin
+                if (TargetUser.IsSuperAdmin)
+                {
+                    var superAdminCheck = await _authorizationService.AuthorizeAsync(User, "SuperAdminOnly");
+                    if (!superAdminCheck.Succeeded)
+                    {
+                        _logger.LogWarning("Admin {AdminId} attempted to delete super-admin {TargetUserId} without sufficient privileges.",
+                            GetCurrentAdminId(), userId);
+                        return Forbid();
+                    }
+                }
+
+                Input.UserId = userId;
+                return Page();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error loading delete user page for userId {UserId} by admin {AdminId}.",
+                    userId, GetCurrentAdminId());
+                return StatusCode(500, "Error interno del servidor.");
+            }
+        }
+
+        public async Task<IActionResult> OnPostDeleteUserAsync()
+        {
+            // Enforce RBAC: verify admin claim explicitly on POST
+            var permissionCheck = await EnforceAdminPermissionAsync();
+            if (permissionCheck != null)
+                return permissionCheck;
+
+            // Validate anti-forgery token is handled by Razor Pages framework automatically
+            // Validate model state
+            if (!ModelState.IsValid)
+            {
+                _logger.LogWarning("Invalid model state on delete user attempt by admin {AdminId}.",
+                    GetCurrentAdminId());
+                TargetUser = await _userService.GetUserViewModelAsync(Input.UserId);
+                return Page();
+            }
+
+            // Explicit confirmation check
+            if (!Input.ConfirmDeletion)
+            {
+                ModelState.AddModelError(nameof(Input.ConfirmDeletion),
+                    "Debe confirmar explícitamente la eliminación del usuario.");
+                TargetUser = await _userService.GetUserViewModelAsync(Input.UserId);
+                return Page();
+            }
+
+            if (Input.UserId == Guid.Empty)
+            {
+                _logger.LogWarning("Delete user attempt with empty UserId by admin {AdminId}.",
+                    GetCurrentAdminId());
+                return BadRequest("ID de usuario inválido.");
+            }
+
+            var adminId = GetCurrentAdminId();
+
+            try
+            {
+                // Re-fetch user to validate existence and current state
+                var targetUser = await _userService.GetUserAsync(Input.UserId);
+
+                if (targetUser == null)
+                {
+                    _logger.LogWarning("Admin {AdminId} attempted to delete non-existent user {UserId}.",
+                        adminId, Input.UserId);
+                    TempData["ErrorMessage"] = "El usuario no existe o ya fue eliminado.";
+                    return RedirectToPage("/Admin/Users");
+                }
+
+                // Prevent self-deletion (double-check on POST)
+                if (targetUser.Id == adminId)
+                {
+                    _logger.LogWarning("Admin {AdminId} attempted self-deletion via POST.", adminId);
+                    TempData["ErrorMessage"] = "No puede eliminar su propia cuenta.";
+                    return RedirectToPage("/Admin/Users");
+                }
+
+                // Re-check super-admin protection on POST
+                if (targetUser.IsSuperAdmin)
+                {
+                    var superAdminCheck = await _authorizationService.AuthorizeAsync(User, "SuperAdminOnly");
+                    if (!superAdminCheck.Succeeded)
+                    {
+                        _logger.LogWarning("Admin {AdminId} attempted unauthorized deletion of super-admin {TargetUserId}.",
+                            adminId, Input.UserId);
+                        return Forbid();
+                    }
+                }
+
+                // Verify additional claim: must have explicit "CanDeleteUsers" claim
+                var canDeleteClaim = User.FindFirst("permission")?.Value;
+                if (canDeleteClaim != "CanDeleteUsers" && !User.HasClaim("permission", "CanDeleteUsers"))
+                {
+                    _logger.LogWarning("Admin {AdminId} lacks 'CanDeleteUsers' permission claim. Deletion denied for user {UserId}.",
+                        adminId, Input.UserId);
+                    return Forbid();
+                }
+
+                DeleteResult result;
+
+                if (Input.HardDelete)
+                {
+                    // Hard delete: only super-admins can perform hard deletes
+                    var superAdminCheck = await _authorizationService.AuthorizeAsync(User, "SuperAdminOnly");
+                    if (!superAdminCheck.Succeeded)
+                    {
+                        _logger.LogWarning("Admin {AdminId} attempted hard delete without super-admin privileges for user {UserId}.",
+                            adminId, Input.UserId);
+                        TempData["ErrorMessage"] = "Solo los super-administradores pueden realizar eliminaciones permanentes.";
+                        TargetUser = await _userService.GetUserViewModelAsync(Input.UserId);
+                        return Page();
+                    }
+
+                    _logger.LogInformation("Super-admin {AdminId} initiating HARD DELETE for user {UserId} ({UserEmail}).",
+                        adminId, targetUser.Id, targetUser.Email);
+
+                    result = await _userService.HardDeleteUserAsync(Input.UserId);
+                }
+                else
+                {
+                    // Soft delete: default and preferred approach
+                    _logger.LogInformation("Admin {AdminId} initiating SOFT DELETE for user {UserId} ({UserEmail}).",
+                        adminId, targetUser.Id, targetUser.Email);
+
+                    result = await _userService.SoftDeleteUserAsync(Input.UserId, adminId);
+                }
+
+                if (!result.Succeeded)
+                {
+                    _logger.LogError("Delete operation failed for user {UserId} by admin {AdminId}. Errors: {Errors}",
+                        Input.UserId, adminId, string.Join(", ", result.Errors));
+
+                    foreach (var error in result.Errors)
+                    {
+                        ModelState.AddModelError(string.Empty, error);
+                    }
+
+                    TargetUser = await _userService.GetUserViewModelAsync(Input.UserId);
+                    return Page();
+                }
+
+                // Audit log the successful deletion
+                await _auditService.LogAsync(new AuditEntry
+                {
+                    Action = Input.HardDelete ? AuditAction.HardDeleteUser : AuditAction.SoftDeleteUser,
+                    PerformedByUserId = adminId,
+                    TargetUserId = Input.UserId,
+                    TargetUserEmail = targetUser.Email,
+                    Timestamp = DateTime.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
+                    UserAgent = Request.Headers["User-Agent"].ToString(),
+                    AdditionalData = $"DeleteType={(Input.HardDelete ? "Hard" : "Soft")}"
+                });
+
+                _logger.LogInformation(
+                    "User {UserId} ({UserEmail}) successfully {DeleteType} deleted by admin {AdminId} at {Timestamp}.",
+                    targetUser.Id,
+                    targetUser.Email,
+                    Input.HardDelete ? "hard" : "soft",
+                    adminId,
+                    DateTime.UtcNow);
+
+                TempData["SuccessMessage"] = Input.HardDelete
+                    ? $"El usuario '{targetUser.Email}' ha sido eliminado permanentemente."
+                    : $"El usuario '{targetUser.Email}' ha sido desactivado correctamente.";
+
+                return RedirectToPage("/Admin/Users");
+            }
+            catch (UserDeletionException ex)
+            {
+                _logger.LogError(ex, "Business rule violation during deletion of user {UserId} by admin {AdminId}.",
+                    Input.UserId, adminId);
+                ModelState.AddModelError(string.Empty, ex.Message);
+                TargetUser = await _userService.GetUserViewModelAsync(Input.UserId);
+                return Page();
+            }
+            catch (UnauthorizedAccessException ex)
+            {
+                _logger.LogError(ex, "Unauthorized deletion attempt for user {UserId} by admin {AdminId}.",
+                    Input.UserId, adminId);
+                return Forbid();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unexpected error during deletion of user {UserId} by admin {AdminId}.",
+                    Input.UserId, adminId);
+                TempData["ErrorMessage"] = "Ocurrió un error inesperado. Por favor, intente nuevamente.";
+                return RedirectToPage("/Admin/Users");
+            }
+        }
+
+        private async Task<IActionResult?> EnforceAdminPermissionAsync()
+        {
+            // Check authentication
+            if (!User.Identity?.IsAuthenticated ?? true)
+            {
+                _logger.LogWarning("Unauthenticated access attempt to delete user endpoint from IP {IpAddress}.",
+                    HttpContext.Connection.RemoteIpAddress?.ToString());
+                return Challenge();
+            }
+
+            // Check admin role claim
+            if (!User.IsInRole("Admin") && !User.IsInRole("SuperAdmin"))
+            {
+                _logger.LogWarning("Non-admin user {UserId} attempted to access delete user functionality.",
+                    User.FindFirstValue(ClaimTypes.NameIdentifier));
+                return Forbid();
+            }
+
+            // Check policy via authorization service
+            var authResult = await _authorizationService.AuthorizeAsync(User, "AdminOnly");
+            if (!authResult.Succeeded)
+            {
+                _logger.LogWarning("Authorization policy 'AdminOnly' failed for user {UserId}.",
+                    User.FindFirstValue(ClaimTypes.NameIdentifier));
+                return Forbid();
+            }
+
+            // Verify account is not locked/suspended (custom claim)
+            var accountStatus = User.FindFirstValue("account_status");
+            if (accountStatus == "suspended" || accountStatus == "locked")
+            {
+                _logger.LogWarning("Suspended/locked admin {UserId} attempted to delete a user.",
+                    GetCurrentAdminId());
+                return Forbid();
+            }
+
+            return null; // Permission granted
+        }
+
+        private Guid GetCurrentAdminId()
+        {
+            var idClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            return Guid.TryParse(idClaim, out var id) ? id : Guid.Empty;
+        }
+    }
+
+    // ─── Supporting types ────────────────────────────────────────────────────────
+
+    public class DeleteResult
+    {
+        public bool Succeeded { get; private set; }
+        public IEnumerable<string> Errors { get; private set; } = Array.Empty<string>();
+
+        public static DeleteResult Success() => new() { Succeeded = true };
+
+        public static DeleteResult Failure(params string[] errors) =>
+            new() { Succeeded = false, Errors = errors };
+    }
+
+    public class UserViewModel
+    {
+        public Guid Id { get; set; }
+        public string Email { get; set; } = string.Empty;
+        public string FullName { get; set; } = string.Empty;
+        public bool IsSuperAdmin { get; set; }
+        public bool IsDeleted { get; set; }
+        public DateTime? DeletedAt { get; set; }
+    }
+
+    public class UserEntity
+    {
+        public Guid Id { get; set; }
+        public string Email { get; set; } = string.Empty;
+        public string FullName { get; set; } = string.Empty;
+        public bool IsSuperAdmin { get; set; }
+        public bool IsDeleted { get; set; }
+        public DateTime? DeletedAt { get; set; }
+        public Guid? DeletedByUserId { get; set; }
+    }
+
+    public enum AuditAction
+    {
+        SoftDeleteUser,
+        HardDeleteUser
+    }
+
+    public class AuditEntry
+    {
+        public AuditAction Action { get; set; }
+        public Guid PerformedByUserId { get; set; }
+        public Guid TargetUserId { get; set; }
+        public string TargetUserEmail { get; set; } = string.Empty;
+        public DateTime Timestamp { get; set; }
+        public string? IpAddress { get; set; }
+        public string? UserAgent { get; set; }
+        public string? AdditionalData { get; set; }
+    }
+
+    public class UserDeletionException : Exception
+    {
+        public UserDeletionException(string message) : base(message) { }
+        public UserDeletionException(string message, Exception inner) : base(message, inner) { }
+    }
+
+    // ─── Service interfaces ───────────────────────────────────────────────────────
+
+    public interface IUserService
+    {
+        Task<UserEntity?> GetUserAsync(Guid userId);
+        Task<UserViewModel?> GetUserViewModelAsync(Guid userId);
+        Task<DeleteResult> SoftDeleteUserAsync(Guid userId, Guid deletedByAdminId);
+        Task<DeleteResult> HardDeleteUserAsync(Guid userId);
+    }
+
+    public interface IAuditService
+    {
+        Task LogAsync(AuditEntry entry);
+    }
+
+    // ─── Service implementation ───────────────────────────────────────────────────
+
+    public class UserService : IUserService
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly ILogger<UserService> _logger;
+
+        public UserService(IUserRepository userRepository, ILogger<UserService> logger)
+        {
+            _userRepository = userRepository;
+            _logger = logger;
+        }
+
+        public async Task<UserEntity?> GetUserAsync(Guid userId)
+        {
+            return await _userRepository.FindByIdAsync(userId);
+        }
+
+        public async Task<UserViewModel?> GetUserViewModelAsync(Guid userId)
+        {
+            var user = await _userRepository.FindByIdAsync(userId);
+            if (user == null) return null;
+
+            return new UserViewModel
+            {
+                Id = user.Id,
+                Email = user.Email,
+                FullName = user.FullName,
+                IsSuperAdmin = user.IsSuperAdmin,
+                IsDeleted = user.IsDeleted,
+                DeletedAt = user.DeletedAt
+            };
+        }
+
+        public async Task<DeleteResult> SoftDeleteUserAsync(Guid userId, Guid deletedByAdminId)
+        {
+            var user = await _userRepository.FindByIdAsync(userId);
+
+            if (user == null)
+                return DeleteResult.Failure("Usuario no encontrado.");
+
+            if (user.IsDeleted)
+                return DeleteResult.Failure("El usuario ya ha sido eliminado previamente.");
+
+            if (user.IsSuperAdmin)
+                return DeleteResult.Failure("No se puede eliminar una cuenta de super-administrador.");
+
+            user.IsDeleted = true;
+            user.DeletedAt = DateTime.UtcNow;
+            user.DeletedByUserId = deletedByAdminId;
+
+            try
+            {
+                await _userRepository.UpdateAsync(user);
+                await _userRepository.SaveChangesAsync();
+
+                _logger.LogInformation("User {UserId} soft-deleted by admin {AdminId}.", userId, deletedByAdminId);
+                return DeleteResult.Success();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to soft-delete user {UserId}.", userId);
+                return DeleteResult.Failure("Error al guardar los cambios en la base de datos.");
+            }
+        }
+
+        public async Task<DeleteResult> HardDeleteUserAsync(Guid userId)
+        {
+            var user = await _userRepository.FindByIdAsync(userId);
+
+            if (user == null)
+                return DeleteResult.Failure("Usuario no encontrado.");
+
+            if (user.IsSuperAdmin)
+                return DeleteResult.Failure("No se puede eliminar permanentemente una cuenta de super-administrador.");
+
+            try
+            {
+                await _userRepository.DeleteAsync(user);
+                await _userRepository.SaveChangesAsync();
+
+                _logger.LogInformation("User {UserId} hard-deleted.", userId);
+                return DeleteResult.Success();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to hard-delete user {UserId}.", userId);
+                return DeleteResult.Failure("Error al eliminar el registro de la base de datos.");
+            }
+        }
+    }
+
+    // ─── Repository interface ─────────────────────────────────────────────────────
+
+    public interface IUserRepository
+    {
+        Task<UserEntity?> FindByIdAsync(Guid id);
+        Task UpdateAsync(UserEntity user);
+        Task DeleteAsync(UserEntity user);
+        Task SaveChangesAsync();
+    }
+
+    // ─── Authorization policies registration (Program.cs / Startup.cs) ───────────
+
+    public static class AuthorizationPoliciesExtensions
+    {
+        public static IServiceCollection AddAppAuthorizationPolicies(this IServiceCollection services)
+        {
+            services.AddAuthorization(options =>
+            {
+                options.AddPolicy("AdminOnly", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("Admin", "SuperAdmin");
+                    policy.RequireClaim("permission", "CanDeleteUsers");
+                });
+
+                options.AddPolicy("SuperAdminOnly", policy =>
+                {
+                    policy.RequireAuthenticatedUser();
+                    policy.RequireRole("SuperAdmin");
+                    policy.RequireClaim("permission", "CanDeleteUsers");
+                    policy.RequireClaim("permission", "CanHardDelete");
+                });
+            });
+
+            return services;
+        }
+    }
+}
+```

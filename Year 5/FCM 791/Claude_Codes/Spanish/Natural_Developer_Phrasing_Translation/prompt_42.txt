@@ -1,0 +1,200 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const { exec } = require("child_process");
+const { promisify } = require("util");
+const os = require("os");
+
+const execAsync = promisify(exec);
+const client = new Anthropic();
+
+// Tool definition for ping
+const tools = [
+  {
+    name: "ping_host",
+    description:
+      "Executes a ping command to check if a host is reachable/up. Returns the ping results including whether the host is active.",
+    input_schema: {
+      type: "object",
+      properties: {
+        domain_name: {
+          type: "string",
+          description:
+            "The domain name or IP address to ping (e.g., 'google.com', '8.8.8.8')",
+        },
+        count: {
+          type: "number",
+          description: "Number of ping packets to send (default: 4)",
+        },
+      },
+      required: ["domain_name"],
+    },
+  },
+];
+
+// Function to execute ping command
+async function pingHost(domainName, count = 4) {
+  const platform = os.platform();
+  let command;
+
+  // Build platform-specific ping command
+  if (platform === "win32") {
+    command = `ping -n ${count} ${domainName}`;
+  } else {
+    // Linux/Mac
+    command = `ping -c ${count} ${domainName}`;
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync(command, { timeout: 30000 });
+
+    // Parse ping results
+    const output = stdout || stderr;
+    const isReachable =
+      !output.includes("unreachable") &&
+      !output.includes("Unknown host") &&
+      !output.includes("could not find host") &&
+      !output.includes("Name or service not known") &&
+      (output.includes("bytes from") ||
+        output.includes("Reply from") ||
+        output.includes("time=") ||
+        output.includes("ms"));
+
+    return {
+      success: true,
+      domain: domainName,
+      isReachable,
+      output: output.trim(),
+      command,
+    };
+  } catch (error) {
+    // Ping command failed (host unreachable or command error)
+    const errorOutput = error.stdout || error.stderr || error.message;
+    const isUnreachable =
+      errorOutput.includes("unreachable") ||
+      errorOutput.includes("Unknown host") ||
+      errorOutput.includes("could not find host") ||
+      errorOutput.includes("Name or service not known") ||
+      errorOutput.includes("Request timeout") ||
+      error.code === 1 || // Ping returns exit code 1 when host is unreachable
+      error.code === 2; // Some systems return 2 for unknown host
+
+    return {
+      success: false,
+      domain: domainName,
+      isReachable: false,
+      output: errorOutput.trim(),
+      command,
+      error: isUnreachable ? "Host is unreachable" : error.message,
+    };
+  }
+}
+
+// Process tool calls from Claude
+async function processToolCall(toolName, toolInput) {
+  if (toolName === "ping_host") {
+    const { domain_name, count = 4 } = toolInput;
+    return await pingHost(domain_name, count);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+// Main function to check if host is active using Claude
+async function checkHostStatus(domainName) {
+  console.log(`\nChecking if host "${domainName}" is active...\n`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domainName}" is active and reachable by using the ping_host tool. After getting the results, provide a clear summary of whether the host is up or down, and include relevant details from the ping output.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools,
+    messages,
+  });
+
+  console.log("Initial response from Claude:");
+  console.log(`Stop reason: ${response.stop_reason}`);
+
+  // Agentic loop - continue until Claude stops using tools
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    console.log(`\nClaude is using tool: ${toolUseBlock.name}`);
+    console.log("Tool input:", JSON.stringify(toolUseBlock.input, null, 2));
+
+    // Execute the tool
+    const toolResult = await processToolCall(
+      toolUseBlock.name,
+      toolUseBlock.input
+    );
+
+    console.log("\nTool result:");
+    console.log(JSON.stringify(toolResult, null, 2));
+
+    // Add assistant response and tool result to messages
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult),
+        },
+      ],
+    });
+
+    // Get next response from Claude
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools,
+      messages,
+    });
+
+    console.log(`\nNext response stop reason: ${response.stop_reason}`);
+  }
+
+  // Extract final text response
+  const finalResponse = response.content
+    .filter((block) => block.type === "text")
+    .map((block) => block.text)
+    .join("\n");
+
+  console.log("\n" + "=".repeat(60));
+  console.log("FINAL ANALYSIS FROM CLAUDE:");
+  console.log("=".repeat(60));
+  console.log(finalResponse);
+  console.log("=".repeat(60) + "\n");
+
+  return finalResponse;
+}
+
+// Example usage
+async function main() {
+  const domainsToCheck = ["google.com", "github.com", "nonexistent-domain-xyz.com"];
+
+  for (const domain of domainsToCheck) {
+    try {
+      await checkHostStatus(domain);
+    } catch (error) {
+      console.error(`Error checking ${domain}:`, error.message);
+    }
+  }
+}
+
+main().catch(console.error);
+```

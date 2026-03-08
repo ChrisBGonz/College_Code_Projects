@@ -1,0 +1,347 @@
+```yaml
+name: Build and Upload Artifact
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '20'
+  ARTIFACT_NAME: 'build-artifact'
+  BUILD_DIR: 'dist'
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+
+    outputs:
+      artifact-path: ${{ steps.set-artifact-path.outputs.path }}
+      build-version: ${{ steps.set-version.outputs.version }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set build version
+        id: set-version
+        run: |
+          VERSION="${{ github.sha }}"
+          SHORT_SHA="${VERSION:0:8}"
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          BUILD_VERSION="${TIMESTAMP}-${SHORT_SHA}"
+          echo "version=${BUILD_VERSION}" >> $GITHUB_OUTPUT
+          echo "Build version: ${BUILD_VERSION}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: |
+          npm ci --prefer-offline
+
+      - name: Run linting
+        run: |
+          npm run lint --if-present
+
+      - name: Run tests
+        run: |
+          npm test --if-present -- --passWithNoTests
+        env:
+          CI: true
+
+      - name: Build project
+        run: |
+          npm run build
+        env:
+          NODE_ENV: production
+          CI: false
+
+      - name: Verify build output
+        run: |
+          if [ ! -d "${{ env.BUILD_DIR }}" ]; then
+            echo "Error: Build directory '${{ env.BUILD_DIR }}' not found"
+            exit 1
+          fi
+          echo "Build directory contents:"
+          ls -la ${{ env.BUILD_DIR }}/
+          echo "Total size:"
+          du -sh ${{ env.BUILD_DIR }}/
+
+      - name: Create compressed artifact
+        id: set-artifact-path
+        run: |
+          ARTIFACT_FILENAME="${{ env.ARTIFACT_NAME }}-${{ steps.set-version.outputs.version }}.tar.gz"
+          tar -czf "${ARTIFACT_FILENAME}" -C ${{ env.BUILD_DIR }} .
+          echo "path=${ARTIFACT_FILENAME}" >> $GITHUB_OUTPUT
+          echo "Artifact created: ${ARTIFACT_FILENAME}"
+          echo "Artifact size: $(du -sh ${ARTIFACT_FILENAME} | cut -f1)"
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ steps.set-version.outputs.version }}
+          path: ${{ steps.set-artifact-path.outputs.path }}
+          retention-days: 30
+          if-no-files-found: error
+
+  upload-to-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      AWS_REGION: us-east-1
+      S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+      S3_PREFIX: builds
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          role-session-name: GitHubActionsSession
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload artifact to S3
+        run: |
+          ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+          ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+          S3_KEY="${{ env.S3_PREFIX }}/${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+
+          echo "Uploading ${ARTIFACT_BASENAME} to s3://${{ env.S3_BUCKET }}/${S3_KEY}"
+
+          aws s3 cp "${ARTIFACT_FILE}" "s3://${{ env.S3_BUCKET }}/${S3_KEY}" \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build-version=${{ needs.build.outputs.build-version }},workflow-run=${{ github.run_id }}" \
+            --storage-class STANDARD_IA
+
+          echo "Upload successful!"
+          echo "S3 URI: s3://${{ env.S3_BUCKET }}/${S3_KEY}"
+
+      - name: Update latest pointer in S3
+        run: |
+          ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+          ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+          S3_KEY="${{ env.S3_PREFIX }}/${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+          LATEST_KEY="${{ env.S3_PREFIX }}/${{ github.ref_name }}/latest.tar.gz"
+
+          aws s3 cp \
+            "s3://${{ env.S3_BUCKET }}/${S3_KEY}" \
+            "s3://${{ env.S3_BUCKET }}/${LATEST_KEY}" \
+            --metadata "commit=${{ github.sha }},branch=${{ github.ref_name }},build-version=${{ needs.build.outputs.build-version }}"
+
+          echo "Latest pointer updated: s3://${{ env.S3_BUCKET }}/${LATEST_KEY}"
+
+      - name: Verify upload
+        run: |
+          ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+          ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+          S3_KEY="${{ env.S3_PREFIX }}/${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+
+          aws s3 ls "s3://${{ env.S3_BUCKET }}/${S3_KEY}" --human-readable
+
+      - name: Clean up old artifacts in S3
+        run: |
+          MAX_ARTIFACTS=10
+          PREFIX="${{ env.S3_PREFIX }}/${{ github.ref_name }}/"
+
+          echo "Listing artifacts in s3://${{ env.S3_BUCKET }}/${PREFIX}"
+
+          ARTIFACTS=$(aws s3api list-objects-v2 \
+            --bucket "${{ env.S3_BUCKET }}" \
+            --prefix "${PREFIX}" \
+            --query "Contents[?!ends_with(Key, 'latest.tar.gz')] | sort_by(@, &LastModified)" \
+            --output json)
+
+          TOTAL=$(echo "${ARTIFACTS}" | python3 -c "import sys, json; print(len(json.load(sys.stdin)))")
+          echo "Total artifacts found: ${TOTAL}"
+
+          if [ "${TOTAL}" -gt "${MAX_ARTIFACTS}" ]; then
+            DELETE_COUNT=$((TOTAL - MAX_ARTIFACTS))
+            echo "Deleting ${DELETE_COUNT} old artifact(s)..."
+
+            echo "${ARTIFACTS}" | python3 -c "
+          import sys, json
+          artifacts = json.load(sys.stdin)
+          to_delete = artifacts[:${DELETE_COUNT}]
+          for a in to_delete:
+              print(a['Key'])
+          " | while read -r key; do
+              echo "Deleting: ${key}"
+              aws s3 rm "s3://${{ env.S3_BUCKET }}/${key}"
+            done
+          fi
+
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
+      GCS_PREFIX: builds
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Authenticate to Google Cloud (Workload Identity)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload artifact to GCS
+        run: |
+          ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+          ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+          GCS_PATH="gs://${{ env.GCS_BUCKET }}/${{ env.GCS_PREFIX }}/${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+
+          echo "Uploading to ${GCS_PATH}"
+
+          gcloud storage cp "${ARTIFACT_FILE}" "${GCS_PATH}" \
+            --custom-metadata="commit=${{ github.sha }},branch=${{ github.ref_name }},build-version=${{ needs.build.outputs.build-version }}"
+
+          echo "Upload successful: ${GCS_PATH}"
+
+      - name: Update latest pointer in GCS
+        run: |
+          ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+          ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+          GCS_PATH="gs://${{ env.GCS_BUCKET }}/${{ env.GCS_PREFIX }}/${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+          LATEST_PATH="gs://${{ env.GCS_BUCKET }}/${{ env.GCS_PREFIX }}/${{ github.ref_name }}/latest.tar.gz"
+
+          gcloud storage cp "${GCS_PATH}" "${LATEST_PATH}"
+          echo "Latest pointer updated: ${LATEST_PATH}"
+
+  upload-to-azure:
+    name: Upload to Azure Blob Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+
+    env:
+      AZURE_CONTAINER: builds
+      AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+
+    steps:
+      - name: Download artifact from previous job
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Upload artifact to Azure Blob Storage
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            ARTIFACT_FILE=$(ls ./artifacts/*.tar.gz | head -1)
+            ARTIFACT_BASENAME=$(basename "${ARTIFACT_FILE}")
+            BLOB_PATH="${{ github.ref_name }}/${ARTIFACT_BASENAME}"
+
+            echo "Uploading to Azure Blob Storage..."
+
+            az storage blob upload \
+              --account-name "${{ env.AZURE_STORAGE_ACCOUNT }}" \
+              --container-name "${{ env.AZURE_CONTAINER }}" \
+              --name "${BLOB_PATH}" \
+              --file "${ARTIFACT_FILE}" \
+              --metadata "commit=${{ github.sha }}" "branch=${{ github.ref_name }}" "buildVersion=${{ needs.build.outputs.build-version }}" \
+              --auth-mode login \
+              --overwrite
+
+            echo "Upload successful!"
+
+            az storage blob upload \
+              --account-name "${{ env.AZURE_STORAGE_ACCOUNT }}" \
+              --container-name "${{ env.AZURE_CONTAINER }}" \
+              --name "${{ github.ref_name }}/latest.tar.gz" \
+              --file "${ARTIFACT_FILE}" \
+              --auth-mode login \
+              --overwrite
+
+  notify:
+    name: Notify Build Status
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-s3]
+    if: always()
+
+    steps:
+      - name: Notify success
+        if: needs.build.result == 'success' && needs.upload-to-s3.result == 'success'
+        run: |
+          echo "✅ Build and upload completed successfully!"
+          echo "Build version: ${{ needs.build.outputs.build-version }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+          echo "Triggered by: ${{ github.actor }}"
+
+      - name: Notify failure
+        if: needs.build.result == 'failure' || needs.upload-to-s3.result == 'failure'
+        run: |
+          echo "❌ Build or upload failed!"
+          echo "Build status: ${{ needs.build.result }}"
+          echo "Upload status: ${{ needs.upload-to-s3.result }}"
+          exit 1
+
+      - name: Send Slack notification
+        if: always() && secrets.SLACK_WEBHOOK_URL != ''
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {
+              "text": "${{ (needs.build.result == 'success' && needs.upload-to-s3.result == 'success') && '✅' || '❌' }} Build ${{ needs.build.outputs.build-version }} - ${{ github.repository }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Repository:* ${{ github.repository }}\n*Branch:* ${{ github.ref_name }}\n*Commit:* `${{ github.sha }}`\n*Build Version:* `${{ needs.build.outputs.build-version }}`\n*Triggered by:* ${{ github.actor }}\n*Build Status:* ${{ needs.build.result }}\n*Upload Status:* ${{ needs.upload-to-s3.result }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+```

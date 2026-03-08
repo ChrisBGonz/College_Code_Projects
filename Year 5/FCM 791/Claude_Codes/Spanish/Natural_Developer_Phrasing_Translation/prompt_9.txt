@@ -1,0 +1,176 @@
+```ruby
+# app/controllers/users_controller.rb
+
+class UsersController < ApplicationController
+  before_action :authenticate_user!
+  before_action :authorize_manager!, only: [:promote_to_manager]
+  before_action :set_user, only: [:promote_to_manager]
+
+  def promote_to_manager
+    unless @user.staff?
+      return render json: {
+        success: false,
+        message: "Only Staff users can be promoted to Manager."
+      }, status: :unprocessable_entity
+    end
+
+    if @user.update(role: :manager)
+      render json: {
+        success: true,
+        message: "User #{@user.full_name} has been successfully promoted to Manager.",
+        user: {
+          id: @user.id,
+          name: @user.full_name,
+          email: @user.email,
+          role: @user.role
+        }
+      }, status: :ok
+    else
+      render json: {
+        success: false,
+        message: "Failed to promote user.",
+        errors: @user.errors.full_messages
+      }, status: :unprocessable_entity
+    end
+  end
+
+  private
+
+  def set_user
+    @user = User.find(params[:id])
+  rescue ActiveRecord::RecordNotFound
+    render json: {
+      success: false,
+      message: "User not found."
+    }, status: :not_found
+  end
+
+  def authorize_manager!
+    unless current_user.manager?
+      render json: {
+        success: false,
+        message: "Access denied. Only Managers can perform this action."
+      }, status: :forbidden
+    end
+  end
+end
+```
+
+```ruby
+# app/models/user.rb
+
+class User < ApplicationRecord
+  enum role: {
+    staff: "staff",
+    manager: "manager",
+    admin: "admin"
+  }
+
+  validates :role, presence: true
+  validates :email, presence: true, uniqueness: true
+
+  def full_name
+    "#{first_name} #{last_name}".strip
+  end
+end
+```
+
+```ruby
+# config/routes.rb
+
+Rails.application.routes.draw do
+  resources :users do
+    member do
+      patch :promote_to_manager
+    end
+  end
+end
+```
+
+```ruby
+# db/migrate/YYYYMMDDHHMMSS_add_role_to_users.rb
+
+class AddRoleToUsers < ActiveRecord::Migration[7.0]
+  def change
+    add_column :users, :role, :string, default: "staff", null: false
+    add_index :users, :role
+  end
+end
+```
+
+```ruby
+# spec/controllers/users_controller_spec.rb
+
+require "rails_helper"
+
+RSpec.describe UsersController, type: :controller do
+  let(:manager_user) { create(:user, role: :manager) }
+  let(:staff_user)   { create(:user, role: :staff) }
+  let(:other_staff)  { create(:user, role: :staff) }
+
+  describe "PATCH #promote_to_manager" do
+    context "when current user is a Manager" do
+      before { sign_in manager_user }
+
+      context "when target user is Staff" do
+        it "promotes the staff user to Manager" do
+          patch :promote_to_manager, params: { id: staff_user.id }
+
+          expect(response).to have_http_status(:ok)
+          expect(staff_user.reload.role).to eq("manager")
+
+          json_response = JSON.parse(response.body)
+          expect(json_response["success"]).to be true
+          expect(json_response["message"]).to include("promoted to Manager")
+        end
+      end
+
+      context "when target user is already a Manager" do
+        it "returns an error" do
+          patch :promote_to_manager, params: { id: manager_user.id }
+
+          expect(response).to have_http_status(:unprocessable_entity)
+
+          json_response = JSON.parse(response.body)
+          expect(json_response["success"]).to be false
+          expect(json_response["message"]).to include("Only Staff users can be promoted")
+        end
+      end
+
+      context "when target user does not exist" do
+        it "returns a not found error" do
+          patch :promote_to_manager, params: { id: 99999 }
+
+          expect(response).to have_http_status(:not_found)
+
+          json_response = JSON.parse(response.body)
+          expect(json_response["success"]).to be false
+          expect(json_response["message"]).to include("User not found")
+        end
+      end
+    end
+
+    context "when current user is Staff" do
+      before { sign_in staff_user }
+
+      it "denies access" do
+        patch :promote_to_manager, params: { id: other_staff.id }
+
+        expect(response).to have_http_status(:forbidden)
+
+        json_response = JSON.parse(response.body)
+        expect(json_response["success"]).to be false
+        expect(json_response["message"]).to include("Access denied")
+      end
+    end
+
+    context "when user is not authenticated" do
+      it "redirects or returns unauthorized" do
+        patch :promote_to_manager, params: { id: staff_user.id }
+
+        expect(response).to have_http_status(:unauthorized).or redirect_to(new_user_session_path)
+      end
+    end
+  end
+end
+```

@@ -1,0 +1,455 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Script to automate updating all dependencies of a Java Maven project to their latest versions.
+Uses Claude AI as the backbone with tool use capabilities.
+"""
+
+import subprocess
+import json
+import os
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+import anthropic
+
+client = anthropic.Anthropic()
+MODEL_NAME = "claude-opus-4-5"
+
+tools = [
+    {
+        "name": "run_maven_command",
+        "description": "Executes a Maven command in the project directory and returns the output",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The Maven command to execute (e.g., 'mvn versions:display-dependency-updates')"
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "The working directory where the Maven project is located"
+                }
+            },
+            "required": ["command", "working_dir"]
+        }
+    },
+    {
+        "name": "read_pom_file",
+        "description": "Reads and returns the content of the pom.xml file",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pom_path": {
+                    "type": "string",
+                    "description": "Path to the pom.xml file"
+                }
+            },
+            "required": ["pom_path"]
+        }
+    },
+    {
+        "name": "update_pom_dependency",
+        "description": "Updates a specific dependency version in the pom.xml file",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pom_path": {
+                    "type": "string",
+                    "description": "Path to the pom.xml file"
+                },
+                "group_id": {
+                    "type": "string",
+                    "description": "The groupId of the dependency to update"
+                },
+                "artifact_id": {
+                    "type": "string",
+                    "description": "The artifactId of the dependency to update"
+                },
+                "new_version": {
+                    "type": "string",
+                    "description": "The new version to set for the dependency"
+                }
+            },
+            "required": ["pom_path", "group_id", "artifact_id", "new_version"]
+        }
+    },
+    {
+        "name": "backup_pom_file",
+        "description": "Creates a backup of the pom.xml file before making changes",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pom_path": {
+                    "type": "string",
+                    "description": "Path to the pom.xml file to backup"
+                }
+            },
+            "required": ["pom_path"]
+        }
+    },
+    {
+        "name": "verify_build",
+        "description": "Runs Maven build to verify the project compiles and tests pass after updates",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "working_dir": {
+                    "type": "string",
+                    "description": "The working directory where the Maven project is located"
+                },
+                "skip_tests": {
+                    "type": "boolean",
+                    "description": "Whether to skip tests during verification (default: false)"
+                }
+            },
+            "required": ["working_dir"]
+        }
+    }
+]
+
+def run_maven_command(command: str, working_dir: str) -> dict:
+    """Execute a Maven command and return the result."""
+    try:
+        result = subprocess.run(
+            command.split(),
+            cwd=working_dir,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return {
+            "success": result.returncode == 0,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "return_code": result.returncode
+        }
+    except subprocess.TimeoutExpired:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": "Command timed out after 300 seconds",
+            "return_code": -1
+        }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"Maven not found or directory doesn't exist: {working_dir}",
+            "return_code": -1
+        }
+
+def read_pom_file(pom_path: str) -> dict:
+    """Read and return the content of pom.xml."""
+    try:
+        with open(pom_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        return {
+            "success": True,
+            "content": content,
+            "path": pom_path
+        }
+    except FileNotFoundError:
+        return {
+            "success": False,
+            "error": f"pom.xml not found at: {pom_path}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def update_pom_dependency(pom_path: str, group_id: str, artifact_id: str, new_version: str) -> dict:
+    """Update a specific dependency version in pom.xml."""
+    try:
+        tree = ET.parse(pom_path)
+        root = tree.getroot()
+        
+        namespace = ''
+        if root.tag.startswith('{'):
+            namespace = root.tag.split('}')[0] + '}'
+        
+        updated = False
+        
+        for deps_section in ['dependencies', 'dependencyManagement/dependencies']:
+            xpath = f'.//{namespace}dependency'
+            for dep in root.findall(xpath):
+                dep_group = dep.find(f'{namespace}groupId')
+                dep_artifact = dep.find(f'{namespace}artifactId')
+                dep_version = dep.find(f'{namespace}version')
+                
+                if (dep_group is not None and dep_group.text == group_id and
+                    dep_artifact is not None and dep_artifact.text == artifact_id and
+                    dep_version is not None):
+                    
+                    old_version = dep_version.text
+                    dep_version.text = new_version
+                    updated = True
+                    
+                    ET.indent(tree, space='    ')
+                    tree.write(pom_path, encoding='utf-8', xml_declaration=True)
+                    
+                    return {
+                        "success": True,
+                        "message": f"Updated {group_id}:{artifact_id} from {old_version} to {new_version}"
+                    }
+        
+        if not updated:
+            return {
+                "success": False,
+                "error": f"Dependency {group_id}:{artifact_id} not found in pom.xml"
+            }
+            
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def backup_pom_file(pom_path: str) -> dict:
+    """Create a backup of pom.xml."""
+    try:
+        import shutil
+        backup_path = pom_path + '.backup'
+        shutil.copy2(pom_path, backup_path)
+        return {
+            "success": True,
+            "backup_path": backup_path,
+            "message": f"Backup created at: {backup_path}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def verify_build(working_dir: str, skip_tests: bool = False) -> dict:
+    """Run Maven build to verify the project."""
+    command = "mvn clean compile"
+    if not skip_tests:
+        command = "mvn clean test"
+    
+    result = run_maven_command(command, working_dir)
+    result["command_used"] = command
+    return result
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results."""
+    if tool_name == "run_maven_command":
+        result = run_maven_command(tool_input["command"], tool_input["working_dir"])
+    elif tool_name == "read_pom_file":
+        result = read_pom_file(tool_input["pom_path"])
+    elif tool_name == "update_pom_dependency":
+        result = update_pom_dependency(
+            tool_input["pom_path"],
+            tool_input["group_id"],
+            tool_input["artifact_id"],
+            tool_input["new_version"]
+        )
+    elif tool_name == "backup_pom_file":
+        result = backup_pom_file(tool_input["pom_path"])
+    elif tool_name == "verify_build":
+        result = verify_build(
+            tool_input["working_dir"],
+            tool_input.get("skip_tests", False)
+        )
+    else:
+        result = {"error": f"Unknown tool: {tool_name}"}
+    
+    return json.dumps(result)
+
+def update_maven_dependencies(project_path: str):
+    """Main function to update Maven dependencies using Claude AI."""
+    
+    pom_path = os.path.join(project_path, "pom.xml")
+    
+    if not os.path.exists(pom_path):
+        print(f"Error: pom.xml not found at {pom_path}")
+        sys.exit(1)
+    
+    print(f"Starting Maven dependency update for project at: {project_path}")
+    print("=" * 60)
+    
+    initial_message = f"""
+    I need you to help me update all Maven dependencies in a Java project to their latest versions.
+    
+    The project is located at: {project_path}
+    The pom.xml file is at: {pom_path}
+    
+    Please follow these steps:
+    1. First, create a backup of the pom.xml file
+    2. Read the current pom.xml to understand the project structure
+    3. Run 'mvn versions:display-dependency-updates' to check for available updates
+    4. For each dependency that has an update available, update it to the latest version
+    5. After all updates, verify the build still works by running 'mvn clean compile'
+    6. Provide a summary of all changes made
+    
+    Please be careful with:
+    - Major version updates that might have breaking changes
+    - Dependencies that use property variables for versions
+    - The project namespace in pom.xml
+    
+    Start by creating a backup and then checking what updates are available.
+    """
+    
+    messages = [{"role": "user", "content": initial_message}]
+    
+    while True:
+        response = client.messages.create(
+            model=MODEL_NAME,
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"\nClaude's response (stop_reason: {response.stop_reason}):")
+        
+        if response.stop_reason == "end_turn":
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    print(block.text)
+            break
+        
+        if response.stop_reason == "tool_use":
+            messages.append({"role": "assistant", "content": response.content})
+            
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nExecuting tool: {block.name}")
+                    print(f"Input: {json.dumps(block.input, indent=2)}")
+                    
+                    result = process_tool_call(block.name, block.input)
+                    result_dict = json.loads(result)
+                    
+                    print(f"Result: {json.dumps(result_dict, indent=2)[:500]}...")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+                elif hasattr(block, 'text'):
+                    print(block.text)
+            
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+    
+    print("\n" + "=" * 60)
+    print("Maven dependency update process completed!")
+
+def create_sample_project():
+    """Create a sample Maven project for testing."""
+    sample_dir = "/tmp/sample-maven-project"
+    os.makedirs(sample_dir, exist_ok=True)
+    
+    pom_content = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>sample-project</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <name>Sample Maven Project</name>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    </properties>
+
+    <dependencies>
+        <!-- Spring Boot -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter</artifactId>
+            <version>2.7.0</version>
+        </dependency>
+        
+        <!-- Jackson -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.13.0</version>
+        </dependency>
+        
+        <!-- Apache Commons -->
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.12.0</version>
+        </dependency>
+        
+        <!-- Guava -->
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>31.0-jre</version>
+        </dependency>
+        
+        <!-- JUnit for testing -->
+        <dependency>
+            <groupId>junit</groupId>
+            <artifactId>junit</artifactId>
+            <version>4.13.1</version>
+            <scope>test</scope>
+        </dependency>
+        
+        <!-- SLF4J -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>1.7.32</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>versions-maven-plugin</artifactId>
+                <version>2.8.1</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>"""
+    
+    with open(os.path.join(sample_dir, "pom.xml"), 'w') as f:
+        f.write(pom_content)
+    
+    src_dir = os.path.join(sample_dir, "src", "main", "java", "com", "example")
+    os.makedirs(src_dir, exist_ok=True)
+    
+    main_class = """package com.example;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("Hello, Maven!");
+    }
+}"""
+    
+    with open(os.path.join(src_dir, "App.java"), 'w') as f:
+        f.write(main_class)
+    
+    print(f"Sample Maven project created at: {sample_dir}")
+    return sample_dir
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        project_path = sys.argv[1]
+    else:
+        print("No project path provided. Creating a sample Maven project for demonstration...")
+        project_path = create_sample_project()
+        print(f"Using sample project at: {project_path}\n")
+    
+    update_maven_dependencies(project_path)
+```

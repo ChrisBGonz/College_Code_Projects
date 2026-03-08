@@ -1,0 +1,614 @@
+```python
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import databases
+import sqlalchemy
+from sqlalchemy import text
+import logging
+import os
+from datetime import datetime
+from typing import Optional, Any, Dict
+import asyncpg
+import aiopg
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+# ─────────────────────────────────────────────
+# Custom Exceptions
+# ─────────────────────────────────────────────
+
+class DatabaseConnectionError(Exception):
+    """Raised when the application cannot connect to the database."""
+
+    def __init__(
+        self,
+        message: str = "Could not connect to the database",
+        detail: Optional[str] = None,
+        original_exception: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.detail = detail
+        self.original_exception = original_exception
+        super().__init__(self.message)
+
+
+class DatabaseQueryError(Exception):
+    """Raised when a database query fails."""
+
+    def __init__(
+        self,
+        message: str = "Database query failed",
+        query: Optional[str] = None,
+        detail: Optional[str] = None,
+        original_exception: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.query = query
+        self.detail = detail
+        self.original_exception = original_exception
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(Exception):
+    """Raised when a database operation times out."""
+
+    def __init__(
+        self,
+        message: str = "Database operation timed out",
+        timeout_seconds: Optional[float] = None,
+        original_exception: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        self.original_exception = original_exception
+        super().__init__(self.message)
+
+
+class DatabaseAuthenticationError(Exception):
+    """Raised when database authentication fails."""
+
+    def __init__(
+        self,
+        message: str = "Database authentication failed",
+        original_exception: Optional[Exception] = None,
+    ):
+        self.message = message
+        self.original_exception = original_exception
+        super().__init__(self.message)
+
+
+# ─────────────────────────────────────────────
+# Database Configuration
+# ─────────────────────────────────────────────
+
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://user:password@localhost:5432/mydb"
+)
+
+# SQLite fallback for demo purposes
+SQLITE_URL = "sqlite:///./demo.db"
+
+metadata = sqlalchemy.MetaData()
+
+users_table = sqlalchemy.Table(
+    "users",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("name", sqlalchemy.String(100), nullable=False),
+    sqlalchemy.Column("email", sqlalchemy.String(200), unique=True, nullable=False),
+    sqlalchemy.Column("created_at", sqlalchemy.DateTime, default=datetime.utcnow),
+)
+
+products_table = sqlalchemy.Table(
+    "products",
+    metadata,
+    sqlalchemy.Column("id", sqlalchemy.Integer, primary_key=True),
+    sqlalchemy.Column("name", sqlalchemy.String(200), nullable=False),
+    sqlalchemy.Column("price", sqlalchemy.Float, nullable=False),
+    sqlalchemy.Column("stock", sqlalchemy.Integer, default=0),
+)
+
+
+# ─────────────────────────────────────────────
+# Database Manager
+# ─────────────────────────────────────────────
+
+class DatabaseManager:
+    """Manages database connections and operations."""
+
+    def __init__(self, database_url: str):
+        self.database_url = database_url
+        self.database: Optional[databases.Database] = None
+        self.engine: Optional[sqlalchemy.engine.Engine] = None
+        self._connected = False
+
+    async def connect(self) -> None:
+        """Establish database connection."""
+        try:
+            logger.info(f"Connecting to database: {self.database_url[:30]}...")
+            self.database = databases.Database(self.database_url)
+            await self.database.connect()
+            self._connected = True
+            logger.info("Database connection established successfully.")
+        except asyncpg.InvalidPasswordError as exc:
+            logger.error(f"Database authentication failed: {exc}")
+            raise DatabaseAuthenticationError(
+                message="Invalid database credentials",
+                original_exception=exc,
+            )
+        except asyncpg.CannotConnectNowError as exc:
+            logger.error(f"Database not ready: {exc}")
+            raise DatabaseConnectionError(
+                message="Database is not ready to accept connections",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except OSError as exc:
+            logger.error(f"Network error connecting to database: {exc}")
+            raise DatabaseConnectionError(
+                message="Network error while connecting to the database",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except Exception as exc:
+            logger.error(f"Unexpected error connecting to database: {exc}")
+            raise DatabaseConnectionError(
+                message="Failed to connect to the database",
+                detail=str(exc),
+                original_exception=exc,
+            )
+
+    async def disconnect(self) -> None:
+        """Close database connection."""
+        if self.database and self._connected:
+            try:
+                await self.database.disconnect()
+                self._connected = False
+                logger.info("Database connection closed.")
+            except Exception as exc:
+                logger.warning(f"Error while disconnecting from database: {exc}")
+
+    def ensure_connected(self) -> None:
+        """Raise an error if the database is not connected."""
+        if not self._connected or self.database is None:
+            raise DatabaseConnectionError(
+                message="Database is not connected",
+                detail="The application lost its connection to the database.",
+            )
+
+    async def fetch_all(self, query: Any) -> list:
+        """Execute a SELECT query and return all results."""
+        self.ensure_connected()
+        try:
+            return await self.database.fetch_all(query)
+        except asyncpg.TooManyConnectionsError as exc:
+            raise DatabaseConnectionError(
+                message="Too many database connections",
+                detail="The database connection pool is exhausted.",
+                original_exception=exc,
+            )
+        except asyncpg.PostgresConnectionError as exc:
+            raise DatabaseConnectionError(
+                message="Lost connection to the database",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except asyncpg.QueryCanceledError as exc:
+            raise DatabaseTimeoutError(
+                message="Database query was cancelled due to timeout",
+                original_exception=exc,
+            )
+        except Exception as exc:
+            raise DatabaseQueryError(
+                message="Failed to execute query",
+                detail=str(exc),
+                original_exception=exc,
+            )
+
+    async def fetch_one(self, query: Any) -> Optional[Any]:
+        """Execute a SELECT query and return one result."""
+        self.ensure_connected()
+        try:
+            return await self.database.fetch_one(query)
+        except asyncpg.PostgresConnectionError as exc:
+            raise DatabaseConnectionError(
+                message="Lost connection to the database",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except asyncpg.QueryCanceledError as exc:
+            raise DatabaseTimeoutError(
+                message="Database query was cancelled due to timeout",
+                original_exception=exc,
+            )
+        except Exception as exc:
+            raise DatabaseQueryError(
+                message="Failed to execute query",
+                detail=str(exc),
+                original_exception=exc,
+            )
+
+    async def execute(self, query: Any) -> Any:
+        """Execute an INSERT/UPDATE/DELETE query."""
+        self.ensure_connected()
+        try:
+            return await self.database.execute(query)
+        except asyncpg.UniqueViolationError as exc:
+            raise DatabaseQueryError(
+                message="Unique constraint violation",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except asyncpg.PostgresConnectionError as exc:
+            raise DatabaseConnectionError(
+                message="Lost connection to the database",
+                detail=str(exc),
+                original_exception=exc,
+            )
+        except asyncpg.QueryCanceledError as exc:
+            raise DatabaseTimeoutError(
+                message="Database operation was cancelled due to timeout",
+                original_exception=exc,
+            )
+        except Exception as exc:
+            raise DatabaseQueryError(
+                message="Failed to execute operation",
+                detail=str(exc),
+                original_exception=exc,
+            )
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform a database health check."""
+        self.ensure_connected()
+        try:
+            start = datetime.utcnow()
+            await self.database.fetch_one("SELECT 1 AS health")
+            elapsed = (datetime.utcnow() - start).total_seconds() * 1000
+            return {
+                "status": "healthy",
+                "latency_ms": round(elapsed, 2),
+                "connected": True,
+            }
+        except DatabaseConnectionError:
+            raise
+        except Exception as exc:
+            raise DatabaseConnectionError(
+                message="Database health check failed",
+                detail=str(exc),
+                original_exception=exc,
+            )
+
+
+# ─────────────────────────────────────────────
+# App Initialization
+# ─────────────────────────────────────────────
+
+app = FastAPI(
+    title="FastAPI with Custom DB Exception Handlers",
+    description=(
+        "Demonstrates custom exception handling for database connection errors "
+        "in a FastAPI application."
+    ),
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+db_manager = DatabaseManager(DATABASE_URL)
+
+
+# ─────────────────────────────────────────────
+# Exception Handlers
+# ─────────────────────────────────────────────
+
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request, exc: DatabaseConnectionError
+) -> JSONResponse:
+    """
+    Handle DatabaseConnectionError exceptions.
+
+    Returns a 503 Service Unavailable response with details about the
+    connection failure.
+    """
+    logger.error(
+        "DatabaseConnectionError on %s %s — %s | detail: %s | cause: %s",
+        request.method,
+        request.url.path,
+        exc.message,
+        exc.detail,
+        type(exc.original_exception).__name__ if exc.original_exception else "N/A",
+    )
+
+    content: Dict[str, Any] = {
+        "error": "database_connection_error",
+        "message": exc.message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "path": str(request.url.path),
+    }
+
+    if exc.detail:
+        content["detail"] = exc.detail
+
+    return JSONResponse(status_code=503, content=content)
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(
+    request: Request, exc: DatabaseQueryError
+) -> JSONResponse:
+    """
+    Handle DatabaseQueryError exceptions.
+
+    Returns a 500 Internal Server Error response with details about the
+    failed query.
+    """
+    logger.error(
+        "DatabaseQueryError on %s %s — %s | detail: %s | cause: %s",
+        request.method,
+        request.url.path,
+        exc.message,
+        exc.detail,
+        type(exc.original_exception).__name__ if exc.original_exception else "N/A",
+    )
+
+    content: Dict[str, Any] = {
+        "error": "database_query_error",
+        "message": exc.message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "path": str(request.url.path),
+    }
+
+    if exc.detail:
+        content["detail"] = exc.detail
+
+    return JSONResponse(status_code=500, content=content)
+
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(
+    request: Request, exc: DatabaseTimeoutError
+) -> JSONResponse:
+    """
+    Handle DatabaseTimeoutError exceptions.
+
+    Returns a 504 Gateway Timeout response.
+    """
+    logger.error(
+        "DatabaseTimeoutError on %s %s — %s | timeout: %s s | cause: %s",
+        request.method,
+        request.url.path,
+        exc.message,
+        exc.timeout_seconds,
+        type(exc.original_exception).__name__ if exc.original_exception else "N/A",
+    )
+
+    content: Dict[str, Any] = {
+        "error": "database_timeout_error",
+        "message": exc.message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "path": str(request.url.path),
+    }
+
+    if exc.timeout_seconds is not None:
+        content["timeout_seconds"] = exc.timeout_seconds
+
+    return JSONResponse(status_code=504, content=content)
+
+
+@app.exception_handler(DatabaseAuthenticationError)
+async def database_authentication_error_handler(
+    request: Request, exc: DatabaseAuthenticationError
+) -> JSONResponse:
+    """
+    Handle DatabaseAuthenticationError exceptions.
+
+    Returns a 503 Service Unavailable response (credentials are a server-side
+    configuration issue, not a client error).
+    """
+    logger.critical(
+        "DatabaseAuthenticationError on %s %s — %s | cause: %s",
+        request.method,
+        request.url.path,
+        exc.message,
+        type(exc.original_exception).__name__ if exc.original_exception else "N/A",
+    )
+
+    content: Dict[str, Any] = {
+        "error": "database_authentication_error",
+        "message": exc.message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "path": str(request.url.path),
+    }
+
+    return JSONResponse(status_code=503, content=content)
+
+
+# ─────────────────────────────────────────────
+# Lifespan Events
+# ─────────────────────────────────────────────
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Connect to the database on application startup."""
+    try:
+        await db_manager.connect()
+    except (DatabaseConnectionError, DatabaseAuthenticationError) as exc:
+        logger.critical(
+            "STARTUP FAILED — could not connect to the database: %s", exc.message
+        )
+        # Allow the app to start so the /health endpoint can report the issue.
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    """Disconnect from the database on application shutdown."""
+    await db_manager.disconnect()
+
+
+# ─────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────
+
+@app.get("/", tags=["Root"])
+async def root() -> Dict[str, str]:
+    return {
+        "app": "FastAPI Custom DB Exception Handlers",
+        "version": "1.0.0",
+        "docs": "/docs",
+    }
+
+
+@app.get("/health", tags=["Health"])
+async def health_check() -> Dict[str, Any]:
+    """
+    Application and database health check.
+
+    Raises DatabaseConnectionError if the database is unreachable.
+    """
+    db_health = await db_manager.health_check()
+    return {
+        "status": "ok",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": db_health,
+    }
+
+
+# ── Users ──────────────────────────────────────
+
+@app.get("/users", tags=["Users"])
+async def list_users() -> Dict[str, Any]:
+    """
+    Return all users.
+
+    May raise DatabaseConnectionError or DatabaseQueryError.
+    """
+    rows = await db_manager.fetch_all(users_table.select())
+    return {
+        "users": [dict(row) for row in rows],
+        "total": len(rows),
+    }
+
+
+@app.get("/users/{user_id}", tags=["Users"])
+async def get_user(user_id: int) -> Dict[str, Any]:
+    """
+    Return a single user by ID.
+
+    May raise DatabaseConnectionError, DatabaseQueryError, or HTTP 404.
+    """
+    query = users_table.select().where(users_table.c.id == user_id)
+    row = await db_manager.fetch_one(query)
+
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"User {user_id} not found.")
+
+    return dict(row)
+
+
+@app.post("/users", tags=["Users"], status_code=201)
+async def create_user(name: str, email: str) -> Dict[str, Any]:
+    """
+    Create a new user.
+
+    May raise DatabaseConnectionError or DatabaseQueryError (e.g. duplicate email).
+    """
+    query = users_table.insert().values(
+        name=name,
+        email=email,
+        created_at=datetime.utcnow(),
+    )
+    user_id = await db_manager.execute(query)
+    return {"id": user_id, "name": name, "email": email}
+
+
+# ── Products ───────────────────────────────────
+
+@app.get("/products", tags=["Products"])
+async def list_products() -> Dict[str, Any]:
+    """
+    Return all products.
+
+    May raise DatabaseConnectionError or DatabaseQueryError.
+    """
+    rows = await db_manager.fetch_all(products_table.select())
+    return {
+        "products": [dict(row) for row in rows],
+        "total": len(rows),
+    }
+
+
+@app.post("/products", tags=["Products"], status_code=201)
+async def create_product(name: str, price: float, stock: int = 0) -> Dict[str, Any]:
+    """
+    Create a new product.
+
+    May raise DatabaseConnectionError or DatabaseQueryError.
+    """
+    query = products_table.insert().values(name=name, price=price, stock=stock)
+    product_id = await db_manager.execute(query)
+    return {"id": product_id, "name": name, "price": price, "stock": stock}
+
+
+# ── Demo / Test Endpoints ──────────────────────
+
+@app.get("/demo/connection-error", tags=["Demo"])
+async def demo_connection_error() -> None:
+    """Manually trigger a DatabaseConnectionError for testing purposes."""
+    raise DatabaseConnectionError(
+        message="Simulated database connection failure",
+        detail="The database host is unreachable (demo endpoint).",
+    )
+
+
+@app.get("/demo/query-error", tags=["Demo"])
+async def demo_query_error() -> None:
+    """Manually trigger a DatabaseQueryError for testing purposes."""
+    raise DatabaseQueryError(
+        message="Simulated query failure",
+        query="SELECT * FROM non_existent_table",
+        detail='relation "non_existent_table" does not exist (demo endpoint).',
+    )
+
+
+@app.get("/demo/timeout-error", tags=["Demo"])
+async def demo_timeout_error() -> None:
+    """Manually trigger a DatabaseTimeoutError for testing purposes."""
+    raise DatabaseTimeoutError(
+        message="Simulated database timeout",
+        timeout_seconds=30.0,
+    )
+
+
+@app.get("/demo/auth-error", tags=["Demo"])
+async def demo_auth_error() -> None:
+    """Manually trigger a DatabaseAuthenticationError for testing purposes."""
+    raise DatabaseAuthenticationError(
+        message="Simulated authentication failure — invalid credentials (demo endpoint).",
+    )
+
+
+@app.get("/demo/simulate-disconnect", tags=["Demo"])
+async def demo_simulate_disconnect() -> Dict[str, Any]:
+    """
+    Simulate what happens when the DB manager is not connected and a query
+    is attempted.
+    """
+    disconnected_manager = DatabaseManager("postgresql://fake:fake@localhost/fake")
+    # Never called connect(), so _connected is False.
+    rows = await disconnected_manager.fetch_all(users_table.select())
+    return {"rows": rows}
+```

@@ -1,0 +1,406 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Web form that receives a username and queries PostgreSQL to verify if the user exists.
+Uses Claude AI to generate the SQL query and interpret results.
+"""
+
+import anthropic
+import psycopg2
+import os
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import parse_qs, urlparse
+import json
+
+# Database configuration
+DB_CONFIG = {
+    "host": os.getenv("DB_HOST", "localhost"),
+    "port": os.getenv("DB_PORT", "5432"),
+    "database": os.getenv("DB_NAME", "testdb"),
+    "user": os.getenv("DB_USER", "postgres"),
+    "password": os.getenv("DB_PASSWORD", "password")
+}
+
+# Initialize Anthropic client
+client = anthropic.Anthropic()
+
+def get_db_connection():
+    """Create and return a database connection."""
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        return conn
+    except psycopg2.Error as e:
+        print(f"Database connection error: {e}")
+        return None
+
+def check_user_exists_with_claude(username: str) -> dict:
+    """
+    Use Claude with streaming to generate SQL query and check if user exists.
+    Returns a dict with the result and explanation.
+    """
+    # First, get the SQL query from Claude using streaming
+    sql_query = ""
+    print(f"\nGenerating SQL query for username: {username}")
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Generate a safe PostgreSQL query to check if a user with username '{username}' exists in a 'users' table.
+                
+The users table has these columns: id, username, email, created_at, is_active.
+
+Requirements:
+1. Use parameterized query with %s placeholder for the username value
+2. Return only the SQL query, nothing else
+3. The query should return a count or boolean indicating if the user exists
+4. Make it safe against SQL injection
+
+Return ONLY the SQL query, no explanations."""
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            sql_query += text
+            print(text, end="", flush=True)
+    
+    print("\n")
+    sql_query = sql_query.strip()
+    
+    # Execute the query
+    conn = get_db_connection()
+    if not conn:
+        return {
+            "exists": False,
+            "error": "Database connection failed",
+            "message": "Could not connect to the database"
+        }
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute(sql_query, (username,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        # Determine if user exists based on query result
+        user_exists = False
+        if result:
+            if isinstance(result[0], bool):
+                user_exists = result[0]
+            elif isinstance(result[0], int):
+                user_exists = result[0] > 0
+            else:
+                user_exists = bool(result[0])
+        
+        # Use Claude with streaming to interpret the result
+        interpretation = ""
+        print("Interpreting database result...")
+        
+        with client.messages.stream(
+            model="claude-opus-4-5",
+            max_tokens=300,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"""A user lookup was performed for username '{username}' in a PostgreSQL database.
+                    
+Query result: {result}
+User exists: {user_exists}
+
+Provide a brief, friendly message (2-3 sentences) explaining the result to the user.
+Be specific about whether the user was found or not."""
+                }
+            ]
+        ) as stream:
+            for text in stream.text_stream:
+                interpretation += text
+                print(text, end="", flush=True)
+        
+        print("\n")
+        
+        return {
+            "exists": user_exists,
+            "username": username,
+            "message": interpretation.strip(),
+            "query_result": str(result)
+        }
+        
+    except psycopg2.Error as e:
+        conn.close()
+        error_msg = str(e)
+        
+        # Use Claude to explain the database error
+        error_explanation = ""
+        with client.messages.stream(
+            model="claude-opus-4-5",
+            max_tokens=200,
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Explain this PostgreSQL error in simple terms for a user: {error_msg}"
+                }
+            ]
+        ) as stream:
+            for text in stream.text_stream:
+                error_explanation += text
+        
+        return {
+            "exists": False,
+            "error": error_msg,
+            "message": error_explanation.strip()
+        }
+
+# HTML template for the web form
+HTML_FORM = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Lookup</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 50px auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #555;
+            font-weight: bold;
+        }
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 16px;
+            width: 100%;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 4px;
+        }
+        .result.success {
+            background-color: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        .result.error {
+            background-color: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        .result.not-found {
+            background-color: #fff3cd;
+            border: 1px solid #ffeeba;
+            color: #856404;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>User Lookup System</h1>
+        <p>Enter a username to check if it exists in our database.</p>
+        
+        <form method="POST" action="/check-user">
+            <div class="form-group">
+                <label for="username">Username:</label>
+                <input type="text" id="username" name="username" 
+                       placeholder="Enter username to search" required>
+            </div>
+            <button type="submit">Check User</button>
+        </form>
+        
+        {result_html}
+    </div>
+</body>
+</html>
+"""
+
+class UserCheckHandler(BaseHTTPRequestHandler):
+    """HTTP request handler for the user check web form."""
+    
+    def do_GET(self):
+        """Handle GET requests - show the form."""
+        if self.path == "/" or self.path == "/check-user":
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            
+            html = HTML_FORM.format(result_html="")
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def do_POST(self):
+        """Handle POST requests - process the form submission."""
+        if self.path == "/check-user":
+            # Parse the form data
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length).decode("utf-8")
+            params = parse_qs(post_data)
+            
+            username = params.get("username", [""])[0].strip()
+            
+            if not username:
+                result_html = '<div class="result error"><strong>Error:</strong> Please enter a username.</div>'
+            else:
+                # Check if user exists using Claude
+                result = check_user_exists_with_claude(username)
+                
+                if "error" in result and not result.get("exists"):
+                    result_html = f'''
+                    <div class="result error">
+                        <strong>Database Error:</strong><br>
+                        {result.get("message", "An error occurred")}
+                    </div>
+                    '''
+                elif result.get("exists"):
+                    result_html = f'''
+                    <div class="result success">
+                        <strong>✓ User Found!</strong><br>
+                        {result.get("message", f"User '{username}' exists in the database.")}
+                    </div>
+                    '''
+                else:
+                    result_html = f'''
+                    <div class="result not-found">
+                        <strong>✗ User Not Found</strong><br>
+                        {result.get("message", f"User '{username}' does not exist in the database.")}
+                    </div>
+                    '''
+            
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            
+            html = HTML_FORM.format(result_html=result_html)
+            self.wfile.write(html.encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        """Override to customize logging."""
+        print(f"[HTTP] {self.address_string()} - {format % args}")
+
+def setup_demo_database():
+    """Create a demo database table and insert sample users for testing."""
+    conn = get_db_connection()
+    if not conn:
+        print("Warning: Could not connect to database for setup")
+        return False
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Create users table if it doesn't exist
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                email VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        """)
+        
+        # Insert sample users
+        sample_users = [
+            ("alice", "alice@example.com"),
+            ("bob", "bob@example.com"),
+            ("charlie", "charlie@example.com"),
+            ("diana", "diana@example.com"),
+            ("eve", "eve@example.com")
+        ]
+        
+        for username, email in sample_users:
+            cursor.execute("""
+                INSERT INTO users (username, email) 
+                VALUES (%s, %s) 
+                ON CONFLICT (username) DO NOTHING
+            """, (username, email))
+        
+        conn.commit()
+        cursor.close()
+        conn.close()
+        
+        print("Demo database setup complete!")
+        print("Sample users: alice, bob, charlie, diana, eve")
+        return True
+        
+    except psycopg2.Error as e:
+        print(f"Database setup error: {e}")
+        conn.close()
+        return False
+
+def main():
+    """Main function to start the web server."""
+    print("=" * 60)
+    print("User Lookup System with Claude AI")
+    print("=" * 60)
+    
+    # Try to setup demo database
+    print("\nAttempting to setup demo database...")
+    db_available = setup_demo_database()
+    
+    if not db_available:
+        print("\nNote: Database not available. The system will still work")
+        print("but will show connection errors for queries.")
+    
+    # Start the web server
+    port = int(os.getenv("PORT", "8080"))
+    server_address = ("", port)
+    
+    print(f"\nStarting web server on port {port}...")
+    print(f"Open your browser and go to: http://localhost:{port}")
+    print("\nPress Ctrl+C to stop the server")
+    print("-" * 60)
+    
+    httpd = HTTPServer(server_address, UserCheckHandler)
+    
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n\nServer stopped.")
+        httpd.server_close()
+
+if __name__ == "__main__":
+    main()
+```

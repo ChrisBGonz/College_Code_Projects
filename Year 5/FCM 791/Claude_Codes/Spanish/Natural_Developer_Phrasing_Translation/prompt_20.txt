@@ -1,0 +1,200 @@
+package main
+
+import (
+	"encoding/json"
+	"log"
+	"net/http"
+	"strings"
+)
+
+type Response struct {
+	Message string `json:"message"`
+	Status  int    `json:"status"`
+}
+
+type CORSConfig struct {
+	AllowedOrigins   []string
+	AllowedMethods   []string
+	AllowedHeaders   []string
+	ExposedHeaders   []string
+	AllowCredentials bool
+	MaxAge           int
+}
+
+func NewDefaultCORSConfig() *CORSConfig {
+	return &CORSConfig{
+		AllowedOrigins: []string{
+			"https://myapp.com",
+		},
+		AllowedMethods: []string{
+			"GET",
+			"POST",
+			"PUT",
+			"PATCH",
+			"DELETE",
+			"OPTIONS",
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Requested-With",
+		},
+		ExposedHeaders: []string{
+			"Link",
+			"X-Total-Count",
+		},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	}
+}
+
+func (c *CORSConfig) isOriginAllowed(origin string) bool {
+	for _, allowedOrigin := range c.AllowedOrigins {
+		if allowedOrigin == "*" {
+			return true
+		}
+		if allowedOrigin == origin {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *CORSConfig) CORSMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !c.isOriginAllowed(origin) {
+			log.Printf("CORS: Origin not allowed: %s", origin)
+			http.Error(w, "CORS: Origin not allowed", http.StatusForbidden)
+			return
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", origin)
+
+		if c.AllowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
+
+		if len(c.ExposedHeaders) > 0 {
+			w.Header().Set("Access-Control-Expose-Headers", strings.Join(c.ExposedHeaders, ", "))
+		}
+
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Methods", strings.Join(c.AllowedMethods, ", "))
+			w.Header().Set("Access-Control-Allow-Headers", strings.Join(c.AllowedHeaders, ", "))
+
+			if c.MaxAge > 0 {
+				w.Header().Set("Access-Control-Max-Age", http.TimeFormat)
+				w.Header().Set("Access-Control-Max-Age", "86400")
+			}
+
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func jsonResponse(w http.ResponseWriter, status int, data interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		log.Printf("Error encoding JSON response: %v", err)
+	}
+}
+
+func homeHandler(w http.ResponseWriter, r *http.Request) {
+	response := Response{
+		Message: "Welcome to the API",
+		Status:  http.StatusOK,
+	}
+	jsonResponse(w, http.StatusOK, response)
+}
+
+func usersHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		users := []map[string]interface{}{
+			{"id": 1, "name": "Alice", "email": "alice@example.com"},
+			{"id": 2, "name": "Bob", "email": "bob@example.com"},
+		}
+		jsonResponse(w, http.StatusOK, users)
+
+	case http.MethodPost:
+		var user map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
+			jsonResponse(w, http.StatusBadRequest, Response{
+				Message: "Invalid request body",
+				Status:  http.StatusBadRequest,
+			})
+			return
+		}
+		user["id"] = 3
+		jsonResponse(w, http.StatusCreated, user)
+
+	default:
+		jsonResponse(w, http.StatusMethodNotAllowed, Response{
+			Message: "Method not allowed",
+			Status:  http.StatusMethodNotAllowed,
+		})
+	}
+}
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	jsonResponse(w, http.StatusOK, map[string]string{
+		"status": "healthy",
+	})
+}
+
+func loggingMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Printf(
+			"[%s] %s %s - Origin: %s",
+			r.Method,
+			r.RequestURI,
+			r.RemoteAddr,
+			r.Header.Get("Origin"),
+		)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func setupRoutes(corsConfig *CORSConfig) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/", homeHandler)
+	mux.HandleFunc("/api/users", usersHandler)
+	mux.HandleFunc("/health", healthHandler)
+
+	handler := corsConfig.CORSMiddleware(mux)
+	handler = loggingMiddleware(handler)
+
+	return handler
+}
+
+func main() {
+	corsConfig := NewDefaultCORSConfig()
+
+	handler := setupRoutes(corsConfig)
+
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: handler,
+	}
+
+	log.Printf("Server starting on port 8080")
+	log.Printf("Allowed origins: %v", corsConfig.AllowedOrigins)
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("Server failed to start: %v", err)
+	}
+}
