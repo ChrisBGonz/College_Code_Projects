@@ -1,0 +1,200 @@
+
+```python
+import anthropic
+import json
+import re
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+INVOICES_DB = {
+    "INV001": {
+        "invoice_id": "INV001",
+        "customer_name": "田中太郎",
+        "customer_email": "tanaka@example.com",
+        "amount": 50000,
+        "currency": "JPY",
+        "status": "paid",
+        "issue_date": "2024-01-15",
+        "due_date": "2024-02-15",
+        "items": [
+            {"description": "Webデザイン", "quantity": 1, "unit_price": 30000},
+            {"description": "SEO最適化", "quantity": 1, "unit_price": 20000}
+        ]
+    },
+    "INV002": {
+        "invoice_id": "INV002",
+        "customer_name": "鈴木花子",
+        "customer_email": "suzuki@example.com",
+        "amount": 75000,
+        "currency": "JPY",
+        "status": "pending",
+        "issue_date": "2024-01-20",
+        "due_date": "2024-02-20",
+        "items": [
+            {"description": "システム開発", "quantity": 1, "unit_price": 75000}
+        ]
+    },
+    "INV003": {
+        "invoice_id": "INV003",
+        "customer_name": "山田次郎",
+        "customer_email": "yamada@example.com",
+        "amount": 25000,
+        "currency": "JPY",
+        "status": "overdue",
+        "issue_date": "2023-12-01",
+        "due_date": "2024-01-01",
+        "items": [
+            {"description": "コンサルティング", "quantity": 5, "unit_price": 5000}
+        ]
+    }
+}
+
+tools = [
+    {
+        "name": "get_invoice_from_database",
+        "description": "データベースから請求書の詳細情報を取得します。invoice_idを使用して特定の請求書を検索します。",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "invoice_id": {
+                    "type": "string",
+                    "description": "取得する請求書のID（例：INV001）"
+                }
+            },
+            "required": ["invoice_id"]
+        }
+    }
+]
+
+def get_invoice_from_database(invoice_id: str) -> dict:
+    """データベースから請求書を取得する関数"""
+    if invoice_id in INVOICES_DB:
+        return {
+            "success": True,
+            "invoice": INVOICES_DB[invoice_id]
+        }
+    else:
+        return {
+            "success": False,
+            "error": f"請求書ID '{invoice_id}' が見つかりません"
+        }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """ツール呼び出しを処理する関数"""
+    if tool_name == "get_invoice_from_database":
+        result = get_invoice_from_database(tool_input["invoice_id"])
+        return json.dumps(result, ensure_ascii=False)
+    return json.dumps({"error": "Unknown tool"})
+
+@app.route('/invoice/<invoice_id>', methods=['GET'])
+def get_invoice(invoice_id: str):
+    """
+    URLからinvoice_idを受け取り、データベースから請求書の詳細を取得して返すルート
+    
+    Args:
+        invoice_id: URLパラメータとして渡される請求書ID
+    
+    Returns:
+        JSON形式の請求書詳細情報
+    """
+    client = anthropic.Anthropic()
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"請求書ID '{invoice_id}' の詳細情報をデータベースから取得してください。"
+        }
+    ]
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages
+    )
+    
+    while response.stop_reason == "tool_use":
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+        
+        if not tool_use_block:
+            break
+        
+        tool_result = process_tool_call(tool_use_block.name, tool_use_block.input)
+        
+        messages.append({
+            "role": "assistant",
+            "content": response.content
+        })
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_block.id,
+                    "content": tool_result
+                }
+            ]
+        })
+        
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+    
+    final_text = ""
+    for block in response.content:
+        if hasattr(block, "text"):
+            final_text = block.text
+            break
+    
+    tool_result_data = None
+    for msg in messages:
+        if isinstance(msg.get("content"), list):
+            for content_item in msg["content"]:
+                if isinstance(content_item, dict) and content_item.get("type") == "tool_result":
+                    tool_result_data = json.loads(content_item["content"])
+                    break
+    
+    if tool_result_data and tool_result_data.get("success"):
+        return jsonify({
+            "status": "success",
+            "invoice": tool_result_data["invoice"],
+            "message": final_text
+        }), 200
+    elif tool_result_data and not tool_result_data.get("success"):
+        return jsonify({
+            "status": "error",
+            "error": tool_result_data.get("error", "請求書が見つかりません"),
+            "message": final_text
+        }), 404
+    else:
+        return jsonify({
+            "status": "error",
+            "error": "請求書の取得に失敗しました",
+            "message": final_text
+        }), 500
+
+@app.route('/invoices', methods=['GET'])
+def list_invoices():
+    """全請求書の一覧を返すルート"""
+    return jsonify({
+        "status": "success",
+        "invoices": list(INVOICES_DB.keys()),
+        "total": len(INVOICES_DB)
+    }), 200
+
+if __name__ == '__main__':
+    print("Flask サーバーを起動中...")
+    print("利用可能なエンドポイント:")
+    print("  GET /invoice/<invoice_id> - 特定の請求書を取得")
+    print("  GET /invoices - 全請求書の一覧を取得")
+    print("\nテスト用請求書ID: INV001, INV002, INV003")
+    app.run(debug=True, port=5000)
+```

@@ -1,0 +1,345 @@
+
+```python
+import anthropic
+import json
+import subprocess
+import sys
+
+# Install required packages
+def install_packages():
+    packages = ["PyJWT", "cryptography"]
+    for package in packages:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", package, "-q"])
+
+install_packages()
+
+import jwt
+import datetime
+from typing import Any
+
+client = anthropic.Anthropic()
+
+# Define JWT tools for Claude to use
+tools = [
+    {
+        "name": "generate_jwt_token",
+        "description": "Generate a JWT token with specified payload and secret key",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "description": "The payload data to encode in the JWT token"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "The secret key used to sign the token"
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "The algorithm to use for signing (e.g., HS256, HS384, HS512)",
+                    "default": "HS256"
+                },
+                "expiration_hours": {
+                    "type": "number",
+                    "description": "Number of hours until token expires",
+                    "default": 24
+                }
+            },
+            "required": ["payload", "secret_key"]
+        }
+    },
+    {
+        "name": "decode_jwt_token",
+        "description": "Decode and verify a JWT token",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "The JWT token to decode"
+                },
+                "secret_key": {
+                    "type": "string",
+                    "description": "The secret key used to verify the token"
+                },
+                "algorithm": {
+                    "type": "string",
+                    "description": "The algorithm used for signing",
+                    "default": "HS256"
+                }
+            },
+            "required": ["token", "secret_key"]
+        }
+    },
+    {
+        "name": "validate_jwt_token",
+        "description": "Validate a JWT token without decoding (check if it's properly formatted)",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "The JWT token to validate"
+                }
+            },
+            "required": ["token"]
+        }
+    },
+    {
+        "name": "inspect_jwt_header",
+        "description": "Inspect the header of a JWT token without verification",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "token": {
+                    "type": "string",
+                    "description": "The JWT token to inspect"
+                }
+            },
+            "required": ["token"]
+        }
+    }
+]
+
+def generate_jwt_token(payload: dict, secret_key: str, algorithm: str = "HS256", expiration_hours: float = 24) -> dict:
+    """Generate a JWT token"""
+    try:
+        # Add expiration time to payload
+        payload_with_exp = payload.copy()
+        payload_with_exp['exp'] = datetime.datetime.utcnow() + datetime.timedelta(hours=expiration_hours)
+        payload_with_exp['iat'] = datetime.datetime.utcnow()
+        
+        # Generate token
+        token = jwt.encode(payload_with_exp, secret_key, algorithm=algorithm)
+        
+        return {
+            "success": True,
+            "token": token,
+            "algorithm": algorithm,
+            "expires_in_hours": expiration_hours
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def decode_jwt_token(token: str, secret_key: str, algorithm: str = "HS256") -> dict:
+    """Decode and verify a JWT token"""
+    try:
+        decoded = jwt.decode(token, secret_key, algorithms=[algorithm])
+        
+        # Convert datetime objects to strings for JSON serialization
+        result = {}
+        for key, value in decoded.items():
+            if isinstance(value, datetime.datetime):
+                result[key] = value.isoformat()
+            else:
+                result[key] = value
+        
+        return {
+            "success": True,
+            "decoded_payload": result,
+            "is_valid": True
+        }
+    except jwt.ExpiredSignatureError:
+        return {
+            "success": False,
+            "error": "Token has expired",
+            "is_valid": False
+        }
+    except jwt.InvalidTokenError as e:
+        return {
+            "success": False,
+            "error": f"Invalid token: {str(e)}",
+            "is_valid": False
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "is_valid": False
+        }
+
+def validate_jwt_token(token: str) -> dict:
+    """Validate JWT token format without verification"""
+    try:
+        # Check if token has three parts
+        parts = token.split('.')
+        if len(parts) != 3:
+            return {
+                "is_valid_format": False,
+                "error": "Token must have exactly 3 parts separated by dots"
+            }
+        
+        # Try to decode header and payload (without verification)
+        import base64
+        
+        def decode_base64(data):
+            # Add padding if necessary
+            padding = 4 - len(data) % 4
+            if padding != 4:
+                data += '=' * padding
+            return base64.urlsafe_b64decode(data)
+        
+        header = json.loads(decode_base64(parts[0]))
+        payload = json.loads(decode_base64(parts[1]))
+        
+        return {
+            "is_valid_format": True,
+            "header": header,
+            "payload_keys": list(payload.keys()),
+            "has_expiration": 'exp' in payload,
+            "has_issued_at": 'iat' in payload
+        }
+    except Exception as e:
+        return {
+            "is_valid_format": False,
+            "error": str(e)
+        }
+
+def inspect_jwt_header(token: str) -> dict:
+    """Inspect JWT token header without verification"""
+    try:
+        header = jwt.get_unverified_header(token)
+        return {
+            "success": True,
+            "header": header,
+            "algorithm": header.get('alg', 'Unknown'),
+            "token_type": header.get('typ', 'Unknown')
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+def process_tool_call(tool_name: str, tool_input: dict) -> Any:
+    """Process tool calls from Claude"""
+    if tool_name == "generate_jwt_token":
+        return generate_jwt_token(
+            tool_input["payload"],
+            tool_input["secret_key"],
+            tool_input.get("algorithm", "HS256"),
+            tool_input.get("expiration_hours", 24)
+        )
+    elif tool_name == "decode_jwt_token":
+        return decode_jwt_token(
+            tool_input["token"],
+            tool_input["secret_key"],
+            tool_input.get("algorithm", "HS256")
+        )
+    elif tool_name == "validate_jwt_token":
+        return validate_jwt_token(tool_input["token"])
+    elif tool_name == "inspect_jwt_header":
+        return inspect_jwt_header(tool_input["token"])
+    else:
+        return {"error": f"Unknown tool: {tool_name}"}
+
+def run_jwt_assistant(user_request: str) -> str:
+    """Run the JWT assistant with Claude"""
+    print(f"\n{'='*60}")
+    print(f"User Request: {user_request}")
+    print('='*60)
+    
+    messages = [{"role": "user", "content": user_request}]
+    
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"\nClaude's Response (stop_reason: {response.stop_reason}):")
+        
+        # Check if we're done
+        if response.stop_reason == "end_turn":
+            # Extract text response
+            for block in response.content:
+                if hasattr(block, 'text'):
+                    print(f"\nFinal Response: {block.text}")
+                    return block.text
+            break
+        
+        # Process tool uses
+        if response.stop_reason == "tool_use":
+            # Add assistant's response to messages
+            messages.append({"role": "assistant", "content": response.content})
+            
+            # Process each tool use
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nTool Called: {block.name}")
+                    print(f"Tool Input: {json.dumps(block.input, indent=2)}")
+                    
+                    # Execute the tool
+                    result = process_tool_call(block.name, block.input)
+                    print(f"Tool Result: {json.dumps(result, indent=2)}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": json.dumps(result)
+                    })
+            
+            # Add tool results to messages
+            messages.append({"role": "user", "content": tool_results})
+        else:
+            # Unexpected stop reason
+            break
+    
+    return "Process completed"
+
+def main():
+    """Main function to demonstrate JWT operations"""
+    print("JWT Authentication and Decoding System")
+    print("Using Claude with Tool Use")
+    print("="*60)
+    
+    # Test scenarios
+    test_requests = [
+        """
+        Please help me with the following JWT operations:
+        1. Generate a JWT token for a user with:
+           - user_id: 12345
+           - username: "john_doe"
+           - role: "admin"
+           - email: "john@example.com"
+           Use secret key "my-super-secret-key-2024" and HS256 algorithm, expiring in 2 hours
+        
+        2. Then decode and verify the generated token
+        
+        3. Also inspect the token's header
+        
+        4. Finally, validate the token format
+        
+        Please provide a comprehensive analysis of all operations.
+        """,
+        
+        """
+        I have a JWT token that I need to analyze. Please:
+        1. First validate its format
+        2. Inspect its header
+        3. Try to decode it with the secret key "test-secret-123"
+        
+        The token is: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+        
+        Provide a detailed analysis of what you find.
+        """
+    ]
+    
+    for i, request in enumerate(test_requests, 1):
+        print(f"\n{'#'*60}")
+        print(f"Test Scenario {i}")
+        print('#'*60)
+        result = run_jwt_assistant(request)
+        print(f"\nCompleted Scenario {i}")
+
+if __name__ == "__main__":
+    main()
+```

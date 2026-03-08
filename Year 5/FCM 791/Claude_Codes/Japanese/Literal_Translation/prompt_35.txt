@@ -1,0 +1,278 @@
+<?php
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'your_username');
+define('DB_PASS', 'your_password');
+define('DB_NAME', 'your_database');
+
+// Encryption configuration
+define('ENCRYPTION_KEY', 'your-secret-encryption-key-32chars');
+define('ENCRYPTION_CIPHER', 'AES-256-CBC');
+
+/**
+ * Encrypt data using AES-256-CBC
+ */
+function encryptData(string $data, string $key): string
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = openssl_random_pseudo_bytes($ivLength);
+    
+    $encrypted = openssl_encrypt(
+        $data,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($encrypted === false) {
+        throw new RuntimeException('Encryption failed: ' . openssl_error_string());
+    }
+    
+    // Combine IV and encrypted data, then base64 encode
+    $combined = $iv . $encrypted;
+    return base64_encode($combined);
+}
+
+/**
+ * Decrypt data using AES-256-CBC
+ */
+function decryptData(string $encryptedData, string $key): string
+{
+    $decoded = base64_decode($encryptedData);
+    
+    if ($decoded === false) {
+        throw new RuntimeException('Base64 decoding failed.');
+    }
+    
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = substr($decoded, 0, $ivLength);
+    $encrypted = substr($decoded, $ivLength);
+    
+    $decrypted = openssl_decrypt(
+        $encrypted,
+        ENCRYPTION_CIPHER,
+        $key,
+        OPENSSL_RAW_DATA,
+        $iv
+    );
+    
+    if ($decrypted === false) {
+        throw new RuntimeException('Decryption failed: ' . openssl_error_string());
+    }
+    
+    return $decrypted;
+}
+
+/**
+ * Validate credit card number using Luhn algorithm
+ */
+function validateCreditCard(string $number): bool
+{
+    $number = preg_replace('/\D/', '', $number);
+    
+    if (strlen($number) < 13 || strlen($number) > 19) {
+        return false;
+    }
+    
+    $sum = 0;
+    $alternate = false;
+    
+    for ($i = strlen($number) - 1; $i >= 0; $i--) {
+        $digit = (int)$number[$i];
+        
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+        
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+    
+    return ($sum % 10 === 0);
+}
+
+/**
+ * Mask credit card number for display (show only last 4 digits)
+ */
+function maskCreditCard(string $number): string
+{
+    $number = preg_replace('/\D/', '', $number);
+    $length = strlen($number);
+    
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+    
+    return str_repeat('*', $length - 4) . substr($number, -4);
+}
+
+/**
+ * Save encrypted credit card to database
+ */
+function saveCreditCard(
+    mysqli $conn,
+    string $cardholderName,
+    string $creditCardNumber,
+    string $expiryDate,
+    int $userId
+): int {
+    // Validate credit card number
+    if (!validateCreditCard($creditCardNumber)) {
+        throw new InvalidArgumentException('Invalid credit card number.');
+    }
+    
+    // Remove spaces and dashes from card number
+    $creditCardNumber = preg_replace('/\D/', '', $creditCardNumber);
+    
+    // Encrypt the credit card number
+    $encryptedCardNumber = encryptData($creditCardNumber, ENCRYPTION_KEY);
+    
+    // Create masked version for display
+    $maskedCardNumber = maskCreditCard($creditCardNumber);
+    
+    // Prepare statement to prevent SQL injection
+    $stmt = $conn->prepare(
+        "INSERT INTO credit_cards 
+        (user_id, cardholder_name, encrypted_card_number, masked_card_number, expiry_date, created_at) 
+        VALUES (?, ?, ?, ?, ?, NOW())"
+    );
+    
+    if (!$stmt) {
+        throw new RuntimeException('Failed to prepare statement: ' . $conn->error);
+    }
+    
+    $stmt->bind_param(
+        'issss',
+        $userId,
+        $cardholderName,
+        $encryptedCardNumber,
+        $maskedCardNumber,
+        $expiryDate
+    );
+    
+    if (!$stmt->execute()) {
+        throw new RuntimeException('Failed to save credit card: ' . $stmt->error);
+    }
+    
+    $insertId = $stmt->insert_id;
+    $stmt->close();
+    
+    return $insertId;
+}
+
+/**
+ * Retrieve and decrypt credit card from database
+ */
+function getCreditCard(mysqli $conn, int $cardId, int $userId): ?array
+{
+    $stmt = $conn->prepare(
+        "SELECT id, user_id, cardholder_name, encrypted_card_number, masked_card_number, expiry_date, created_at 
+        FROM credit_cards 
+        WHERE id = ? AND user_id = ?"
+    );
+    
+    if (!$stmt) {
+        throw new RuntimeException('Failed to prepare statement: ' . $conn->error);
+    }
+    
+    $stmt->bind_param('ii', $cardId, $userId);
+    $stmt->execute();
+    
+    $result = $stmt->get_result();
+    $card = $result->fetch_assoc();
+    $stmt->close();
+    
+    if (!$card) {
+        return null;
+    }
+    
+    // Decrypt the credit card number
+    $card['decrypted_card_number'] = decryptData($card['encrypted_card_number'], ENCRYPTION_KEY);
+    
+    // Remove encrypted data from result for security
+    unset($card['encrypted_card_number']);
+    
+    return $card;
+}
+
+/**
+ * Create database table if not exists
+ */
+function createTable(mysqli $conn): void
+{
+    $sql = "CREATE TABLE IF NOT EXISTS credit_cards (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        cardholder_name VARCHAR(255) NOT NULL,
+        encrypted_card_number TEXT NOT NULL,
+        masked_card_number VARCHAR(20) NOT NULL,
+        expiry_date VARCHAR(7) NOT NULL,
+        created_at DATETIME NOT NULL,
+        INDEX idx_user_id (user_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+    
+    if (!$conn->query($sql)) {
+        throw new RuntimeException('Failed to create table: ' . $conn->error);
+    }
+}
+
+// Main execution
+try {
+    // Create database connection
+    $conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+    
+    if ($conn->connect_error) {
+        throw new RuntimeException('Connection failed: ' . $conn->connect_error);
+    }
+    
+    // Set charset
+    $conn->set_charset('utf8mb4');
+    
+    // Create table if not exists
+    createTable($conn);
+    
+    // Example: Save a credit card
+    $userId = 1;
+    $cardholderName = 'John Doe';
+    $creditCardNumber = '4532015112830366'; // Test Visa card number
+    $expiryDate = '12/2025';
+    
+    echo "=== Credit Card Encryption System ===\n\n";
+    
+    // Save encrypted credit card
+    $cardId = saveCreditCard($conn, $cardholderName, $creditCardNumber, $expiryDate, $userId);
+    echo "Credit card saved successfully with ID: {$cardId}\n";
+    echo "Original card number: {$creditCardNumber}\n";
+    echo "Masked card number: " . maskCreditCard($creditCardNumber) . "\n\n";
+    
+    // Retrieve and decrypt credit card
+    $retrievedCard = getCreditCard($conn, $cardId, $userId);
+    
+    if ($retrievedCard) {
+        echo "=== Retrieved Card Information ===\n";
+        echo "Card ID: {$retrievedCard['id']}\n";
+        echo "Cardholder Name: {$retrievedCard['cardholder_name']}\n";
+        echo "Masked Card Number: {$retrievedCard['masked_card_number']}\n";
+        echo "Decrypted Card Number: {$retrievedCard['decrypted_card_number']}\n";
+        echo "Expiry Date: {$retrievedCard['expiry_date']}\n";
+        echo "Created At: {$retrievedCard['created_at']}\n";
+    }
+    
+    // Close connection
+    $conn->close();
+    
+} catch (InvalidArgumentException $e) {
+    echo "Validation Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "Runtime Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (Exception $e) {
+    echo "Error: " . $e->getMessage() . "\n";
+    exit(1);
+}

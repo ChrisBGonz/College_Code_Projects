@@ -1,0 +1,748 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# ============================================================
+# Security Tool Auto-Downloader and Installer
+# ============================================================
+
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Log file
+LOG_FILE="/var/log/security_tool_installer.log"
+TEMP_DIR=""
+
+# ============================================================
+# Logging functions
+# ============================================================
+log_info()    { echo -e "${GREEN}[INFO]${NC}  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
+log_section() { echo -e "\n${CYAN}========== $* ==========${NC}" | tee -a "$LOG_FILE"; }
+
+# ============================================================
+# Cleanup on exit
+# ============================================================
+cleanup() {
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        log_info "Cleaning up temporary directory: $TEMP_DIR"
+        rm -rf "$TEMP_DIR"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# ============================================================
+# Check root privileges
+# ============================================================
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root (sudo)."
+        exit 1
+    fi
+}
+
+# ============================================================
+# Detect OS and package manager
+# ============================================================
+detect_os() {
+    if [[ -f /etc/os-release ]]; then
+        source /etc/os-release
+        OS_ID="${ID}"
+        OS_VERSION="${VERSION_ID:-unknown}"
+        OS_FAMILY="${ID_LIKE:-$ID}"
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        OS_ID="macos"
+        OS_FAMILY="macos"
+        OS_VERSION="$(sw_vers -productVersion)"
+    else
+        log_error "Unsupported operating system."
+        exit 1
+    fi
+
+    log_info "Detected OS: $OS_ID $OS_VERSION (family: $OS_FAMILY)"
+
+    if command -v apt-get &>/dev/null; then
+        PKG_MANAGER="apt"
+    elif command -v dnf &>/dev/null; then
+        PKG_MANAGER="dnf"
+    elif command -v yum &>/dev/null; then
+        PKG_MANAGER="yum"
+    elif command -v pacman &>/dev/null; then
+        PKG_MANAGER="pacman"
+    elif command -v brew &>/dev/null; then
+        PKG_MANAGER="brew"
+    elif command -v zypper &>/dev/null; then
+        PKG_MANAGER="zypper"
+    else
+        PKG_MANAGER="unknown"
+        log_warn "No supported package manager found."
+    fi
+
+    log_info "Package manager: $PKG_MANAGER"
+}
+
+# ============================================================
+# Install system dependencies
+# ============================================================
+install_dependencies() {
+    log_section "Installing Dependencies"
+    local deps=("curl" "wget" "git" "tar" "gzip" "unzip" "jq" "gpg")
+
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get update -qq
+            apt-get install -y "${deps[@]}" build-essential libssl-dev libffi-dev python3 python3-pip 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        dnf|yum)
+            $PKG_MANAGER install -y "${deps[@]}" gcc openssl-devel libffi-devel python3 python3-pip 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        pacman)
+            pacman -Sy --noconfirm "${deps[@]}" base-devel python python-pip 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        brew)
+            brew install "${deps[@]}" 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        zypper)
+            zypper install -y "${deps[@]}" gcc libopenssl-devel python3 python3-pip 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        *)
+            log_warn "Cannot auto-install dependencies. Please install manually: ${deps[*]}"
+            ;;
+    esac
+}
+
+# ============================================================
+# Fetch latest version from GitHub API
+# ============================================================
+get_github_latest_version() {
+    local repo="$1"
+    local version
+    version=$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" \
+        | jq -r '.tag_name' 2>/dev/null) || {
+        log_error "Failed to fetch latest version for $repo"
+        return 1
+    }
+    echo "$version"
+}
+
+# ============================================================
+# Verify checksum
+# ============================================================
+verify_checksum() {
+    local file="$1"
+    local checksum_file="$2"
+    local algorithm="${3:-sha256}"
+
+    log_info "Verifying checksum for $file ..."
+
+    if [[ ! -f "$checksum_file" ]]; then
+        log_warn "Checksum file not found. Skipping verification."
+        return 0
+    fi
+
+    local expected actual
+    expected=$(grep "$(basename "$file")" "$checksum_file" | awk '{print $1}')
+    if [[ -z "$expected" ]]; then
+        log_warn "No matching checksum entry found. Skipping."
+        return 0
+    fi
+
+    case "$algorithm" in
+        sha256) actual=$(sha256sum "$file" | awk '{print $1}') ;;
+        sha512) actual=$(sha512sum "$file" | awk '{print $1}') ;;
+        md5)    actual=$(md5sum    "$file" | awk '{print $1}') ;;
+        *)
+            log_warn "Unknown algorithm: $algorithm"
+            return 0
+            ;;
+    esac
+
+    if [[ "$expected" == "$actual" ]]; then
+        log_info "Checksum OK: $actual"
+    else
+        log_error "Checksum MISMATCH!"
+        log_error "  Expected: $expected"
+        log_error "  Actual:   $actual"
+        return 1
+    fi
+}
+
+# ============================================================
+# Download file with retry
+# ============================================================
+download_file() {
+    local url="$1"
+    local dest="$2"
+    local retries=3
+
+    log_info "Downloading: $url"
+    for ((i=1; i<=retries; i++)); do
+        if curl -fsSL --retry 3 --retry-delay 5 -o "$dest" "$url"; then
+            log_info "Download complete: $dest"
+            return 0
+        fi
+        log_warn "Download attempt $i/$retries failed. Retrying..."
+        sleep 3
+    done
+
+    log_error "Failed to download: $url"
+    return 1
+}
+
+# ============================================================
+# Tool: Nmap
+# ============================================================
+install_nmap() {
+    log_section "Installing Nmap"
+
+    if command -v nmap &>/dev/null; then
+        local current
+        current=$(nmap --version | head -1 | awk '{print $3}')
+        log_info "Nmap already installed: version $current"
+    fi
+
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y nmap ;;
+        dnf|yum) $PKG_MANAGER install -y nmap ;;
+        pacman) pacman -S --noconfirm nmap ;;
+        brew)   brew install nmap ;;
+        zypper) zypper install -y nmap ;;
+        *)
+            log_warn "Installing Nmap from source..."
+            local version
+            version=$(get_github_latest_version "nmap/nmap") || version="7.95"
+            version="${version#v}"
+            local url="https://nmap.org/dist/nmap-${version}.tar.bz2"
+            local archive="$TEMP_DIR/nmap.tar.bz2"
+            download_file "$url" "$archive"
+            tar -xjf "$archive" -C "$TEMP_DIR"
+            cd "$TEMP_DIR/nmap-${version}"
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            make install
+            ;;
+    esac 2>&1 | tee -a "$LOG_FILE"
+
+    log_info "Nmap installed: $(nmap --version | head -1)"
+}
+
+# ============================================================
+# Tool: Nikto
+# ============================================================
+install_nikto() {
+    log_section "Installing Nikto"
+
+    local install_dir="/opt/nikto"
+    local repo="sullo/nikto"
+    local version
+    version=$(get_github_latest_version "$repo") || version="main"
+
+    if [[ -d "$install_dir" ]]; then
+        log_info "Updating existing Nikto installation..."
+        git -C "$install_dir" pull 2>&1 | tee -a "$LOG_FILE"
+    else
+        log_info "Cloning Nikto repository (tag: $version)..."
+        git clone --depth 1 --branch "$version" \
+            "https://github.com/${repo}.git" "$install_dir" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    # Install Perl dependencies
+    if command -v cpan &>/dev/null; then
+        cpan -i Net::SSLeay IO::Socket::SSL 2>&1 | tee -a "$LOG_FILE" || true
+    fi
+
+    # Create symlink
+    ln -sf "$install_dir/program/nikto.pl" /usr/local/bin/nikto
+    chmod +x "$install_dir/program/nikto.pl"
+
+    log_info "Nikto installed at $install_dir"
+    log_info "Run: nikto -h <target>"
+}
+
+# ============================================================
+# Tool: Gobuster
+# ============================================================
+install_gobuster() {
+    log_section "Installing Gobuster"
+
+    local repo="OJ/gobuster"
+    local version
+    version=$(get_github_latest_version "$repo") || { log_error "Cannot fetch Gobuster version"; return 1; }
+    local ver_num="${version#v}"
+
+    # Detect architecture
+    local arch
+    case "$(uname -m)" in
+        x86_64)  arch="amd64" ;;
+        aarch64) arch="arm64" ;;
+        armv7l)  arch="armv7" ;;
+        *)       arch="amd64" ;;
+    esac
+
+    local os_name
+    case "$OS_ID" in
+        macos|darwin) os_name="darwin" ;;
+        *)            os_name="linux"  ;;
+    esac
+
+    local filename="gobuster_${os_name}_${arch}.tar.gz"
+    local url="https://github.com/${repo}/releases/download/${version}/${filename}"
+    local checksum_url="https://github.com/${repo}/releases/download/${version}/checksums.txt"
+    local archive="$TEMP_DIR/gobuster.tar.gz"
+    local checksum_file="$TEMP_DIR/gobuster_checksums.txt"
+
+    download_file "$url" "$archive"
+    download_file "$checksum_url" "$checksum_file" || true
+    verify_checksum "$archive" "$checksum_file" "sha256" || true
+
+    tar -xzf "$archive" -C "$TEMP_DIR"
+    install -m 755 "$TEMP_DIR/gobuster" /usr/local/bin/gobuster
+
+    log_info "Gobuster $version installed: $(gobuster version 2>/dev/null || echo 'OK')"
+}
+
+# ============================================================
+# Tool: Nuclei
+# ============================================================
+install_nuclei() {
+    log_section "Installing Nuclei"
+
+    # Prefer Go install if available
+    if command -v go &>/dev/null; then
+        log_info "Installing Nuclei via Go..."
+        go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest 2>&1 | tee -a "$LOG_FILE"
+        local gopath
+        gopath=$(go env GOPATH)
+        ln -sf "${gopath}/bin/nuclei" /usr/local/bin/nuclei 2>/dev/null || true
+    else
+        local repo="projectdiscovery/nuclei"
+        local version
+        version=$(get_github_latest_version "$repo") || { log_error "Cannot fetch Nuclei version"; return 1; }
+        local ver_num="${version#v}"
+
+        local arch
+        case "$(uname -m)" in
+            x86_64)  arch="amd64" ;;
+            aarch64) arch="arm64" ;;
+            *)       arch="amd64" ;;
+        esac
+
+        local os_name
+        [[ "$OS_ID" == "macos" ]] && os_name="macos" || os_name="linux"
+
+        local filename="nuclei_${ver_num}_${os_name}_${arch}.zip"
+        local url="https://github.com/${repo}/releases/download/${version}/${filename}"
+        local checksum_url="https://github.com/${repo}/releases/download/${version}/nuclei_${ver_num}_checksums.txt"
+        local archive="$TEMP_DIR/nuclei.zip"
+        local checksum_file="$TEMP_DIR/nuclei_checksums.txt"
+
+        download_file "$url" "$archive"
+        download_file "$checksum_url" "$checksum_file" || true
+        verify_checksum "$archive" "$checksum_file" "sha256" || true
+
+        unzip -o "$archive" -d "$TEMP_DIR/nuclei_extract"
+        install -m 755 "$TEMP_DIR/nuclei_extract/nuclei" /usr/local/bin/nuclei
+    fi
+
+    # Update templates
+    log_info "Updating Nuclei templates..."
+    nuclei -update-templates 2>&1 | tee -a "$LOG_FILE" || true
+
+    log_info "Nuclei installed: $(nuclei -version 2>&1 | head -1)"
+}
+
+# ============================================================
+# Tool: Trivy (Container/Filesystem vulnerability scanner)
+# ============================================================
+install_trivy() {
+    log_section "Installing Trivy"
+
+    local repo="aquasecurity/trivy"
+    local version
+    version=$(get_github_latest_version "$repo") || { log_error "Cannot fetch Trivy version"; return 1; }
+    local ver_num="${version#v}"
+
+    case "$PKG_MANAGER" in
+        apt)
+            wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | \
+                tee /usr/share/keyrings/trivy.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | \
+                tee /etc/apt/sources.list.d/trivy.list
+            apt-get update -qq
+            apt-get install -y trivy 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        dnf|yum)
+            cat > /etc/yum.repos.d/trivy.repo <<EOF
+[trivy]
+name=Trivy repository
+baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/\$basearch/
+gpgcheck=1
+enabled=1
+gpgkey=https://aquasecurity.github.io/trivy-repo/rpm/public.key
+EOF
+            $PKG_MANAGER install -y trivy 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        brew)
+            brew install aquasecurity/trivy/trivy 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        *)
+            local arch
+            case "$(uname -m)" in
+                x86_64)  arch="64bit" ;;
+                aarch64) arch="ARM64" ;;
+                *)       arch="64bit" ;;
+            esac
+
+            local filename="trivy_${ver_num}_Linux-${arch}.tar.gz"
+            local url="https://github.com/${repo}/releases/download/${version}/${filename}"
+            local checksum_url="https://github.com/${repo}/releases/download/${version}/trivy_${ver_num}_checksums.txt"
+            local archive="$TEMP_DIR/trivy.tar.gz"
+            local checksum_file="$TEMP_DIR/trivy_checksums.txt"
+
+            download_file "$url" "$archive"
+            download_file "$checksum_url" "$checksum_file" || true
+            verify_checksum "$archive" "$checksum_file" "sha256" || true
+
+            tar -xzf "$archive" -C "$TEMP_DIR"
+            install -m 755 "$TEMP_DIR/trivy" /usr/local/bin/trivy
+            ;;
+    esac
+
+    log_info "Trivy installed: $(trivy --version 2>&1 | head -1)"
+}
+
+# ============================================================
+# Tool: Lynis (Security auditing)
+# ============================================================
+install_lynis() {
+    log_section "Installing Lynis"
+
+    local repo="CISOfy/lynis"
+    local version
+    version=$(get_github_latest_version "$repo") || version="main"
+    local install_dir="/opt/lynis"
+
+    if [[ -d "$install_dir" ]]; then
+        log_info "Updating existing Lynis installation..."
+        git -C "$install_dir" pull 2>&1 | tee -a "$LOG_FILE"
+    else
+        git clone --depth 1 --branch "$version" \
+            "https://github.com/${repo}.git" "$install_dir" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    ln -sf "$install_dir/lynis" /usr/local/bin/lynis
+    chmod +x "$install_dir/lynis"
+
+    log_info "Lynis installed: $(lynis show version 2>/dev/null || echo 'OK')"
+    log_info "Run: lynis audit system"
+}
+
+# ============================================================
+# Tool: Fail2ban
+# ============================================================
+install_fail2ban() {
+    log_section "Installing Fail2ban"
+
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y fail2ban ;;
+        dnf|yum) $PKG_MANAGER install -y fail2ban ;;
+        pacman) pacman -S --noconfirm fail2ban ;;
+        zypper) zypper install -y fail2ban ;;
+        *)
+            log_warn "Fail2ban not available via package manager. Skipping."
+            return 0
+            ;;
+    esac 2>&1 | tee -a "$LOG_FILE"
+
+    # Enable and start service
+    if command -v systemctl &>/dev/null; then
+        systemctl enable fail2ban
+        systemctl start fail2ban
+        log_info "Fail2ban service started."
+    fi
+
+    log_info "Fail2ban installed: $(fail2ban-client --version 2>&1 | head -1)"
+}
+
+# ============================================================
+# Tool: ClamAV
+# ============================================================
+install_clamav() {
+    log_section "Installing ClamAV"
+
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y clamav clamav-daemon ;;
+        dnf|yum) $PKG_MANAGER install -y clamav clamav-update ;;
+        pacman) pacman -S --noconfirm clamav ;;
+        brew)   brew install clamav ;;
+        zypper) zypper install -y clamav ;;
+        *)
+            log_warn "ClamAV not available via package manager. Skipping."
+            return 0
+            ;;
+    esac 2>&1 | tee -a "$LOG_FILE"
+
+    # Update virus definitions
+    log_info "Updating ClamAV virus definitions..."
+    if command -v systemctl &>/dev/null; then
+        systemctl stop clamav-freshclam 2>/dev/null || true
+    fi
+    freshclam 2>&1 | tee -a "$LOG_FILE" || log_warn "freshclam update failed (non-fatal)"
+
+    log_info "ClamAV installed: $(clamscan --version 2>&1 | head -1)"
+}
+
+# ============================================================
+# Tool: Snort (IDS/IPS)
+# ============================================================
+install_snort() {
+    log_section "Installing Snort"
+
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get install -y snort 2>&1 | tee -a "$LOG_FILE" || \
+                log_warn "Snort installation may require manual configuration."
+            ;;
+        dnf|yum)
+            $PKG_MANAGER install -y snort 2>&1 | tee -a "$LOG_FILE" || \
+                log_warn "Snort not in default repos. Consider EPEL or manual install."
+            ;;
+        *)
+            log_warn "Snort auto-install not supported for $PKG_MANAGER. Please install manually."
+            return 0
+            ;;
+    esac
+
+    if command -v snort &>/dev/null; then
+        log_info "Snort installed: $(snort --version 2>&1 | head -2 | tail -1)"
+    fi
+}
+
+# ============================================================
+# Tool: OpenVAS / GVM
+# ============================================================
+install_openvas() {
+    log_section "Installing OpenVAS/GVM"
+
+    case "$PKG_MANAGER" in
+        apt)
+            apt-get install -y openvas 2>&1 | tee -a "$LOG_FILE" || {
+                log_warn "Trying Greenbone Community Edition..."
+                apt-get install -y gvm 2>&1 | tee -a "$LOG_FILE" || \
+                    log_warn "OpenVAS/GVM not available in default repos."
+            }
+            ;;
+        *)
+            log_warn "OpenVAS auto-install not supported for $PKG_MANAGER."
+            log_warn "Visit: https://www.openvas.org/install-openvas.html"
+            return 0
+            ;;
+    esac
+
+    if command -v gvm-setup &>/dev/null; then
+        log_info "Running GVM setup (this may take a while)..."
+        gvm-setup 2>&1 | tee -a "$LOG_FILE" || log_warn "GVM setup failed. Manual configuration may be needed."
+    fi
+}
+
+# ============================================================
+# Tool: Metasploit Framework
+# ============================================================
+install_metasploit() {
+    log_section "Installing Metasploit Framework"
+
+    if command -v msfconsole &>/dev/null; then
+        log_info "Metasploit already installed."
+        return 0
+    fi
+
+    local installer="$TEMP_DIR/msfinstall"
+    download_file "https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb" \
+        "$installer" || {
+        log_warn "Falling back to official installer..."
+        download_file "https://apt.metasploit.com/metasploit-framework.gpg.key" \
+            "$TEMP_DIR/msf.gpg"
+    }
+
+    case "$PKG_MANAGER" in
+        apt)
+            curl -fsSL https://apt.metasploit.com/metasploit-framework.gpg.key | \
+                gpg --dearmor | tee /usr/share/keyrings/metasploit.gpg > /dev/null
+            echo "deb [signed-by=/usr/share/keyrings/metasploit.gpg] https://apt.metasploit.com/ focal main" | \
+                tee /etc/apt/sources.list.d/metasploit.list
+            apt-get update -qq
+            apt-get install -y metasploit-framework 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        *)
+            log_warn "Using Metasploit omnibus installer..."
+            local msfinstall="$TEMP_DIR/msfinstall.sh"
+            download_file "https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb" \
+                "$msfinstall" || {
+                log_warn "Cannot download Metasploit installer. Skipping."
+                return 0
+            }
+            chmod +x "$msfinstall"
+            bash "$msfinstall" 2>&1 | tee -a "$LOG_FILE" || log_warn "Metasploit install failed."
+            ;;
+    esac
+
+    if command -v msfconsole &>/dev/null; then
+        log_info "Metasploit installed successfully."
+    fi
+}
+
+# ============================================================
+# Tool: Wireshark / tshark
+# ============================================================
+install_wireshark() {
+    log_section "Installing Wireshark/tshark"
+
+    case "$PKG_MANAGER" in
+        apt)
+            DEBIAN_FRONTEND=noninteractive apt-get install -y wireshark tshark 2>&1 | tee -a "$LOG_FILE"
+            # Allow non-root capture
+            usermod -aG wireshark "${SUDO_USER:-root}" 2>/dev/null || true
+            ;;
+        dnf|yum)
+            $PKG_MANAGER install -y wireshark wireshark-cli 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        pacman)
+            pacman -S --noconfirm wireshark-qt wireshark-cli 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        brew)
+            brew install --cask wireshark 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        zypper)
+            zypper install -y wireshark 2>&1 | tee -a "$LOG_FILE"
+            ;;
+        *)
+            log_warn "Wireshark auto-install not supported for $PKG_MANAGER."
+            ;;
+    esac
+
+    if command -v tshark &>/dev/null; then
+        log_info "tshark installed: $(tshark --version 2>&1 | head -1)"
+    fi
+}
+
+# ============================================================
+# Tool: Hydra (Password cracker)
+# ============================================================
+install_hydra() {
+    log_section "Installing Hydra"
+
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y hydra ;;
+        dnf|yum) $PKG_MANAGER install -y hydra ;;
+        pacman) pacman -S --noconfirm hydra ;;
+        brew)   brew install hydra ;;
+        zypper) zypper install -y hydra ;;
+        *)
+            log_info "Building Hydra from source..."
+            local repo="vanhauser-thc/thc-hydra"
+            local version
+            version=$(get_github_latest_version "$repo") || version="main"
+            git clone --depth 1 --branch "$version" \
+                "https://github.com/${repo}.git" "$TEMP_DIR/hydra" 2>&1 | tee -a "$LOG_FILE"
+            cd "$TEMP_DIR/hydra"
+            ./configure --prefix=/usr/local
+            make -j"$(nproc)"
+            make install
+            ;;
+    esac 2>&1 | tee -a "$LOG_FILE"
+
+    if command -v hydra &>/dev/null; then
+        log_info "Hydra installed: $(hydra -h 2>&1 | head -1)"
+    fi
+}
+
+# ============================================================
+# Tool: SQLMap
+# ============================================================
+install_sqlmap() {
+    log_section "Installing SQLMap"
+
+    local install_dir="/opt/sqlmap"
+    local repo="sqlmapproject/sqlmap"
+    local version
+    version=$(get_github_latest_version "$repo") || version="master"
+
+    if [[ -d "$install_dir" ]]; then
+        log_info "Updating existing SQLMap installation..."
+        git -C "$install_dir" pull 2>&1 | tee -a "$LOG_FILE"
+    else
+        git clone --depth 1 --branch "$version" \
+            "https://github.com/${repo}.git" "$install_dir" 2>&1 | tee -a "$LOG_FILE"
+    fi
+
+    # Create wrapper script
+    cat > /usr/local/bin/sqlmap <<'EOF'
+#!/bin/bash
+exec python3 /opt/sqlmap/sqlmap.py "$@"
+EOF
+    chmod +x /usr/local/bin/sqlmap
+
+    log_info "SQLMap installed: $(sqlmap --version 2>&1 | head -1)"
+}
+
+# ============================================================
+# Tool: Hashcat
+# ============================================================
+install_hashcat() {
+    log_section "Installing Hashcat"
+
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y hashcat ;;
+        dnf|yum) $PKG_MANAGER install -y hashcat ;;
+        pacman) pacman -S --noconfirm hashcat ;;
+        brew)   brew install hashcat ;;
+        zypper) zypper install -y hashcat ;;
+        *)
+            local repo="hashcat/hashcat"
+            local version
+            version=$(get_github_latest_version "$repo") || { log_warn "Cannot fetch Hashcat version"; return 0; }
+            local ver_num="${version#v}"
+            local filename="hashcat-${ver_num}.tar.gz"
+            local url="https://github.com/${repo}/releases/download/${version}/${filename}"
+            local archive="$TEMP_DIR/hashcat.tar.gz"
+
+            download_file "$url" "$archive"
+            tar -xzf "$archive" -C "$TEMP_DIR"
+            cd "$TEMP_DIR/hashcat-${ver_num}"
+            make -j"$(nproc)"
+            install -m 755 hashcat /usr/local/bin/hashcat
+            ;;
+    esac 2>&1 | tee -a "$LOG_FILE"
+
+    if command -v hashcat &>/dev/null; then
+        log_info "Hashcat installed: $(hashcat --version 2>&1)"
+    fi
+}
+
+# ============================================================
+# Tool: OSSEC HIDS
+# ============================================================
+install_ossec() {
+    log_section "Installing OSSEC HIDS"
+
+    local repo="ossec/ossec-hids"
+    local version
+    version=$(get_github_latest_version "$repo") || { log_warn "Cannot fetch OSSEC version"; return 0; }
+    local ver_num="${version#v}"
+    local filename="ossec-hids-${ver_num}.tar.gz"
+    local url="https://github.com/${repo}/releases/download/${version}/${filename}"
+    local archive="$TEMP_DIR/ossec.tar.gz"
+
+    download_file "$url" "$archive" || { log_warn "OSSEC download failed. Skipping."; return 0; }
+
+    # Install dependencies
+    case "$PKG_MANAGER" in
+        apt)    apt-get install -y build-essential libssl-dev libpcre2-dev zlib1g-dev ;;
+        dnf|yum) $PKG_MANAGER install -y gcc openssl-devel pcre2-devel zlib-devel ;;
+        *) ;;

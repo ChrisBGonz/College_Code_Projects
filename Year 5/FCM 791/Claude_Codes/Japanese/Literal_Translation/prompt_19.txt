@@ -1,0 +1,293 @@
+
+```python
+import asyncio
+import logging
+import os
+import random
+from contextlib import asynccontextmanager
+
+import anthropic
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Custom Exception Classes
+class DatabaseConnectionError(Exception):
+    """Custom exception for database connection errors"""
+    def __init__(self, message: str, db_host: str = None, error_code: int = None):
+        self.message = message
+        self.db_host = db_host
+        self.error_code = error_code
+        super().__init__(self.message)
+
+class DatabaseQueryError(Exception):
+    """Custom exception for database query errors"""
+    def __init__(self, message: str, query: str = None):
+        self.message = message
+        self.query = query
+        super().__init__(self.message)
+
+class DatabaseTimeoutError(Exception):
+    """Custom exception for database timeout errors"""
+    def __init__(self, message: str, timeout_seconds: int = None):
+        self.message = message
+        self.timeout_seconds = timeout_seconds
+        super().__init__(self.message)
+
+# Simulated Database Operations
+class DatabaseSimulator:
+    """Simulates database operations that may fail"""
+    
+    def __init__(self):
+        self.connection_attempts = 0
+        self.query_count = 0
+    
+    async def connect(self, host: str = "localhost", port: int = 5432):
+        """Simulate database connection"""
+        self.connection_attempts += 1
+        
+        # Simulate various connection failures
+        if host == "invalid-host":
+            raise DatabaseConnectionError(
+                f"Cannot connect to database host: {host}",
+                db_host=host,
+                error_code=111
+            )
+        
+        if self.connection_attempts % 3 == 0:
+            raise DatabaseConnectionError(
+                "Connection refused: Database server is not running",
+                db_host=host,
+                error_code=61
+            )
+        
+        logger.info(f"Successfully connected to database at {host}:{port}")
+        return True
+    
+    async def execute_query(self, query: str):
+        """Simulate query execution"""
+        self.query_count += 1
+        
+        # Simulate query errors
+        if "DROP TABLE" in query.upper():
+            raise DatabaseQueryError(
+                "Permission denied: Cannot execute DROP TABLE",
+                query=query
+            )
+        
+        if self.query_count % 4 == 0:
+            raise DatabaseTimeoutError(
+                "Query execution timeout exceeded",
+                timeout_seconds=30
+            )
+        
+        # Simulate successful query
+        return {"rows": [{"id": 1, "name": "Test User"}, {"id": 2, "name": "Another User"}]}
+
+# Initialize database simulator
+db = DatabaseSimulator()
+
+# Lifespan context manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Starting FastAPI application with database error handling")
+    yield
+    logger.info("Shutting down FastAPI application")
+
+# Create FastAPI app
+app = FastAPI(
+    title="Database Error Handler with Claude AI",
+    description="FastAPI application with custom database exception handlers and AI-powered error analysis",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Custom Exception Handlers
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(request: Request, exc: DatabaseConnectionError):
+    """Handle database connection errors"""
+    logger.error(f"Database connection error: {exc.message}")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error_type": "DatabaseConnectionError",
+            "message": exc.message,
+            "db_host": exc.db_host,
+            "error_code": exc.error_code,
+            "suggestion": "Please check if the database server is running and accessible"
+        }
+    )
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(request: Request, exc: DatabaseQueryError):
+    """Handle database query errors"""
+    logger.error(f"Database query error: {exc.message}")
+    return JSONResponse(
+        status_code=400,
+        content={
+            "error_type": "DatabaseQueryError",
+            "message": exc.message,
+            "failed_query": exc.query,
+            "suggestion": "Please review your query syntax and permissions"
+        }
+    )
+
+@app.exception_handler(DatabaseTimeoutError)
+async def database_timeout_error_handler(request: Request, exc: DatabaseTimeoutError):
+    """Handle database timeout errors"""
+    logger.error(f"Database timeout error: {exc.message}")
+    return JSONResponse(
+        status_code=504,
+        content={
+            "error_type": "DatabaseTimeoutError",
+            "message": exc.message,
+            "timeout_seconds": exc.timeout_seconds,
+            "suggestion": "Consider optimizing your query or increasing the timeout limit"
+        }
+    )
+
+# AI-Powered Error Analysis using Claude
+async def analyze_error_with_claude(error_type: str, error_message: str, context: dict):
+    """Use Claude to analyze database errors and provide solutions"""
+    client = anthropic.Anthropic()
+    
+    prompt = f"""You are a database expert. Analyze the following database error and provide:
+1. A brief explanation of what caused the error
+2. Immediate steps to resolve it
+3. Best practices to prevent it in the future
+
+Error Type: {error_type}
+Error Message: {error_message}
+Context: {context}
+
+Please provide a concise, practical response."""
+
+    async def generate():
+        with client.messages.stream(
+            model="claude-opus-4-5",
+            max_tokens=500,
+            messages=[
+                {"role": "user", "content": prompt}
+            ]
+        ) as stream:
+            for text in stream.text_stream:
+                yield text
+    
+    return generate()
+
+# API Endpoints
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "Database Error Handler API",
+        "endpoints": {
+            "/connect": "Test database connection",
+            "/query": "Execute a test query",
+            "/connect-invalid": "Test connection to invalid host",
+            "/query-forbidden": "Test forbidden query",
+            "/analyze-error": "Get AI analysis of a database error"
+        }
+    }
+
+@app.get("/connect")
+async def test_connection():
+    """Test database connection - may raise DatabaseConnectionError"""
+    try:
+        result = await db.connect()
+        return {"status": "success", "message": "Database connection successful", "connected": result}
+    except DatabaseConnectionError:
+        raise  # Re-raise to be handled by the exception handler
+
+@app.get("/connect-invalid")
+async def test_invalid_connection():
+    """Test connection to invalid host - will raise DatabaseConnectionError"""
+    await db.connect(host="invalid-host")
+    return {"status": "success"}
+
+@app.get("/query")
+async def test_query():
+    """Execute a test query - may raise DatabaseTimeoutError"""
+    try:
+        # First ensure we're connected
+        await db.connect()
+        result = await db.execute_query("SELECT * FROM users LIMIT 10")
+        return {"status": "success", "data": result}
+    except (DatabaseConnectionError, DatabaseTimeoutError):
+        raise  # Re-raise to be handled by exception handlers
+
+@app.get("/query-forbidden")
+async def test_forbidden_query():
+    """Execute a forbidden query - will raise DatabaseQueryError"""
+    await db.execute_query("DROP TABLE users")
+    return {"status": "success"}
+
+@app.get("/analyze-error")
+async def analyze_database_error(
+    error_type: str = "DatabaseConnectionError",
+    error_message: str = "Connection refused: Database server is not running"
+):
+    """Get AI-powered analysis of a database error using Claude with streaming"""
+    
+    context = {
+        "application": "FastAPI",
+        "database": "PostgreSQL",
+        "environment": "production",
+        "timestamp": "2024-01-01T00:00:00Z"
+    }
+    
+    generator = await analyze_error_with_claude(error_type, error_message, context)
+    
+    return StreamingResponse(
+        generator,
+        media_type="text/plain",
+        headers={
+            "X-Error-Type": error_type,
+            "X-Analysis-Model": "claude-opus-4-5"
+        }
+    )
+
+@app.post("/simulate-error")
+async def simulate_database_error(error_scenario: str = "connection"):
+    """Simulate different database error scenarios"""
+    
+    if error_scenario == "connection":
+        raise DatabaseConnectionError(
+            "Simulated connection error: Unable to reach database server",
+            db_host="db.example.com",
+            error_code=111
+        )
+    elif error_scenario == "query":
+        raise DatabaseQueryError(
+            "Simulated query error: Syntax error in SQL statement",
+            query="SELECT * FORM users"  # Intentional typo
+        )
+    elif error_scenario == "timeout":
+        raise DatabaseTimeoutError(
+            "Simulated timeout error: Query took too long to execute",
+            timeout_seconds=30
+        )
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown error scenario: {error_scenario}. Use 'connection', 'query', or 'timeout'"
+        )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "database_simulator": {
+            "connection_attempts": db.connection_attempts,
+            "query_count": db.query_count
+        }
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+```
