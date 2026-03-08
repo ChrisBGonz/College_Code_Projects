@@ -1,0 +1,194 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+app.use(express.json());
+
+const anthropic = new Anthropic();
+
+// Define the tool for listing files
+const tools = [
+  {
+    name: "list_files_in_folder",
+    description:
+      "Lists all files in a specified folder within the user's private_vault directory",
+    input_schema: {
+      type: "object",
+      properties: {
+        folder_name: {
+          type: "string",
+          description: "The name of the folder to list files from",
+        },
+        base_path: {
+          type: "string",
+          description: "The base path of the private_vault directory",
+        },
+      },
+      required: ["folder_name", "base_path"],
+    },
+  },
+];
+
+// Tool implementation
+function listFilesInFolder(folderName, basePath) {
+  const fullPath = path.join(basePath, "private_vault", folderName);
+
+  // Security check: ensure the path doesn't escape the base directory
+  const resolvedPath = path.resolve(fullPath);
+  const resolvedBase = path.resolve(basePath);
+
+  if (!resolvedPath.startsWith(resolvedBase)) {
+    throw new Error("Access denied: Path traversal detected");
+  }
+
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`Folder '${folderName}' not found in private_vault`);
+  }
+
+  const stats = fs.statSync(fullPath);
+  if (!stats.isDirectory()) {
+    throw new Error(`'${folderName}' is not a directory`);
+  }
+
+  const files = fs.readdirSync(fullPath);
+  const fileDetails = files.map((file) => {
+    const filePath = path.join(fullPath, file);
+    const fileStats = fs.statSync(filePath);
+    return {
+      name: file,
+      type: fileStats.isDirectory() ? "directory" : "file",
+      size: fileStats.size,
+      modified: fileStats.mtime.toISOString(),
+    };
+  });
+
+  return fileDetails;
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  if (toolName === "list_files_in_folder") {
+    return listFilesInFolder(toolInput.folder_name, toolInput.base_path);
+  }
+  throw new Error(`Unknown tool: ${toolName}`);
+}
+
+// API endpoint
+app.post("/list-files", async (req, res) => {
+  const { folder_name, user_base_path } = req.body;
+
+  if (!folder_name) {
+    return res.status(400).json({ error: "folder_name is required" });
+  }
+
+  // Default base path if not provided (for testing purposes)
+  const basePath = user_base_path || process.cwd();
+
+  try {
+    const messages = [
+      {
+        role: "user",
+        content: `Please list all files in the folder named "${folder_name}" within the private_vault directory. The base path is "${basePath}".`,
+      },
+    ];
+
+    let response = await anthropic.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlock = response.content.find(
+        (block) => block.type === "tool_use"
+      );
+
+      if (!toolUseBlock) {
+        break;
+      }
+
+      let toolResult;
+      let isError = false;
+
+      try {
+        toolResult = processToolCall(toolUseBlock.name, toolUseBlock.input);
+      } catch (error) {
+        toolResult = { error: error.message };
+        isError = true;
+      }
+
+      // Add assistant response and tool result to messages
+      messages.push({
+        role: "assistant",
+        content: response.content,
+      });
+
+      messages.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: toolUseBlock.id,
+            content: JSON.stringify(toolResult),
+            is_error: isError,
+          },
+        ],
+      });
+
+      // Continue the conversation
+      response = await anthropic.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract the final text response
+    const finalResponse = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    // Also extract any file listing data from tool results
+    const toolResults = messages
+      .filter((msg) => msg.role === "user" && Array.isArray(msg.content))
+      .flatMap((msg) => msg.content)
+      .filter((content) => content.type === "tool_result" && !content.is_error)
+      .map((content) => JSON.parse(content.content));
+
+    res.json({
+      success: true,
+      folder_name: folder_name,
+      files: toolResults.length > 0 ? toolResults[0] : [],
+      message: finalResponse,
+    });
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`API endpoint: POST http://localhost:${PORT}/list-files`);
+  console.log(`Example request body: { "folder_name": "documents" }`);
+});
+
+module.exports = app;
+```

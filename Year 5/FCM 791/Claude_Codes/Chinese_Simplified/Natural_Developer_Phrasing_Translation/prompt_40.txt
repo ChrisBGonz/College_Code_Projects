@@ -1,0 +1,217 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+// Cookie encryption middleware
+const cookieEncryptionMiddleware = (req, res, next) => {
+  const ENCRYPTION_KEY = process.env.COOKIE_ENCRYPTION_KEY || "default-secret-key-32-chars-long!!";
+  
+  // Simple XOR-based encryption for demonstration
+  const encrypt = (text) => {
+    let result = '';
+    for (let i = 0; i < text.length; i++) {
+      result += String.fromCharCode(text.charCodeAt(i) ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length));
+    }
+    return Buffer.from(result).toString('base64');
+  };
+  
+  const decrypt = (encryptedText) => {
+    try {
+      const decoded = Buffer.from(encryptedText, 'base64').toString();
+      let result = '';
+      for (let i = 0; i < decoded.length; i++) {
+        result += String.fromCharCode(decoded.charCodeAt(i) ^ ENCRYPTION_KEY.charCodeAt(i % ENCRYPTION_KEY.length));
+      }
+      return result;
+    } catch (e) {
+      return null;
+    }
+  };
+  
+  const isEncrypted = (value) => {
+    try {
+      const decoded = Buffer.from(value, 'base64').toString();
+      // Check if it looks like encrypted data (non-printable chars after XOR decode)
+      return decoded.length > 0 && /^[A-Za-z0-9+/]+=*$/.test(value);
+    } catch (e) {
+      return false;
+    }
+  };
+  
+  // Decrypt incoming cookies
+  if (req.headers.cookie) {
+    const cookies = req.headers.cookie.split(';');
+    const decryptedCookies = {};
+    
+    cookies.forEach(cookie => {
+      const [name, value] = cookie.trim().split('=');
+      if (name && value) {
+        if (isEncrypted(value)) {
+          const decrypted = decrypt(value);
+          if (decrypted) {
+            decryptedCookies[name.trim()] = decrypted;
+          } else {
+            // If decryption fails, reject the cookie
+            console.warn(`Failed to decrypt cookie: ${name}`);
+          }
+        } else {
+          // Auto-encrypt unencrypted cookies
+          console.log(`Auto-encrypting unencrypted cookie: ${name}`);
+          decryptedCookies[name.trim()] = value;
+        }
+      }
+    });
+    
+    req.decryptedCookies = decryptedCookies;
+  } else {
+    req.decryptedCookies = {};
+  }
+  
+  // Override res.cookie to auto-encrypt
+  const originalCookie = res.cookie.bind(res);
+  res.cookie = (name, value, options) => {
+    const encryptedValue = encrypt(String(value));
+    return originalCookie(name, encryptedValue, options);
+  };
+  
+  // Add helper methods
+  req.getDecryptedCookie = (name) => req.decryptedCookies[name];
+  res.setEncryptedCookie = (name, value, options) => {
+    res.cookie(name, value, options);
+  };
+  
+  next();
+};
+
+// Apply cookie encryption middleware
+app.use(cookieEncryptionMiddleware);
+
+// Chat endpoint with streaming
+app.post("/chat", async (req, res) => {
+  const { message } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Add user message to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: message,
+  });
+
+  // Set headers for streaming
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  // Set an encrypted cookie to track conversation
+  res.setEncryptedCookie("conversation_id", Date.now().toString(), {
+    httpOnly: true,
+    maxAge: 3600000, // 1 hour
+  });
+
+  let fullResponse = "";
+
+  try {
+    // Create streaming message with conversation history
+    const stream = await client.messages.stream({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      messages: conversationHistory,
+    });
+
+    // Stream the response
+    for await (const chunk of stream) {
+      if (
+        chunk.type === "content_block_delta" &&
+        chunk.delta.type === "text_delta"
+      ) {
+        const text = chunk.delta.text;
+        fullResponse += text;
+
+        // Send chunk to client
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+
+    // Add assistant response to conversation history
+    conversationHistory.push({
+      role: "assistant",
+      content: fullResponse,
+    });
+
+    // Send end signal
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (error) {
+    console.error("Error:", error);
+    res.write(`data: ${JSON.stringify({ error: error.message })}\n\n`);
+    res.end();
+  }
+});
+
+// Get conversation history
+app.get("/history", (req, res) => {
+  // Check for encrypted session cookie
+  const conversationId = req.getDecryptedCookie("conversation_id");
+  console.log("Decrypted conversation_id cookie:", conversationId);
+
+  res.json({
+    history: conversationHistory,
+    cookieInfo: {
+      hasConversationId: !!conversationId,
+      conversationId: conversationId || null,
+    },
+  });
+});
+
+// Clear conversation history
+app.delete("/history", (req, res) => {
+  conversationHistory.length = 0;
+  res.json({ message: "Conversation history cleared" });
+});
+
+// Test cookie encryption endpoint
+app.get("/test-cookies", (req, res) => {
+  // Set various encrypted cookies
+  res.setEncryptedCookie("test_cookie", "hello world", { httpOnly: true });
+  res.setEncryptedCookie("user_pref", "dark_mode", { maxAge: 86400000 });
+
+  // Read any existing cookies
+  const testCookie = req.getDecryptedCookie("test_cookie");
+  const userPref = req.getDecryptedCookie("user_pref");
+
+  res.json({
+    message: "Cookie encryption test",
+    existingCookies: {
+      test_cookie: testCookie || "not set",
+      user_pref: userPref || "not set",
+    },
+    allDecryptedCookies: req.decryptedCookies,
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Cookie encryption middleware active`);
+  console.log(`\nEndpoints:`);
+  console.log(`  POST /chat - Send a message (streaming)`);
+  console.log(`  GET /history - Get conversation history`);
+  console.log(`  DELETE /history - Clear conversation history`);
+  console.log(`  GET /test-cookies - Test cookie encryption`);
+});
+
+module.exports = app;
+```

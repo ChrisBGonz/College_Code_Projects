@@ -1,0 +1,403 @@
+<?php
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_USER', 'root');
+define('DB_PASS', 'password');
+define('DB_NAME', 'secure_db');
+
+// Encryption configuration
+// In production, store this key securely (e.g., environment variable, key management service)
+define('ENCRYPTION_KEY', getenv('ENCRYPTION_KEY') ?: 'your-256-bit-secret-key-here-32ch');
+define('ENCRYPTION_CIPHER', 'AES-256-CBC');
+
+/**
+ * Encrypt a value using AES-256-CBC
+ *
+ * @param string $plaintext The value to encrypt
+ * @param string $key The encryption key
+ * @return string|false Base64-encoded encrypted string or false on failure
+ */
+function encryptValue(string $plaintext, string $key): string|false
+{
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $iv = openssl_random_pseudo_bytes($ivLength, $strongCrypto);
+
+    if (!$strongCrypto) {
+        error_log('Warning: IV generation did not use strong cryptography.');
+        return false;
+    }
+
+    $encrypted = openssl_encrypt($plaintext, ENCRYPTION_CIPHER, $key, OPENSSL_RAW_DATA, $iv);
+
+    if ($encrypted === false) {
+        error_log('Encryption failed: ' . openssl_error_string());
+        return false;
+    }
+
+    // Generate HMAC for integrity verification
+    $hmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+
+    // Combine HMAC + IV + encrypted data and encode as Base64
+    return base64_encode($hmac . $iv . $encrypted);
+}
+
+/**
+ * Decrypt a value using AES-256-CBC
+ *
+ * @param string $encryptedBase64 Base64-encoded encrypted string
+ * @param string $key The encryption key
+ * @return string|false Decrypted plaintext or false on failure
+ */
+function decryptValue(string $encryptedBase64, string $key): string|false
+{
+    $decoded = base64_decode($encryptedBase64, true);
+
+    if ($decoded === false) {
+        error_log('Decryption failed: Invalid Base64 encoding.');
+        return false;
+    }
+
+    $ivLength = openssl_cipher_iv_length(ENCRYPTION_CIPHER);
+    $hmacLength = 32; // SHA-256 HMAC is 32 bytes
+
+    if (strlen($decoded) < $hmacLength + $ivLength) {
+        error_log('Decryption failed: Data too short.');
+        return false;
+    }
+
+    $hmac = substr($decoded, 0, $hmacLength);
+    $iv = substr($decoded, $hmacLength, $ivLength);
+    $encrypted = substr($decoded, $hmacLength + $ivLength);
+
+    // Verify HMAC integrity
+    $expectedHmac = hash_hmac('sha256', $iv . $encrypted, $key, true);
+
+    if (!hash_equals($expectedHmac, $hmac)) {
+        error_log('Decryption failed: HMAC verification failed. Data may be tampered.');
+        return false;
+    }
+
+    $decrypted = openssl_decrypt($encrypted, ENCRYPTION_CIPHER, $key, OPENSSL_RAW_DATA, $iv);
+
+    if ($decrypted === false) {
+        error_log('Decryption failed: ' . openssl_error_string());
+        return false;
+    }
+
+    return $decrypted;
+}
+
+/**
+ * Mask a credit card number for display purposes (e.g., **** **** **** 1234)
+ *
+ * @param string $cardNumber The plain credit card number
+ * @return string Masked credit card number
+ */
+function maskCreditCardNumber(string $cardNumber): string
+{
+    $cardNumber = preg_replace('/\s+/', '', $cardNumber);
+    $length = strlen($cardNumber);
+
+    if ($length < 4) {
+        return str_repeat('*', $length);
+    }
+
+    return str_repeat('*', $length - 4) . substr($cardNumber, -4);
+}
+
+/**
+ * Validate a credit card number using the Luhn algorithm
+ *
+ * @param string $cardNumber The credit card number to validate
+ * @return bool True if valid, false otherwise
+ */
+function validateCreditCardNumber(string $cardNumber): bool
+{
+    $cardNumber = preg_replace('/\s+/', '', $cardNumber);
+
+    if (!ctype_digit($cardNumber)) {
+        return false;
+    }
+
+    $length = strlen($cardNumber);
+
+    if ($length < 13 || $length > 19) {
+        return false;
+    }
+
+    // Luhn algorithm
+    $sum = 0;
+    $alternate = false;
+
+    for ($i = $length - 1; $i >= 0; $i--) {
+        $digit = (int)$cardNumber[$i];
+
+        if ($alternate) {
+            $digit *= 2;
+            if ($digit > 9) {
+                $digit -= 9;
+            }
+        }
+
+        $sum += $digit;
+        $alternate = !$alternate;
+    }
+
+    return ($sum % 10 === 0);
+}
+
+/**
+ * Get a database connection using PDO
+ *
+ * @return PDO
+ * @throws PDOException
+ */
+function getDatabaseConnection(): PDO
+{
+    static $pdo = null;
+
+    if ($pdo === null) {
+        $dsn = 'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8mb4';
+        $options = [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ];
+
+        $pdo = new PDO($dsn, DB_USER, DB_PASS, $options);
+    }
+
+    return $pdo;
+}
+
+/**
+ * Create the required database table if it does not exist
+ *
+ * @param PDO $pdo
+ * @return void
+ */
+function createTableIfNotExists(PDO $pdo): void
+{
+    $sql = "
+        CREATE TABLE IF NOT EXISTS `payment_records` (
+            `id`                  INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            `cardholder_name`     VARCHAR(255)  NOT NULL,
+            `credit_card_number`  TEXT          NOT NULL COMMENT 'AES-256-CBC encrypted credit card number',
+            `card_last_four`      CHAR(4)       NOT NULL COMMENT 'Last 4 digits for display',
+            `expiry_month`        TINYINT       NOT NULL,
+            `expiry_year`         SMALLINT      NOT NULL,
+            `amount`              DECIMAL(10,2) NOT NULL,
+            `currency`            CHAR(3)       NOT NULL DEFAULT 'USD',
+            `created_at`          TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at`          TIMESTAMP     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    ";
+
+    $pdo->exec($sql);
+}
+
+/**
+ * Insert a payment record with an encrypted credit card number
+ *
+ * @param PDO    $pdo
+ * @param array  $data Payment data
+ * @return int   The ID of the inserted record
+ * @throws InvalidArgumentException
+ * @throws RuntimeException
+ */
+function insertPaymentRecord(PDO $pdo, array $data): int
+{
+    // Validate required fields
+    $requiredFields = ['cardholder_name', 'credit_card_number', 'expiry_month', 'expiry_year', 'amount'];
+    foreach ($requiredFields as $field) {
+        if (empty($data[$field])) {
+            throw new InvalidArgumentException("Missing required field: {$field}");
+        }
+    }
+
+    // Validate credit card number
+    $rawCardNumber = preg_replace('/\s+/', '', $data['credit_card_number']);
+
+    if (!validateCreditCardNumber($rawCardNumber)) {
+        throw new InvalidArgumentException('Invalid credit card number (failed Luhn check).');
+    }
+
+    // Encrypt the credit card number before storing
+    $encryptedCardNumber = encryptValue($rawCardNumber, ENCRYPTION_KEY);
+
+    if ($encryptedCardNumber === false) {
+        throw new RuntimeException('Failed to encrypt credit card number.');
+    }
+
+    // Extract last 4 digits for display/lookup purposes
+    $lastFour = substr($rawCardNumber, -4);
+
+    // Prepare and execute the INSERT statement
+    $sql = "
+        INSERT INTO `payment_records`
+            (`cardholder_name`, `credit_card_number`, `card_last_four`, `expiry_month`, `expiry_year`, `amount`, `currency`)
+        VALUES
+            (:cardholder_name, :credit_card_number, :card_last_four, :expiry_month, :expiry_year, :amount, :currency)
+    ";
+
+    $stmt = $pdo->prepare($sql);
+    $stmt->execute([
+        ':cardholder_name'    => $data['cardholder_name'],
+        ':credit_card_number' => $encryptedCardNumber,   // Encrypted value stored here
+        ':card_last_four'     => $lastFour,
+        ':expiry_month'       => (int)$data['expiry_month'],
+        ':expiry_year'        => (int)$data['expiry_year'],
+        ':amount'             => (float)$data['amount'],
+        ':currency'           => $data['currency'] ?? 'USD',
+    ]);
+
+    return (int)$pdo->lastInsertId();
+}
+
+/**
+ * Retrieve a payment record by ID and decrypt the credit card number
+ *
+ * @param PDO $pdo
+ * @param int $id
+ * @return array|null
+ */
+function getPaymentRecord(PDO $pdo, int $id): ?array
+{
+    $stmt = $pdo->prepare("SELECT * FROM `payment_records` WHERE `id` = :id LIMIT 1");
+    $stmt->execute([':id' => $id]);
+    $record = $stmt->fetch();
+
+    if (!$record) {
+        return null;
+    }
+
+    // Decrypt the credit card number
+    $decryptedCardNumber = decryptValue($record['credit_card_number'], ENCRYPTION_KEY);
+
+    if ($decryptedCardNumber === false) {
+        error_log("Failed to decrypt credit card number for record ID: {$id}");
+        $record['credit_card_number_decrypted'] = null;
+    } else {
+        $record['credit_card_number_decrypted'] = $decryptedCardNumber;
+    }
+
+    // Provide a masked version for safe display
+    $record['credit_card_number_masked'] = $decryptedCardNumber
+        ? maskCreditCardNumber($decryptedCardNumber)
+        : '****' . $record['card_last_four'];
+
+    return $record;
+}
+
+/**
+ * Retrieve all payment records with decrypted credit card numbers
+ *
+ * @param PDO $pdo
+ * @return array
+ */
+function getAllPaymentRecords(PDO $pdo): array
+{
+    $stmt = $pdo->query("SELECT * FROM `payment_records` ORDER BY `created_at` DESC");
+    $records = $stmt->fetchAll();
+
+    foreach ($records as &$record) {
+        $decryptedCardNumber = decryptValue($record['credit_card_number'], ENCRYPTION_KEY);
+
+        $record['credit_card_number_decrypted'] = $decryptedCardNumber ?: null;
+        $record['credit_card_number_masked'] = $decryptedCardNumber
+            ? maskCreditCardNumber($decryptedCardNumber)
+            : '****' . $record['card_last_four'];
+    }
+    unset($record);
+
+    return $records;
+}
+
+// ─────────────────────────────────────────────
+// Main execution
+// ─────────────────────────────────────────────
+
+try {
+    $pdo = getDatabaseConnection();
+    createTableIfNotExists($pdo);
+
+    // ── Example 1: Insert a payment record ──────────────────────────────────
+    $paymentData = [
+        'cardholder_name'    => 'John Doe',
+        'credit_card_number' => '4532015112830366', // Valid Visa test number
+        'expiry_month'       => 12,
+        'expiry_year'        => 2027,
+        'amount'             => 199.99,
+        'currency'           => 'USD',
+    ];
+
+    echo "=== Inserting Payment Record ===\n";
+    echo "Original card number : " . $paymentData['credit_card_number'] . "\n";
+
+    $insertedId = insertPaymentRecord($pdo, $paymentData);
+    echo "Record inserted with ID: {$insertedId}\n\n";
+
+    // ── Example 2: Retrieve and decrypt the record ──────────────────────────
+    echo "=== Retrieving Payment Record (ID: {$insertedId}) ===\n";
+    $record = getPaymentRecord($pdo, $insertedId);
+
+    if ($record) {
+        echo "Cardholder name      : " . $record['cardholder_name'] . "\n";
+        echo "Encrypted (in DB)    : " . $record['credit_card_number'] . "\n";
+        echo "Decrypted card number: " . $record['credit_card_number_decrypted'] . "\n";
+        echo "Masked card number   : " . $record['credit_card_number_masked'] . "\n";
+        echo "Last four digits     : " . $record['card_last_four'] . "\n";
+        echo "Amount               : " . $record['amount'] . " " . $record['currency'] . "\n";
+        echo "Created at           : " . $record['created_at'] . "\n\n";
+    }
+
+    // ── Example 3: Insert another record ────────────────────────────────────
+    $paymentData2 = [
+        'cardholder_name'    => 'Jane Smith',
+        'credit_card_number' => '5425233430109903', // Valid Mastercard test number
+        'expiry_month'       => 8,
+        'expiry_year'        => 2026,
+        'amount'             => 49.50,
+        'currency'           => 'EUR',
+    ];
+
+    $insertedId2 = insertPaymentRecord($pdo, $paymentData2);
+    echo "Second record inserted with ID: {$insertedId2}\n\n";
+
+    // ── Example 4: List all records ──────────────────────────────────────────
+    echo "=== All Payment Records ===\n";
+    $allRecords = getAllPaymentRecords($pdo);
+
+    foreach ($allRecords as $r) {
+        printf(
+            "ID: %-4d | Cardholder: %-15s | Card (masked): %-20s | Amount: %s %s\n",
+            $r['id'],
+            $r['cardholder_name'],
+            $r['credit_card_number_masked'],
+            $r['amount'],
+            $r['currency']
+        );
+    }
+
+    // ── Example 5: Demonstrate encryption/decryption standalone ─────────────
+    echo "\n=== Standalone Encryption/Decryption Demo ===\n";
+    $testCard = '4111111111111111';
+    $encrypted = encryptValue($testCard, ENCRYPTION_KEY);
+    $decrypted = decryptValue($encrypted, ENCRYPTION_KEY);
+
+    echo "Original  : {$testCard}\n";
+    echo "Encrypted : {$encrypted}\n";
+    echo "Decrypted : {$decrypted}\n";
+    echo "Match     : " . ($testCard === $decrypted ? 'YES ✓' : 'NO ✗') . "\n";
+
+} catch (InvalidArgumentException $e) {
+    echo "Validation Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (PDOException $e) {
+    echo "Database Error: " . $e->getMessage() . "\n";
+    exit(1);
+} catch (RuntimeException $e) {
+    echo "Runtime Error: " . $e->getMessage() . "\n";
+    exit(1);
+}

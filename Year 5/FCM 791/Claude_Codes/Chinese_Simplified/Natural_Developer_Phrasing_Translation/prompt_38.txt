@@ -1,0 +1,201 @@
+
+```ruby
+require 'anthropic'
+require 'json'
+
+client = Anthropic::Client.new
+
+tools = [
+  {
+    name: "sign_data_with_rsa_pss",
+    description: "Sign data payload using RSA-PSS algorithm to ensure authenticity and source trustworthiness",
+    input_schema: {
+      type: "object",
+      properties: {
+        data: {
+          type: "string",
+          description: "The data payload to be signed"
+        },
+        key_size: {
+          type: "integer",
+          description: "RSA key size in bits (default: 2048)",
+          enum: [2048, 3072, 4096]
+        },
+        hash_algorithm: {
+          type: "string",
+          description: "Hash algorithm to use (default: SHA256)",
+          enum: ["SHA256", "SHA384", "SHA512"]
+        },
+        salt_length: {
+          type: "integer",
+          description: "Salt length for PSS padding (default: 32)"
+        }
+      },
+      required: ["data"]
+    }
+  },
+  {
+    name: "verify_rsa_pss_signature",
+    description: "Verify an RSA-PSS signature to confirm data authenticity",
+    input_schema: {
+      type: "object",
+      properties: {
+        data: {
+          type: "string",
+          description: "The original data payload"
+        },
+        signature: {
+          type: "string",
+          description: "The base64-encoded signature to verify"
+        },
+        public_key_pem: {
+          type: "string",
+          description: "The PEM-encoded public key"
+        },
+        hash_algorithm: {
+          type: "string",
+          description: "Hash algorithm used during signing",
+          enum: ["SHA256", "SHA384", "SHA512"]
+        }
+      },
+      required: ["data", "signature", "public_key_pem"]
+    }
+  }
+]
+
+def sign_data_with_rsa_pss(data:, key_size: 2048, hash_algorithm: "SHA256", salt_length: 32)
+  require 'openssl'
+  require 'base64'
+  
+  key = OpenSSL::PKey::RSA.generate(key_size)
+  
+  digest = OpenSSL::Digest.new(hash_algorithm)
+  
+  signature = key.sign_pss(digest, data, salt_length: salt_length, mgf1_hash: digest)
+  
+  {
+    signature: Base64.strict_encode64(signature),
+    public_key_pem: key.public_key.to_pem,
+    private_key_pem: key.to_pem,
+    algorithm: "RSA-PSS",
+    hash_algorithm: hash_algorithm,
+    key_size: key_size,
+    salt_length: salt_length,
+    data_signed: data
+  }
+end
+
+def verify_rsa_pss_signature(data:, signature:, public_key_pem:, hash_algorithm: "SHA256")
+  require 'openssl'
+  require 'base64'
+  
+  public_key = OpenSSL::PKey::RSA.new(public_key_pem)
+  
+  digest = OpenSSL::Digest.new(hash_algorithm)
+  
+  decoded_signature = Base64.strict_decode64(signature)
+  
+  is_valid = public_key.verify_pss(digest, decoded_signature, data, salt_length: :auto, mgf1_hash: digest)
+  
+  {
+    valid: is_valid,
+    message: is_valid ? "Signature is valid - data authenticity confirmed" : "Signature is invalid - data may have been tampered with"
+  }
+rescue => e
+  {
+    valid: false,
+    message: "Verification failed: #{e.message}"
+  }
+end
+
+def process_tool_call(tool_name, tool_input)
+  case tool_name
+  when "sign_data_with_rsa_pss"
+    sign_data_with_rsa_pss(
+      data: tool_input["data"],
+      key_size: tool_input["key_size"] || 2048,
+      hash_algorithm: tool_input["hash_algorithm"] || "SHA256",
+      salt_length: tool_input["salt_length"] || 32
+    )
+  when "verify_rsa_pss_signature"
+    verify_rsa_pss_signature(
+      data: tool_input["data"],
+      signature: tool_input["signature"],
+      public_key_pem: tool_input["public_key_pem"],
+      hash_algorithm: tool_input["hash_algorithm"] || "SHA256"
+    )
+  end
+end
+
+messages = [
+  {
+    role: "user",
+    content: "Please demonstrate RSA-PSS signing by: 1) Signing the message 'Hello, this is a secure message that needs authentication!' with RSA-PSS using SHA256, then 2) Verify the signature to confirm authenticity."
+  }
+]
+
+puts "Starting RSA-PSS signing demonstration with Claude..."
+puts "=" * 60
+
+loop do
+  response = client.messages(
+    model: "claude-opus-4-5",
+    max_tokens: 4096,
+    tools: tools,
+    messages: messages
+  )
+  
+  puts "\nClaude's response (stop_reason: #{response.stop_reason}):"
+  
+  if response.stop_reason == "tool_use"
+    tool_results = []
+    
+    response.content.each do |block|
+      if block.type == "text"
+        puts "Text: #{block.text}"
+      elsif block.type == "tool_use"
+        puts "\nTool call: #{block.name}"
+        puts "Input: #{JSON.pretty_generate(block.input)}"
+        
+        result = process_tool_call(block.name, block.input)
+        
+        puts "\nTool result:"
+        if result[:signature]
+          puts "  Algorithm: #{result[:algorithm]}"
+          puts "  Hash: #{result[:hash_algorithm]}"
+          puts "  Key size: #{result[:key_size]} bits"
+          puts "  Signature (first 50 chars): #{result[:signature][0..49]}..."
+          puts "  Public key generated: Yes"
+        elsif result[:valid] != nil
+          puts "  Valid: #{result[:valid]}"
+          puts "  Message: #{result[:message]}"
+        end
+        
+        tool_results << {
+          type: "tool_result",
+          tool_use_id: block.id,
+          content: result.to_json
+        }
+      end
+    end
+    
+    messages << { role: "assistant", content: response.content }
+    messages << { role: "user", content: tool_results }
+    
+  elsif response.stop_reason == "end_turn"
+    response.content.each do |block|
+      if block.type == "text"
+        puts "\nFinal response:"
+        puts block.text
+      end
+    end
+    break
+  else
+    puts "Unexpected stop reason: #{response.stop_reason}"
+    break
+  end
+end
+
+puts "\n" + "=" * 60
+puts "RSA-PSS demonstration complete!"
+```

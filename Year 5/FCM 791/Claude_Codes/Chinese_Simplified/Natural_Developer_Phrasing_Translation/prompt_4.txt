@@ -1,0 +1,527 @@
+```csharp
+using System;
+using System.Security.Claims;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+
+namespace AdminPortal.Controllers
+{
+    [ApiController]
+    [Route("api/admin/users")]
+    [Authorize] // Requires authentication at controller level
+    public class AdminUserController : ControllerBase
+    {
+        private readonly IUserRepository _userRepository;
+        private readonly IAuditLogService _auditLogService;
+        private readonly IIdempotencyService _idempotencyService;
+        private readonly ILogger<AdminUserController> _logger;
+
+        public AdminUserController(
+            IUserRepository userRepository,
+            IAuditLogService auditLogService,
+            IIdempotencyService idempotencyService,
+            ILogger<AdminUserController> logger)
+        {
+            _userRepository = userRepository ?? throw new ArgumentNullException(nameof(userRepository));
+            _auditLogService = auditLogService ?? throw new ArgumentNullException(nameof(auditLogService));
+            _idempotencyService = idempotencyService ?? throw new ArgumentNullException(nameof(idempotencyService));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+        }
+
+        /// <summary>
+        /// Deletes a user by ID. Requires Admin role.
+        /// Supports soft delete (default) and hard delete (explicit flag).
+        /// Includes CSRF protection, idempotency key, audit logging, and concurrency handling.
+        /// </summary>
+        [HttpDelete("{userId:guid}")]
+        [Authorize(Roles = "Admin")]
+        [ValidateAntiForgeryToken] // CSRF protection for non-SPA; for SPA/API use [AutoValidateAntiforgeryToken] or custom header validation
+        [ProducesResponseType(typeof(DeleteUserResponse), 200)]
+        [ProducesResponseType(typeof(ErrorResponse), 400)]
+        [ProducesResponseType(typeof(ErrorResponse), 401)]
+        [ProducesResponseType(typeof(ErrorResponse), 403)]
+        [ProducesResponseType(typeof(ErrorResponse), 404)]
+        [ProducesResponseType(typeof(ErrorResponse), 409)]
+        [ProducesResponseType(typeof(ErrorResponse), 500)]
+        public async Task<IActionResult> DeleteUserAsync(
+            [FromRoute] Guid userId,
+            [FromQuery] bool hardDelete = false,
+            [FromHeader(Name = "X-Idempotency-Key")] string idempotencyKey = null,
+            CancellationToken cancellationToken = default)
+        {
+            // ─── 1. Parameter Validation ───────────────────────────────────────────────
+            if (userId == Guid.Empty)
+            {
+                return BadRequest(new ErrorResponse
+                {
+                    Code = "INVALID_USER_ID",
+                    Message = "User ID must be a valid non-empty GUID."
+                });
+            }
+
+            // ─── 2. Resolve Current Operator Identity ──────────────────────────────────
+            var operatorIdClaim = User.FindFirstValue(ClaimTypes.NameIdentifier);
+            var operatorNameClaim = User.FindFirstValue(ClaimTypes.Name) ?? User.FindFirstValue("preferred_username");
+
+            if (string.IsNullOrWhiteSpace(operatorIdClaim) || !Guid.TryParse(operatorIdClaim, out var operatorId))
+            {
+                _logger.LogWarning("DeleteUser: Unable to resolve operator identity from token.");
+                return Unauthorized(new ErrorResponse
+                {
+                    Code = "IDENTITY_UNRESOLVABLE",
+                    Message = "Cannot resolve the current user identity from the provided token."
+                });
+            }
+
+            // ─── 3. Authorization Check (Defense-in-Depth beyond [Authorize(Roles)]) ───
+            if (!User.IsInRole("Admin"))
+            {
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.Forbidden,
+                    Reason = "Caller does not have Admin role.",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return StatusCode(403, new ErrorResponse
+                {
+                    Code = "INSUFFICIENT_PERMISSIONS",
+                    Message = "You do not have permission to delete users. Admin role is required."
+                });
+            }
+
+            // ─── 4. Prevent Self-Deletion ──────────────────────────────────────────────
+            if (operatorId == userId)
+            {
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.Rejected,
+                    Reason = "Admin attempted to delete their own account.",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return BadRequest(new ErrorResponse
+                {
+                    Code = "SELF_DELETION_FORBIDDEN",
+                    Message = "Administrators cannot delete their own account."
+                });
+            }
+
+            // ─── 5. Idempotency / Replay Attack Prevention ────────────────────────────
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                var cachedResult = await _idempotencyService.GetCachedResponseAsync(idempotencyKey, cancellationToken);
+                if (cachedResult != null)
+                {
+                    _logger.LogInformation(
+                        "DeleteUser: Returning cached idempotent response for key {IdempotencyKey}.", idempotencyKey);
+                    return Ok(cachedResult);
+                }
+            }
+
+            // ─── 6. Fetch Target User ──────────────────────────────────────────────────
+            ApplicationUser targetUser;
+            try
+            {
+                targetUser = await _userRepository.FindByIdAsync(userId, cancellationToken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "DeleteUser: Database error while fetching user {UserId}.", userId);
+                return StatusCode(500, new ErrorResponse
+                {
+                    Code = "DATABASE_ERROR",
+                    Message = "An unexpected error occurred while retrieving the user."
+                });
+            }
+
+            if (targetUser == null)
+            {
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.NotFound,
+                    Reason = "Target user not found.",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return NotFound(new ErrorResponse
+                {
+                    Code = "USER_NOT_FOUND",
+                    Message = $"No user with ID '{userId}' was found."
+                });
+            }
+
+            // ─── 7. Guard: Already Deleted ────────────────────────────────────────────
+            if (targetUser.IsDeleted && !hardDelete)
+            {
+                return Ok(new DeleteUserResponse
+                {
+                    UserId = userId,
+                    DeleteType = "SoftDelete",
+                    Message = "User was already soft-deleted.",
+                    DeletedAt = targetUser.DeletedAt
+                });
+            }
+
+            // ─── 8. Guard: Protect Super-Admin Accounts ───────────────────────────────
+            if (targetUser.IsSuperAdmin)
+            {
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.Rejected,
+                    Reason = "Attempt to delete a super-admin account.",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return StatusCode(403, new ErrorResponse
+                {
+                    Code = "SUPERADMIN_DELETION_FORBIDDEN",
+                    Message = "Super-admin accounts cannot be deleted through this interface."
+                });
+            }
+
+            // ─── 9. Execute Delete with Optimistic Concurrency ────────────────────────
+            DeleteUserResponse response;
+            var deleteType = hardDelete ? "HardDelete" : "SoftDelete";
+            var deletedAt = DateTimeOffset.UtcNow;
+
+            try
+            {
+                if (hardDelete)
+                {
+                    await _userRepository.HardDeleteAsync(targetUser, cancellationToken);
+                    _logger.LogWarning(
+                        "DeleteUser: Hard delete executed on user {UserId} by operator {OperatorId}.",
+                        userId, operatorId);
+                }
+                else
+                {
+                    targetUser.IsDeleted = true;
+                    targetUser.DeletedAt = deletedAt;
+                    targetUser.DeletedByOperatorId = operatorId;
+                    await _userRepository.SoftDeleteAsync(targetUser, cancellationToken);
+                    _logger.LogInformation(
+                        "DeleteUser: Soft delete executed on user {UserId} by operator {OperatorId}.",
+                        userId, operatorId);
+                }
+
+                response = new DeleteUserResponse
+                {
+                    UserId = userId,
+                    DeleteType = deleteType,
+                    Message = hardDelete
+                        ? "User has been permanently deleted."
+                        : "User has been deactivated (soft-deleted) and can be restored if needed.",
+                    DeletedAt = deletedAt
+                };
+            }
+            catch (DbUpdateConcurrencyException ex)
+            {
+                _logger.LogWarning(ex,
+                    "DeleteUser: Concurrency conflict while deleting user {UserId}.", userId);
+
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.ConcurrencyConflict,
+                    Reason = "Optimistic concurrency conflict detected.",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return Conflict(new ErrorResponse
+                {
+                    Code = "CONCURRENCY_CONFLICT",
+                    Message = "The user record was modified by another operation. Please retry."
+                });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex,
+                    "DeleteUser: Unexpected error while deleting user {UserId}.", userId);
+
+                await _auditLogService.RecordAsync(new AuditEntry
+                {
+                    OperatorId = operatorId,
+                    OperatorName = operatorNameClaim,
+                    TargetUserId = userId,
+                    Action = "DELETE_USER",
+                    Result = AuditResult.Error,
+                    Reason = $"Unhandled exception: {ex.GetType().Name}",
+                    Timestamp = DateTimeOffset.UtcNow,
+                    IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+                });
+
+                return StatusCode(500, new ErrorResponse
+                {
+                    Code = "INTERNAL_ERROR",
+                    Message = "An unexpected error occurred while processing the delete request."
+                });
+            }
+
+            // ─── 10. Audit Log: Success ────────────────────────────────────────────────
+            await _auditLogService.RecordAsync(new AuditEntry
+            {
+                OperatorId = operatorId,
+                OperatorName = operatorNameClaim,
+                TargetUserId = userId,
+                TargetUserName = targetUser.UserName,
+                Action = "DELETE_USER",
+                Result = AuditResult.Success,
+                Reason = deleteType,
+                Timestamp = deletedAt,
+                IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString(),
+                AdditionalData = new System.Collections.Generic.Dictionary<string, string>
+                {
+                    { "DeleteType", deleteType },
+                    { "IdempotencyKey", idempotencyKey ?? "N/A" }
+                }
+            });
+
+            // ─── 11. Cache Idempotent Response ────────────────────────────────────────
+            if (!string.IsNullOrWhiteSpace(idempotencyKey))
+            {
+                await _idempotencyService.CacheResponseAsync(
+                    idempotencyKey, response, TimeSpan.FromHours(24), cancellationToken);
+            }
+
+            return Ok(response);
+        }
+    }
+
+    // ─── Domain Models ─────────────────────────────────────────────────────────────
+
+    public class ApplicationUser
+    {
+        public Guid Id { get; set; }
+        public string UserName { get; set; }
+        public string Email { get; set; }
+        public bool IsDeleted { get; set; }
+        public bool IsSuperAdmin { get; set; }
+        public DateTimeOffset? DeletedAt { get; set; }
+        public Guid? DeletedByOperatorId { get; set; }
+
+        // EF Core concurrency token
+        public byte[] RowVersion { get; set; }
+    }
+
+    // ─── DTOs ──────────────────────────────────────────────────────────────────────
+
+    public class DeleteUserResponse
+    {
+        public Guid UserId { get; set; }
+        public string DeleteType { get; set; }
+        public string Message { get; set; }
+        public DateTimeOffset? DeletedAt { get; set; }
+    }
+
+    public class ErrorResponse
+    {
+        public string Code { get; set; }
+        public string Message { get; set; }
+    }
+
+    // ─── Audit Models ──────────────────────────────────────────────────────────────
+
+    public enum AuditResult
+    {
+        Success,
+        Forbidden,
+        Rejected,
+        NotFound,
+        ConcurrencyConflict,
+        Error
+    }
+
+    public class AuditEntry
+    {
+        public Guid OperatorId { get; set; }
+        public string OperatorName { get; set; }
+        public Guid TargetUserId { get; set; }
+        public string TargetUserName { get; set; }
+        public string Action { get; set; }
+        public AuditResult Result { get; set; }
+        public string Reason { get; set; }
+        public DateTimeOffset Timestamp { get; set; }
+        public string IpAddress { get; set; }
+        public System.Collections.Generic.Dictionary<string, string> AdditionalData { get; set; }
+    }
+
+    // ─── Service Interfaces ────────────────────────────────────────────────────────
+
+    public interface IUserRepository
+    {
+        Task<ApplicationUser> FindByIdAsync(Guid userId, CancellationToken cancellationToken = default);
+        Task SoftDeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default);
+        Task HardDeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default);
+    }
+
+    public interface IAuditLogService
+    {
+        Task RecordAsync(AuditEntry entry, CancellationToken cancellationToken = default);
+    }
+
+    public interface IIdempotencyService
+    {
+        Task<DeleteUserResponse> GetCachedResponseAsync(string key, CancellationToken cancellationToken = default);
+        Task CacheResponseAsync(string key, DeleteUserResponse response, TimeSpan ttl, CancellationToken cancellationToken = default);
+    }
+
+    // ─── Sample Repository Implementation (EF Core) ────────────────────────────────
+
+    public class UserRepository : IUserRepository
+    {
+        private readonly AppDbContext _dbContext;
+
+        public UserRepository(AppDbContext dbContext)
+        {
+            _dbContext = dbContext;
+        }
+
+        public async Task<ApplicationUser> FindByIdAsync(Guid userId, CancellationToken cancellationToken = default)
+        {
+            return await _dbContext.Users
+                .AsNoTracking()
+                .FirstOrDefaultAsync(u => u.Id == userId, cancellationToken);
+        }
+
+        public async Task SoftDeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default)
+        {
+            // Re-attach for update to leverage optimistic concurrency via RowVersion
+            _dbContext.Users.Attach(user);
+            _dbContext.Entry(user).Property(u => u.IsDeleted).IsModified = true;
+            _dbContext.Entry(user).Property(u => u.DeletedAt).IsModified = true;
+            _dbContext.Entry(user).Property(u => u.DeletedByOperatorId).IsModified = true;
+            await _dbContext.SaveChangesAsync(cancellationToken);
+        }
+
+        public async Task HardDeleteAsync(ApplicationUser user, CancellationToken cancellationToken = default)
+        {
+            _dbContext.Users.Remove(user);
+            await _dbContext.SaveChangesAsync(cancellationToken);
+        }
+    }
+
+    // ─── Sample Audit Log Implementation ──────────────────────────────────────────
+
+    public class AuditLogService : IAuditLogService
+    {
+        private readonly AppDbContext _dbContext;
+        private readonly ILogger<AuditLogService> _logger;
+
+        public AuditLogService(AppDbContext dbContext, ILogger<AuditLogService> logger)
+        {
+            _dbContext = dbContext;
+            _logger = logger;
+        }
+
+        public async Task RecordAsync(AuditEntry entry, CancellationToken cancellationToken = default)
+        {
+            try
+            {
+                var record = new AuditLog
+                {
+                    Id = Guid.NewGuid(),
+                    OperatorId = entry.OperatorId,
+                    OperatorName = entry.OperatorName,
+                    TargetUserId = entry.TargetUserId,
+                    TargetUserName = entry.TargetUserName,
+                    Action = entry.Action,
+                    Result = entry.Result.ToString(),
+                    Reason = entry.Reason,
+                    Timestamp = entry.Timestamp,
+                    IpAddress = entry.IpAddress,
+                    AdditionalData = entry.AdditionalData != null
+                        ? System.Text.Json.JsonSerializer.Serialize(entry.AdditionalData)
+                        : null
+                };
+
+                await _dbContext.AuditLogs.AddAsync(record, cancellationToken);
+                await _dbContext.SaveChangesAsync(cancellationToken);
+
+                _logger.LogInformation(
+                    "[AUDIT] Action={Action} Operator={OperatorId}({OperatorName}) Target={TargetUserId} Result={Result} Reason={Reason} IP={IpAddress} Time={Timestamp}",
+                    entry.Action, entry.OperatorId, entry.OperatorName,
+                    entry.TargetUserId, entry.Result, entry.Reason,
+                    entry.IpAddress, entry.Timestamp);
+            }
+            catch (Exception ex)
+            {
+                // Audit failure must never crash the main flow; log and continue
+                _logger.LogError(ex, "Failed to persist audit log entry for action {Action}.", entry.Action);
+            }
+        }
+    }
+
+    // ─── Audit Log Entity ──────────────────────────────────────────────────────────
+
+    public class AuditLog
+    {
+        public Guid Id { get; set; }
+        public Guid OperatorId { get; set; }
+        public string OperatorName { get; set; }
+        public Guid TargetUserId { get; set; }
+        public string TargetUserName { get; set; }
+        public string Action { get; set; }
+        public string Result { get; set; }
+        public string Reason { get; set; }
+        public DateTimeOffset Timestamp { get; set; }
+        public string IpAddress { get; set; }
+        public string AdditionalData { get; set; }
+    }
+
+    // ─── Minimal DbContext Stub ────────────────────────────────────────────────────
+
+    public class AppDbContext : DbContext
+    {
+        public AppDbContext(DbContextOptions<AppDbContext> options) : base(options) { }
+
+        public DbSet<ApplicationUser> Users { get; set; }
+        public DbSet<AuditLog> AuditLogs { get; set; }
+
+        protected override void OnModelCreating(ModelBuilder modelBuilder)
+        {
+            modelBuilder.Entity<ApplicationUser>(entity =>
+            {
+                entity.HasKey(u => u.Id);
+                entity.Property(u => u.RowVersion).IsRowVersion(); // Optimistic concurrency
+                entity.HasIndex(u => u.Email).IsUnique();
+            });
+
+            modelBuilder.Entity<AuditLog>(entity =>
+            {
+                entity.HasKey(a => a.Id);
+                entity.HasIndex(a => new { a.OperatorId, a.Timestamp });
+                entity.HasIndex(a => new { a.TargetUserId, a.Timestamp });
+            });
+        }
+    }
+}
+```

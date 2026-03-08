@@ -1,0 +1,527 @@
+
+```python
+import os
+import json
+import time
+import secrets
+from datetime import datetime, timezone
+from typing import Optional
+from anthropic import Anthropic
+
+# JWT and cryptography imports
+try:
+    import jwt
+    from jwt import PyJWKClient, PyJWT
+    from jwt.exceptions import (
+        InvalidTokenError,
+        ExpiredSignatureError,
+        InvalidSignatureError,
+        DecodeError,
+        InvalidAlgorithmError,
+    )
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
+    print("Warning: PyJWT not available. Install with: pip install PyJWT cryptography")
+
+try:
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa, ec, padding
+    from cryptography.hazmat.backends import default_backend
+    from cryptography.x509 import load_pem_x509_certificate
+    CRYPTO_AVAILABLE = True
+except ImportError:
+    CRYPTO_AVAILABLE = False
+    print("Warning: cryptography not available. Install with: pip install cryptography")
+
+# Initialize Anthropic client
+client = Anthropic()
+
+# JWT Key Manager
+class JWTKeyManager:
+    """Manages JWT keys and certificates"""
+    
+    def __init__(self):
+        self.keys = {}
+        self.certificates = {}
+        self._generate_default_keys()
+    
+    def _generate_default_keys(self):
+        """Generate default keys for demonstration"""
+        if not CRYPTO_AVAILABLE:
+            return
+            
+        # Generate RSA key pair
+        rsa_private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=2048,
+            backend=default_backend()
+        )
+        
+        self.keys['rsa_private'] = rsa_private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        
+        self.keys['rsa_public'] = rsa_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        
+        # Generate EC key pair
+        ec_private_key = ec.generate_private_key(
+            ec.SECP256R1(),
+            backend=default_backend()
+        )
+        
+        self.keys['ec_private'] = ec_private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        )
+        
+        self.keys['ec_public'] = ec_private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        
+        # Generate HMAC secret
+        self.keys['hmac_secret'] = secrets.token_bytes(32)
+    
+    def get_key(self, key_type: str):
+        """Get a key by type"""
+        return self.keys.get(key_type)
+    
+    def list_keys(self):
+        """List available key types"""
+        return list(self.keys.keys())
+
+# JWT Handler
+class JWTHandler:
+    """Handles JWT operations"""
+    
+    def __init__(self, key_manager: JWTKeyManager):
+        self.key_manager = key_manager
+        self.supported_algorithms = ['HS256', 'HS384', 'HS512', 'RS256', 'RS384', 'RS512', 'ES256', 'ES384', 'ES512']
+    
+    def create_token(self, payload: dict, algorithm: str = 'HS256', 
+                     expiry_seconds: int = 3600, additional_claims: dict = None) -> Optional[str]:
+        """Create a JWT token"""
+        if not JWT_AVAILABLE:
+            return None
+            
+        # Add standard claims
+        now = datetime.now(timezone.utc)
+        claims = {
+            'iat': now,
+            'nbf': now,
+            'exp': datetime.fromtimestamp(now.timestamp() + expiry_seconds, tz=timezone.utc),
+            'jti': secrets.token_urlsafe(16),
+        }
+        
+        # Merge with provided payload
+        claims.update(payload)
+        
+        # Add additional claims if provided
+        if additional_claims:
+            claims.update(additional_claims)
+        
+        # Select appropriate key
+        if algorithm.startswith('HS'):
+            key = self.key_manager.get_key('hmac_secret')
+        elif algorithm.startswith('RS'):
+            key = self.key_manager.get_key('rsa_private')
+        elif algorithm.startswith('ES'):
+            key = self.key_manager.get_key('ec_private')
+        else:
+            return None
+        
+        if key is None:
+            return None
+            
+        try:
+            token = jwt.encode(claims, key, algorithm=algorithm)
+            return token
+        except Exception as e:
+            print(f"Error creating token: {e}")
+            return None
+    
+    def decode_token(self, token: str, algorithm: str = 'HS256', 
+                     verify_signature: bool = True, audience: str = None,
+                     issuer: str = None) -> dict:
+        """Decode and verify a JWT token"""
+        if not JWT_AVAILABLE:
+            return {'error': 'PyJWT not available'}
+        
+        # Select appropriate key for verification
+        if algorithm.startswith('HS'):
+            key = self.key_manager.get_key('hmac_secret')
+        elif algorithm.startswith('RS'):
+            key = self.key_manager.get_key('rsa_public')
+        elif algorithm.startswith('ES'):
+            key = self.key_manager.get_key('ec_public')
+        else:
+            return {'error': f'Unsupported algorithm: {algorithm}'}
+        
+        options = {}
+        if not verify_signature:
+            options['verify_signature'] = False
+        
+        decode_options = {
+            'algorithms': [algorithm],
+            'options': options
+        }
+        
+        if audience:
+            decode_options['audience'] = audience
+        if issuer:
+            decode_options['issuer'] = issuer
+        
+        try:
+            if verify_signature:
+                decoded = jwt.decode(token, key, **decode_options)
+            else:
+                decoded = jwt.decode(token, options={'verify_signature': False}, algorithms=[algorithm])
+            
+            return {
+                'success': True,
+                'claims': decoded,
+                'algorithm': algorithm,
+                'verified': verify_signature
+            }
+        except ExpiredSignatureError:
+            return {'error': 'Token has expired', 'error_type': 'ExpiredSignatureError'}
+        except InvalidSignatureError:
+            return {'error': 'Invalid signature', 'error_type': 'InvalidSignatureError'}
+        except DecodeError as e:
+            return {'error': f'Decode error: {str(e)}', 'error_type': 'DecodeError'}
+        except InvalidTokenError as e:
+            return {'error': f'Invalid token: {str(e)}', 'error_type': 'InvalidTokenError'}
+        except Exception as e:
+            return {'error': f'Unexpected error: {str(e)}', 'error_type': 'UnexpectedError'}
+    
+    def inspect_token(self, token: str) -> dict:
+        """Inspect token without verification"""
+        if not JWT_AVAILABLE:
+            return {'error': 'PyJWT not available'}
+        
+        try:
+            # Decode header
+            header = jwt.get_unverified_header(token)
+            
+            # Decode payload without verification
+            payload = jwt.decode(
+                token, 
+                options={'verify_signature': False},
+                algorithms=self.supported_algorithms
+            )
+            
+            return {
+                'header': header,
+                'payload': payload,
+                'algorithm': header.get('alg', 'unknown'),
+                'token_type': header.get('typ', 'JWT')
+            }
+        except Exception as e:
+            return {'error': f'Failed to inspect token: {str(e)}'}
+    
+    def validate_claims(self, claims: dict) -> dict:
+        """Validate JWT claims"""
+        validation_results = {}
+        now = datetime.now(timezone.utc).timestamp()
+        
+        # Check expiration
+        if 'exp' in claims:
+            exp = claims['exp']
+            if isinstance(exp, datetime):
+                exp = exp.timestamp()
+            validation_results['expired'] = now > exp
+            validation_results['expires_at'] = datetime.fromtimestamp(exp, tz=timezone.utc).isoformat()
+        
+        # Check not before
+        if 'nbf' in claims:
+            nbf = claims['nbf']
+            if isinstance(nbf, datetime):
+                nbf = nbf.timestamp()
+            validation_results['not_yet_valid'] = now < nbf
+        
+        # Check issued at
+        if 'iat' in claims:
+            iat = claims['iat']
+            if isinstance(iat, datetime):
+                iat = iat.timestamp()
+            validation_results['issued_at'] = datetime.fromtimestamp(iat, tz=timezone.utc).isoformat()
+        
+        # Check standard claims presence
+        validation_results['has_subject'] = 'sub' in claims
+        validation_results['has_issuer'] = 'iss' in claims
+        validation_results['has_audience'] = 'aud' in claims
+        validation_results['has_jwt_id'] = 'jti' in claims
+        
+        return validation_results
+
+# Initialize components
+key_manager = JWTKeyManager()
+jwt_handler = JWTHandler(key_manager)
+
+# Conversation history for multi-turn chat
+conversation_history = []
+
+def process_jwt_request(user_message: str) -> str:
+    """Process JWT-related requests using Claude"""
+    
+    # Add user message to history
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    # Create system prompt with JWT context
+    system_prompt = """You are a JWT (JSON Web Token) expert assistant. You help users with:
+1. Creating JWT tokens with various algorithms (HS256, RS256, ES256, etc.)
+2. Decoding and verifying JWT tokens
+3. Explaining JWT claims and their meanings
+4. Managing keys and certificates for JWT
+5. Troubleshooting JWT authentication issues
+6. Best practices for JWT security
+
+When users ask to perform JWT operations, provide clear explanations and guide them through the process.
+You have access to a JWT handler that supports:
+- HMAC algorithms: HS256, HS384, HS512
+- RSA algorithms: RS256, RS384, RS512  
+- EC algorithms: ES256, ES384, ES512
+
+For token creation, you can specify:
+- payload: custom claims
+- algorithm: signing algorithm
+- expiry_seconds: token lifetime
+- additional_claims: extra JWT claims
+
+Always explain what you're doing and why, and provide security recommendations."""
+    
+    # Call Claude API
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=system_prompt,
+        messages=conversation_history
+    )
+    
+    assistant_message = response.content[0].text
+    
+    # Add assistant response to history
+    conversation_history.append({
+        "role": "assistant",
+        "content": assistant_message
+    })
+    
+    return assistant_message
+
+def execute_jwt_operation(operation: str, **kwargs) -> dict:
+    """Execute JWT operations based on user requests"""
+    
+    if operation == 'create':
+        payload = kwargs.get('payload', {'sub': 'user123', 'name': 'Test User'})
+        algorithm = kwargs.get('algorithm', 'HS256')
+        expiry = kwargs.get('expiry_seconds', 3600)
+        additional_claims = kwargs.get('additional_claims', {})
+        
+        token = jwt_handler.create_token(payload, algorithm, expiry, additional_claims)
+        if token:
+            return {
+                'operation': 'create',
+                'token': token,
+                'algorithm': algorithm,
+                'payload': payload
+            }
+        return {'error': 'Failed to create token'}
+    
+    elif operation == 'decode':
+        token = kwargs.get('token', '')
+        algorithm = kwargs.get('algorithm', 'HS256')
+        verify = kwargs.get('verify_signature', True)
+        
+        result = jwt_handler.decode_token(token, algorithm, verify)
+        return result
+    
+    elif operation == 'inspect':
+        token = kwargs.get('token', '')
+        result = jwt_handler.inspect_token(token)
+        return result
+    
+    elif operation == 'validate_claims':
+        claims = kwargs.get('claims', {})
+        result = jwt_handler.validate_claims(claims)
+        return result
+    
+    elif operation == 'list_algorithms':
+        return {
+            'supported_algorithms': jwt_handler.supported_algorithms,
+            'available_keys': key_manager.list_keys()
+        }
+    
+    return {'error': f'Unknown operation: {operation}'}
+
+def demonstrate_jwt_operations():
+    """Demonstrate various JWT operations"""
+    print("\n" + "="*60)
+    print("JWT Authentication & Decoding System Demo")
+    print("="*60)
+    
+    # Demo 1: Create HS256 token
+    print("\n1. Creating HS256 Token:")
+    result = execute_jwt_operation(
+        'create',
+        payload={'sub': 'user123', 'name': 'Alice', 'role': 'admin'},
+        algorithm='HS256',
+        expiry_seconds=3600,
+        additional_claims={'iss': 'my-app', 'aud': 'api-service'}
+    )
+    
+    if 'token' in result:
+        hs256_token = result['token']
+        print(f"Token created: {hs256_token[:50]}...")
+        
+        # Inspect the token
+        print("\n2. Inspecting Token (without verification):")
+        inspect_result = execute_jwt_operation('inspect', token=hs256_token)
+        print(f"Header: {json.dumps(inspect_result.get('header', {}), indent=2)}")
+        print(f"Algorithm: {inspect_result.get('algorithm')}")
+        
+        # Decode and verify
+        print("\n3. Decoding and Verifying Token:")
+        decode_result = execute_jwt_operation(
+            'decode',
+            token=hs256_token,
+            algorithm='HS256',
+            verify_signature=True
+        )
+        
+        if decode_result.get('success'):
+            claims = decode_result['claims']
+            print(f"Claims: {json.dumps({k: str(v) for k, v in claims.items()}, indent=2)}")
+            
+            # Validate claims
+            print("\n4. Validating Claims:")
+            validation = execute_jwt_operation('validate_claims', claims=claims)
+            print(f"Validation results: {json.dumps(validation, indent=2)}")
+    
+    # Demo 2: Create RS256 token
+    if CRYPTO_AVAILABLE:
+        print("\n5. Creating RS256 Token:")
+        rs256_result = execute_jwt_operation(
+            'create',
+            payload={'sub': 'user456', 'name': 'Bob', 'role': 'user'},
+            algorithm='RS256',
+            expiry_seconds=7200
+        )
+        
+        if 'token' in rs256_result:
+            print(f"RS256 Token created: {rs256_result['token'][:50]}...")
+    
+    # Demo 3: List supported algorithms
+    print("\n6. Supported Algorithms:")
+    algo_result = execute_jwt_operation('list_algorithms')
+    print(f"Algorithms: {algo_result.get('supported_algorithms', [])}")
+    print(f"Available keys: {algo_result.get('available_keys', [])}")
+
+def interactive_chat():
+    """Run interactive chat session"""
+    print("\n" + "="*60)
+    print("JWT Expert Assistant - Interactive Mode")
+    print("="*60)
+    print("Ask me anything about JWT tokens, authentication, and security!")
+    print("Type 'demo' to see a demonstration, 'quit' to exit")
+    print("="*60 + "\n")
+    
+    while True:
+        try:
+            user_input = input("You: ").strip()
+            
+            if not user_input:
+                continue
+            
+            if user_input.lower() == 'quit':
+                print("Goodbye!")
+                break
+            
+            if user_input.lower() == 'demo':
+                demonstrate_jwt_operations()
+                continue
+            
+            # Check for specific JWT operations
+            if user_input.lower().startswith('create token'):
+                # Parse simple create token request
+                result = execute_jwt_operation(
+                    'create',
+                    payload={'sub': 'demo_user', 'name': 'Demo User'},
+                    algorithm='HS256'
+                )
+                print(f"\nSystem: Token created!")
+                if 'token' in result:
+                    print(f"Token: {result['token']}")
+                    
+                    # Get Claude's explanation
+                    explanation = process_jwt_request(
+                        f"I just created a JWT token with HS256 algorithm. The token starts with: {result['token'][:30]}... "
+                        f"Can you explain what this token contains and how it works?"
+                    )
+                    print(f"\nAssistant: {explanation}\n")
+                continue
+            
+            if user_input.lower().startswith('decode '):
+                # Extract token from message
+                token = user_input[7:].strip()
+                if token:
+                    result = execute_jwt_operation('inspect', token=token)
+                    print(f"\nSystem: Token inspection result:")
+                    print(json.dumps(result, indent=2, default=str))
+                    
+                    # Get Claude's analysis
+                    analysis = process_jwt_request(
+                        f"I decoded a JWT token and got these results: {json.dumps(result, default=str)}. "
+                        f"Can you analyze this token and explain what each field means?"
+                    )
+                    print(f"\nAssistant: {analysis}\n")
+                continue
+            
+            # General JWT question - use Claude
+            response = process_jwt_request(user_input)
+            print(f"\nAssistant: {response}\n")
+            
+        except KeyboardInterrupt:
+            print("\n\nInterrupted. Goodbye!")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            continue
+
+def main():
+    """Main entry point"""
+    print("JWT Authentication & Decoding System")
+    print("Powered by Claude AI and PyJWT")
+    print()
+    
+    # Check dependencies
+    if not JWT_AVAILABLE:
+        print("ERROR: PyJWT is required. Install with: pip install PyJWT")
+        print("For full functionality: pip install PyJWT cryptography")
+        return
+    
+    if not CRYPTO_AVAILABLE:
+        print("WARNING: cryptography library not available.")
+        print("RSA and EC algorithms will not work.")
+        print("Install with: pip install cryptography")
+    
+    # Run demonstration first
+    demonstrate_jwt_operations()
+    
+    # Start interactive chat
+    print("\n" + "="*60)
+    print("Starting Interactive JWT Assistant...")
+    interactive_chat()
+
+if __name__ == "__main__":
+    main()
+```

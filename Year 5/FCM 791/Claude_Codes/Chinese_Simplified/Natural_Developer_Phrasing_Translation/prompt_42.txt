@@ -1,0 +1,155 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import { exec } from "child_process";
+import { promisify } from "util";
+
+const execAsync = promisify(exec);
+const client = new Anthropic();
+
+async function pingHost(domain_name) {
+  const platform = process.platform;
+  let pingCommand;
+
+  if (platform === "win32") {
+    pingCommand = `ping -n 1 -w 3000 ${domain_name}`;
+  } else {
+    pingCommand = `ping -c 1 -W 3 ${domain_name}`;
+  }
+
+  try {
+    const { stdout, stderr } = await execAsync(pingCommand, { timeout: 10000 });
+    return {
+      success: true,
+      output: stdout,
+      error: stderr,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      output: error.stdout || "",
+      error: error.stderr || error.message,
+    };
+  }
+}
+
+async function checkHostStatus(domain_name) {
+  const tools = [
+    {
+      name: "ping_host",
+      description:
+        "Execute a ping command to check if a host/domain is alive (up/down). Returns the ping result including success status and output.",
+      input_schema: {
+        type: "object",
+        properties: {
+          domain_name: {
+            type: "string",
+            description: "The domain name or IP address to ping",
+          },
+        },
+        required: ["domain_name"],
+      },
+    },
+  ];
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please check if the host "${domain_name}" is alive by using the ping tool. After getting the result, tell me clearly whether the host is UP or DOWN, and provide a brief explanation.`,
+    },
+  ];
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    tools: tools,
+    messages: messages,
+  });
+
+  while (response.stop_reason === "tool_use") {
+    const toolUseBlock = response.content.find(
+      (block) => block.type === "tool_use"
+    );
+
+    if (!toolUseBlock) break;
+
+    const toolName = toolUseBlock.name;
+    const toolInput = toolUseBlock.input;
+
+    let toolResult;
+    if (toolName === "ping_host") {
+      toolResult = await pingHost(toolInput.domain_name);
+    }
+
+    messages.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    messages.push({
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: toolUseBlock.id,
+          content: JSON.stringify(toolResult),
+        },
+      ],
+    });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+  }
+
+  const textBlock = response.content.find((block) => block.type === "text");
+  const analysisText = textBlock ? textBlock.text : "No analysis available";
+
+  const isUp =
+    analysisText.toLowerCase().includes("up") &&
+    !analysisText.toLowerCase().includes("down");
+  const isDown = analysisText.toLowerCase().includes("down");
+
+  let status;
+  if (isUp && !isDown) {
+    status = "UP";
+  } else if (isDown) {
+    status = "DOWN";
+  } else {
+    status = "UNKNOWN";
+  }
+
+  return {
+    domain_name: domain_name,
+    status: status,
+    analysis: analysisText,
+  };
+}
+
+async function main() {
+  const testHosts = ["google.com", "github.com", "nonexistent-host-12345.com"];
+
+  console.log("Host Status Checker using Claude AI with Tool Use\n");
+  console.log("=".repeat(50));
+
+  for (const host of testHosts) {
+    console.log(`\nChecking host: ${host}`);
+    console.log("-".repeat(30));
+
+    try {
+      const result = await checkHostStatus(host);
+      console.log(`Status: ${result.status}`);
+      console.log(`Analysis: ${result.analysis}`);
+    } catch (error) {
+      console.error(`Error checking ${host}:`, error.message);
+    }
+
+    console.log("-".repeat(30));
+  }
+}
+
+main().catch(console.error);
+```

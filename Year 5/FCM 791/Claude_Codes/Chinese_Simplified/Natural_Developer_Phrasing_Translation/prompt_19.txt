@@ -1,0 +1,344 @@
+
+```python
+import logging
+import traceback
+import uuid
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("app.log"),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+# Error codes enum
+class ErrorCode(str, Enum):
+    DB_CONNECTION_ERROR = "DB_CONNECTION_ERROR"
+    DB_TIMEOUT_ERROR = "DB_TIMEOUT_ERROR"
+    DB_QUERY_ERROR = "DB_QUERY_ERROR"
+    DB_POOL_EXHAUSTED = "DB_POOL_EXHAUSTED"
+    INTERNAL_SERVER_ERROR = "INTERNAL_SERVER_ERROR"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+
+
+# Standard error response schema
+class ErrorResponse(BaseModel):
+    success: bool = False
+    error_code: str
+    message: str
+    trace_id: str
+    timestamp: str
+    details: Optional[dict] = None
+    path: Optional[str] = None
+
+
+# Custom database exceptions
+class DatabaseConnectionError(Exception):
+    """Raised when database connection fails"""
+
+    def __init__(
+        self,
+        message: str = "Database connection failed",
+        error_code: ErrorCode = ErrorCode.DB_CONNECTION_ERROR,
+        details: Optional[dict] = None,
+    ):
+        self.message = message
+        self.error_code = error_code
+        self.details = details
+        super().__init__(self.message)
+
+
+class DatabaseTimeoutError(DatabaseConnectionError):
+    """Raised when database connection times out"""
+
+    def __init__(
+        self,
+        message: str = "Database connection timed out",
+        details: Optional[dict] = None,
+    ):
+        super().__init__(
+            message=message,
+            error_code=ErrorCode.DB_TIMEOUT_ERROR,
+            details=details,
+        )
+
+
+class DatabaseQueryError(Exception):
+    """Raised when database query fails"""
+
+    def __init__(
+        self,
+        message: str = "Database query failed",
+        details: Optional[dict] = None,
+    ):
+        self.message = message
+        self.error_code = ErrorCode.DB_QUERY_ERROR
+        self.details = details
+        super().__init__(self.message)
+
+
+class DatabasePoolExhaustedError(DatabaseConnectionError):
+    """Raised when database connection pool is exhausted"""
+
+    def __init__(
+        self,
+        message: str = "Database connection pool exhausted",
+        details: Optional[dict] = None,
+    ):
+        super().__init__(
+            message=message,
+            error_code=ErrorCode.DB_POOL_EXHAUSTED,
+            details=details,
+        )
+
+
+def generate_trace_id() -> str:
+    """Generate a unique trace ID for request tracking"""
+    return str(uuid.uuid4())
+
+
+def create_error_response(
+    error_code: str,
+    message: str,
+    trace_id: str,
+    path: Optional[str] = None,
+    details: Optional[dict] = None,
+) -> dict:
+    """Create a standardized error response"""
+    return {
+        "success": False,
+        "error_code": error_code,
+        "message": message,
+        "trace_id": trace_id,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "details": details,
+        "path": path,
+    }
+
+
+# Create FastAPI application
+app = FastAPI(
+    title="FastAPI with Database Error Handling",
+    description="FastAPI application with custom database exception handlers",
+    version="1.0.0",
+)
+
+
+# Exception handlers
+@app.exception_handler(DatabaseConnectionError)
+async def database_connection_error_handler(
+    request: Request, exc: DatabaseConnectionError
+):
+    """Handle database connection errors - returns HTTP 503"""
+    trace_id = generate_trace_id()
+
+    # Log the error with full traceback
+    logger.error(
+        f"Database connection error | trace_id={trace_id} | "
+        f"path={request.url.path} | error_code={exc.error_code} | "
+        f"message={exc.message}",
+        exc_info=True,
+    )
+
+    error_response = create_error_response(
+        error_code=exc.error_code,
+        message=exc.message,
+        trace_id=trace_id,
+        path=str(request.url.path),
+        details=exc.details,
+    )
+
+    return JSONResponse(
+        status_code=503,
+        content=error_response,
+        headers={"X-Trace-ID": trace_id},
+    )
+
+
+@app.exception_handler(DatabaseQueryError)
+async def database_query_error_handler(request: Request, exc: DatabaseQueryError):
+    """Handle database query errors - returns HTTP 500"""
+    trace_id = generate_trace_id()
+
+    # Log the error with full traceback
+    logger.error(
+        f"Database query error | trace_id={trace_id} | "
+        f"path={request.url.path} | error_code={exc.error_code} | "
+        f"message={exc.message}",
+        exc_info=True,
+    )
+
+    error_response = create_error_response(
+        error_code=exc.error_code,
+        message=exc.message,
+        trace_id=trace_id,
+        path=str(request.url.path),
+        details=exc.details,
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content=error_response,
+        headers={"X-Trace-ID": trace_id},
+    )
+
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """Handle all other unhandled exceptions - returns HTTP 500"""
+    trace_id = generate_trace_id()
+
+    # Log the error with full traceback
+    logger.error(
+        f"Unhandled exception | trace_id={trace_id} | "
+        f"path={request.url.path} | "
+        f"exception_type={type(exc).__name__} | "
+        f"message={str(exc)}\n"
+        f"Traceback: {traceback.format_exc()}",
+    )
+
+    error_response = create_error_response(
+        error_code=ErrorCode.INTERNAL_SERVER_ERROR,
+        message="An unexpected error occurred",
+        trace_id=trace_id,
+        path=str(request.url.path),
+        details={"exception_type": type(exc).__name__},
+    )
+
+    return JSONResponse(
+        status_code=500,
+        content=error_response,
+        headers={"X-Trace-ID": trace_id},
+    )
+
+
+# Middleware to add trace ID to all requests
+@app.middleware("http")
+async def add_trace_id_middleware(request: Request, call_next):
+    """Add trace ID to request state and response headers"""
+    trace_id = request.headers.get("X-Trace-ID", generate_trace_id())
+    request.state.trace_id = trace_id
+
+    response = await call_next(request)
+    response.headers["X-Trace-ID"] = trace_id
+
+    return response
+
+
+# Demo routes to test error handling
+@app.get("/")
+async def root():
+    """Root endpoint"""
+    return {
+        "message": "FastAPI Database Error Handling Demo",
+        "endpoints": {
+            "/db/connection-error": "Simulate database connection error",
+            "/db/timeout-error": "Simulate database timeout error",
+            "/db/query-error": "Simulate database query error",
+            "/db/pool-exhausted": "Simulate connection pool exhausted error",
+            "/db/success": "Simulate successful database operation",
+            "/error/unhandled": "Simulate unhandled exception",
+        },
+    }
+
+
+@app.get("/db/connection-error")
+async def simulate_connection_error():
+    """Simulate a database connection error"""
+    raise DatabaseConnectionError(
+        message="Failed to connect to PostgreSQL database",
+        details={
+            "host": "db.example.com",
+            "port": 5432,
+            "database": "myapp",
+            "retry_attempts": 3,
+        },
+    )
+
+
+@app.get("/db/timeout-error")
+async def simulate_timeout_error():
+    """Simulate a database timeout error"""
+    raise DatabaseTimeoutError(
+        message="Database connection timed out after 30 seconds",
+        details={
+            "timeout_seconds": 30,
+            "host": "db.example.com",
+        },
+    )
+
+
+@app.get("/db/query-error")
+async def simulate_query_error():
+    """Simulate a database query error"""
+    raise DatabaseQueryError(
+        message="Failed to execute SQL query",
+        details={
+            "query": "SELECT * FROM users WHERE id = ?",
+            "error": "relation 'users' does not exist",
+        },
+    )
+
+
+@app.get("/db/pool-exhausted")
+async def simulate_pool_exhausted():
+    """Simulate connection pool exhausted error"""
+    raise DatabasePoolExhaustedError(
+        message="All database connections are in use",
+        details={
+            "pool_size": 10,
+            "active_connections": 10,
+            "waiting_requests": 5,
+        },
+    )
+
+
+@app.get("/db/success")
+async def simulate_success():
+    """Simulate a successful database operation"""
+    logger.info("Database query executed successfully")
+    return {
+        "success": True,
+        "data": {
+            "users": [
+                {"id": 1, "name": "Alice", "email": "alice@example.com"},
+                {"id": 2, "name": "Bob", "email": "bob@example.com"},
+            ],
+            "total": 2,
+        },
+    }
+
+
+@app.get("/error/unhandled")
+async def simulate_unhandled_error():
+    """Simulate an unhandled exception"""
+    # This will trigger the general exception handler
+    raise ValueError("This is an unexpected error that wasn't caught")
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+```

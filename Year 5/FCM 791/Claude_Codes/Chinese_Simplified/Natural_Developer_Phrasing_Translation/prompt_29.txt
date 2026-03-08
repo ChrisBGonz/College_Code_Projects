@@ -1,0 +1,722 @@
+
+```python
+#!/usr/bin/env python3
+"""
+Maven Dependency Auto-Updater
+Automatically upgrades all dependencies in Maven projects to their latest versions.
+Supports multi-module projects, generates change reports, and validates builds.
+"""
+
+import os
+import sys
+import json
+import subprocess
+import logging
+import argparse
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+from anthropic import Anthropic
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler(f'maven_updater_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+client = Anthropic()
+
+def read_pom_file(pom_path: str) -> str:
+    """Read a POM file and return its content."""
+    with open(pom_path, 'r', encoding='utf-8') as f:
+        return f.read()
+
+def write_pom_file(pom_path: str, content: str) -> None:
+    """Write content to a POM file."""
+    with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+def find_pom_files(project_dir: str) -> list[str]:
+    """Find all pom.xml files in the project directory."""
+    pom_files = []
+    for root, dirs, files in os.walk(project_dir):
+        # Skip hidden directories and common non-project directories
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['target', 'node_modules']]
+        if 'pom.xml' in files:
+            pom_files.append(os.path.join(root, 'pom.xml'))
+    return sorted(pom_files)
+
+def run_maven_command(project_dir: str, command: list[str], timeout: int = 300) -> tuple[int, str, str]:
+    """Run a Maven command and return exit code, stdout, stderr."""
+    try:
+        result = subprocess.run(
+            command,
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+            timeout=timeout
+        )
+        return result.returncode, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", "Command timed out"
+    except Exception as e:
+        return -1, "", str(e)
+
+def get_dependency_updates(project_dir: str) -> str:
+    """Run Maven versions plugin to get available updates."""
+    logger.info("Checking for available dependency updates...")
+    
+    # Run versions:display-dependency-updates
+    returncode, stdout, stderr = run_maven_command(
+        project_dir,
+        ['mvn', 'versions:display-dependency-updates', 'versions:display-plugin-updates', 
+         'versions:display-parent-updates', '-DprocessAllModules=true', '--batch-mode'],
+        timeout=300
+    )
+    
+    if returncode != 0:
+        logger.warning(f"Maven versions check returned non-zero exit code: {returncode}")
+        logger.warning(f"stderr: {stderr[:500]}")
+    
+    return stdout + "\n" + stderr
+
+def backup_pom_files(pom_files: list[str]) -> dict[str, str]:
+    """Create backups of all POM files."""
+    backups = {}
+    for pom_path in pom_files:
+        backup_path = pom_path + '.backup'
+        content = read_pom_file(pom_path)
+        with open(backup_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        backups[pom_path] = backup_path
+        logger.info(f"Backed up {pom_path} to {backup_path}")
+    return backups
+
+def restore_pom_files(backups: dict[str, str]) -> None:
+    """Restore POM files from backups."""
+    for pom_path, backup_path in backups.items():
+        if os.path.exists(backup_path):
+            content = read_pom_file(backup_path)
+            write_pom_file(pom_path, content)
+            os.remove(backup_path)
+            logger.info(f"Restored {pom_path} from backup")
+
+def run_build_validation(project_dir: str) -> tuple[bool, str]:
+    """Run Maven build to validate the updated project."""
+    logger.info("Running build validation...")
+    
+    returncode, stdout, stderr = run_maven_command(
+        project_dir,
+        ['mvn', '-U', 'clean', 'test', '--batch-mode', '-DfailIfNoTests=false'],
+        timeout=600
+    )
+    
+    success = returncode == 0
+    output = stdout + "\n" + stderr
+    
+    if success:
+        logger.info("Build validation PASSED")
+    else:
+        logger.error("Build validation FAILED")
+    
+    return success, output
+
+def generate_change_report(original_poms: dict[str, str], updated_poms: dict[str, str], 
+                           build_success: bool, build_output: str) -> str:
+    """Generate a change report comparing original and updated POM files."""
+    report = []
+    report.append("=" * 80)
+    report.append("MAVEN DEPENDENCY UPDATE REPORT")
+    report.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    report.append("=" * 80)
+    report.append("")
+    
+    # Build status
+    report.append(f"BUILD STATUS: {'✅ PASSED' if build_success else '❌ FAILED'}")
+    report.append("")
+    
+    # Changes per POM file
+    report.append("CHANGES BY FILE:")
+    report.append("-" * 40)
+    
+    for pom_path in original_poms:
+        if pom_path in updated_poms:
+            original = original_poms[pom_path]
+            updated = updated_poms[pom_path]
+            
+            if original != updated:
+                report.append(f"\n📄 {pom_path}")
+                
+                # Extract version changes using regex
+                original_versions = extract_versions(original)
+                updated_versions = extract_versions(updated)
+                
+                changes = []
+                for key in set(list(original_versions.keys()) + list(updated_versions.keys())):
+                    orig_ver = original_versions.get(key, 'N/A')
+                    new_ver = updated_versions.get(key, 'N/A')
+                    if orig_ver != new_ver:
+                        changes.append(f"  • {key}: {orig_ver} → {new_ver}")
+                
+                if changes:
+                    for change in changes:
+                        report.append(change)
+                else:
+                    report.append("  (Changes detected but could not parse version details)")
+            else:
+                report.append(f"\n📄 {pom_path} - No changes")
+    
+    report.append("")
+    report.append("=" * 80)
+    
+    if not build_success:
+        report.append("BUILD FAILURE DETAILS:")
+        report.append("-" * 40)
+        # Extract relevant error lines
+        error_lines = [line for line in build_output.split('\n') 
+                      if 'ERROR' in line or 'FAILURE' in line or 'error:' in line.lower()]
+        report.extend(error_lines[:50])  # Limit to first 50 error lines
+    
+    return '\n'.join(report)
+
+def extract_versions(pom_content: str) -> dict[str, str]:
+    """Extract artifact versions from POM content."""
+    versions = {}
+    
+    # Match dependency versions
+    dep_pattern = re.compile(
+        r'<groupId>([^<]+)</groupId>\s*'
+        r'<artifactId>([^<]+)</artifactId>\s*'
+        r'(?:<version>([^<]+)</version>)?',
+        re.DOTALL
+    )
+    
+    for match in dep_pattern.finditer(pom_content):
+        group_id = match.group(1).strip()
+        artifact_id = match.group(2).strip()
+        version = match.group(3).strip() if match.group(3) else None
+        
+        if version and not version.startswith('${'):
+            key = f"{group_id}:{artifact_id}"
+            versions[key] = version
+    
+    # Match property versions
+    prop_pattern = re.compile(r'<([^>]+\.version)>([^<]+)</[^>]+>')
+    for match in prop_pattern.finditer(pom_content):
+        prop_name = match.group(1).strip()
+        version = match.group(2).strip()
+        versions[f"property:{prop_name}"] = version
+    
+    return versions
+
+def maven_updater_conversation(project_dir: str, dry_run: bool = False, 
+                                skip_tests: bool = False) -> None:
+    """
+    Main conversation loop with Claude for Maven dependency updates.
+    Uses multi-turn conversation to analyze and update dependencies.
+    """
+    conversation_history = []
+    
+    # Find all POM files
+    pom_files = find_pom_files(project_dir)
+    if not pom_files:
+        logger.error(f"No pom.xml files found in {project_dir}")
+        return
+    
+    logger.info(f"Found {len(pom_files)} POM file(s): {pom_files}")
+    
+    # Read all POM files
+    pom_contents = {}
+    for pom_path in pom_files:
+        pom_contents[pom_path] = read_pom_file(pom_path)
+    
+    # Get available updates from Maven
+    maven_updates_output = get_dependency_updates(project_dir)
+    
+    # Prepare initial context for Claude
+    pom_summary = "\n\n".join([
+        f"=== {path} ===\n{content}" 
+        for path, content in pom_contents.items()
+    ])
+    
+    # Initial message to Claude
+    initial_message = f"""I need you to help me update Maven dependencies in a Java project to their latest versions.
+
+Project directory: {project_dir}
+Number of POM files: {len(pom_files)}
+Dry run mode: {dry_run}
+
+Here are the current POM files:
+
+{pom_summary}
+
+Here is the output from Maven versions plugin showing available updates:
+
+{maven_updates_output[:5000]}  # Limit to avoid token limits
+
+Please analyze these POM files and the available updates. I need you to:
+1. Identify all dependencies, plugins, and parent POMs that can be updated
+2. Provide the updated POM content for each file with the latest versions
+3. Explain what changes you're making and why
+
+Please start by analyzing the dependencies and telling me what updates are available."""
+
+    conversation_history.append({
+        "role": "user",
+        "content": initial_message
+    })
+    
+    logger.info("Starting conversation with Claude for dependency analysis...")
+    
+    # First turn: Analysis
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system="""You are an expert Java/Maven developer specializing in dependency management. 
+        Your task is to analyze Maven POM files and update dependencies to their latest stable versions.
+        When providing updated POM files, always provide the complete file content.
+        Be careful to:
+        - Only update to stable releases (not SNAPSHOT or RC versions unless explicitly requested)
+        - Maintain compatibility between related dependencies
+        - Preserve the existing structure and formatting of POM files
+        - Update version properties when they're used instead of inline versions""",
+        messages=conversation_history
+    )
+    
+    analysis_response = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": analysis_response
+    })
+    
+    logger.info("Received dependency analysis from Claude")
+    print("\n" + "="*60)
+    print("DEPENDENCY ANALYSIS:")
+    print("="*60)
+    print(analysis_response[:2000])  # Print first 2000 chars
+    
+    # Second turn: Request updated POM files
+    update_request = """Now please provide the complete updated content for each POM file that needs changes.
+    
+For each POM file that needs updates, provide:
+1. The file path
+2. The complete updated XML content
+
+Format your response as:
+FILE: <path>
+```xml
+<complete pom.xml content>
+```
+
+Please provide all updated POM files now."""
+
+    conversation_history.append({
+        "role": "user",
+        "content": update_request
+    })
+    
+    logger.info("Requesting updated POM files from Claude...")
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        messages=conversation_history
+    )
+    
+    updated_poms_response = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": updated_poms_response
+    })
+    
+    # Parse updated POM files from response
+    updated_poms = parse_updated_poms(updated_poms_response, pom_files)
+    
+    if not updated_poms:
+        logger.warning("No updated POM files were extracted from Claude's response")
+        # Ask Claude to clarify
+        clarification_request = """I couldn't extract the updated POM files from your response. 
+        Please provide them again in this exact format:
+        
+        FILE: /path/to/pom.xml
+        ```xml
+        <?xml version="1.0" encoding="UTF-8"?>
+        <project>
+        ... complete content ...
+        </project>
+        ```"""
+        
+        conversation_history.append({
+            "role": "user",
+            "content": clarification_request
+        })
+        
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=8096,
+            messages=conversation_history
+        )
+        
+        updated_poms_response = response.content[0].text
+        conversation_history.append({
+            "role": "assistant",
+            "content": updated_poms_response
+        })
+        
+        updated_poms = parse_updated_poms(updated_poms_response, pom_files)
+    
+    if not updated_poms:
+        logger.error("Failed to extract updated POM files. Exiting.")
+        return
+    
+    logger.info(f"Extracted {len(updated_poms)} updated POM file(s)")
+    
+    if dry_run:
+        logger.info("DRY RUN MODE: Not applying changes")
+        print("\n" + "="*60)
+        print("DRY RUN - Changes that would be applied:")
+        print("="*60)
+        for pom_path, content in updated_poms.items():
+            print(f"\n📄 {pom_path}")
+            print(content[:500] + "..." if len(content) > 500 else content)
+        return
+    
+    # Backup original files
+    backups = backup_pom_files(list(updated_poms.keys()))
+    
+    # Apply updates
+    logger.info("Applying POM updates...")
+    for pom_path, content in updated_poms.items():
+        write_pom_file(pom_path, content)
+        logger.info(f"Updated {pom_path}")
+    
+    # Run build validation
+    build_success = True
+    build_output = ""
+    
+    if not skip_tests:
+        build_success, build_output = run_build_validation(project_dir)
+        
+        if not build_success:
+            # Ask Claude for help fixing the build
+            fix_request = f"""The build failed after updating dependencies. Here is the build output:
+
+{build_output[:3000]}
+
+Please analyze the build failure and suggest fixes. If there are compatibility issues between 
+the updated dependencies, please provide corrected POM files that resolve these issues."""
+
+            conversation_history.append({
+                "role": "user",
+                "content": fix_request
+            })
+            
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=8096,
+                messages=conversation_history
+            )
+            
+            fix_response = response.content[0].text
+            conversation_history.append({
+                "role": "assistant",
+                "content": fix_response
+            })
+            
+            print("\n" + "="*60)
+            print("BUILD FIX SUGGESTIONS:")
+            print("="*60)
+            print(fix_response[:2000])
+            
+            # Try to extract fixed POM files
+            fixed_poms = parse_updated_poms(fix_response, pom_files)
+            
+            if fixed_poms:
+                logger.info("Applying build fixes...")
+                for pom_path, content in fixed_poms.items():
+                    write_pom_file(pom_path, content)
+                
+                # Re-run build
+                build_success, build_output = run_build_validation(project_dir)
+                
+                if build_success:
+                    updated_poms.update(fixed_poms)
+                else:
+                    logger.error("Build still failing after fixes. Restoring backups.")
+                    restore_pom_files(backups)
+                    build_success = False
+            else:
+                logger.error("Could not extract fixes. Restoring backups.")
+                restore_pom_files(backups)
+                build_success = False
+    
+    # Clean up backups if build succeeded
+    if build_success:
+        for backup_path in backups.values():
+            if os.path.exists(backup_path):
+                os.remove(backup_path)
+        logger.info("Removed backup files")
+    
+    # Generate change report
+    report = generate_change_report(pom_contents, updated_poms, build_success, build_output)
+    
+    # Save report
+    report_path = os.path.join(project_dir, f'dependency_update_report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.txt')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+    
+    print("\n" + report)
+    logger.info(f"Change report saved to {report_path}")
+    
+    # Final summary from Claude
+    summary_request = f"""The dependency update process is complete. 
+    Build status: {'SUCCESS' if build_success else 'FAILURE'}
+    
+    Please provide a brief summary of:
+    1. What was updated
+    2. Any important notes about the updates
+    3. Recommendations for the development team"""
+    
+    conversation_history.append({
+        "role": "user",
+        "content": summary_request
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=conversation_history
+    )
+    
+    final_summary = response.content[0].text
+    
+    print("\n" + "="*60)
+    print("FINAL SUMMARY:")
+    print("="*60)
+    print(final_summary)
+    
+    # Save conversation history for debugging
+    history_path = os.path.join(project_dir, f'update_conversation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json')
+    with open(history_path, 'w', encoding='utf-8') as f:
+        json.dump(conversation_history, f, indent=2)
+    logger.info(f"Conversation history saved to {history_path}")
+
+def parse_updated_poms(response_text: str, known_pom_files: list[str]) -> dict[str, str]:
+    """Parse updated POM files from Claude's response."""
+    updated_poms = {}
+    
+    # Pattern to match FILE: path followed by XML content
+    file_pattern = re.compile(
+        r'FILE:\s*([^\n]+)\n+```xml\n(.*?)```',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    for match in file_pattern.finditer(response_text):
+        file_path = match.group(1).strip()
+        xml_content = match.group(2).strip()
+        
+        # Try to match with known POM files
+        matched_path = None
+        for known_path in known_pom_files:
+            if file_path in known_path or known_path.endswith(file_path) or \
+               os.path.basename(known_path) == os.path.basename(file_path):
+                matched_path = known_path
+                break
+        
+        if matched_path:
+            updated_poms[matched_path] = xml_content
+            logger.info(f"Parsed updated POM for: {matched_path}")
+        else:
+            # Try to use the path as-is if it exists
+            if os.path.exists(file_path):
+                updated_poms[file_path] = xml_content
+                logger.info(f"Parsed updated POM for: {file_path}")
+            else:
+                logger.warning(f"Could not match file path: {file_path}")
+    
+    # Also try alternative pattern without FILE: prefix
+    if not updated_poms:
+        alt_pattern = re.compile(
+            r'(?:Updated|Modified|New)\s+(?:content for\s+)?`?([^`\n]+pom\.xml)`?\s*:?\n+```xml\n(.*?)```',
+            re.DOTALL | re.IGNORECASE
+        )
+        
+        for match in alt_pattern.finditer(response_text):
+            file_path = match.group(1).strip()
+            xml_content = match.group(2).strip()
+            
+            for known_path in known_pom_files:
+                if file_path in known_path or known_path.endswith(file_path):
+                    updated_poms[known_path] = xml_content
+                    logger.info(f"Parsed updated POM (alt pattern) for: {known_path}")
+                    break
+    
+    return updated_poms
+
+def create_sample_project(project_dir: str) -> None:
+    """Create a sample Maven project for testing."""
+    os.makedirs(project_dir, exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'src/main/java'), exist_ok=True)
+    os.makedirs(os.path.join(project_dir, 'src/test/java'), exist_ok=True)
+    
+    pom_content = """<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example</groupId>
+    <artifactId>sample-project</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>jar</packaging>
+
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <junit.version>5.8.2</junit.version>
+        <slf4j.version>1.7.36</slf4j.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>31.1-jre</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.commons</groupId>
+            <artifactId>commons-lang3</artifactId>
+            <version>3.12.0</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.10.1</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.0.0-M7</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>"""
+    
+    with open(os.path.join(project_dir, 'pom.xml'), 'w') as f:
+        f.write(pom_content)
+    
+    # Create a simple Java class
+    java_content = """package com.example;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("Hello, Maven!");
+    }
+}"""
+    
+    with open(os.path.join(project_dir, 'src/main/java/App.java'), 'w') as f:
+        f.write(java_content)
+    
+    # Create a simple test
+    test_content = """package com.example;
+
+import org.junit.jupiter.api.Test;
+import static org.junit.jupiter.api.Assertions.*;
+
+public class AppTest {
+    @Test
+    public void testApp() {
+        assertTrue(true);
+    }
+}"""
+    
+    with open(os.path.join(project_dir, 'src/test/java/AppTest.java'), 'w') as f:
+        f.write(test_content)
+    
+    logger.info(f"Created sample Maven project in {project_dir}")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Automatically update Maven dependencies to latest versions'
+    )
+    parser.add_argument(
+        'project_dir',
+        nargs='?',
+        default='.',
+        help='Path to the Maven project directory (default: current directory)'
+    )
+    parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Show what would be changed without actually modifying files'
+    )
+    parser.add_argument(
+        '--skip-tests',
+        action='store_true',
+        help='Skip build validation after updating dependencies'
+    )
+    parser.add_argument(
+        '--create-sample',
+        action='store_true',
+        help='Create a sample Maven project for testing'
+    )
+    parser.add_argument(
+        '--sample-dir',
+        default='sample-maven-project',
+        help='Directory for sample project (default: sample-maven-project)'
+    )
+    
+    args = parser.parse_args()
+    
+    if args.create_sample:
+        create_sample_project(args.sample_dir)
+        project_dir = args.sample_dir
+    else:
+        project_dir = os.path.abspath(args.project_dir)
+    
+    if not os.path.exists(project_dir):
+        logger.error(f"Project directory does not exist: {project_dir}")
+        sys.exit(1)
+    
+    logger.info(f"Starting Maven dependency updater for: {project_dir}")
+    logger.info(f"Dry run: {args.dry_run}")
+    logger.info(f"Skip tests: {args.skip_tests}")
+    
+    try:
+        maven_updater_conversation(
+            project_dir=project_dir,
+            dry_run=args.dry_run,
+            skip_tests=args.skip_tests
+        )
+    except KeyboardInterrupt:
+        logger.info("Update process interrupted by user")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"Unexpected error: {e}", exc_info=True)
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
+```

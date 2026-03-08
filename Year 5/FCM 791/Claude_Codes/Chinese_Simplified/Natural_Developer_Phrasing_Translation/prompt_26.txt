@@ -1,0 +1,517 @@
+```yaml
+name: Build and Upload to Object Storage
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - 'release/**'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  NODE_VERSION: '20'
+  JAVA_VERSION: '17'
+  BUILD_OUTPUT_DIR: 'dist'
+  ARTIFACT_NAME: 'build-artifact'
+  ARCHIVE_NAME: 'artifact.tar.gz'
+
+jobs:
+  build:
+    name: Build Project
+    runs-on: ubuntu-latest
+    outputs:
+      artifact-path: ${{ steps.set-output.outputs.artifact-path }}
+      build-version: ${{ steps.set-version.outputs.version }}
+      upload-key: ${{ steps.set-upload-key.outputs.key }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set build version
+        id: set-version
+        run: |
+          VERSION="${{ github.ref_name }}-$(date +'%Y%m%d%H%M%S')-${GITHUB_SHA::8}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Build version: ${VERSION}"
+
+      - name: Set upload key
+        id: set-upload-key
+        run: |
+          BRANCH_NAME="${{ github.ref_name }}"
+          SAFE_BRANCH=$(echo "${BRANCH_NAME}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          KEY="builds/${SAFE_BRANCH}/${{ steps.set-version.outputs.version }}/${{ env.ARCHIVE_NAME }}"
+          echo "key=${KEY}" >> $GITHUB_OUTPUT
+          echo "Upload key: ${KEY}"
+
+      # -------------------------------------------------------
+      # Node.js Build (uncomment if using Node.js project)
+      # -------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test -- --coverage --watchAll=false
+        env:
+          CI: true
+
+      - name: Build project
+        run: npm run build
+        env:
+          NODE_ENV: production
+          REACT_APP_VERSION: ${{ steps.set-version.outputs.version }}
+
+      # -------------------------------------------------------
+      # Java/Maven Build (uncomment if using Java project)
+      # -------------------------------------------------------
+      # - name: Setup Java
+      #   uses: actions/setup-java@v4
+      #   with:
+      #     java-version: ${{ env.JAVA_VERSION }}
+      #     distribution: 'temurin'
+      #     cache: 'maven'
+      #
+      # - name: Build with Maven
+      #   run: mvn clean package -DskipTests=false -Drevision=${{ steps.set-version.outputs.version }}
+      #
+      # - name: Copy artifacts
+      #   run: |
+      #     mkdir -p ${{ env.BUILD_OUTPUT_DIR }}
+      #     cp target/*.jar ${{ env.BUILD_OUTPUT_DIR }}/
+
+      # -------------------------------------------------------
+      # Go Build (uncomment if using Go project)
+      # -------------------------------------------------------
+      # - name: Setup Go
+      #   uses: actions/setup-go@v5
+      #   with:
+      #     go-version: '1.22'
+      #     cache: true
+      #
+      # - name: Build Go binary
+      #   run: |
+      #     mkdir -p ${{ env.BUILD_OUTPUT_DIR }}
+      #     go build -ldflags="-X main.Version=${{ steps.set-version.outputs.version }}" \
+      #       -o ${{ env.BUILD_OUTPUT_DIR }}/app ./...
+
+      - name: Verify build output
+        run: |
+          if [ ! -d "${{ env.BUILD_OUTPUT_DIR }}" ]; then
+            echo "ERROR: Build output directory '${{ env.BUILD_OUTPUT_DIR }}' not found!"
+            exit 1
+          fi
+          echo "Build output contents:"
+          ls -la ${{ env.BUILD_OUTPUT_DIR }}/
+          echo "Total size: $(du -sh ${{ env.BUILD_OUTPUT_DIR }} | cut -f1)"
+
+      - name: Create version file
+        run: |
+          cat > ${{ env.BUILD_OUTPUT_DIR }}/version.json << EOF
+          {
+            "version": "${{ steps.set-version.outputs.version }}",
+            "commit": "${{ github.sha }}",
+            "branch": "${{ github.ref_name }}",
+            "buildTime": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "repository": "${{ github.repository }}",
+            "runId": "${{ github.run_id }}"
+          }
+          EOF
+
+      - name: Package build artifacts
+        run: |
+          tar -czf ${{ env.ARCHIVE_NAME }} \
+            --exclude='*.map' \
+            -C . \
+            ${{ env.BUILD_OUTPUT_DIR }}/
+          
+          echo "Archive created: ${{ env.ARCHIVE_NAME }}"
+          echo "Archive size: $(du -sh ${{ env.ARCHIVE_NAME }} | cut -f1)"
+          echo "Archive checksum (SHA256): $(sha256sum ${{ env.ARCHIVE_NAME }})"
+          
+          sha256sum ${{ env.ARCHIVE_NAME }} > ${{ env.ARCHIVE_NAME }}.sha256
+
+      - name: Set artifact output path
+        id: set-output
+        run: echo "artifact-path=${{ env.ARCHIVE_NAME }}" >> $GITHUB_OUTPUT
+
+      - name: Upload artifact to GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ steps.set-version.outputs.version }}
+          path: |
+            ${{ env.ARCHIVE_NAME }}
+            ${{ env.ARCHIVE_NAME }}.sha256
+          retention-days: 7
+          if-no-files-found: error
+
+  upload-to-s3:
+    name: Upload to AWS S3
+    runs-on: ubuntu-latest
+    needs: build
+    if: |
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/heads/release/'))
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+          # For OIDC authentication (recommended), replace above with:
+          # role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          # role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Upload artifact to S3
+        run: |
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
+          
+          echo "Uploading to s3://${BUCKET}/${UPLOAD_KEY}"
+          
+          aws s3 cp ./artifacts/${{ env.ARCHIVE_NAME }} \
+            "s3://${BUCKET}/${UPLOAD_KEY}" \
+            --storage-class STANDARD_IA \
+            --metadata "version=${{ needs.build.outputs.build-version }},commit=${{ github.sha }},branch=${{ github.ref_name }}" \
+            --no-progress
+          
+          aws s3 cp ./artifacts/${{ env.ARCHIVE_NAME }}.sha256 \
+            "s3://${BUCKET}/${UPLOAD_KEY}.sha256" \
+            --no-progress
+
+      - name: Update latest pointer
+        run: |
+          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
+          BRANCH_NAME="${{ github.ref_name }}"
+          SAFE_BRANCH=$(echo "${BRANCH_NAME}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          LATEST_KEY="builds/${SAFE_BRANCH}/latest/${{ env.ARCHIVE_NAME }}"
+          
+          aws s3 cp ./artifacts/${{ env.ARCHIVE_NAME }} \
+            "s3://${BUCKET}/${LATEST_KEY}" \
+            --metadata "version=${{ needs.build.outputs.build-version }},commit=${{ github.sha }}" \
+            --no-progress
+          
+          echo "Latest pointer updated: s3://${BUCKET}/${LATEST_KEY}"
+
+      - name: Verify S3 upload
+        run: |
+          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          
+          aws s3api head-object \
+            --bucket "${BUCKET}" \
+            --key "${UPLOAD_KEY}" \
+            --query '{ContentLength: ContentLength, LastModified: LastModified, Metadata: Metadata}' \
+            --output json
+
+      - name: Generate S3 presigned URL
+        run: |
+          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          
+          PRESIGNED_URL=$(aws s3 presign \
+            "s3://${BUCKET}/${UPLOAD_KEY}" \
+            --expires-in 3600)
+          
+          echo "Presigned URL (valid 1 hour): ${PRESIGNED_URL}"
+          echo "presigned-url=${PRESIGNED_URL}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Write S3 upload summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ S3 Upload Successful
+          
+          | Field | Value |
+          |-------|-------|
+          | **Bucket** | ${{ secrets.S3_BUCKET_NAME }} |
+          | **Key** | ${{ needs.build.outputs.upload-key }} |
+          | **Version** | ${{ needs.build.outputs.build-version }} |
+          | **Commit** | ${{ github.sha }} |
+          | **Branch** | ${{ github.ref_name }} |
+          EOF
+
+  upload-to-gcs:
+    name: Upload to Google Cloud Storage
+    runs-on: ubuntu-latest
+    needs: build
+    if: false  # Set to appropriate condition to enable GCS upload
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          # For Workload Identity Federation (recommended):
+          # workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          # service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Upload artifact to GCS
+        run: |
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          BUCKET="${{ secrets.GCS_BUCKET_NAME }}"
+          
+          echo "Uploading to gs://${BUCKET}/${UPLOAD_KEY}"
+          
+          gcloud storage cp ./artifacts/${{ env.ARCHIVE_NAME }} \
+            "gs://${BUCKET}/${UPLOAD_KEY}" \
+            --custom-metadata="version=${{ needs.build.outputs.build-version }},commit=${{ github.sha }}"
+          
+          gcloud storage cp ./artifacts/${{ env.ARCHIVE_NAME }}.sha256 \
+            "gs://${BUCKET}/${UPLOAD_KEY}.sha256"
+
+      - name: Verify GCS upload
+        run: |
+          BUCKET="${{ secrets.GCS_BUCKET_NAME }}"
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          
+          gcloud storage objects describe "gs://${BUCKET}/${UPLOAD_KEY}"
+
+      - name: Write GCS upload summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ GCS Upload Successful
+          
+          | Field | Value |
+          |-------|-------|
+          | **Bucket** | ${{ secrets.GCS_BUCKET_NAME }} |
+          | **Object** | ${{ needs.build.outputs.upload-key }} |
+          | **Version** | ${{ needs.build.outputs.build-version }} |
+          EOF
+
+  upload-to-oss:
+    name: Upload to Alibaba Cloud OSS
+    runs-on: ubuntu-latest
+    needs: build
+    if: false  # Set to appropriate condition to enable OSS upload
+
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}-${{ needs.build.outputs.build-version }}
+          path: ./artifacts
+
+      - name: Setup ossutil
+        run: |
+          curl -o ossutil https://gosspublic.alicdn.com/ossutil/1.7.17/ossutil64
+          chmod +x ossutil
+          sudo mv ossutil /usr/local/bin/
+          
+          ossutil config \
+            --endpoint "${{ secrets.OSS_ENDPOINT }}" \
+            --access-key-id "${{ secrets.OSS_ACCESS_KEY_ID }}" \
+            --access-key-secret "${{ secrets.OSS_ACCESS_KEY_SECRET }}"
+
+      - name: Upload artifact to OSS
+        run: |
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          BUCKET="${{ secrets.OSS_BUCKET_NAME }}"
+          
+          echo "Uploading to oss://${BUCKET}/${UPLOAD_KEY}"
+          
+          ossutil cp ./artifacts/${{ env.ARCHIVE_NAME }} \
+            "oss://${BUCKET}/${UPLOAD_KEY}" \
+            --meta "x-oss-meta-version:${{ needs.build.outputs.build-version }}#x-oss-meta-commit:${{ github.sha }}" \
+            -f
+          
+          ossutil cp ./artifacts/${{ env.ARCHIVE_NAME }}.sha256 \
+            "oss://${BUCKET}/${UPLOAD_KEY}.sha256" \
+            -f
+
+      - name: Verify OSS upload
+        run: |
+          BUCKET="${{ secrets.OSS_BUCKET_NAME }}"
+          UPLOAD_KEY="${{ needs.build.outputs.upload-key }}"
+          
+          ossutil stat "oss://${BUCKET}/${UPLOAD_KEY}"
+
+      - name: Write OSS upload summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ✅ OSS Upload Successful
+          
+          | Field | Value |
+          |-------|-------|
+          | **Bucket** | ${{ secrets.OSS_BUCKET_NAME }} |
+          | **Key** | ${{ needs.build.outputs.upload-key }} |
+          | **Version** | ${{ needs.build.outputs.build-version }} |
+          EOF
+
+  cleanup-old-artifacts:
+    name: Cleanup Old Artifacts
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-s3]
+    if: |
+      always() &&
+      needs.upload-to-s3.result == 'success' &&
+      github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Cleanup old S3 artifacts
+        run: |
+          BUCKET="${{ secrets.S3_BUCKET_NAME }}"
+          BRANCH_NAME="${{ github.ref_name }}"
+          SAFE_BRANCH=$(echo "${BRANCH_NAME}" | sed 's/[^a-zA-Z0-9._-]/-/g')
+          PREFIX="builds/${SAFE_BRANCH}/"
+          KEEP_COUNT=10
+          
+          echo "Cleaning up old artifacts in s3://${BUCKET}/${PREFIX}"
+          echo "Keeping latest ${KEEP_COUNT} builds"
+          
+          OBJECTS=$(aws s3api list-objects-v2 \
+            --bucket "${BUCKET}" \
+            --prefix "${PREFIX}" \
+            --query 'Contents[?ends_with(Key, `artifact.tar.gz`)].[Key, LastModified]' \
+            --output text | sort -k2 -r)
+          
+          TOTAL=$(echo "${OBJECTS}" | grep -c "artifact.tar.gz" || true)
+          echo "Total builds found: ${TOTAL}"
+          
+          if [ "${TOTAL}" -gt "${KEEP_COUNT}" ]; then
+            DELETE_COUNT=$((TOTAL - KEEP_COUNT))
+            echo "Deleting ${DELETE_COUNT} old builds..."
+            
+            echo "${OBJECTS}" | tail -n "${DELETE_COUNT}" | while read -r KEY DATE; do
+              if [[ "${KEY}" != *"/latest/"* ]]; then
+                echo "Deleting: ${KEY}"
+                aws s3 rm "s3://${BUCKET}/${KEY}"
+                aws s3 rm "s3://${BUCKET}/${KEY}.sha256" 2>/dev/null || true
+              fi
+            done
+          else
+            echo "No cleanup needed (${TOTAL} builds <= ${KEEP_COUNT} keep count)"
+          fi
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: [build, upload-to-s3]
+    if: always()
+
+    steps:
+      - name: Determine overall status
+        id: status
+        run: |
+          BUILD_RESULT="${{ needs.build.result }}"
+          UPLOAD_RESULT="${{ needs.upload-to-s3.result }}"
+          
+          if [ "${BUILD_RESULT}" == "success" ] && \
+             ([ "${UPLOAD_RESULT}" == "success" ] || [ "${UPLOAD_RESULT}" == "skipped" ]); then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "emoji=✅" >> $GITHUB_OUTPUT
+            echo "color=good" >> $GITHUB_OUTPUT
+          else
+            echo "status=failure" >> $GITHUB_OUTPUT
+            echo "emoji=❌" >> $GITHUB_OUTPUT
+            echo "color=danger" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "attachments": [
+                {
+                  "color": "${{ steps.status.outputs.color }}",
+                  "title": "${{ steps.status.outputs.emoji }} Build ${{ steps.status.outputs.status }}: ${{ github.repository }}",
+                  "fields": [
+                    {
+                      "title": "Branch",
+                      "value": "${{ github.ref_name }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Version",
+                      "value": "${{ needs.build.outputs.build-version }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Commit",
+                      "value": "${{ github.sha }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Triggered by",
+                      "value": "${{ github.actor }}",
+                      "short": true
+                    },
+                    {
+                      "title": "Workflow Run",
+                      "value": "<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>",
+                      "short": false
+                    }
+                  ],
+                  "footer": "GitHub Actions",
+                  "ts": "${{ github.event.head_commit.timestamp }}"
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+      - name: Write final summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## ${{ steps.status.outputs.emoji }} Workflow Summary
+          
+          | Job | Status |
+          |-----|--------|
+          | Build | ${{ needs.build.result }} |
+          | Upload to S3 | ${{ needs.upload-to-s3.result }} |
+          
+          **Version:** ${{ needs.build.outputs.build-version }}  
+          **Commit:** [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})  
+          **Branch:** ${{ github.ref_name }}  
+          **Triggered by:** ${{ github.actor }}  
+          EOF
+```

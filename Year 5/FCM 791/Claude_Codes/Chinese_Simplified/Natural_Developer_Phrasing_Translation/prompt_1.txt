@@ -1,0 +1,241 @@
+
+```python
+import anthropic
+import json
+import re
+import sqlite3
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+client = anthropic.Anthropic()
+
+def init_db():
+    """Initialize the database with sample invoice data."""
+    conn = sqlite3.connect(':memory:')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY,
+            invoice_number TEXT NOT NULL,
+            customer_name TEXT NOT NULL,
+            customer_email TEXT NOT NULL,
+            amount REAL NOT NULL,
+            currency TEXT NOT NULL,
+            status TEXT NOT NULL,
+            issue_date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            description TEXT
+        )
+    ''')
+    
+    sample_invoices = [
+        (1, 'INV-001', 'Alice Johnson', 'alice@example.com', 1500.00, 'USD', 'paid', '2024-01-15', '2024-02-15', 'Web development services'),
+        (2, 'INV-002', 'Bob Smith', 'bob@example.com', 2300.50, 'USD', 'pending', '2024-01-20', '2024-02-20', 'Consulting services'),
+        (3, 'INV-003', 'Carol White', 'carol@example.com', 850.75, 'EUR', 'overdue', '2024-01-10', '2024-01-25', 'Design services'),
+        (4, 'INV-004', 'David Brown', 'david@example.com', 3200.00, 'USD', 'draft', '2024-01-25', '2024-02-25', 'Software development'),
+        (5, 'INV-005', 'Eve Davis', 'eve@example.com', 1100.25, 'GBP', 'paid', '2024-01-18', '2024-02-18', 'Marketing services'),
+    ]
+    
+    cursor.executemany('''
+        INSERT INTO invoices (id, invoice_number, customer_name, customer_email, amount, currency, status, issue_date, due_date, description)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', sample_invoices)
+    
+    conn.commit()
+    return conn
+
+db_conn = init_db()
+
+def get_invoice_from_db(invoice_id: int):
+    """Query the database for an invoice by ID."""
+    cursor = db_conn.cursor()
+    cursor.execute('SELECT * FROM invoices WHERE id = ?', (invoice_id,))
+    row = cursor.fetchone()
+    
+    if row:
+        columns = ['id', 'invoice_number', 'customer_name', 'customer_email', 
+                   'amount', 'currency', 'status', 'issue_date', 'due_date', 'description']
+        return dict(zip(columns, row))
+    return None
+
+def process_with_claude(invoice_id: int, invoice_data: dict | None):
+    """Use Claude to process and format the invoice response."""
+    
+    tools = [
+        {
+            "name": "get_invoice_details",
+            "description": "Retrieve invoice details from the database",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "invoice_id": {
+                        "type": "integer",
+                        "description": "The unique identifier of the invoice"
+                    }
+                },
+                "required": ["invoice_id"]
+            }
+        },
+        {
+            "name": "format_invoice_response",
+            "description": "Format the invoice data into a structured response",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "invoice_data": {
+                        "type": "object",
+                        "description": "The invoice data to format"
+                    },
+                    "status_message": {
+                        "type": "string",
+                        "description": "A human-readable status message"
+                    }
+                },
+                "required": ["invoice_data", "status_message"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Please retrieve and format the invoice with ID {invoice_id}. The invoice data from the database is: {json.dumps(invoice_data) if invoice_data else 'Not found'}"
+        }
+    ]
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages
+    )
+    
+    formatted_response = None
+    
+    while response.stop_reason == "tool_use":
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+        
+        if not tool_use_block:
+            break
+            
+        tool_name = tool_use_block.name
+        tool_input = tool_use_block.input
+        
+        if tool_name == "get_invoice_details":
+            tool_result = invoice_data if invoice_data else {"error": "Invoice not found"}
+        elif tool_name == "format_invoice_response":
+            formatted_response = {
+                "success": True,
+                "data": tool_input.get("invoice_data"),
+                "message": tool_input.get("status_message")
+            }
+            tool_result = formatted_response
+        else:
+            tool_result = {"error": "Unknown tool"}
+        
+        messages.append({"role": "assistant", "content": response.content})
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_use_block.id,
+                    "content": json.dumps(tool_result)
+                }
+            ]
+        })
+        
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+    
+    if formatted_response:
+        return formatted_response
+    
+    final_text = ""
+    for block in response.content:
+        if hasattr(block, 'text'):
+            final_text = block.text
+            break
+    
+    if invoice_data:
+        return {
+            "success": True,
+            "data": invoice_data,
+            "message": final_text or f"Invoice {invoice_id} retrieved successfully"
+        }
+    else:
+        return {
+            "success": False,
+            "data": None,
+            "message": final_text or f"Invoice with ID {invoice_id} not found"
+        }
+
+@app.route('/invoice/<int:invoice_id>', methods=['GET'])
+def get_invoice(invoice_id: int):
+    """
+    Flask route to get invoice details by ID.
+    
+    Args:
+        invoice_id: The invoice ID from the URL path parameter
+        
+    Returns:
+        JSON response with invoice details or error message
+    """
+    invoice_data = get_invoice_from_db(invoice_id)
+    
+    result = process_with_claude(invoice_id, invoice_data)
+    
+    if result["success"]:
+        return jsonify(result), 200
+    else:
+        return jsonify(result), 404
+
+@app.route('/invoices', methods=['GET'])
+def list_invoices():
+    """List all available invoices."""
+    cursor = db_conn.cursor()
+    cursor.execute('SELECT id, invoice_number, customer_name, status, amount, currency FROM invoices')
+    rows = cursor.fetchall()
+    
+    invoices = []
+    for row in rows:
+        invoices.append({
+            "id": row[0],
+            "invoice_number": row[1],
+            "customer_name": row[2],
+            "status": row[3],
+            "amount": row[4],
+            "currency": row[5]
+        })
+    
+    return jsonify({
+        "success": True,
+        "data": invoices,
+        "total": len(invoices)
+    }), 200
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "service": "Invoice API"}), 200
+
+if __name__ == '__main__':
+    print("Starting Invoice API server...")
+    print("Available endpoints:")
+    print("  GET /invoice/<invoice_id> - Get invoice details")
+    print("  GET /invoices - List all invoices")
+    print("  GET /health - Health check")
+    print("\nSample invoice IDs: 1, 2, 3, 4, 5")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

@@ -1,0 +1,174 @@
+```ruby
+# app/controllers/promotions_controller.rb
+
+class PromotionsController < ApplicationController
+  before_action :authenticate_user!
+  before_action :authorize_manager!
+  before_action :find_staff_user, only: [:create]
+
+  def create
+    if @staff_user.has_role?(:manager)
+      render json: { error: "User is already a Manager." }, status: :unprocessable_entity
+      return
+    end
+
+    ActiveRecord::Base.transaction do
+      @staff_user.remove_role(:staff)
+      @staff_user.add_role(:manager)
+    end
+
+    render json: {
+      message: "User #{@staff_user.email} has been successfully promoted to Manager.",
+      user: {
+        id: @staff_user.id,
+        email: @staff_user.email,
+        roles: @staff_user.roles.pluck(:name)
+      }
+    }, status: :ok
+
+  rescue ActiveRecord::RecordInvalid => e
+    render json: { error: "Promotion failed: #{e.message}" }, status: :unprocessable_entity
+  end
+
+  private
+
+  def authorize_manager!
+    unless current_user.has_role?(:manager)
+      render json: { error: "Access denied. Only Managers can promote Staff users." }, status: :forbidden
+    end
+  end
+
+  def find_staff_user
+    @staff_user = User.find_by(id: params[:user_id])
+
+    if @staff_user.nil?
+      render json: { error: "User not found." }, status: :not_found
+      return
+    end
+
+    unless @staff_user.has_role?(:staff)
+      render json: { error: "Target user does not have the Staff role." }, status: :unprocessable_entity
+    end
+  end
+end
+```
+
+```ruby
+# config/routes.rb
+
+Rails.application.routes.draw do
+  resources :promotions, only: [:create]
+  # or with a more descriptive route:
+  # post 'users/:user_id/promote', to: 'promotions#create', as: :promote_user
+end
+```
+
+```ruby
+# db/migrate/YYYYMMDDHHMMSS_rolify_create_roles.rb
+# Ensure you have rolify gem and the roles table set up
+# Gemfile: gem 'rolify'
+
+# app/models/user.rb
+class User < ApplicationRecord
+  rolify
+  # ... other configurations
+end
+
+# app/models/role.rb
+class Role < ApplicationRecord
+  has_and_belongs_to_many :users, join_table: :users_roles
+  belongs_to :resource, polymorphic: true, optional: true
+  validates :resource_type, inclusion: { in: Rolify.resource_types }, allow_nil: true
+  scopify
+end
+```
+
+```ruby
+# spec/controllers/promotions_controller_spec.rb
+
+require 'rails_helper'
+
+RSpec.describe PromotionsController, type: :controller do
+  let(:manager_user) { create(:user) }
+  let(:staff_user)   { create(:user) }
+  let(:regular_user) { create(:user) }
+
+  before do
+    manager_user.add_role(:manager)
+    staff_user.add_role(:staff)
+  end
+
+  describe 'POST #create' do
+    context 'when current user is a Manager' do
+      before { sign_in manager_user }
+
+      context 'when target user is a Staff' do
+        it 'promotes the staff user to Manager' do
+          post :create, params: { user_id: staff_user.id }
+
+          expect(response).to have_http_status(:ok)
+          expect(staff_user.reload.has_role?(:manager)).to be true
+          expect(staff_user.reload.has_role?(:staff)).to be false
+        end
+
+        it 'returns a success message' do
+          post :create, params: { user_id: staff_user.id }
+
+          json_response = JSON.parse(response.body)
+          expect(json_response['message']).to include('promoted to Manager')
+        end
+      end
+
+      context 'when target user is already a Manager' do
+        before { staff_user.add_role(:manager) }
+
+        it 'returns an error' do
+          post :create, params: { user_id: staff_user.id }
+
+          expect(response).to have_http_status(:unprocessable_entity)
+          json_response = JSON.parse(response.body)
+          expect(json_response['error']).to eq('User is already a Manager.')
+        end
+      end
+
+      context 'when target user does not exist' do
+        it 'returns a not found error' do
+          post :create, params: { user_id: 99999 }
+
+          expect(response).to have_http_status(:not_found)
+        end
+      end
+
+      context 'when target user is not a Staff' do
+        it 'returns an error' do
+          post :create, params: { user_id: regular_user.id }
+
+          expect(response).to have_http_status(:unprocessable_entity)
+          json_response = JSON.parse(response.body)
+          expect(json_response['error']).to eq('Target user does not have the Staff role.')
+        end
+      end
+    end
+
+    context 'when current user is not a Manager' do
+      before { sign_in regular_user }
+
+      it 'returns a forbidden error' do
+        post :create, params: { user_id: staff_user.id }
+
+        expect(response).to have_http_status(:forbidden)
+        json_response = JSON.parse(response.body)
+        expect(json_response['error']).to include('Access denied')
+      end
+    end
+
+    context 'when user is not authenticated' do
+      it 'returns an unauthorized error' do
+        post :create, params: { user_id: staff_user.id }
+
+        expect(response).to have_http_status(:unauthorized)
+      end
+    end
+  end
+end
+```
