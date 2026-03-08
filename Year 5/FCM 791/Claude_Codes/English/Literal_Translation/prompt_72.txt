@@ -1,0 +1,306 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const https = require("https");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const client = new Anthropic();
+
+// Tool definitions for Claude to use
+const tools = [
+  {
+    name: "download_file",
+    description: "Downloads a file from a URL and saves it to a local path",
+    input_schema: {
+      type: "object",
+      properties: {
+        url: {
+          type: "string",
+          description: "The URL to download the file from",
+        },
+        destination: {
+          type: "string",
+          description: "The local file path to save the downloaded file",
+        },
+      },
+      required: ["url", "destination"],
+    },
+  },
+  {
+    name: "extract_zip",
+    description: "Extracts a zip file to a specified directory",
+    input_schema: {
+      type: "object",
+      properties: {
+        zip_path: {
+          type: "string",
+          description: "Path to the zip file to extract",
+        },
+        destination: {
+          type: "string",
+          description: "Directory to extract the zip file contents to",
+        },
+      },
+      required: ["zip_path", "destination"],
+    },
+  },
+  {
+    name: "create_directory",
+    description: "Creates a directory if it doesn't exist",
+    input_schema: {
+      type: "object",
+      properties: {
+        path: {
+          type: "string",
+          description: "The directory path to create",
+        },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "cleanup_file",
+    description: "Removes a temporary file",
+    input_schema: {
+      type: "object",
+      properties: {
+        file_path: {
+          type: "string",
+          description: "Path to the file to remove",
+        },
+      },
+      required: ["file_path"],
+    },
+  },
+];
+
+// Tool implementation functions
+function downloadFile(url, destination) {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith("https") ? https : http;
+    const file = fs.createWriteStream(destination);
+
+    protocol
+      .get(url, (response) => {
+        if (response.statusCode === 301 || response.statusCode === 302) {
+          // Handle redirects
+          file.close();
+          downloadFile(response.headers.location, destination)
+            .then(resolve)
+            .catch(reject);
+          return;
+        }
+
+        if (response.statusCode !== 200) {
+          file.close();
+          fs.unlink(destination, () => {});
+          reject(
+            new Error(
+              `Failed to download: HTTP status ${response.statusCode}`
+            )
+          );
+          return;
+        }
+
+        response.pipe(file);
+
+        file.on("finish", () => {
+          file.close();
+          resolve(`File downloaded successfully to ${destination}`);
+        });
+      })
+      .on("error", (err) => {
+        file.close();
+        fs.unlink(destination, () => {});
+        reject(err);
+      });
+  });
+}
+
+function extractZip(zipPath, destination) {
+  try {
+    // Ensure destination exists
+    if (!fs.existsSync(destination)) {
+      fs.mkdirSync(destination, { recursive: true });
+    }
+
+    // Use unzip command (available on most Unix systems)
+    // For Windows, you might need a different approach
+    execSync(`unzip -o "${zipPath}" -d "${destination}"`, {
+      stdio: "pipe",
+    });
+
+    return `Successfully extracted ${zipPath} to ${destination}`;
+  } catch (error) {
+    // Try alternative extraction method
+    try {
+      execSync(`python3 -c "import zipfile; zipfile.ZipFile('${zipPath}').extractall('${destination}')"`, {
+        stdio: "pipe",
+      });
+      return `Successfully extracted ${zipPath} to ${destination} using Python`;
+    } catch (pythonError) {
+      throw new Error(`Failed to extract zip: ${error.message}`);
+    }
+  }
+}
+
+function createDirectory(dirPath) {
+  try {
+    if (!fs.existsSync(dirPath)) {
+      fs.mkdirSync(dirPath, { recursive: true });
+      return `Directory created: ${dirPath}`;
+    }
+    return `Directory already exists: ${dirPath}`;
+  } catch (error) {
+    throw new Error(`Failed to create directory: ${error.message}`);
+  }
+}
+
+function cleanupFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+      return `File removed: ${filePath}`;
+    }
+    return `File not found: ${filePath}`;
+  } catch (error) {
+    throw new Error(`Failed to remove file: ${error.message}`);
+  }
+}
+
+// Process tool calls from Claude
+async function processToolCall(toolName, toolInput) {
+  console.log(`\nExecuting tool: ${toolName}`);
+  console.log("Tool input:", JSON.stringify(toolInput, null, 2));
+
+  let result;
+
+  switch (toolName) {
+    case "download_file":
+      result = await downloadFile(toolInput.url, toolInput.destination);
+      break;
+    case "extract_zip":
+      result = extractZip(toolInput.zip_path, toolInput.destination);
+      break;
+    case "create_directory":
+      result = createDirectory(toolInput.path);
+      break;
+    case "cleanup_file":
+      result = cleanupFile(toolInput.file_path);
+      break;
+    default:
+      throw new Error(`Unknown tool: ${toolName}`);
+  }
+
+  console.log("Tool result:", result);
+  return result;
+}
+
+// Main function to download and extract update
+async function downloadAndExtractUpdate(updateUrl, appDirectory = "/app") {
+  console.log(`Starting update process...`);
+  console.log(`Update URL: ${updateUrl}`);
+  console.log(`Target directory: ${appDirectory}`);
+
+  const messages = [
+    {
+      role: "user",
+      content: `Please help me download a zip update from "${updateUrl}" and extract it to the "${appDirectory}" directory. 
+      Follow these steps:
+      1. Create the ${appDirectory} directory if it doesn't exist
+      2. Download the zip file to a temporary location (use /tmp/update.zip)
+      3. Extract the zip file to ${appDirectory}
+      4. Clean up the temporary zip file
+      
+      Please execute each step and report the results.`,
+    },
+  ];
+
+  let continueLoop = true;
+
+  while (continueLoop) {
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 4096,
+      tools: tools,
+      messages: messages,
+    });
+
+    console.log("\n--- Claude Response ---");
+    console.log("Stop reason:", response.stop_reason);
+
+    // Process the response content
+    const assistantMessage = { role: "assistant", content: response.content };
+    messages.push(assistantMessage);
+
+    if (response.stop_reason === "tool_use") {
+      // Process tool calls
+      const toolResults = [];
+
+      for (const block of response.content) {
+        if (block.type === "text") {
+          console.log("Claude:", block.text);
+        } else if (block.type === "tool_use") {
+          try {
+            const result = await processToolCall(block.name, block.input);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: result,
+            });
+          } catch (error) {
+            console.error(`Tool error: ${error.message}`);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: `Error: ${error.message}`,
+              is_error: true,
+            });
+          }
+        }
+      }
+
+      // Add tool results to messages
+      messages.push({
+        role: "user",
+        content: toolResults,
+      });
+    } else if (response.stop_reason === "end_turn") {
+      // Final response
+      for (const block of response.content) {
+        if (block.type === "text") {
+          console.log("\n--- Final Response ---");
+          console.log(block.text);
+        }
+      }
+      continueLoop = false;
+    } else {
+      console.log("Unexpected stop reason:", response.stop_reason);
+      continueLoop = false;
+    }
+  }
+
+  console.log("\nUpdate process completed!");
+}
+
+// Example usage
+async function main() {
+  // Example with a real zip file URL for testing
+  // Using a small test zip file from a public source
+  const testUrl =
+    "https://www.learningcontainer.com/wp-content/uploads/2020/05/sample-zip-file.zip";
+  const appDir = "./test-app"; // Using a local directory for testing
+
+  try {
+    await downloadAndExtractUpdate(testUrl, appDir);
+  } catch (error) {
+    console.error("Error during update:", error);
+    process.exit(1);
+  }
+}
+
+main();
+```

@@ -1,0 +1,170 @@
+
+```javascript
+const express = require("express");
+const Anthropic = require("@anthropic-ai/sdk");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = new Map();
+
+// Route that intentionally throws an error for testing
+app.get("/test-error", (req, res) => {
+  throw new Error("This is a test error!");
+});
+
+// Route that throws an async error
+app.get("/test-async-error", async (req, res) => {
+  await Promise.reject(new Error("This is an async error!"));
+});
+
+// Chat endpoint with streaming
+app.post("/chat", async (req, res) => {
+  const { message, sessionId = "default" } = req.body;
+
+  if (!message) {
+    return res.status(400).json({ error: "Message is required" });
+  }
+
+  // Get or initialize conversation history for this session
+  if (!conversationHistory.has(sessionId)) {
+    conversationHistory.set(sessionId, []);
+  }
+
+  const history = conversationHistory.get(sessionId);
+
+  // Add user message to history
+  history.push({
+    role: "user",
+    content: message,
+  });
+
+  // Set up SSE headers for streaming
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  let fullResponse = "";
+
+  // Create streaming message with conversation history
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    messages: history,
+  });
+
+  // Stream the response
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      const text = chunk.delta.text;
+      fullResponse += text;
+
+      // Send chunk to client
+      res.write(`data: ${JSON.stringify({ text, type: "chunk" })}\n\n`);
+    }
+  }
+
+  // Add assistant response to history
+  history.push({
+    role: "assistant",
+    content: fullResponse,
+  });
+
+  // Send completion signal
+  res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+  res.end();
+});
+
+// Get conversation history
+app.get("/history/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  const history = conversationHistory.get(sessionId) || [];
+  res.json({ history });
+});
+
+// Clear conversation history
+app.delete("/history/:sessionId", (req, res) => {
+  const { sessionId } = req.params;
+  conversationHistory.delete(sessionId);
+  res.json({ message: "History cleared" });
+});
+
+// 404 handler for undefined routes
+app.use((req, res, next) => {
+  const error = new Error(`Route ${req.method} ${req.path} not found`);
+  error.status = 404;
+  next(error);
+});
+
+// Global error handler - catches all unhandled exceptions
+app.use((err, req, res, next) => {
+  console.error("Error caught by global handler:", err);
+
+  // Determine status code
+  const statusCode = err.status || err.statusCode || 500;
+
+  // Prepare error response
+  const errorResponse = {
+    error: {
+      message: err.message || "Internal Server Error",
+      status: statusCode,
+      timestamp: new Date().toISOString(),
+      path: req.path,
+      method: req.method,
+    },
+  };
+
+  // Include stack trace in development
+  if (process.env.NODE_ENV !== "production") {
+    errorResponse.error.stack = err.stack;
+  }
+
+  // Check if response headers have already been sent (for streaming)
+  if (res.headersSent) {
+    // For SSE connections, send error as event before closing
+    res.write(
+      `data: ${JSON.stringify({ type: "error", error: errorResponse.error })}\n\n`
+    );
+    res.end();
+    return;
+  }
+
+  res.status(statusCode).json(errorResponse);
+});
+
+// Handle uncaught exceptions at process level
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+  // In production, you might want to gracefully shutdown here
+  // process.exit(1);
+});
+
+// Handle unhandled promise rejections
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`
+Available endpoints:
+  POST /chat - Chat with Claude (supports multi-turn conversations)
+    Body: { "message": "your message", "sessionId": "optional-session-id" }
+  
+  GET /history/:sessionId - Get conversation history
+  DELETE /history/:sessionId - Clear conversation history
+  
+  GET /test-error - Test synchronous error handling
+  GET /test-async-error - Test asynchronous error handling
+  `);
+});
+
+module.exports = app;
+```

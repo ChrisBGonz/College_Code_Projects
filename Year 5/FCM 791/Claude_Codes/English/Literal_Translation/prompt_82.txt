@@ -1,0 +1,529 @@
+
+```javascript
+const express = require('express');
+const morgan = require('morgan');
+const fs = require('fs');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+
+// Create logs directory if it doesn't exist
+const logsDir = path.join(__dirname, 'logs');
+if (!fs.existsSync(logsDir)) {
+  fs.mkdirSync(logsDir, { recursive: true });
+}
+
+// Create write stream for access logs
+const accessLogStream = fs.createWriteStream(
+  path.join(logsDir, 'access.log'),
+  { flags: 'a' }
+);
+
+// Create write stream for debug logs
+const debugLogStream = fs.createWriteStream(
+  path.join(logsDir, 'debug.log'),
+  { flags: 'a' }
+);
+
+// Color codes for console output
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+};
+
+// Helper function to get color based on HTTP method
+function getMethodColor(method) {
+  const methodColors = {
+    GET: colors.green,
+    POST: colors.blue,
+    PUT: colors.yellow,
+    PATCH: colors.magenta,
+    DELETE: colors.red,
+    OPTIONS: colors.cyan,
+    HEAD: colors.white,
+  };
+  return methodColors[method] || colors.white;
+}
+
+// Helper function to get color based on status code
+function getStatusColor(statusCode) {
+  if (statusCode >= 500) return colors.red;
+  if (statusCode >= 400) return colors.yellow;
+  if (statusCode >= 300) return colors.cyan;
+  if (statusCode >= 200) return colors.green;
+  return colors.white;
+}
+
+// Helper function to format bytes
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 Bytes';
+  const k = 1024;
+  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+}
+
+// Helper function to sanitize sensitive data
+function sanitizeBody(body, sensitiveFields = ['password', 'token', 'secret', 'creditCard', 'ssn', 'apiKey']) {
+  if (!body || typeof body !== 'object') return body;
+  
+  const sanitized = { ...body };
+  
+  function sanitizeObject(obj) {
+    for (const key in obj) {
+      if (sensitiveFields.some(field => key.toLowerCase().includes(field.toLowerCase()))) {
+        obj[key] = '[REDACTED]';
+      } else if (typeof obj[key] === 'object' && obj[key] !== null) {
+        sanitizeObject(obj[key]);
+      }
+    }
+    return obj;
+  }
+  
+  return sanitizeObject(sanitized);
+}
+
+// Helper function to format log entry
+function formatLogEntry(data) {
+  return JSON.stringify(data, null, 2);
+}
+
+// Helper function to write to log file
+function writeToLog(stream, data) {
+  const logEntry = typeof data === 'string' ? data : formatLogEntry(data);
+  stream.write(logEntry + '\n');
+}
+
+// Main request logger middleware
+function requestLogger(options = {}) {
+  const {
+    logBody = true,
+    logHeaders = true,
+    logQuery = true,
+    logParams = true,
+    sanitize = true,
+    sensitiveFields = ['password', 'token', 'secret', 'creditCard', 'ssn', 'apiKey'],
+    maxBodySize = 10 * 1024, // 10KB default max body size to log
+    excludePaths = [],
+    includeResponse = true,
+    colorize = true,
+  } = options;
+
+  return function (req, res, next) {
+    // Generate unique request ID
+    const requestId = uuidv4();
+    req.requestId = requestId;
+    
+    // Record start time
+    const startTime = Date.now();
+    const startHrTime = process.hrtime();
+    
+    // Check if path should be excluded
+    if (excludePaths.some(path => req.path.startsWith(path))) {
+      return next();
+    }
+    
+    // Collect request body chunks
+    const chunks = [];
+    const originalWrite = res.write.bind(res);
+    const originalEnd = res.end.bind(res);
+    const responseChunks = [];
+    
+    // Intercept response to capture it
+    if (includeResponse) {
+      res.write = function(chunk, ...args) {
+        if (chunk) responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        return originalWrite(chunk, ...args);
+      };
+      
+      res.end = function(chunk, ...args) {
+        if (chunk) responseChunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        return originalEnd(chunk, ...args);
+      };
+    }
+    
+    // Function to log the complete request/response cycle
+    function logRequest() {
+      const endTime = Date.now();
+      const hrTime = process.hrtime(startHrTime);
+      const responseTime = hrTime[0] * 1000 + hrTime[1] / 1000000;
+      
+      // Prepare request body
+      let requestBody = req.body;
+      if (sanitize && requestBody) {
+        requestBody = sanitizeBody(requestBody, sensitiveFields);
+      }
+      
+      // Check body size
+      const bodyString = JSON.stringify(requestBody);
+      const bodySize = Buffer.byteLength(bodyString || '', 'utf8');
+      
+      if (bodySize > maxBodySize) {
+        requestBody = `[Body too large to log: ${formatBytes(bodySize)}]`;
+      }
+      
+      // Prepare response body
+      let responseBody = null;
+      if (includeResponse && responseChunks.length > 0) {
+        const responseBuffer = Buffer.concat(responseChunks);
+        const responseString = responseBuffer.toString('utf8');
+        
+        try {
+          responseBody = JSON.parse(responseString);
+          if (sanitize) {
+            responseBody = sanitizeBody(responseBody, sensitiveFields);
+          }
+        } catch {
+          responseBody = responseString.length > 500 
+            ? responseString.substring(0, 500) + '...[truncated]' 
+            : responseString;
+        }
+      }
+      
+      // Build log data object
+      const logData = {
+        requestId,
+        timestamp: new Date().toISOString(),
+        request: {
+          method: req.method,
+          url: req.originalUrl || req.url,
+          path: req.path,
+          ...(logParams && Object.keys(req.params || {}).length > 0 && { params: req.params }),
+          ...(logQuery && Object.keys(req.query || {}).length > 0 && { query: req.query }),
+          ...(logHeaders && {
+            headers: {
+              'content-type': req.headers['content-type'],
+              'user-agent': req.headers['user-agent'],
+              'authorization': req.headers['authorization'] ? '[PRESENT]' : '[NOT PRESENT]',
+              'x-forwarded-for': req.headers['x-forwarded-for'],
+              'x-real-ip': req.headers['x-real-ip'],
+              'accept': req.headers['accept'],
+              'accept-language': req.headers['accept-language'],
+              'origin': req.headers['origin'],
+              'referer': req.headers['referer'],
+            }
+          }),
+          ip: req.ip || req.connection.remoteAddress,
+          protocol: req.protocol,
+          httpVersion: req.httpVersion,
+          ...(logBody && requestBody && { body: requestBody }),
+        },
+        response: {
+          statusCode: res.statusCode,
+          statusMessage: res.statusMessage,
+          responseTime: `${responseTime.toFixed(3)}ms`,
+          ...(includeResponse && responseBody && { body: responseBody }),
+        },
+      };
+      
+      // Console output with colors
+      const methodColor = colorize ? getMethodColor(req.method) : '';
+      const statusColor = colorize ? getStatusColor(res.statusCode) : '';
+      const resetColor = colorize ? colors.reset : '';
+      const brightColor = colorize ? colors.bright : '';
+      
+      console.log('\n' + '='.repeat(80));
+      console.log(
+        `${brightColor}[${new Date().toISOString()}] ${requestId}${resetColor}`
+      );
+      console.log(
+        `${methodColor}${brightColor}${req.method}${resetColor} ${req.originalUrl || req.url} ` +
+        `${statusColor}${res.statusCode}${resetColor} ` +
+        `${colors.cyan}${responseTime.toFixed(3)}ms${resetColor}`
+      );
+      
+      if (logBody && requestBody && typeof requestBody === 'object') {
+        console.log(`${colors.yellow}Request Body:${resetColor}`);
+        console.log(JSON.stringify(requestBody, null, 2));
+      }
+      
+      if (includeResponse && responseBody) {
+        console.log(`${colors.green}Response Body:${resetColor}`);
+        if (typeof responseBody === 'object') {
+          console.log(JSON.stringify(responseBody, null, 2));
+        } else {
+          console.log(responseBody);
+        }
+      }
+      
+      console.log('='.repeat(80));
+      
+      // Write to log files
+      writeToLog(debugLogStream, logData);
+      writeToLog(accessLogStream, {
+        requestId,
+        timestamp: new Date().toISOString(),
+        method: req.method,
+        url: req.originalUrl || req.url,
+        statusCode: res.statusCode,
+        responseTime: `${responseTime.toFixed(3)}ms`,
+        ip: req.ip || req.connection.remoteAddress,
+        userAgent: req.headers['user-agent'],
+      });
+    }
+    
+    // Listen for response finish event
+    res.on('finish', logRequest);
+    res.on('close', () => {
+      if (!res.finished) {
+        logRequest();
+      }
+    });
+    
+    next();
+  };
+}
+
+// Error logger middleware
+function errorLogger(err, req, res, next) {
+  const errorData = {
+    requestId: req.requestId,
+    timestamp: new Date().toISOString(),
+    error: {
+      message: err.message,
+      stack: err.stack,
+      status: err.status || err.statusCode || 500,
+      name: err.name,
+    },
+    request: {
+      method: req.method,
+      url: req.originalUrl || req.url,
+      body: req.body,
+      params: req.params,
+      query: req.query,
+      ip: req.ip,
+    },
+  };
+  
+  console.error(`${colors.red}${colors.bright}ERROR:${colors.reset}`, JSON.stringify(errorData, null, 2));
+  
+  const errorLogStream = fs.createWriteStream(
+    path.join(logsDir, 'error.log'),
+    { flags: 'a' }
+  );
+  writeToLog(errorLogStream, errorData);
+  
+  next(err);
+}
+
+// Performance monitoring middleware
+function performanceMonitor(threshold = 1000) {
+  return function(req, res, next) {
+    const startTime = process.hrtime();
+    
+    res.on('finish', () => {
+      const hrTime = process.hrtime(startTime);
+      const responseTime = hrTime[0] * 1000 + hrTime[1] / 1000000;
+      
+      if (responseTime > threshold) {
+        console.warn(
+          `${colors.yellow}${colors.bright}SLOW REQUEST WARNING:${colors.reset} ` +
+          `${req.method} ${req.url} took ${responseTime.toFixed(3)}ms ` +
+          `(threshold: ${threshold}ms)`
+        );
+        
+        const slowLogStream = fs.createWriteStream(
+          path.join(logsDir, 'slow-requests.log'),
+          { flags: 'a' }
+        );
+        writeToLog(slowLogStream, {
+          timestamp: new Date().toISOString(),
+          method: req.method,
+          url: req.url,
+          responseTime: `${responseTime.toFixed(3)}ms`,
+          threshold: `${threshold}ms`,
+        });
+      }
+    });
+    
+    next();
+  };
+}
+
+// Request counter middleware
+let requestCount = 0;
+function requestCounter() {
+  return function(req, res, next) {
+    requestCount++;
+    req.requestNumber = requestCount;
+    
+    if (requestCount % 100 === 0) {
+      console.log(`${colors.cyan}Total requests processed: ${requestCount}${colors.reset}`);
+    }
+    
+    next();
+  };
+}
+
+// Create Express app for demonstration
+const app = express();
+
+// Parse JSON bodies
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+// Add request counter
+app.use(requestCounter());
+
+// Add performance monitor (warn if request takes more than 500ms)
+app.use(performanceMonitor(500));
+
+// Add Morgan for basic HTTP logging
+app.use(morgan('combined', { stream: accessLogStream }));
+
+// Add our custom request logger
+app.use(requestLogger({
+  logBody: true,
+  logHeaders: true,
+  logQuery: true,
+  logParams: true,
+  sanitize: true,
+  sensitiveFields: ['password', 'token', 'secret', 'creditCard', 'ssn', 'apiKey', 'authorization'],
+  maxBodySize: 50 * 1024, // 50KB
+  excludePaths: ['/health', '/favicon.ico'],
+  includeResponse: true,
+  colorize: true,
+}));
+
+// Sample routes for testing
+app.get('/health', (req, res) => {
+  res.json({ status: 'healthy', timestamp: new Date().toISOString() });
+});
+
+app.get('/users', (req, res) => {
+  const { page = 1, limit = 10, search } = req.query;
+  res.json({
+    users: [
+      { id: 1, name: 'John Doe', email: 'john@example.com' },
+      { id: 2, name: 'Jane Smith', email: 'jane@example.com' },
+    ],
+    pagination: { page: parseInt(page), limit: parseInt(limit), total: 2 },
+    ...(search && { search }),
+  });
+});
+
+app.get('/users/:id', (req, res) => {
+  const { id } = req.params;
+  res.json({
+    id: parseInt(id),
+    name: 'John Doe',
+    email: 'john@example.com',
+    createdAt: new Date().toISOString(),
+  });
+});
+
+app.post('/users', (req, res) => {
+  const { name, email, password } = req.body;
+  
+  if (!name || !email) {
+    return res.status(400).json({ error: 'Name and email are required' });
+  }
+  
+  res.status(201).json({
+    id: Math.floor(Math.random() * 1000),
+    name,
+    email,
+    createdAt: new Date().toISOString(),
+  });
+});
+
+app.put('/users/:id', (req, res) => {
+  const { id } = req.params;
+  const updates = req.body;
+  
+  res.json({
+    id: parseInt(id),
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  });
+});
+
+app.delete('/users/:id', (req, res) => {
+  const { id } = req.params;
+  res.json({ message: `User ${id} deleted successfully` });
+});
+
+app.post('/auth/login', (req, res) => {
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Email and password are required' });
+  }
+  
+  // Simulate authentication
+  if (email === 'admin@example.com' && password === 'password123') {
+    res.json({
+      token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...',
+      user: { id: 1, email, name: 'Admin User' },
+    });
+  } else {
+    res.status(401).json({ error: 'Invalid credentials' });
+  }
+});
+
+app.post('/data/bulk', (req, res) => {
+  const { items } = req.body;
+  
+  if (!Array.isArray(items)) {
+    return res.status(400).json({ error: 'Items must be an array' });
+  }
+  
+  res.json({
+    processed: items.length,
+    success: true,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Simulate slow endpoint
+app.get('/slow', async (req, res) => {
+  await new Promise(resolve => setTimeout(resolve, 600));
+  res.json({ message: 'This was a slow response' });
+});
+
+// Simulate error
+app.get('/error', (req, res, next) => {
+  const error = new Error('Simulated server error');
+  error.status = 500;
+  next(error);
+});
+
+// Add error logger middleware
+app.use(errorLogger);
+
+// Global error handler
+app.use((err, req, res, next) => {
+  res.status(err.status || 500).json({
+    error: {
+      message: err.message,
+      requestId: req.requestId,
+    },
+  });
+});
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`${colors.green}${colors.bright}Server running on port ${PORT}${colors.reset}`);
+  console.log(`${colors.cyan}Logs directory: ${logsDir}${colors.reset}`);
+  console.log('\nAvailable endpoints:');
+  console.log('  GET    /health');
+  console.log('  GET    /users');
+  console.log('  GET    /users/:id');
+  console.log('  POST   /users');
+  console.log('  PUT    /users/:id');
+  console.log('  DELETE /users/:id');
+  console.log('  POST   /auth/login');
+  console.log('  POST   /data/bulk');
+  console.log('  GET    /slow');
+  console.log('  GET    /error');
+});
+
+module.exports = { requestLogger, errorLogger, performanceMonitor, requestCounter };
+```

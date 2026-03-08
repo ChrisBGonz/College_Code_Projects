@@ -1,0 +1,347 @@
+
+```go
+package main
+
+import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+)
+
+// Secret key for signing JWTs - in production, use environment variables
+var jwtSecretKey []byte
+
+func init() {
+	// Generate a random secret key for demonstration
+	// In production, load this from environment variables or a secure vault
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		log.Fatal("Failed to generate secret key:", err)
+	}
+	jwtSecretKey = key
+}
+
+// User represents a user in the system
+type User struct {
+	ID       string `json:"id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+}
+
+// Claims represents the JWT claims
+type Claims struct {
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
+	jwt.RegisteredClaims
+}
+
+// LoginRequest represents the login request body
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+// LoginResponse represents the login response
+type LoginResponse struct {
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
+	ExpiresAt    time.Time `json:"expires_at"`
+	User         User      `json:"user"`
+}
+
+// TokenConfig holds configuration for token generation
+type TokenConfig struct {
+	SecretKey      []byte
+	Issuer         string
+	Audience       []string
+	ExpirationTime time.Duration
+}
+
+// DefaultTokenConfig returns a default token configuration
+func DefaultTokenConfig() TokenConfig {
+	return TokenConfig{
+		SecretKey:      jwtSecretKey,
+		Issuer:         "myapp",
+		Audience:       []string{"myapp-users"},
+		ExpirationTime: 24 * time.Hour,
+	}
+}
+
+// GenerateJWT generates a JWT token for the given user
+func GenerateJWT(user User, config TokenConfig) (string, time.Time, error) {
+	if user.ID == "" {
+		return "", time.Time{}, errors.New("user ID cannot be empty")
+	}
+	if user.Username == "" {
+		return "", time.Time{}, errors.New("username cannot be empty")
+	}
+
+	expirationTime := time.Now().Add(config.ExpirationTime)
+
+	claims := &Claims{
+		UserID:   user.ID,
+		Username: user.Username,
+		Email:    user.Email,
+		Role:     user.Role,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			NotBefore: jwt.NewNumericDate(time.Now()),
+			Issuer:    config.Issuer,
+			Subject:   user.ID,
+			ID:        generateTokenID(),
+			Audience:  config.Audience,
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokenString, err := token.SignedString(config.SecretKey)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to sign token: %w", err)
+	}
+
+	return tokenString, expirationTime, nil
+}
+
+// GenerateRefreshToken generates a refresh token for the given user
+func GenerateRefreshToken(user User, config TokenConfig) (string, time.Time, error) {
+	refreshConfig := config
+	refreshConfig.ExpirationTime = 7 * 24 * time.Hour // Refresh tokens last 7 days
+
+	expirationTime := time.Now().Add(refreshConfig.ExpirationTime)
+
+	claims := &Claims{
+		UserID:   user.ID,
+		Username: user.Username,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(expirationTime),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			Issuer:    config.Issuer,
+			Subject:   user.ID,
+			ID:        generateTokenID(),
+			Audience:  []string{"myapp-refresh"},
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokenString, err := token.SignedString(config.SecretKey)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("failed to sign refresh token: %w", err)
+	}
+
+	return tokenString, expirationTime, nil
+}
+
+// ValidateJWT validates a JWT token and returns the claims
+func ValidateJWT(tokenString string, config TokenConfig) (*Claims, error) {
+	claims := &Claims{}
+
+	token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+		}
+		return config.SecretKey, nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse token: %w", err)
+	}
+
+	if !token.Valid {
+		return nil, errors.New("invalid token")
+	}
+
+	return claims, nil
+}
+
+// generateTokenID generates a unique token ID
+func generateTokenID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return base64.URLEncoding.EncodeToString(b)
+}
+
+// Mock user database for demonstration
+var mockUsers = map[string]struct {
+	User     User
+	Password string
+}{
+	"john_doe": {
+		User: User{
+			ID:       "user-123",
+			Username: "john_doe",
+			Email:    "john@example.com",
+			Role:     "admin",
+		},
+		Password: "password123",
+	},
+	"jane_smith": {
+		User: User{
+			ID:       "user-456",
+			Username: "jane_smith",
+			Email:    "jane@example.com",
+			Role:     "user",
+		},
+		Password: "securepass",
+	},
+}
+
+// AuthenticateUser authenticates a user and returns their information
+func AuthenticateUser(username, password string) (User, error) {
+	userData, exists := mockUsers[username]
+	if !exists {
+		return User{}, errors.New("invalid credentials")
+	}
+
+	// In production, use bcrypt or similar for password comparison
+	if userData.Password != password {
+		return User{}, errors.New("invalid credentials")
+	}
+
+	return userData.User, nil
+}
+
+// Login handles the login process and generates JWT tokens
+func Login(username, password string) (*LoginResponse, error) {
+	user, err := AuthenticateUser(username, password)
+	if err != nil {
+		return nil, fmt.Errorf("authentication failed: %w", err)
+	}
+
+	config := DefaultTokenConfig()
+
+	// Generate access token
+	accessToken, expiresAt, err := GenerateJWT(user, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate access token: %w", err)
+	}
+
+	// Generate refresh token
+	refreshToken, _, err := GenerateRefreshToken(user, config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate refresh token: %w", err)
+	}
+
+	return &LoginResponse{
+		Token:        accessToken,
+		RefreshToken: refreshToken,
+		ExpiresAt:    expiresAt,
+		User:         user,
+	}, nil
+}
+
+// HTTP Handler for login endpoint
+func loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var loginReq LoginRequest
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&loginReq); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+
+	response, err := Login(loginReq.Username, loginReq.Password)
+	if err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(response)
+}
+
+// HTTP Handler for protected endpoint
+func protectedHandler(w http.ResponseWriter, r *http.Request) {
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "Authorization header required", http.StatusUnauthorized)
+		return
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" {
+		http.Error(w, "Invalid authorization header format", http.StatusUnauthorized)
+		return
+	}
+
+	config := DefaultTokenConfig()
+	claims, err := ValidateJWT(parts[1], config)
+	if err != nil {
+		http.Error(w, "Invalid or expired token", http.StatusUnauthorized)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"message":  "Access granted",
+		"user_id":  claims.UserID,
+		"username": claims.Username,
+		"role":     claims.Role,
+	})
+}
+
+func main() {
+	// Demonstration of JWT generation
+	fmt.Println("=== JWT Generation Demo ===\n")
+
+	// Test login
+	response, err := Login("john_doe", "password123")
+	if err != nil {
+		log.Fatal("Login failed:", err)
+	}
+
+	fmt.Printf("Login successful!\n")
+	fmt.Printf("User: %s (%s)\n", response.User.Username, response.User.Role)
+	fmt.Printf("Token expires at: %s\n", response.ExpiresAt.Format(time.RFC3339))
+	fmt.Printf("Access Token: %s...\n\n", response.Token[:50])
+
+	// Validate the generated token
+	config := DefaultTokenConfig()
+	claims, err := ValidateJWT(response.Token, config)
+	if err != nil {
+		log.Fatal("Token validation failed:", err)
+	}
+
+	fmt.Printf("Token validation successful!\n")
+	fmt.Printf("Claims - UserID: %s, Username: %s, Role: %s\n",
+		claims.UserID, claims.Username, claims.Role)
+	fmt.Printf("Issued at: %s\n", claims.IssuedAt.Time.Format(time.RFC3339))
+	fmt.Printf("Expires at: %s\n\n", claims.ExpiresAt.Time.Format(time.RFC3339))
+
+	// Test invalid credentials
+	_, err = Login("john_doe", "wrongpassword")
+	if err != nil {
+		fmt.Printf("Expected error for invalid credentials: %v\n\n", err)
+	}
+
+	// Start HTTP server
+	fmt.Println("Starting HTTP server on :8080")
+	fmt.Println("POST /login - Login endpoint")
+	fmt.Println("GET /protected - Protected endpoint (requires Bearer token)")
+
+	http.HandleFunc("/login", loginHandler)
+	http.HandleFunc("/protected", protectedHandler)
+
+	if err := http.ListenAndServe(":8080", nil); err != nil {
+		log.Fatal("Server failed to start:", err)
+	}
+}
+```

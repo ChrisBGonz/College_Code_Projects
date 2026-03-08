@@ -1,0 +1,870 @@
+<?php
+session_start();
+
+// Database configuration
+define('DB_HOST', 'localhost');
+define('DB_NAME', 'secret_question_db');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+
+// Connect to database
+function getDBConnection() {
+    try {
+        $pdo = new PDO(
+            'mysql:host=' . DB_HOST . ';dbname=' . DB_NAME . ';charset=utf8',
+            DB_USER,
+            DB_PASS,
+            [
+                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES => false,
+            ]
+        );
+        return $pdo;
+    } catch (PDOException $e) {
+        die('Database connection failed: ' . $e->getMessage());
+    }
+}
+
+// Initialize database tables
+function initializeDatabase() {
+    $pdo = getDBConnection();
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS secret_questions (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            question TEXT NOT NULL
+        )
+    ");
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(100) NOT NULL UNIQUE,
+            email VARCHAR(255) NOT NULL UNIQUE,
+            password VARCHAR(255) NOT NULL,
+            question_id INT NOT NULL,
+            secret_answer VARCHAR(255) NOT NULL,
+            reset_token VARCHAR(64) DEFAULT NULL,
+            reset_token_expiry DATETIME DEFAULT NULL,
+            failed_attempts INT DEFAULT 0,
+            locked_until DATETIME DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (question_id) REFERENCES secret_questions(id)
+        )
+    ");
+
+    // Seed questions if empty
+    $count = $pdo->query("SELECT COUNT(*) FROM secret_questions")->fetchColumn();
+    if ($count == 0) {
+        $questions = [
+            "What is your mother's maiden name?",
+            "What was the name of your first pet?",
+            "What city were you born in?",
+            "What was the name of your elementary school?",
+            "What is your oldest sibling's middle name?",
+            "What street did you grow up on?",
+            "What was the make of your first car?",
+            "What is your maternal grandmother's maiden name?",
+            "What was your childhood nickname?",
+            "What is the name of the town where your nearest sibling lives?",
+        ];
+        $stmt = $pdo->prepare("INSERT INTO secret_questions (question) VALUES (?)");
+        foreach ($questions as $q) {
+            $stmt->execute([$q]);
+        }
+    }
+}
+
+// Hash secret answer (case-insensitive, trimmed)
+function hashAnswer(string $answer): string {
+    return password_hash(strtolower(trim($answer)), PASSWORD_BCRYPT);
+}
+
+// Verify secret answer
+function verifyAnswer(string $answer, string $hash): bool {
+    return password_verify(strtolower(trim($answer)), $hash);
+}
+
+// Generate CSRF token
+function generateCSRFToken(): string {
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+// Validate CSRF token
+function validateCSRFToken(string $token): bool {
+    return isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+// Sanitize output
+function e(string $str): string {
+    return htmlspecialchars($str, ENT_QUOTES, 'UTF-8');
+}
+
+// Check if account is locked
+function isAccountLocked(array $user): bool {
+    if ($user['locked_until'] && new DateTime() < new DateTime($user['locked_until'])) {
+        return true;
+    }
+    return false;
+}
+
+// Handle registration
+function handleRegister(): array {
+    $errors = [];
+    $success = '';
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['register'])) {
+        if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+            $errors[] = 'Invalid CSRF token.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        $username    = trim($_POST['username'] ?? '');
+        $email       = trim($_POST['email'] ?? '');
+        $password    = $_POST['password'] ?? '';
+        $questionId  = (int)($_POST['question_id'] ?? 0);
+        $answer      = $_POST['secret_answer'] ?? '';
+
+        if (empty($username) || strlen($username) < 3) {
+            $errors[] = 'Username must be at least 3 characters.';
+        }
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Invalid email address.';
+        }
+        if (strlen($password) < 8) {
+            $errors[] = 'Password must be at least 8 characters.';
+        }
+        if ($questionId <= 0) {
+            $errors[] = 'Please select a secret question.';
+        }
+        if (empty(trim($answer))) {
+            $errors[] = 'Secret answer cannot be empty.';
+        }
+
+        if (empty($errors)) {
+            $pdo = getDBConnection();
+
+            // Check uniqueness
+            $stmt = $pdo->prepare("SELECT id FROM users WHERE username = ? OR email = ?");
+            $stmt->execute([$username, $email]);
+            if ($stmt->fetch()) {
+                $errors[] = 'Username or email already exists.';
+            } else {
+                $hashedPassword = password_hash($password, PASSWORD_BCRYPT);
+                $hashedAnswer   = hashAnswer($answer);
+
+                $stmt = $pdo->prepare("
+                    INSERT INTO users (username, email, password, question_id, secret_answer)
+                    VALUES (?, ?, ?, ?, ?)
+                ");
+                $stmt->execute([$username, $email, $hashedPassword, $questionId, $hashedAnswer]);
+                $success = 'Registration successful! You can now <a href="?page=login">log in</a>.';
+            }
+        }
+    }
+
+    return ['errors' => $errors, 'success' => $success];
+}
+
+// Handle login
+function handleLogin(): array {
+    $errors = [];
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login'])) {
+        if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+            $errors[] = 'Invalid CSRF token.';
+            return ['errors' => $errors];
+        }
+
+        $username = trim($_POST['username'] ?? '');
+        $password = $_POST['password'] ?? '';
+
+        if (empty($username) || empty($password)) {
+            $errors[] = 'Please enter username and password.';
+            return ['errors' => $errors];
+        }
+
+        $pdo  = getDBConnection();
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE username = ?");
+        $stmt->execute([$username]);
+        $user = $stmt->fetch();
+
+        if (!$user) {
+            $errors[] = 'Invalid username or password.';
+            return ['errors' => $errors];
+        }
+
+        if (isAccountLocked($user)) {
+            $errors[] = 'Account is temporarily locked due to too many failed attempts. Try again later.';
+            return ['errors' => $errors];
+        }
+
+        if (!password_verify($password, $user['password'])) {
+            // Increment failed attempts
+            $attempts = $user['failed_attempts'] + 1;
+            $lockedUntil = null;
+            if ($attempts >= 5) {
+                $lockedUntil = (new DateTime('+15 minutes'))->format('Y-m-d H:i:s');
+            }
+            $pdo->prepare("UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?")
+                ->execute([$attempts, $lockedUntil, $user['id']]);
+
+            $errors[] = 'Invalid username or password.';
+            return ['errors' => $errors];
+        }
+
+        // Reset failed attempts
+        $pdo->prepare("UPDATE users SET failed_attempts = 0, locked_until = NULL WHERE id = ?")
+            ->execute([$user['id']]);
+
+        $_SESSION['user_id']   = $user['id'];
+        $_SESSION['username']  = $user['username'];
+        header('Location: ?page=dashboard');
+        exit;
+    }
+
+    return ['errors' => $errors];
+}
+
+// Handle forgot password step 1: find user
+function handleForgotStep1(): array {
+    $errors = [];
+    $question = null;
+    $userId = null;
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['find_user'])) {
+        if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+            $errors[] = 'Invalid CSRF token.';
+            return ['errors' => $errors, 'question' => $question, 'userId' => $userId];
+        }
+
+        $email = trim($_POST['email'] ?? '');
+
+        if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            $errors[] = 'Please enter a valid email address.';
+            return ['errors' => $errors, 'question' => $question, 'userId' => $userId];
+        }
+
+        $pdo  = getDBConnection();
+        $stmt = $pdo->prepare("
+            SELECT u.id, u.username, sq.question
+            FROM users u
+            JOIN secret_questions sq ON u.question_id = sq.id
+            WHERE u.email = ?
+        ");
+        $stmt->execute([$email]);
+        $row = $stmt->fetch();
+
+        if (!$row) {
+            // Avoid user enumeration: show generic message
+            $errors[] = 'If that email exists, you will be prompted with your secret question.';
+        } else {
+            $_SESSION['recovery_user_id'] = $row['id'];
+            $_SESSION['recovery_step']    = 'answer';
+            $question = $row['question'];
+            $userId   = $row['id'];
+        }
+    }
+
+    return ['errors' => $errors, 'question' => $question, 'userId' => $userId];
+}
+
+// Handle forgot password step 2: verify answer
+function handleForgotStep2(): array {
+    $errors  = [];
+    $success = false;
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['verify_answer'])) {
+        if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+            $errors[] = 'Invalid CSRF token.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        if (empty($_SESSION['recovery_user_id']) || ($_SESSION['recovery_step'] ?? '') !== 'answer') {
+            $errors[] = 'Invalid recovery session. Please start over.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        $userId = (int)$_SESSION['recovery_user_id'];
+        $answer = $_POST['secret_answer'] ?? '';
+
+        if (empty(trim($answer))) {
+            $errors[] = 'Please enter your secret answer.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        $pdo  = getDBConnection();
+        $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ?");
+        $stmt->execute([$userId]);
+        $user = $stmt->fetch();
+
+        if (!$user) {
+            $errors[] = 'User not found.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        if (isAccountLocked($user)) {
+            $errors[] = 'Account is temporarily locked. Please try again later.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        if (!verifyAnswer($answer, $user['secret_answer'])) {
+            $attempts = $user['failed_attempts'] + 1;
+            $lockedUntil = null;
+            if ($attempts >= 5) {
+                $lockedUntil = (new DateTime('+15 minutes'))->format('Y-m-d H:i:s');
+            }
+            $pdo->prepare("UPDATE users SET failed_attempts = ?, locked_until = ? WHERE id = ?")
+                ->execute([$attempts, $lockedUntil, $userId]);
+
+            $errors[] = 'Incorrect answer. Please try again.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        // Answer correct — generate reset token
+        $token  = bin2hex(random_bytes(32));
+        $expiry = (new DateTime('+30 minutes'))->format('Y-m-d H:i:s');
+
+        $pdo->prepare("UPDATE users SET reset_token = ?, reset_token_expiry = ?, failed_attempts = 0, locked_until = NULL WHERE id = ?")
+            ->execute([$token, $expiry, $userId]);
+
+        $_SESSION['recovery_step']  = 'reset';
+        $_SESSION['recovery_token'] = $token;
+
+        $success = true;
+    }
+
+    return ['errors' => $errors, 'success' => $success];
+}
+
+// Handle password reset
+function handlePasswordReset(): array {
+    $errors  = [];
+    $success = '';
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['reset_password'])) {
+        if (!validateCSRFToken($_POST['csrf_token'] ?? '')) {
+            $errors[] = 'Invalid CSRF token.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        if (empty($_SESSION['recovery_user_id']) || ($_SESSION['recovery_step'] ?? '') !== 'reset') {
+            $errors[] = 'Invalid recovery session. Please start over.';
+            return ['errors' => $errors, 'success' => $success];
+        }
+
+        $userId   = (int)$_SESSION['recovery_user_id'];
+        $token    = $_SESSION['recovery_token'] ?? '';
+        $password = $_POST['new_password'] ?? '';
+        $confirm  = $_POST['confirm_password'] ?? '';
+
+        if (strlen($password) < 8) {
+            $errors[] = 'Password must be at least 8 characters.';
+        }
+        if ($password !== $confirm) {
+            $errors[] = 'Passwords do not match.';
+        }
+
+        if (empty($errors)) {
+            $pdo  = getDBConnection();
+            $stmt = $pdo->prepare("SELECT * FROM users WHERE id = ? AND reset_token = ?");
+            $stmt->execute([$userId, $token]);
+            $user = $stmt->fetch();
+
+            if (!$user || new DateTime() > new DateTime($user['reset_token_expiry'])) {
+                $errors[] = 'Reset token is invalid or has expired. Please start over.';
+                return ['errors' => $errors, 'success' => $success];
+            }
+
+            $hashedPassword = password_hash($password, PASSWORD_BCRYPT);
+            $pdo->prepare("UPDATE users SET password = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?")
+                ->execute([$hashedPassword, $userId]);
+
+            // Clear recovery session
+            unset($_SESSION['recovery_user_id'], $_SESSION['recovery_step'], $_SESSION['recovery_token']);
+
+            $success = 'Your password has been reset successfully! You can now <a href="?page=login">log in</a>.';
+        }
+    }
+
+    return ['errors' => $errors, 'success' => $success];
+}
+
+// Handle logout
+function handleLogout(): void {
+    if (isset($_GET['logout'])) {
+        session_destroy();
+        header('Location: ?page=login');
+        exit;
+    }
+}
+
+// Require login
+function requireLogin(): void {
+    if (empty($_SESSION['user_id'])) {
+        header('Location: ?page=login');
+        exit;
+    }
+}
+
+// ─── Bootstrap ───────────────────────────────────────────────────────────────
+initializeDatabase();
+handleLogout();
+
+$page = $_GET['page'] ?? 'login';
+$csrfToken = generateCSRFToken();
+
+// Fetch all questions for forms
+$pdo = getDBConnection();
+$questions = $pdo->query("SELECT * FROM secret_questions ORDER BY id")->fetchAll();
+
+// Page-specific logic
+$registerData   = ['errors' => [], 'success' => ''];
+$loginData      = ['errors' => []];
+$forgot1Data    = ['errors' => [], 'question' => null, 'userId' => null];
+$forgot2Data    = ['errors' => [], 'success' => false];
+$resetData      = ['errors' => [], 'success' => ''];
+
+switch ($page) {
+    case 'register':
+        $registerData = handleRegister();
+        break;
+    case 'login':
+        $loginData = handleLogin();
+        break;
+    case 'forgot':
+        if (($_SESSION['recovery_step'] ?? '') === 'reset') {
+            $resetData = handlePasswordReset();
+        } elseif (($_SESSION['recovery_step'] ?? '') === 'answer') {
+            $forgot2Data = handleForgotStep2();
+            if ($forgot2Data['success']) {
+                // Stay on forgot page, show reset form
+            }
+        } else {
+            $forgot1Data = handleForgotStep1();
+        }
+        break;
+    case 'dashboard':
+        requireLogin();
+        break;
+}
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secret Question Recovery</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: #f0f2f5;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .card {
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.1);
+            padding: 40px;
+            width: 100%;
+            max-width: 480px;
+        }
+
+        h1 {
+            font-size: 1.6rem;
+            color: #333;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #666;
+            font-size: 0.9rem;
+            margin-bottom: 24px;
+        }
+
+        .form-group {
+            margin-bottom: 18px;
+        }
+
+        label {
+            display: block;
+            font-size: 0.875rem;
+            font-weight: 600;
+            color: #444;
+            margin-bottom: 6px;
+        }
+
+        input[type="text"],
+        input[type="email"],
+        input[type="password"],
+        select {
+            width: 100%;
+            padding: 10px 14px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            transition: border-color 0.2s;
+            background: #fafafa;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #4a90e2;
+            background: #fff;
+        }
+
+        button[type="submit"] {
+            width: 100%;
+            padding: 12px;
+            background: #4a90e2;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s;
+            margin-top: 6px;
+        }
+
+        button[type="submit"]:hover {
+            background: #357abd;
+        }
+
+        .errors {
+            background: #fdecea;
+            border: 1px solid #f5c6cb;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 18px;
+            color: #721c24;
+            font-size: 0.875rem;
+        }
+
+        .errors ul { padding-left: 18px; }
+        .errors li { margin-bottom: 4px; }
+
+        .success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 18px;
+            color: #155724;
+            font-size: 0.875rem;
+        }
+
+        .links {
+            margin-top: 20px;
+            text-align: center;
+            font-size: 0.875rem;
+            color: #666;
+        }
+
+        .links a {
+            color: #4a90e2;
+            text-decoration: none;
+            font-weight: 600;
+        }
+
+        .links a:hover { text-decoration: underline; }
+
+        .nav {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 24px;
+            flex-wrap: wrap;
+        }
+
+        .nav a {
+            padding: 8px 16px;
+            border-radius: 6px;
+            background: #e9ecef;
+            color: #333;
+            text-decoration: none;
+            font-size: 0.875rem;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+
+        .nav a:hover, .nav a.active {
+            background: #4a90e2;
+            color: #fff;
+        }
+
+        .step-indicator {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 24px;
+        }
+
+        .step {
+            flex: 1;
+            height: 4px;
+            border-radius: 2px;
+            background: #e0e0e0;
+        }
+
+        .step.active { background: #4a90e2; }
+        .step.done   { background: #28a745; }
+
+        .info-box {
+            background: #e8f4fd;
+            border: 1px solid #bee5eb;
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 18px;
+            color: #0c5460;
+            font-size: 0.875rem;
+        }
+
+        .dashboard-welcome {
+            text-align: center;
+        }
+
+        .dashboard-welcome .avatar {
+            width: 80px;
+            height: 80px;
+            border-radius: 50%;
+            background: #4a90e2;
+            color: #fff;
+            font-size: 2rem;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0 auto 16px;
+        }
+
+        .logout-btn {
+            display: inline-block;
+            margin-top: 20px;
+            padding: 10px 24px;
+            background: #dc3545;
+            color: #fff;
+            border-radius: 6px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 0.9rem;
+            transition: background 0.2s;
+        }
+
+        .logout-btn:hover { background: #c82333; }
+
+        .hint {
+            font-size: 0.78rem;
+            color: #888;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="card">
+
+    <?php if ($page !== 'dashboard'): ?>
+    <div class="nav">
+        <a href="?page=login"    class="<?= $page === 'login'    ? 'active' : '' ?>">Login</a>
+        <a href="?page=register" class="<?= $page === 'register' ? 'active' : '' ?>">Register</a>
+        <a href="?page=forgot"   class="<?= $page === 'forgot'   ? 'active' : '' ?>">Forgot Password</a>
+    </div>
+    <?php endif; ?>
+
+    <?php
+    // ─── REGISTER ────────────────────────────────────────────────────────────
+    if ($page === 'register'):
+    ?>
+        <h1>Create Account</h1>
+        <p class="subtitle">Set up your account with a secret recovery question.</p>
+
+        <?php if (!empty($registerData['errors'])): ?>
+            <div class="errors">
+                <ul>
+                    <?php foreach ($registerData['errors'] as $err): ?>
+                        <li><?= e($err) ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        <?php endif; ?>
+
+        <?php if (!empty($registerData['success'])): ?>
+            <div class="success"><?= $registerData['success'] ?></div>
+        <?php else: ?>
+        <form method="POST" action="?page=register" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username"
+                       value="<?= e($_POST['username'] ?? '') ?>"
+                       placeholder="e.g. johndoe" required>
+            </div>
+
+            <div class="form-group">
+                <label for="email">Email Address</label>
+                <input type="email" id="email" name="email"
+                       value="<?= e($_POST['email'] ?? '') ?>"
+                       placeholder="you@example.com" required>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password"
+                       placeholder="Minimum 8 characters" required>
+            </div>
+
+            <div class="form-group">
+                <label for="question_id">Secret Question</label>
+                <select id="question_id" name="question_id" required>
+                    <option value="">— Select a question —</option>
+                    <?php foreach ($questions as $q): ?>
+                        <option value="<?= e($q['id']) ?>"
+                            <?= (isset($_POST['question_id']) && $_POST['question_id'] == $q['id']) ? 'selected' : '' ?>>
+                            <?= e($q['question']) ?>
+                        </option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="secret_answer">Your Answer</label>
+                <input type="text" id="secret_answer" name="secret_answer"
+                       placeholder="Enter your answer" required autocomplete="off">
+                <p class="hint">Answers are case-insensitive and stored securely.</p>
+            </div>
+
+            <button type="submit" name="register">Create Account</button>
+        </form>
+        <?php endif; ?>
+
+    <?php
+    // ─── LOGIN ───────────────────────────────────────────────────────────────
+    elseif ($page === 'login'):
+    ?>
+        <h1>Welcome Back</h1>
+        <p class="subtitle">Sign in to your account.</p>
+
+        <?php if (!empty($loginData['errors'])): ?>
+            <div class="errors">
+                <ul>
+                    <?php foreach ($loginData['errors'] as $err): ?>
+                        <li><?= e($err) ?></li>
+                    <?php endforeach; ?>
+                </ul>
+            </div>
+        <?php endif; ?>
+
+        <form method="POST" action="?page=login" novalidate>
+            <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+
+            <div class="form-group">
+                <label for="username">Username</label>
+                <input type="text" id="username" name="username"
+                       value="<?= e($_POST['username'] ?? '') ?>"
+                       placeholder="Your username" required>
+            </div>
+
+            <div class="form-group">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password"
+                       placeholder="Your password" required>
+            </div>
+
+            <button type="submit" name="login">Sign In</button>
+        </form>
+
+        <div class="links">
+            <a href="?page=forgot">Forgot your password?</a>
+        </div>
+
+    <?php
+    // ─── FORGOT PASSWORD ─────────────────────────────────────────────────────
+    elseif ($page === 'forgot'):
+
+        $step = $_SESSION['recovery_step'] ?? 'find';
+
+        // Determine step number for indicator
+        $stepNum = match($step) {
+            'find'   => 1,
+            'answer' => 2,
+            'reset'  => 3,
+            default  => 1,
+        };
+    ?>
+        <h1>Password Recovery</h1>
+        <p class="subtitle">Recover your account using your secret question.</p>
+
+        <!-- Step indicator -->
+        <div class="step-indicator">
+            <div class="step <?= $stepNum >= 1 ? ($stepNum > 1 ? 'done' : 'active') : '' ?>"></div>
+            <div class="step <?= $stepNum >= 2 ? ($stepNum > 2 ? 'done' : 'active') : '' ?>"></div>
+            <div class="step <?= $stepNum >= 3 ? 'active' : '' ?>"></div>
+        </div>
+
+        <?php
+        // ── Step 1: Find user by email ────────────────────────────────────
+        if ($step === 'find'):
+        ?>
+            <div class="info-box">
+                <strong>Step 1 of 3:</strong> Enter your email address to find your account.
+            </div>
+
+            <?php if (!empty($forgot1Data['errors'])): ?>
+                <div class="errors">
+                    <ul>
+                        <?php foreach ($forgot1Data['errors'] as $err): ?>
+                            <li><?= e($err) ?></li>
+                        <?php endforeach; ?>
+                    </ul>
+                </div>
+            <?php endif; ?>
+
+            <form method="POST" action="?page=forgot" novalidate>
+                <input type="hidden" name="csrf_token" value="<?= e($csrfToken) ?>">
+
+                <div class="form-group">
+                    <label for="email">Email Address</label>
+                    <input type="email" id="email" name="email"
+                           value="<?= e($_POST['email'] ?? '') ?>"
+                           placeholder="you@example.com" required>
+                </div>
+
+                <button type="submit" name="find_user">Find My Account</button>
+            </form>
+
+        <?php
+        // ── Step 2: Answer secret question ───────────────────────────────
+        elseif ($step === 'answer'):
+
+            // Fetch the question for this user
+            $userId = (int)$_SESSION['recovery_user_id'];
+            $stmt = $pdo->prepare("
+                SELECT sq.question
+                FROM users u
+                JOIN secret_questions sq ON u.question_id = sq.id
+                WHERE u.id = ?
+            ");
+            $stmt->execute([$userId]);
+            $userQuestion = $stmt->fetchColumn();
+        ?>
+            <div class="info-box">
+                <strong>Step 2 of 3:</strong> Answer your secret question.
+            </div>
+
+            <?php if (!empty($forgot2Data['errors'])): ?>
+                <div class="errors">
+                    <ul>
+                        <?php foreach ($forgot2Data['errors'] as $err): ?>
+                            <li><?= e($err) ?></li>
+                        <?php

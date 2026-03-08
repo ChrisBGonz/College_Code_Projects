@@ -1,0 +1,233 @@
+
+```go
+package main
+
+import (
+	"errors"
+	"fmt"
+	"log"
+	"sync"
+	"time"
+)
+
+type Account struct {
+	ID      string
+	Balance float64
+	mu      sync.Mutex
+}
+
+type TransferLog struct {
+	Timestamp  time.Time
+	SenderID   string
+	ReceiverID string
+	Amount     float64
+	Status     string
+	Message    string
+}
+
+type Bank struct {
+	accounts map[string]*Account
+	mu       sync.RWMutex
+	logs     []TransferLog
+}
+
+func NewBank() *Bank {
+	return &Bank{
+		accounts: make(map[string]*Account),
+		logs:     []TransferLog{},
+	}
+}
+
+func (b *Bank) AddAccount(id string, initialBalance float64) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if _, exists := b.accounts[id]; exists {
+		return fmt.Errorf("account with ID %s already exists", id)
+	}
+
+	b.accounts[id] = &Account{
+		ID:      id,
+		Balance: initialBalance,
+	}
+	return nil
+}
+
+func (b *Bank) GetBalance(id string) (float64, error) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	account, exists := b.accounts[id]
+	if !exists {
+		return 0, fmt.Errorf("account with ID %s not found", id)
+	}
+
+	account.mu.Lock()
+	defer account.mu.Unlock()
+	return account.Balance, nil
+}
+
+func (b *Bank) Transfer(senderID, receiverID string, amount float64) error {
+	log.Printf("Initiating transfer: sender_id=%s, receiver_id=%s, amount=%.2f", senderID, receiverID, amount)
+
+	transferLog := TransferLog{
+		Timestamp:  time.Now(),
+		SenderID:   senderID,
+		ReceiverID: receiverID,
+		Amount:     amount,
+	}
+
+	if amount <= 0 {
+		err := errors.New("transfer amount must be greater than zero")
+		transferLog.Status = "FAILED"
+		transferLog.Message = err.Error()
+		b.recordLog(transferLog)
+		log.Printf("Transfer failed: sender_id=%s, receiver_id=%s, amount=%.2f, reason=%s", senderID, receiverID, amount, err.Error())
+		return err
+	}
+
+	if senderID == receiverID {
+		err := errors.New("sender and receiver cannot be the same account")
+		transferLog.Status = "FAILED"
+		transferLog.Message = err.Error()
+		b.recordLog(transferLog)
+		log.Printf("Transfer failed: sender_id=%s, receiver_id=%s, amount=%.2f, reason=%s", senderID, receiverID, amount, err.Error())
+		return err
+	}
+
+	b.mu.RLock()
+	sender, senderExists := b.accounts[senderID]
+	receiver, receiverExists := b.accounts[receiverID]
+	b.mu.RUnlock()
+
+	if !senderExists {
+		err := fmt.Errorf("sender account with ID %s not found", senderID)
+		transferLog.Status = "FAILED"
+		transferLog.Message = err.Error()
+		b.recordLog(transferLog)
+		log.Printf("Transfer failed: sender_id=%s, receiver_id=%s, amount=%.2f, reason=%s", senderID, receiverID, amount, err.Error())
+		return err
+	}
+
+	if !receiverExists {
+		err := fmt.Errorf("receiver account with ID %s not found", receiverID)
+		transferLog.Status = "FAILED"
+		transferLog.Message = err.Error()
+		b.recordLog(transferLog)
+		log.Printf("Transfer failed: sender_id=%s, receiver_id=%s, amount=%.2f, reason=%s", senderID, receiverID, amount, err.Error())
+		return err
+	}
+
+	// Lock accounts in a consistent order to prevent deadlocks
+	first, second := sender, receiver
+	if senderID > receiverID {
+		first, second = receiver, sender
+	}
+
+	first.mu.Lock()
+	defer first.mu.Unlock()
+	second.mu.Lock()
+	defer second.mu.Unlock()
+
+	if sender.Balance < amount {
+		err := fmt.Errorf("insufficient funds: sender_id=%s has balance %.2f, required %.2f", senderID, sender.Balance, amount)
+		transferLog.Status = "FAILED"
+		transferLog.Message = err.Error()
+		b.recordLog(transferLog)
+		log.Printf("Transfer failed: sender_id=%s, receiver_id=%s, amount=%.2f, reason=%s", senderID, receiverID, amount, err.Error())
+		return err
+	}
+
+	sender.Balance -= amount
+	receiver.Balance += amount
+
+	transferLog.Status = "SUCCESS"
+	transferLog.Message = fmt.Sprintf("Transfer completed successfully. Sender new balance: %.2f, Receiver new balance: %.2f", sender.Balance, receiver.Balance)
+	b.recordLog(transferLog)
+
+	log.Printf("Transfer successful: sender_id=%s, receiver_id=%s, amount=%.2f, sender_balance=%.2f, receiver_balance=%.2f",
+		senderID, receiverID, amount, sender.Balance, receiver.Balance)
+
+	return nil
+}
+
+func (b *Bank) recordLog(entry TransferLog) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.logs = append(b.logs, entry)
+}
+
+func (b *Bank) GetTransferLogs() []TransferLog {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	logsCopy := make([]TransferLog, len(b.logs))
+	copy(logsCopy, b.logs)
+	return logsCopy
+}
+
+func main() {
+	bank := NewBank()
+
+	bank.AddAccount("ACC001", 1000.00)
+	bank.AddAccount("ACC002", 500.00)
+	bank.AddAccount("ACC003", 250.00)
+
+	fmt.Println("=== Bank Transfer System ===")
+	fmt.Println()
+
+	// Successful transfer
+	err := bank.Transfer("ACC001", "ACC002", 200.00)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+
+	// Transfer with insufficient funds
+	err = bank.Transfer("ACC003", "ACC001", 500.00)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+
+	// Transfer with invalid amount
+	err = bank.Transfer("ACC001", "ACC002", -50.00)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+
+	// Transfer to same account
+	err = bank.Transfer("ACC001", "ACC001", 100.00)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+
+	// Transfer to non-existent account
+	err = bank.Transfer("ACC001", "ACC999", 100.00)
+	if err != nil {
+		fmt.Printf("Error: %v\n", err)
+	}
+
+	fmt.Println()
+	fmt.Println("=== Final Balances ===")
+	for _, id := range []string{"ACC001", "ACC002", "ACC003"} {
+		balance, err := bank.GetBalance(id)
+		if err != nil {
+			fmt.Printf("Error getting balance for %s: %v\n", id, err)
+			continue
+		}
+		fmt.Printf("Account %s: $%.2f\n", id, balance)
+	}
+
+	fmt.Println()
+	fmt.Println("=== Transfer Logs ===")
+	for _, entry := range bank.GetTransferLogs() {
+		fmt.Printf("[%s] sender_id=%s, receiver_id=%s, amount=%.2f, status=%s, message=%s\n",
+			entry.Timestamp.Format(time.RFC3339),
+			entry.SenderID,
+			entry.ReceiverID,
+			entry.Amount,
+			entry.Status,
+			entry.Message,
+		)
+	}
+}
+```

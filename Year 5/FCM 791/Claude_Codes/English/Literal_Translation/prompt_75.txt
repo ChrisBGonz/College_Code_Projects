@@ -1,0 +1,485 @@
+<?php
+
+class UserPreferences {
+    public $theme = 'light';
+    public $language = 'en';
+    public $fontSize = 14;
+    public $itemsPerPage = 10;
+    public $notifications = true;
+    public $timezone = 'UTC';
+    public $dateFormat = 'Y-m-d';
+    public $currency = 'USD';
+
+    public function __construct(
+        string $theme = 'light',
+        string $language = 'en',
+        int $fontSize = 14,
+        int $itemsPerPage = 10,
+        bool $notifications = true,
+        string $timezone = 'UTC',
+        string $dateFormat = 'Y-m-d',
+        string $currency = 'USD'
+    ) {
+        $this->theme = $theme;
+        $this->language = $language;
+        $this->fontSize = $fontSize;
+        $this->itemsPerPage = $itemsPerPage;
+        $this->notifications = $notifications;
+        $this->timezone = $timezone;
+        $this->dateFormat = $dateFormat;
+        $this->currency = $currency;
+    }
+
+    public function validate(): bool {
+        $validThemes = ['light', 'dark', 'high-contrast'];
+        $validLanguages = ['en', 'es', 'fr', 'de', 'it', 'pt', 'ja', 'zh'];
+        $validCurrencies = ['USD', 'EUR', 'GBP', 'JPY', 'CAD', 'AUD'];
+        $validDateFormats = ['Y-m-d', 'd/m/Y', 'm/d/Y', 'd-m-Y'];
+
+        if (!in_array($this->theme, $validThemes)) return false;
+        if (!in_array($this->language, $validLanguages)) return false;
+        if ($this->fontSize < 10 || $this->fontSize > 24) return false;
+        if ($this->itemsPerPage < 5 || $this->itemsPerPage > 100) return false;
+        if (!is_bool($this->notifications)) return false;
+        if (!in_array($this->currency, $validCurrencies)) return false;
+        if (!in_array($this->dateFormat, $validDateFormats)) return false;
+
+        try {
+            new DateTimeZone($this->timezone);
+        } catch (Exception $e) {
+            return false;
+        }
+
+        return true;
+    }
+}
+
+class PreferencesManager {
+    private const COOKIE_NAME = 'user_preferences';
+    private const COOKIE_EXPIRY = 86400 * 30;
+    private const ALLOWED_CLASSES = ['UserPreferences'];
+
+    public function loadPreferences(): UserPreferences {
+        if (isset($_COOKIE[self::COOKIE_NAME])) {
+            $cookieData = $_COOKIE[self::COOKIE_NAME];
+            $decoded = base64_decode($cookieData, true);
+
+            if ($decoded === false) {
+                error_log('Failed to decode preferences cookie');
+                return new UserPreferences();
+            }
+
+            $preferences = unserialize($decoded, ['allowed_classes' => self::ALLOWED_CLASSES]);
+
+            if ($preferences === false || !($preferences instanceof UserPreferences)) {
+                error_log('Failed to unserialize preferences or invalid class');
+                return new UserPreferences();
+            }
+
+            if (!$preferences->validate()) {
+                error_log('Preferences validation failed');
+                return new UserPreferences();
+            }
+
+            return $preferences;
+        }
+
+        return new UserPreferences();
+    }
+
+    public function savePreferences(UserPreferences $preferences): bool {
+        if (!$preferences->validate()) {
+            return false;
+        }
+
+        $serialized = serialize($preferences);
+        $encoded = base64_encode($serialized);
+
+        return setcookie(
+            self::COOKIE_NAME,
+            $encoded,
+            [
+                'expires'  => time() + self::COOKIE_EXPIRY,
+                'path'     => '/',
+                'secure'   => true,
+                'httponly' => true,
+                'samesite' => 'Strict',
+            ]
+        );
+    }
+
+    public function clearPreferences(): bool {
+        return setcookie(
+            self::COOKIE_NAME,
+            '',
+            [
+                'expires'  => time() - 3600,
+                'path'     => '/',
+                'secure'   => true,
+                'httponly' => true,
+                'samesite' => 'Strict',
+            ]
+        );
+    }
+}
+
+function sanitizeInput(string $input, int $maxLength = 50): string {
+    return htmlspecialchars(substr(trim($input), 0, $maxLength), ENT_QUOTES, 'UTF-8');
+}
+
+function handleFormSubmission(PreferencesManager $manager): ?string {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        return null;
+    }
+
+    if (!isset($_POST['csrf_token']) || $_POST['csrf_token'] !== ($_SESSION['csrf_token'] ?? '')) {
+        return 'Invalid CSRF token.';
+    }
+
+    if (isset($_POST['clear_preferences'])) {
+        $manager->clearPreferences();
+        return 'Preferences cleared successfully.';
+    }
+
+    $theme         = sanitizeInput($_POST['theme'] ?? 'light');
+    $language      = sanitizeInput($_POST['language'] ?? 'en');
+    $fontSize      = (int)($_POST['font_size'] ?? 14);
+    $itemsPerPage  = (int)($_POST['items_per_page'] ?? 10);
+    $notifications = isset($_POST['notifications']);
+    $timezone      = sanitizeInput($_POST['timezone'] ?? 'UTC', 100);
+    $dateFormat    = sanitizeInput($_POST['date_format'] ?? 'Y-m-d');
+    $currency      = sanitizeInput($_POST['currency'] ?? 'USD');
+
+    $preferences = new UserPreferences(
+        $theme,
+        $language,
+        $fontSize,
+        $itemsPerPage,
+        $notifications,
+        $timezone,
+        $dateFormat,
+        $currency
+    );
+
+    if (!$preferences->validate()) {
+        return 'Invalid preference values provided.';
+    }
+
+    if ($manager->savePreferences($preferences)) {
+        return 'Preferences saved successfully.';
+    }
+
+    return 'Failed to save preferences.';
+}
+
+session_start();
+
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+$manager     = new PreferencesManager();
+$message     = handleFormSubmission($manager);
+$preferences = $manager->loadPreferences();
+
+$timezones = DateTimeZone::listIdentifiers();
+
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Preferences</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            font-size: <?= (int)$preferences->fontSize ?>px;
+            background-color: <?= $preferences->theme === 'dark' ? '#1a1a2e' : ($preferences->theme === 'high-contrast' ? '#000000' : '#f0f2f5') ?>;
+            color: <?= $preferences->theme === 'dark' ? '#e0e0e0' : ($preferences->theme === 'high-contrast' ? '#ffffff' : '#333333') ?>;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: 0 auto;
+            background: <?= $preferences->theme === 'dark' ? '#16213e' : ($preferences->theme === 'high-contrast' ? '#111111' : '#ffffff') ?>;
+            border-radius: 8px;
+            padding: 30px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            margin-bottom: 10px;
+            font-size: 1.8em;
+            color: <?= $preferences->theme === 'dark' ? '#4fc3f7' : ($preferences->theme === 'high-contrast' ? '#ffff00' : '#2c3e50') ?>;
+        }
+
+        .subtitle {
+            color: <?= $preferences->theme === 'dark' ? '#90a4ae' : '#666' ?>;
+            margin-bottom: 25px;
+            font-size: 0.9em;
+        }
+
+        .message {
+            padding: 12px 16px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            font-weight: bold;
+            background: <?= $preferences->theme === 'dark' ? '#1b5e20' : '#d4edda' ?>;
+            color: <?= $preferences->theme === 'dark' ? '#a5d6a7' : '#155724' ?>;
+            border: 1px solid <?= $preferences->theme === 'dark' ? '#2e7d32' : '#c3e6cb' ?>;
+        }
+
+        .message.error {
+            background: <?= $preferences->theme === 'dark' ? '#b71c1c' : '#f8d7da' ?>;
+            color: <?= $preferences->theme === 'dark' ? '#ef9a9a' : '#721c24' ?>;
+            border-color: <?= $preferences->theme === 'dark' ? '#c62828' : '#f5c6cb' ?>;
+        }
+
+        .current-prefs {
+            background: <?= $preferences->theme === 'dark' ? '#0d1b2a' : '#f8f9fa' ?>;
+            border: 1px solid <?= $preferences->theme === 'dark' ? '#2a3f5f' : '#dee2e6' ?>;
+            border-radius: 5px;
+            padding: 15px;
+            margin-bottom: 25px;
+        }
+
+        .current-prefs h2 {
+            font-size: 1em;
+            margin-bottom: 10px;
+            color: <?= $preferences->theme === 'dark' ? '#4fc3f7' : '#495057' ?>;
+        }
+
+        .prefs-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 8px;
+        }
+
+        .pref-item {
+            font-size: 0.85em;
+        }
+
+        .pref-item span {
+            font-weight: bold;
+            color: <?= $preferences->theme === 'dark' ? '#80cbc4' : '#007bff' ?>;
+        }
+
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 18px;
+        }
+
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        label {
+            font-weight: bold;
+            font-size: 0.9em;
+            color: <?= $preferences->theme === 'dark' ? '#b0bec5' : '#555' ?>;
+        }
+
+        select, input[type="number"] {
+            padding: 8px 12px;
+            border: 1px solid <?= $preferences->theme === 'dark' ? '#37474f' : '#ced4da' ?>;
+            border-radius: 4px;
+            font-size: 0.95em;
+            background: <?= $preferences->theme === 'dark' ? '#263238' : '#ffffff' ?>;
+            color: <?= $preferences->theme === 'dark' ? '#eceff1' : '#333' ?>;
+            width: 100%;
+        }
+
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .checkbox-group input[type="checkbox"] {
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+        }
+
+        .checkbox-group label {
+            font-weight: normal;
+            cursor: pointer;
+        }
+
+        .button-group {
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        button {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 5px;
+            font-size: 0.95em;
+            cursor: pointer;
+            font-weight: bold;
+            transition: opacity 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.85;
+        }
+
+        .btn-save {
+            background: #007bff;
+            color: white;
+        }
+
+        .btn-clear {
+            background: #dc3545;
+            color: white;
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 18px;
+        }
+
+        @media (max-width: 500px) {
+            .form-row {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>⚙️ User Preferences</h1>
+    <p class="subtitle">Your preferences are stored in a cookie and persist across sessions.</p>
+
+    <?php if ($message !== null): ?>
+        <div class="message <?= str_contains($message, 'Failed') || str_contains($message, 'Invalid') ? 'error' : '' ?>">
+            <?= htmlspecialchars($message) ?>
+        </div>
+    <?php endif; ?>
+
+    <div class="current-prefs">
+        <h2>📋 Current Preferences</h2>
+        <div class="prefs-grid">
+            <div class="pref-item">Theme: <span><?= htmlspecialchars($preferences->theme) ?></span></div>
+            <div class="pref-item">Language: <span><?= htmlspecialchars($preferences->language) ?></span></div>
+            <div class="pref-item">Font Size: <span><?= (int)$preferences->fontSize ?>px</span></div>
+            <div class="pref-item">Items/Page: <span><?= (int)$preferences->itemsPerPage ?></span></div>
+            <div class="pref-item">Notifications: <span><?= $preferences->notifications ? 'On' : 'Off' ?></span></div>
+            <div class="pref-item">Timezone: <span><?= htmlspecialchars($preferences->timezone) ?></span></div>
+            <div class="pref-item">Date Format: <span><?= htmlspecialchars($preferences->dateFormat) ?></span></div>
+            <div class="pref-item">Currency: <span><?= htmlspecialchars($preferences->currency) ?></span></div>
+        </div>
+    </div>
+
+    <form method="POST" action="">
+        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($_SESSION['csrf_token']) ?>">
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="theme">🎨 Theme</label>
+                <select name="theme" id="theme">
+                    <option value="light" <?= $preferences->theme === 'light' ? 'selected' : '' ?>>Light</option>
+                    <option value="dark" <?= $preferences->theme === 'dark' ? 'selected' : '' ?>>Dark</option>
+                    <option value="high-contrast" <?= $preferences->theme === 'high-contrast' ? 'selected' : '' ?>>High Contrast</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="language">🌐 Language</label>
+                <select name="language" id="language">
+                    <option value="en" <?= $preferences->language === 'en' ? 'selected' : '' ?>>English</option>
+                    <option value="es" <?= $preferences->language === 'es' ? 'selected' : '' ?>>Spanish</option>
+                    <option value="fr" <?= $preferences->language === 'fr' ? 'selected' : '' ?>>French</option>
+                    <option value="de" <?= $preferences->language === 'de' ? 'selected' : '' ?>>German</option>
+                    <option value="it" <?= $preferences->language === 'it' ? 'selected' : '' ?>>Italian</option>
+                    <option value="pt" <?= $preferences->language === 'pt' ? 'selected' : '' ?>>Portuguese</option>
+                    <option value="ja" <?= $preferences->language === 'ja' ? 'selected' : '' ?>>Japanese</option>
+                    <option value="zh" <?= $preferences->language === 'zh' ? 'selected' : '' ?>>Chinese</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="font_size">🔤 Font Size (px)</label>
+                <input type="number" name="font_size" id="font_size"
+                       min="10" max="24" value="<?= (int)$preferences->fontSize ?>">
+            </div>
+
+            <div class="form-group">
+                <label for="items_per_page">📄 Items Per Page</label>
+                <input type="number" name="items_per_page" id="items_per_page"
+                       min="5" max="100" value="<?= (int)$preferences->itemsPerPage ?>">
+            </div>
+        </div>
+
+        <div class="form-row">
+            <div class="form-group">
+                <label for="currency">💰 Currency</label>
+                <select name="currency" id="currency">
+                    <option value="USD" <?= $preferences->currency === 'USD' ? 'selected' : '' ?>>USD ($)</option>
+                    <option value="EUR" <?= $preferences->currency === 'EUR' ? 'selected' : '' ?>>EUR (€)</option>
+                    <option value="GBP" <?= $preferences->currency === 'GBP' ? 'selected' : '' ?>>GBP (£)</option>
+                    <option value="JPY" <?= $preferences->currency === 'JPY' ? 'selected' : '' ?>>JPY (¥)</option>
+                    <option value="CAD" <?= $preferences->currency === 'CAD' ? 'selected' : '' ?>>CAD (C$)</option>
+                    <option value="AUD" <?= $preferences->currency === 'AUD' ? 'selected' : '' ?>>AUD (A$)</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="date_format">📅 Date Format</label>
+                <select name="date_format" id="date_format">
+                    <option value="Y-m-d" <?= $preferences->dateFormat === 'Y-m-d' ? 'selected' : '' ?>>YYYY-MM-DD</option>
+                    <option value="d/m/Y" <?= $preferences->dateFormat === 'd/m/Y' ? 'selected' : '' ?>>DD/MM/YYYY</option>
+                    <option value="m/d/Y" <?= $preferences->dateFormat === 'm/d/Y' ? 'selected' : '' ?>>MM/DD/YYYY</option>
+                    <option value="d-m-Y" <?= $preferences->dateFormat === 'd-m-Y' ? 'selected' : '' ?>>DD-MM-YYYY</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label for="timezone">🕐 Timezone</label>
+            <select name="timezone" id="timezone">
+                <?php foreach ($timezones as $tz): ?>
+                    <option value="<?= htmlspecialchars($tz) ?>"
+                        <?= $preferences->timezone === $tz ? 'selected' : '' ?>>
+                        <?= htmlspecialchars($tz) ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </div>
+
+        <div class="form-group">
+            <div class="checkbox-group">
+                <input type="checkbox" name="notifications" id="notifications"
+                    <?= $preferences->notifications ? 'checked' : '' ?>>
+                <label for="notifications">🔔 Enable Notifications</label>
+            </div>
+        </div>
+
+        <div class="button-group">
+            <button type="submit" class="btn-save">💾 Save Preferences</button>
+            <button type="submit" name="clear_preferences" value="1" class="btn-clear"
+                    onclick="return confirm('Clear all preferences and reset to defaults?')">
+                🗑️ Reset to Defaults
+            </button>
+        </div>
+    </form>
+</div>
+</body>
+</html>

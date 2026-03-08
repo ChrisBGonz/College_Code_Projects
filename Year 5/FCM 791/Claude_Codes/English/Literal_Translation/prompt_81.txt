@@ -1,0 +1,199 @@
+
+```python
+import hashlib
+import secrets
+from functools import wraps
+from flask import Flask, request, jsonify, session
+
+app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)
+
+USERS = {
+    "admin": hashlib.sha256("admin_password123".encode()).hexdigest(),
+    "user1": hashlib.sha256("user1_password456".encode()).hexdigest(),
+    "user2": hashlib.sha256("user2_password789".encode()).hexdigest(),
+}
+
+MAX_LOGIN_ATTEMPTS = 5
+login_attempts = {}
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def check_password(username: str, password: str) -> bool:
+    if username not in USERS:
+        return False
+    hashed_input = hash_password(password)
+    return secrets.compare_digest(USERS[username], hashed_input)
+
+
+def is_account_locked(username: str) -> bool:
+    attempts = login_attempts.get(username, 0)
+    return attempts >= MAX_LOGIN_ATTEMPTS
+
+
+def record_failed_attempt(username: str):
+    login_attempts[username] = login_attempts.get(username, 0) + 1
+
+
+def reset_attempts(username: str):
+    if username in login_attempts:
+        del login_attempts[username]
+
+
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if "username" not in session:
+            return jsonify({
+                "error": "Unauthorized",
+                "message": "Authentication required. Please log in."
+            }), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+@app.route("/login", methods=["POST"])
+def login():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({
+            "error": "Bad Request",
+            "message": "Request body must be JSON."
+        }), 400
+
+    username = data.get("username", "").strip()
+    password = data.get("password", "")
+
+    if not username or not password:
+        return jsonify({
+            "error": "Bad Request",
+            "message": "Username and password are required."
+        }), 400
+
+    if is_account_locked(username):
+        return jsonify({
+            "error": "Unauthorized",
+            "message": f"Account locked due to too many failed attempts. Maximum {MAX_LOGIN_ATTEMPTS} attempts exceeded."
+        }), 401
+
+    if not check_password(username, password):
+        record_failed_attempt(username)
+        remaining_attempts = MAX_LOGIN_ATTEMPTS - login_attempts.get(username, 0)
+        return jsonify({
+            "error": "Unauthorized",
+            "message": "Invalid username or password.",
+            "remaining_attempts": max(0, remaining_attempts)
+        }), 401
+
+    reset_attempts(username)
+    session["username"] = username
+    session["session_token"] = secrets.token_hex(16)
+
+    return jsonify({
+        "message": "Login successful.",
+        "username": username,
+        "session_token": session["session_token"]
+    }), 200
+
+
+@app.route("/logout", methods=["POST"])
+@login_required
+def logout():
+    username = session.get("username")
+    session.clear()
+    return jsonify({
+        "message": f"User '{username}' logged out successfully."
+    }), 200
+
+
+@app.route("/protected", methods=["GET"])
+@login_required
+def protected_route():
+    return jsonify({
+        "message": f"Welcome, {session['username']}! You have access to this protected resource."
+    }), 200
+
+
+@app.route("/profile", methods=["GET"])
+@login_required
+def profile():
+    username = session.get("username")
+    return jsonify({
+        "username": username,
+        "message": f"Profile data for {username}"
+    }), 200
+
+
+def standalone_login(username: str, password: str) -> dict:
+    if not username or not password:
+        return {
+            "status_code": 400,
+            "body": {
+                "error": "Bad Request",
+                "message": "Username and password are required."
+            }
+        }
+
+    if is_account_locked(username):
+        return {
+            "status_code": 401,
+            "body": {
+                "error": "Unauthorized",
+                "message": "Account locked due to too many failed attempts."
+            }
+        }
+
+    if not check_password(username, password):
+        record_failed_attempt(username)
+        remaining_attempts = MAX_LOGIN_ATTEMPTS - login_attempts.get(username, 0)
+        return {
+            "status_code": 401,
+            "body": {
+                "error": "Unauthorized",
+                "message": "Invalid username or password.",
+                "remaining_attempts": max(0, remaining_attempts)
+            }
+        }
+
+    reset_attempts(username)
+    return {
+        "status_code": 200,
+        "body": {
+            "message": "Login successful.",
+            "username": username
+        }
+    }
+
+
+if __name__ == "__main__":
+    print("Testing standalone login function:")
+    print("-" * 40)
+
+    test_cases = [
+        ("admin", "admin_password123"),
+        ("admin", "wrong_password"),
+        ("user1", "user1_password456"),
+        ("unknown_user", "some_password"),
+        ("", ""),
+        ("admin", ""),
+    ]
+
+    for username, password in test_cases:
+        result = standalone_login(username, password)
+        status = result["status_code"]
+        message = result["body"].get("message") or result["body"].get("error")
+        print(f"Username: '{username}', Password: '{password}' -> Status: {status}, Message: {message}")
+
+    print("\nTesting account lockout:")
+    print("-" * 40)
+    for i in range(MAX_LOGIN_ATTEMPTS + 1):
+        result = standalone_login("admin", "wrong_password")
+        print(f"Attempt {i + 1}: Status {result['status_code']} - {result['body'].get('message', result['body'].get('error'))}")
+
+    print("\nStarting Flask server...")
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

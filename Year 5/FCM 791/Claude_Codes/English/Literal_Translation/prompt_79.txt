@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import hashlib
+import json
+import argparse
+from pathlib import Path
+
+
+def compute_hash(filepath, algorithm="sha256", chunk_size=8192):
+    try:
+        h = hashlib.new(algorithm)
+        with open(filepath, "rb") as f:
+            while chunk := f.read(chunk_size):
+                h.update(chunk)
+        return h.hexdigest()
+    except FileNotFoundError:
+        return None
+    except PermissionError:
+        return None
+    except OSError as e:
+        print(f"[ERROR] Cannot read '{filepath}': {e}", file=sys.stderr)
+        return None
+
+
+def load_manifest(manifest_path):
+    manifest_path = Path(manifest_path)
+    if not manifest_path.exists():
+        print(f"[ERROR] Manifest file not found: {manifest_path}", file=sys.stderr)
+        sys.exit(1)
+
+    suffix = manifest_path.suffix.lower()
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError as e:
+        print(f"[ERROR] Cannot read manifest: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if suffix == ".json":
+        return parse_json_manifest(content, manifest_path)
+    else:
+        return parse_text_manifest(content, manifest_path)
+
+
+def parse_json_manifest(content, manifest_path):
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Invalid JSON in manifest: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    entries = {}
+
+    if isinstance(data, dict):
+        algorithm = data.get("algorithm", "sha256").lower()
+        files = data.get("files", data)
+
+        if isinstance(files, dict):
+            for filepath, value in files.items():
+                if filepath in ("algorithm", "version", "created", "description"):
+                    continue
+                if isinstance(value, dict):
+                    hash_value = value.get("hash") or value.get("checksum") or value.get("sha256") or value.get("md5")
+                    file_algorithm = value.get("algorithm", algorithm).lower()
+                else:
+                    hash_value = value
+                    file_algorithm = algorithm
+
+                if hash_value:
+                    entries[filepath] = {"hash": hash_value.lower(), "algorithm": file_algorithm}
+        else:
+            print(f"[ERROR] Unexpected JSON structure in manifest.", file=sys.stderr)
+            sys.exit(1)
+
+    elif isinstance(data, list):
+        algorithm = "sha256"
+        for item in data:
+            if isinstance(item, dict):
+                filepath = item.get("file") or item.get("path") or item.get("name")
+                hash_value = item.get("hash") or item.get("checksum") or item.get("sha256") or item.get("md5")
+                file_algorithm = item.get("algorithm", algorithm).lower()
+                if filepath and hash_value:
+                    entries[filepath] = {"hash": hash_value.lower(), "algorithm": file_algorithm}
+    else:
+        print(f"[ERROR] Unexpected JSON structure in manifest.", file=sys.stderr)
+        sys.exit(1)
+
+    return entries
+
+
+def parse_text_manifest(content, manifest_path):
+    entries = {}
+    algorithm = "sha256"
+
+    for lineno, line in enumerate(content.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            if line.startswith("# algorithm:"):
+                algorithm = line.split(":", 1)[1].strip().lower()
+            continue
+
+        parts = line.split()
+        if len(parts) == 2:
+            hash_value, filepath = parts
+            filepath = filepath.lstrip("*")
+            entries[filepath] = {"hash": hash_value.lower(), "algorithm": algorithm}
+        elif len(parts) == 3:
+            hash_value, file_algorithm, filepath = parts
+            filepath = filepath.lstrip("*")
+            entries[filepath] = {"hash": hash_value.lower(), "algorithm": file_algorithm.lower()}
+        else:
+            print(f"[WARN] Skipping malformed line {lineno} in manifest: {line!r}", file=sys.stderr)
+
+    return entries
+
+
+def verify_manifest(manifest_entries, base_dir, strict=False):
+    base_dir = Path(base_dir).resolve()
+
+    results = {
+        "ok": [],
+        "mismatch": [],
+        "missing": [],
+        "extra": [],
+        "error": [],
+    }
+
+    checked_files = set()
+
+    for rel_path, entry in manifest_entries.items():
+        expected_hash = entry["hash"]
+        algorithm = entry["algorithm"]
+        full_path = base_dir / rel_path
+        checked_files.add(full_path.resolve())
+
+        if not full_path.exists():
+            results["missing"].append(rel_path)
+            continue
+
+        try:
+            hashlib.new(algorithm)
+        except ValueError:
+            print(f"[ERROR] Unsupported hash algorithm '{algorithm}' for '{rel_path}'", file=sys.stderr)
+            results["error"].append(rel_path)
+            continue
+
+        actual_hash = compute_hash(full_path, algorithm)
+
+        if actual_hash is None:
+            results["error"].append(rel_path)
+        elif actual_hash == expected_hash:
+            results["ok"].append(rel_path)
+        else:
+            results["mismatch"].append({
+                "file": rel_path,
+                "expected": expected_hash,
+                "actual": actual_hash,
+                "algorithm": algorithm,
+            })
+
+    if strict:
+        for path in base_dir.rglob("*"):
+            if path.is_file() and path.resolve() not in checked_files:
+                try:
+                    rel = path.relative_to(base_dir)
+                    results["extra"].append(str(rel))
+                except ValueError:
+                    pass
+
+    return results
+
+
+def print_results(results, verbose=False):
+    ok_count = len(results["ok"])
+    mismatch_count = len(results["mismatch"])
+    missing_count = len(results["missing"])
+    extra_count = len(results["extra"])
+    error_count = len(results["error"])
+
+    print("\n" + "=" * 60)
+    print("MANIFEST VERIFICATION RESULTS")
+    print("=" * 60)
+
+    if verbose and results["ok"]:
+        print(f"\n[OK] Verified ({ok_count}):")
+        for f in sorted(results["ok"]):
+            print(f"  ✓  {f}")
+
+    if results["mismatch"]:
+        print(f"\n[FAIL] Hash Mismatch ({mismatch_count}):")
+        for item in sorted(results["mismatch"], key=lambda x: x["file"]):
+            print(f"  ✗  {item['file']}")
+            print(f"       Algorithm : {item['algorithm']}")
+            print(f"       Expected  : {item['expected']}")
+            print(f"       Actual    : {item['actual']}")
+
+    if results["missing"]:
+        print(f"\n[FAIL] Missing Files ({missing_count}):")
+        for f in sorted(results["missing"]):
+            print(f"  ?  {f}")
+
+    if results["extra"]:
+        print(f"\n[WARN] Extra Files Not in Manifest ({extra_count}):")
+        for f in sorted(results["extra"]):
+            print(f"  +  {f}")
+
+    if results["error"]:
+        print(f"\n[ERROR] Files with Errors ({error_count}):")
+        for f in sorted(results["error"]):
+            print(f"  !  {f}")
+
+    print("\n" + "-" * 60)
+    print(f"  Total checked : {ok_count + mismatch_count + missing_count + error_count}")
+    print(f"  Passed        : {ok_count}")
+    print(f"  Failed        : {mismatch_count + missing_count + error_count}")
+
+    if mismatch_count + missing_count + error_count == 0:
+        print("\n  ✓  All files verified successfully.")
+    else:
+        print(f"\n  ✗  Verification FAILED.")
+
+    print("=" * 60 + "\n")
+
+
+def generate_manifest(base_dir, output_path, algorithm="sha256", output_format="text"):
+    base_dir = Path(base_dir).resolve()
+    output_path = Path(output_path)
+    entries = {}
+
+    print(f"[INFO] Generating manifest for: {base_dir}")
+
+    for path in sorted(base_dir.rglob("*")):
+        if path.is_file() and path.resolve() != output_path.resolve():
+            rel = str(path.relative_to(base_dir))
+            h = compute_hash(path, algorithm)
+            if h:
+                entries[rel] = h
+                print(f"  Hashed: {rel}")
+
+    if output_format == "json":
+        data = {
+            "algorithm": algorithm,
+            "files": {k: v for k, v in entries.items()}
+        }
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    else:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(f"# algorithm: {algorithm}\n")
+            for filepath, hash_value in entries.items():
+                f.write(f"{hash_value}  {filepath}\n")
+
+    print(f"\n[INFO] Manifest written to: {output_path}")
+    print(f"[INFO] Total files: {len(entries)}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Verify project files against a manifest of hashes.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  Verify files against a manifest:
+    %(prog)s verify manifest.txt
+    %(prog)s verify manifest.json --dir /path/to/project
+    %(prog)s verify manifest.txt --strict --verbose
+
+  Generate a new manifest:
+    %(prog)s generate --output manifest.txt --algorithm sha256
+    %(prog)s generate --output manifest.json --format json --dir /path/to/project
+        """
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    verify_parser = subparsers.add_parser("verify", help="Verify files against a manifest")
+    verify_parser.add_argument("manifest", help="Path to the manifest file")
+    verify_parser.add_argument("--dir", default=".", help="Base directory of project files (default: current directory)")
+    verify_parser.add_argument("--strict", action="store_true", help="Fail if extra files exist that are not in the manifest")
+    verify_parser.add_argument("--verbose", "-v", action="store_true", help="Show all files including passing ones")
+    verify_parser.add_argument("--json-output", action="store_true", help="Output results as JSON")
+
+    gen_parser = subparsers.add_parser("generate", help="Generate a new manifest file")
+    gen_parser.add_argument("--dir", default=".", help="Base directory to hash (default: current directory)")
+    gen_parser.add_argument("--output", "-o", default="manifest.txt", help="Output manifest file path")
+    gen_parser.add_argument("--algorithm", "-a", default="sha256",
+                            choices=["sha256", "sha512", "sha1", "md5", "sha3_256"],
+                            help="Hash algorithm to use (default: sha256)")
+    gen_parser.add_argument("--format", "-f", default="text", choices=["text", "json"],
+                            help="Output format (default: text)")
+
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.command == "generate":
+        generate_manifest(
+            base_dir=args.dir,
+            output_path=args.output,
+            algorithm=args.algorithm,
+            output_format=args.format,
+        )
+        sys.exit(0)
+
+    if args.command == "verify":
+        manifest_entries = load_manifest(args.manifest)
+
+        if not manifest_entries:
+            print("[WARN] Manifest is empty or no valid entries found.", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[INFO] Loaded {len(manifest_entries)} entries from manifest.")
+        print(f"[INFO] Verifying against base directory: {Path(args.dir).resolve()}")
+
+        results = verify_manifest(
+            manifest_entries=manifest_entries,
+            base_dir=args.dir,
+            strict=args.strict,
+        )
+
+        if args.json_output:
+            output = {
+                "ok": results["ok"],
+                "mismatch": results["mismatch"],
+                "missing": results["missing"],
+                "extra": results["extra"],
+                "error": results["error"],
+                "summary": {
+                    "total": len(results["ok"]) + len(results["mismatch"]) + len(results["missing"]) + len(results["error"]),
+                    "passed": len(results["ok"]),
+                    "failed": len(results["mismatch"]) + len(results["missing"]) + len(results["error"]),
+                }
+            }
+            print(json.dumps(output, indent=2))
+        else:
+            print_results(results, verbose=args.verbose)
+
+        failed = len(results["mismatch"]) + len(results["missing"]) + len(results["error"])
+        sys.exit(1 if failed > 0 else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,362 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using Anthropic.SDK;
+using Anthropic.SDK.Messaging;
+
+public class CheckoutItem
+{
+    public string Name { get; set; } = string.Empty;
+    public decimal Price { get; set; }
+    public int Quantity { get; set; }
+}
+
+public class CheckoutRequest
+{
+    public List<CheckoutItem> Items { get; set; } = new List<CheckoutItem>();
+    public string? DiscountCode { get; set; }
+}
+
+public class CheckoutResult
+{
+    public decimal Subtotal { get; set; }
+    public decimal DiscountAmount { get; set; }
+    public decimal Tax { get; set; }
+    public decimal Total { get; set; }
+    public string Summary { get; set; } = string.Empty;
+}
+
+public class ShoppingCartCheckout
+{
+    private readonly AnthropicClient _client;
+    private readonly List<Tool> _tools;
+
+    public ShoppingCartCheckout()
+    {
+        _client = new AnthropicClient();
+        _tools = CreateTools();
+    }
+
+    private List<Tool> CreateTools()
+    {
+        return new List<Tool>
+        {
+            new Tool
+            {
+                Name = "calculate_subtotal",
+                Description = "Calculate the subtotal of all items in the cart",
+                InputSchema = new InputSchema
+                {
+                    Type = "object",
+                    Properties = new Dictionary<string, Property>
+                    {
+                        {
+                            "items", new Property
+                            {
+                                Type = "array",
+                                Description = "Array of cart items with name, price, and quantity"
+                            }
+                        }
+                    },
+                    Required = new List<string> { "items" }
+                }
+            },
+            new Tool
+            {
+                Name = "apply_discount",
+                Description = "Apply a discount code to the subtotal",
+                InputSchema = new InputSchema
+                {
+                    Type = "object",
+                    Properties = new Dictionary<string, Property>
+                    {
+                        {
+                            "subtotal", new Property
+                            {
+                                Type = "number",
+                                Description = "The subtotal amount before discount"
+                            }
+                        },
+                        {
+                            "discount_code", new Property
+                            {
+                                Type = "string",
+                                Description = "The discount code to apply"
+                            }
+                        }
+                    },
+                    Required = new List<string> { "subtotal", "discount_code" }
+                }
+            },
+            new Tool
+            {
+                Name = "calculate_tax",
+                Description = "Calculate tax on the discounted amount",
+                InputSchema = new InputSchema
+                {
+                    Type = "object",
+                    Properties = new Dictionary<string, Property>
+                    {
+                        {
+                            "amount", new Property
+                            {
+                                Type = "number",
+                                Description = "The amount to calculate tax on"
+                            }
+                        },
+                        {
+                            "tax_rate", new Property
+                            {
+                                Type = "number",
+                                Description = "The tax rate as a decimal (e.g., 0.08 for 8%)"
+                            }
+                        }
+                    },
+                    Required = new List<string> { "amount", "tax_rate" }
+                }
+            }
+        };
+    }
+
+    private string ProcessToolCall(string toolName, JsonElement toolInput)
+    {
+        switch (toolName)
+        {
+            case "calculate_subtotal":
+                return CalculateSubtotal(toolInput);
+            case "apply_discount":
+                return ApplyDiscount(toolInput);
+            case "calculate_tax":
+                return CalculateTax(toolInput);
+            default:
+                return JsonSerializer.Serialize(new { error = "Unknown tool" });
+        }
+    }
+
+    private string CalculateSubtotal(JsonElement input)
+    {
+        decimal subtotal = 0;
+        var itemsList = new List<object>();
+
+        if (input.TryGetProperty("items", out var items))
+        {
+            foreach (var item in items.EnumerateArray())
+            {
+                decimal price = 0;
+                int quantity = 1;
+                string name = "";
+
+                if (item.TryGetProperty("price", out var priceElement))
+                    price = priceElement.GetDecimal();
+                if (item.TryGetProperty("quantity", out var quantityElement))
+                    quantity = quantityElement.GetInt32();
+                if (item.TryGetProperty("name", out var nameElement))
+                    name = nameElement.GetString() ?? "";
+
+                decimal itemTotal = price * quantity;
+                subtotal += itemTotal;
+                itemsList.Add(new { name, price, quantity, item_total = itemTotal });
+            }
+        }
+
+        return JsonSerializer.Serialize(new { subtotal, items = itemsList });
+    }
+
+    private string ApplyDiscount(JsonElement input)
+    {
+        decimal subtotal = 0;
+        string discountCode = "";
+
+        if (input.TryGetProperty("subtotal", out var subtotalElement))
+            subtotal = subtotalElement.GetDecimal();
+        if (input.TryGetProperty("discount_code", out var codeElement))
+            discountCode = codeElement.GetString() ?? "";
+
+        decimal discountRate = discountCode.ToUpper() switch
+        {
+            "SAVE10" => 0.10m,
+            "SAVE20" => 0.20m,
+            "SAVE30" => 0.30m,
+            "WELCOME" => 0.15m,
+            _ => 0m
+        };
+
+        decimal discountAmount = subtotal * discountRate;
+        decimal discountedTotal = subtotal - discountAmount;
+
+        return JsonSerializer.Serialize(new
+        {
+            original_subtotal = subtotal,
+            discount_code = discountCode,
+            discount_rate = discountRate,
+            discount_amount = discountAmount,
+            discounted_total = discountedTotal,
+            valid_code = discountRate > 0
+        });
+    }
+
+    private string CalculateTax(JsonElement input)
+    {
+        decimal amount = 0;
+        decimal taxRate = 0.08m;
+
+        if (input.TryGetProperty("amount", out var amountElement))
+            amount = amountElement.GetDecimal();
+        if (input.TryGetProperty("tax_rate", out var rateElement))
+            taxRate = rateElement.GetDecimal();
+
+        decimal taxAmount = amount * taxRate;
+        decimal totalWithTax = amount + taxAmount;
+
+        return JsonSerializer.Serialize(new
+        {
+            pre_tax_amount = amount,
+            tax_rate = taxRate,
+            tax_amount = taxAmount,
+            total_with_tax = totalWithTax
+        });
+    }
+
+    public async Task<CheckoutResult> ProcessCheckoutAsync(CheckoutRequest request)
+    {
+        var itemsJson = JsonSerializer.Serialize(request.Items);
+        var userMessage = $@"Process a checkout for the following cart:
+Items: {itemsJson}
+Discount Code: {request.DiscountCode ?? "none"}
+
+Please:
+1. Calculate the subtotal for all items
+2. Apply the discount code if provided (valid codes: SAVE10, SAVE20, SAVE30, WELCOME)
+3. Calculate 8% tax on the discounted amount
+4. Provide a complete summary of the checkout
+
+Use the available tools to perform each calculation step.";
+
+        var messages = new List<Message>
+        {
+            new Message { Role = RoleType.User, Content = userMessage }
+        };
+
+        var result = new CheckoutResult();
+        string finalSummary = "";
+
+        while (true)
+        {
+            var response = await _client.Messages.GetClaudeMessageAsync(new MessageParameters
+            {
+                Model = AnthropicModels.Claude3_5Sonnet,
+                MaxTokens = 4096,
+                Messages = messages,
+                Tools = _tools
+            });
+
+            if (response.StopReason == "tool_use")
+            {
+                var assistantMessage = new Message
+                {
+                    Role = RoleType.Assistant,
+                    Content = response.Content
+                };
+                messages.Add(assistantMessage);
+
+                var toolResults = new List<ToolResultContent>();
+
+                foreach (var content in response.Content)
+                {
+                    if (content is ToolUseContent toolUse)
+                    {
+                        var toolResult = ProcessToolCall(toolUse.Name, toolUse.Input);
+                        toolResults.Add(new ToolResultContent
+                        {
+                            ToolUseId = toolUse.Id,
+                            Content = toolResult
+                        });
+
+                        // Extract values from tool results for our CheckoutResult
+                        var resultJson = JsonSerializer.Deserialize<JsonElement>(toolResult);
+                        
+                        if (toolUse.Name == "calculate_subtotal" && resultJson.TryGetProperty("subtotal", out var subtotalProp))
+                        {
+                            result.Subtotal = subtotalProp.GetDecimal();
+                        }
+                        else if (toolUse.Name == "apply_discount" && resultJson.TryGetProperty("discount_amount", out var discountProp))
+                        {
+                            result.DiscountAmount = discountProp.GetDecimal();
+                        }
+                        else if (toolUse.Name == "calculate_tax")
+                        {
+                            if (resultJson.TryGetProperty("tax_amount", out var taxProp))
+                                result.Tax = taxProp.GetDecimal();
+                            if (resultJson.TryGetProperty("total_with_tax", out var totalProp))
+                                result.Total = totalProp.GetDecimal();
+                        }
+                    }
+                }
+
+                var toolResultMessage = new Message
+                {
+                    Role = RoleType.User,
+                    Content = toolResults.Cast<ContentBase>().ToList()
+                };
+                messages.Add(toolResultMessage);
+            }
+            else
+            {
+                // Extract the final text summary
+                foreach (var content in response.Content)
+                {
+                    if (content is TextContent textContent)
+                    {
+                        finalSummary = textContent.Text;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        result.Summary = finalSummary;
+        return result;
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        Console.WriteLine("Shopping Cart Checkout System");
+        Console.WriteLine("==============================\n");
+
+        var checkout = new ShoppingCartCheckout();
+
+        // Example checkout request
+        var request = new CheckoutRequest
+        {
+            Items = new List<CheckoutItem>
+            {
+                new CheckoutItem { Name = "Laptop", Price = 999.99m, Quantity = 1 },
+                new CheckoutItem { Name = "Mouse", Price = 29.99m, Quantity = 2 },
+                new CheckoutItem { Name = "Keyboard", Price = 79.99m, Quantity = 1 },
+                new CheckoutItem { Name = "USB Hub", Price = 39.99m, Quantity = 1 }
+            },
+            DiscountCode = "SAVE20"
+        };
+
+        Console.WriteLine("Processing checkout...");
+        Console.WriteLine($"Items: {request.Items.Count}");
+        Console.WriteLine($"Discount Code: {request.DiscountCode}\n");
+
+        var result = await checkout.ProcessCheckoutAsync(request);
+
+        Console.WriteLine("Checkout Results:");
+        Console.WriteLine($"Subtotal: ${result.Subtotal:F2}");
+        Console.WriteLine($"Discount: -${result.DiscountAmount:F2}");
+        Console.WriteLine($"Tax (8%): ${result.Tax:F2}");
+        Console.WriteLine($"Total: ${result.Total:F2}");
+        Console.WriteLine("\nDetailed Summary from AI:");
+        Console.WriteLine(result.Summary);
+    }
+}
+```

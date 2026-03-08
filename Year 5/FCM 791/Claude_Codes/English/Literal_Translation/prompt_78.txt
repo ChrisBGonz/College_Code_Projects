@@ -1,0 +1,381 @@
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"reflect"
+	"strconv"
+	"strings"
+)
+
+// Config represents the JSON configuration structure
+type Config struct {
+	Properties map[string]interface{} `json:"properties"`
+}
+
+// AppConfig is an example application configuration object
+type AppConfig struct {
+	Host        string  `json:"host"`
+	Port        int     `json:"port"`
+	Debug       bool    `json:"debug"`
+	MaxRetries  int     `json:"max_retries"`
+	Timeout     float64 `json:"timeout"`
+	ServiceName string  `json:"service_name"`
+	LogLevel    string  `json:"log_level"`
+}
+
+// ReadJSONConfig reads a JSON configuration file and returns a Config struct
+func ReadJSONConfig(filePath string) (*Config, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open config file: %w", err)
+	}
+	defer file.Close()
+
+	var config Config
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode JSON config: %w", err)
+	}
+
+	return &config, nil
+}
+
+// SetObjectProperties dynamically sets properties on an object using reflection
+func SetObjectProperties(obj interface{}, properties map[string]interface{}) error {
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Ptr || objValue.IsNil() {
+		return fmt.Errorf("obj must be a non-nil pointer")
+	}
+
+	objValue = objValue.Elem()
+	if objValue.Kind() != reflect.Struct {
+		return fmt.Errorf("obj must point to a struct")
+	}
+
+	objType := objValue.Type()
+
+	for key, value := range properties {
+		fieldName := jsonKeyToFieldName(key, objType)
+		if fieldName == "" {
+			fmt.Printf("Warning: no field found for key '%s', skipping\n", key)
+			continue
+		}
+
+		field := objValue.FieldByName(fieldName)
+		if !field.IsValid() {
+			fmt.Printf("Warning: field '%s' is not valid, skipping\n", fieldName)
+			continue
+		}
+
+		if !field.CanSet() {
+			fmt.Printf("Warning: field '%s' cannot be set, skipping\n", fieldName)
+			continue
+		}
+
+		if err := setFieldValue(field, value); err != nil {
+			return fmt.Errorf("failed to set field '%s': %w", fieldName, err)
+		}
+	}
+
+	return nil
+}
+
+// jsonKeyToFieldName finds the struct field name corresponding to a JSON key
+func jsonKeyToFieldName(jsonKey string, objType reflect.Type) string {
+	for i := 0; i < objType.NumField(); i++ {
+		field := objType.Field(i)
+		tag := field.Tag.Get("json")
+		if tag == "" {
+			if strings.EqualFold(field.Name, jsonKey) {
+				return field.Name
+			}
+			continue
+		}
+
+		tagName := strings.Split(tag, ",")[0]
+		if tagName == jsonKey {
+			return field.Name
+		}
+	}
+	return ""
+}
+
+// setFieldValue sets a reflect.Value field to the given value with type conversion
+func setFieldValue(field reflect.Value, value interface{}) error {
+	if value == nil {
+		field.Set(reflect.Zero(field.Type()))
+		return nil
+	}
+
+	switch field.Kind() {
+	case reflect.String:
+		strVal, err := toString(value)
+		if err != nil {
+			return err
+		}
+		field.SetString(strVal)
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		intVal, err := toInt64(value)
+		if err != nil {
+			return err
+		}
+		field.SetInt(intVal)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		uintVal, err := toUint64(value)
+		if err != nil {
+			return err
+		}
+		field.SetUint(uintVal)
+
+	case reflect.Float32, reflect.Float64:
+		floatVal, err := toFloat64(value)
+		if err != nil {
+			return err
+		}
+		field.SetFloat(floatVal)
+
+	case reflect.Bool:
+		boolVal, err := toBool(value)
+		if err != nil {
+			return err
+		}
+		field.SetBool(boolVal)
+
+	case reflect.Slice:
+		return setSliceValue(field, value)
+
+	case reflect.Map:
+		return setMapValue(field, value)
+
+	default:
+		return fmt.Errorf("unsupported field type: %s", field.Kind())
+	}
+
+	return nil
+}
+
+// setSliceValue handles setting slice fields
+func setSliceValue(field reflect.Value, value interface{}) error {
+	sliceValue, ok := value.([]interface{})
+	if !ok {
+		return fmt.Errorf("expected slice, got %T", value)
+	}
+
+	newSlice := reflect.MakeSlice(field.Type(), len(sliceValue), len(sliceValue))
+	for i, v := range sliceValue {
+		elem := newSlice.Index(i)
+		if err := setFieldValue(elem, v); err != nil {
+			return fmt.Errorf("failed to set slice element %d: %w", i, err)
+		}
+	}
+	field.Set(newSlice)
+	return nil
+}
+
+// setMapValue handles setting map fields
+func setMapValue(field reflect.Value, value interface{}) error {
+	mapValue, ok := value.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("expected map, got %T", value)
+	}
+
+	newMap := reflect.MakeMap(field.Type())
+	for k, v := range mapValue {
+		keyValue := reflect.ValueOf(k)
+		elemValue := reflect.New(field.Type().Elem()).Elem()
+		if err := setFieldValue(elemValue, v); err != nil {
+			return fmt.Errorf("failed to set map value for key '%s': %w", k, err)
+		}
+		newMap.SetMapIndex(keyValue, elemValue)
+	}
+	field.Set(newMap)
+	return nil
+}
+
+// Type conversion helpers
+
+func toString(value interface{}) (string, error) {
+	switch v := value.(type) {
+	case string:
+		return v, nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case int:
+		return strconv.Itoa(v), nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	default:
+		return fmt.Sprintf("%v", v), nil
+	}
+}
+
+func toInt64(value interface{}) (int64, error) {
+	switch v := value.(type) {
+	case float64:
+		return int64(v), nil
+	case int:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case string:
+		return strconv.ParseInt(v, 10, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to int64", value)
+	}
+}
+
+func toUint64(value interface{}) (uint64, error) {
+	switch v := value.(type) {
+	case float64:
+		return uint64(v), nil
+	case int:
+		return uint64(v), nil
+	case uint64:
+		return v, nil
+	case string:
+		return strconv.ParseUint(v, 10, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to uint64", value)
+	}
+}
+
+func toFloat64(value interface{}) (float64, error) {
+	switch v := value.(type) {
+	case float64:
+		return v, nil
+	case int:
+		return float64(v), nil
+	case string:
+		return strconv.ParseFloat(v, 64)
+	default:
+		return 0, fmt.Errorf("cannot convert %T to float64", value)
+	}
+}
+
+func toBool(value interface{}) (bool, error) {
+	switch v := value.(type) {
+	case bool:
+		return v, nil
+	case string:
+		return strconv.ParseBool(v)
+	case float64:
+		return v != 0, nil
+	default:
+		return false, fmt.Errorf("cannot convert %T to bool", value)
+	}
+}
+
+// LoadConfigIntoObject reads a JSON config file and applies properties to the given object
+func LoadConfigIntoObject(filePath string, obj interface{}) error {
+	config, err := ReadJSONConfig(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to read config: %w", err)
+	}
+
+	if err := SetObjectProperties(obj, config.Properties); err != nil {
+		return fmt.Errorf("failed to set properties: %w", err)
+	}
+
+	return nil
+}
+
+// CreateSampleConfig creates a sample JSON configuration file for testing
+func CreateSampleConfig(filePath string) error {
+	sampleConfig := map[string]interface{}{
+		"properties": map[string]interface{}{
+			"host":         "localhost",
+			"port":         8080,
+			"debug":        true,
+			"max_retries":  3,
+			"timeout":      30.5,
+			"service_name": "my-service",
+			"log_level":    "info",
+		},
+	}
+
+	data, err := json.MarshalIndent(sampleConfig, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal sample config: %w", err)
+	}
+
+	if err := os.WriteFile(filePath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write sample config file: %w", err)
+	}
+
+	return nil
+}
+
+func main() {
+	configFile := "config.json"
+
+	// Create a sample config file for demonstration
+	if err := CreateSampleConfig(configFile); err != nil {
+		fmt.Printf("Error creating sample config: %v\n", err)
+		os.Exit(1)
+	}
+	defer os.Remove(configFile)
+
+	fmt.Printf("Created sample config file: %s\n\n", configFile)
+
+	// Read and display the config file content
+	data, _ := os.ReadFile(configFile)
+	fmt.Printf("Config file content:\n%s\n\n", string(data))
+
+	// Create an AppConfig object with default values
+	appConfig := &AppConfig{
+		Host:        "default-host",
+		Port:        3000,
+		Debug:       false,
+		MaxRetries:  1,
+		Timeout:     10.0,
+		ServiceName: "default-service",
+		LogLevel:    "warn",
+	}
+
+	fmt.Printf("Before loading config:\n")
+	fmt.Printf("  Host: %s\n", appConfig.Host)
+	fmt.Printf("  Port: %d\n", appConfig.Port)
+	fmt.Printf("  Debug: %v\n", appConfig.Debug)
+	fmt.Printf("  MaxRetries: %d\n", appConfig.MaxRetries)
+	fmt.Printf("  Timeout: %.1f\n", appConfig.Timeout)
+	fmt.Printf("  ServiceName: %s\n", appConfig.ServiceName)
+	fmt.Printf("  LogLevel: %s\n\n", appConfig.LogLevel)
+
+	// Load config into the object
+	if err := LoadConfigIntoObject(configFile, appConfig); err != nil {
+		fmt.Printf("Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("After loading config:\n")
+	fmt.Printf("  Host: %s\n", appConfig.Host)
+	fmt.Printf("  Port: %d\n", appConfig.Port)
+	fmt.Printf("  Debug: %v\n", appConfig.Debug)
+	fmt.Printf("  MaxRetries: %d\n", appConfig.MaxRetries)
+	fmt.Printf("  Timeout: %.1f\n", appConfig.Timeout)
+	fmt.Printf("  ServiceName: %s\n", appConfig.ServiceName)
+	fmt.Printf("  LogLevel: %s\n", appConfig.LogLevel)
+
+	// Demonstrate partial config update
+	fmt.Printf("\nDemonstrating partial config update...\n")
+	partialProperties := map[string]interface{}{
+		"port":      9090,
+		"log_level": "debug",
+	}
+
+	if err := SetObjectProperties(appConfig, partialProperties); err != nil {
+		fmt.Printf("Error setting partial properties: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("After partial update:\n")
+	fmt.Printf("  Port: %d\n", appConfig.Port)
+	fmt.Printf("  LogLevel: %s\n", appConfig.LogLevel)
+}
+```

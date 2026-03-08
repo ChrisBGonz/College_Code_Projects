@@ -1,0 +1,258 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.Serialization.Formatters.Binary;
+using Anthropic.SDK;
+using Anthropic.SDK.Messaging;
+
+[Serializable]
+public class ApplicationSettings
+{
+    public string Theme { get; set; } = "Light";
+    public int FontSize { get; set; } = 12;
+    public bool AutoSave { get; set; } = true;
+    public string Language { get; set; } = "English";
+    public Dictionary<string, string> CustomSettings { get; set; } = new Dictionary<string, string>();
+    
+    public override string ToString()
+    {
+        var customSettingsStr = string.Join(", ", CustomSettings.Select(kvp => $"{kvp.Key}={kvp.Value}"));
+        return $"Theme: {Theme}, FontSize: {FontSize}, AutoSave: {AutoSave}, Language: {Language}, CustomSettings: [{customSettingsStr}]";
+    }
+}
+
+public class SettingsManager
+{
+    private readonly string _settingsFilePath;
+    
+    public SettingsManager(string settingsFilePath = "app_settings.bin")
+    {
+        _settingsFilePath = settingsFilePath;
+    }
+    
+    public void SaveSettings(ApplicationSettings settings)
+    {
+        try
+        {
+#pragma warning disable SYSLIB0011
+            var formatter = new BinaryFormatter();
+#pragma warning restore SYSLIB0011
+            using var stream = new FileStream(_settingsFilePath, FileMode.Create, FileAccess.Write);
+            formatter.Serialize(stream, settings);
+            Console.WriteLine($"Settings saved to {_settingsFilePath}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error saving settings: {ex.Message}");
+            throw;
+        }
+    }
+    
+    public ApplicationSettings LoadSettings()
+    {
+        try
+        {
+            if (!File.Exists(_settingsFilePath))
+            {
+                Console.WriteLine("Settings file not found. Returning default settings.");
+                return new ApplicationSettings();
+            }
+            
+#pragma warning disable SYSLIB0011
+            var formatter = new BinaryFormatter();
+#pragma warning restore SYSLIB0011
+            using var stream = new FileStream(_settingsFilePath, FileMode.Open, FileAccess.Read);
+            var settings = (ApplicationSettings)formatter.Deserialize(stream);
+            Console.WriteLine($"Settings loaded from {_settingsFilePath}");
+            return settings;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Error loading settings: {ex.Message}");
+            throw;
+        }
+    }
+    
+    public void DeleteSettings()
+    {
+        if (File.Exists(_settingsFilePath))
+        {
+            File.Delete(_settingsFilePath);
+            Console.WriteLine($"Settings file {_settingsFilePath} deleted.");
+        }
+    }
+}
+
+class Program
+{
+    static async Task Main(string[] args)
+    {
+        var settingsManager = new SettingsManager();
+        var conversationHistory = new List<Message>();
+        
+        // Create initial settings
+        var currentSettings = new ApplicationSettings
+        {
+            Theme = "Dark",
+            FontSize = 14,
+            AutoSave = true,
+            Language = "English",
+            CustomSettings = new Dictionary<string, string>
+            {
+                { "BackupInterval", "30" },
+                { "MaxRecentFiles", "10" }
+            }
+        };
+        
+        // Save initial settings
+        settingsManager.SaveSettings(currentSettings);
+        Console.WriteLine($"Initial settings: {currentSettings}\n");
+        
+        var client = new AnthropicClient();
+        
+        Console.WriteLine("Settings Manager with Claude AI Assistant");
+        Console.WriteLine("==========================================");
+        Console.WriteLine("You can ask Claude to help you manage your application settings.");
+        Console.WriteLine("Type 'exit' to quit.\n");
+        
+        while (true)
+        {
+            Console.Write("You: ");
+            var userInput = Console.ReadLine();
+            
+            if (string.IsNullOrWhiteSpace(userInput) || userInput.ToLower() == "exit")
+                break;
+            
+            // Load current settings to provide context
+            var loadedSettings = settingsManager.LoadSettings();
+            
+            // Add context about current settings to the conversation
+            var systemPrompt = $@"You are a helpful assistant for managing application settings. 
+The current application settings are:
+- Theme: {loadedSettings.Theme}
+- Font Size: {loadedSettings.FontSize}
+- Auto Save: {loadedSettings.AutoSave}
+- Language: {loadedSettings.Language}
+- Custom Settings: {string.Join(", ", loadedSettings.CustomSettings.Select(kvp => $"{kvp.Key}={kvp.Value}"))}
+
+When the user wants to change settings, provide specific recommendations and explain what changes should be made.
+If the user asks to change a setting, respond with the new value in a clear format like 'Setting: Value'.
+For example: 'Theme: Light' or 'FontSize: 16' or 'AutoSave: false'.";
+            
+            conversationHistory.Add(new Message
+            {
+                Role = RoleType.User,
+                Content = userInput
+            });
+            
+            var messageRequest = new MessageParameters
+            {
+                Model = AnthropicModels.Claude3_5Sonnet,
+                MaxTokens = 1024,
+                System = new List<SystemMessage> { new SystemMessage(systemPrompt) },
+                Messages = conversationHistory
+            };
+            
+            var response = await client.Messages.GetClaudeMessageAsync(messageRequest);
+            var assistantMessage = response.Content[0].ToString();
+            
+            conversationHistory.Add(new Message
+            {
+                Role = RoleType.Assistant,
+                Content = assistantMessage
+            });
+            
+            Console.WriteLine($"\nClaude: {assistantMessage}\n");
+            
+            // Parse Claude's response for setting changes
+            var updatedSettings = ParseAndApplySettings(assistantMessage, loadedSettings);
+            
+            if (updatedSettings != null)
+            {
+                settingsManager.SaveSettings(updatedSettings);
+                Console.WriteLine($"Updated settings saved: {updatedSettings}\n");
+            }
+        }
+        
+        // Final settings display
+        Console.WriteLine("\nFinal Settings:");
+        var finalSettings = settingsManager.LoadSettings();
+        Console.WriteLine(finalSettings);
+    }
+    
+    static ApplicationSettings ParseAndApplySettings(string response, ApplicationSettings currentSettings)
+    {
+        bool settingsChanged = false;
+        var newSettings = new ApplicationSettings
+        {
+            Theme = currentSettings.Theme,
+            FontSize = currentSettings.FontSize,
+            AutoSave = currentSettings.AutoSave,
+            Language = currentSettings.Language,
+            CustomSettings = new Dictionary<string, string>(currentSettings.CustomSettings)
+        };
+        
+        // Simple parsing logic for demonstration
+        var lines = response.Split('\n');
+        foreach (var line in lines)
+        {
+            if (line.Contains("Theme:") && !line.Contains("current"))
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 2)
+                {
+                    var theme = parts[1].Trim().Split(' ')[0].Trim('*', ' ', '.', ',');
+                    if (!string.IsNullOrEmpty(theme) && (theme == "Light" || theme == "Dark"))
+                    {
+                        newSettings.Theme = theme;
+                        settingsChanged = true;
+                    }
+                }
+            }
+            else if (line.Contains("FontSize:") || line.Contains("Font Size:"))
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 2)
+                {
+                    var sizeStr = parts[1].Trim().Split(' ')[0].Trim('*', ' ', '.', ',');
+                    if (int.TryParse(sizeStr, out int fontSize) && fontSize > 0 && fontSize <= 72)
+                    {
+                        newSettings.FontSize = fontSize;
+                        settingsChanged = true;
+                    }
+                }
+            }
+            else if (line.Contains("AutoSave:") || line.Contains("Auto Save:"))
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 2)
+                {
+                    var value = parts[1].Trim().ToLower().Split(' ')[0].Trim('*', ' ', '.', ',');
+                    if (value == "true" || value == "false")
+                    {
+                        newSettings.AutoSave = value == "true";
+                        settingsChanged = true;
+                    }
+                }
+            }
+            else if (line.Contains("Language:"))
+            {
+                var parts = line.Split(':');
+                if (parts.Length >= 2)
+                {
+                    var language = parts[1].Trim().Split(' ')[0].Trim('*', ' ', '.', ',');
+                    if (!string.IsNullOrEmpty(language))
+                    {
+                        newSettings.Language = language;
+                        settingsChanged = true;
+                    }
+                }
+            }
+        }
+        
+        return settingsChanged ? newSettings : null;
+    }
+}
+```

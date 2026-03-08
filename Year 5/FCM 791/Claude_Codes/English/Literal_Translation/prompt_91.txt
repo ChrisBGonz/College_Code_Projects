@@ -1,0 +1,188 @@
+
+```python
+import anthropic
+import json
+import time
+import random
+
+client = anthropic.Anthropic()
+
+def simulate_payment_api(amount: float, currency: str, card_number: str) -> dict:
+    """Simulates an external payment API that might be slow."""
+    # Simulate random API response time (sometimes slow)
+    response_time = random.uniform(0.5, 4.0)
+    time.sleep(response_time)
+    
+    return {
+        "status": "success",
+        "transaction_id": f"TXN_{random.randint(10000, 99999)}",
+        "amount": amount,
+        "currency": currency,
+        "response_time": response_time
+    }
+
+def process_payment_with_timeout(amount: float, currency: str, card_number: str) -> bool:
+    """
+    Process payment using Claude's tool use with timeout handling.
+    Returns True if payment should proceed (either success or timeout).
+    """
+    
+    tools = [
+        {
+            "name": "call_payment_api",
+            "description": "Calls the external payment API to process a payment transaction. This API might be slow or unresponsive.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "amount": {
+                        "type": "number",
+                        "description": "The payment amount"
+                    },
+                    "currency": {
+                        "type": "string",
+                        "description": "The currency code (e.g., USD, EUR)"
+                    },
+                    "card_number": {
+                        "type": "string",
+                        "description": "The card number for payment"
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "description": "Maximum seconds to wait for API response"
+                    }
+                },
+                "required": ["amount", "currency", "card_number", "timeout_seconds"]
+            }
+        }
+    ]
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"Process a payment of {amount} {currency} for card ending in {card_number[-4:]}. Use the payment API with a 2-second timeout. If the API doesn't respond within 2 seconds, allow the transaction to proceed."
+        }
+    ]
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        tools=tools,
+        messages=messages
+    )
+    
+    if response.stop_reason == "tool_use":
+        tool_use_block = None
+        for block in response.content:
+            if block.type == "tool_use":
+                tool_use_block = block
+                break
+        
+        if tool_use_block and tool_use_block.name == "call_payment_api":
+            tool_input = tool_use_block.input
+            timeout = tool_input.get("timeout_seconds", 2.0)
+            
+            print(f"Calling payment API with {timeout}s timeout...")
+            
+            import threading
+            result = {"response": None, "timed_out": False}
+            
+            def api_call():
+                try:
+                    result["response"] = simulate_payment_api(
+                        tool_input["amount"],
+                        tool_input["currency"],
+                        tool_input["card_number"]
+                    )
+                except Exception as e:
+                    result["error"] = str(e)
+            
+            thread = threading.Thread(target=api_call)
+            thread.start()
+            thread.join(timeout=timeout)
+            
+            if thread.is_alive():
+                result["timed_out"] = True
+                print(f"Payment API timed out after {timeout} seconds")
+                tool_result = {
+                    "status": "timeout",
+                    "message": f"API did not respond within {timeout} seconds",
+                    "allow_proceed": True
+                }
+            else:
+                if result.get("response"):
+                    print(f"Payment API responded in {result['response']['response_time']:.2f}s")
+                    tool_result = result["response"]
+                    tool_result["allow_proceed"] = True
+                else:
+                    tool_result = {
+                        "status": "error",
+                        "message": result.get("error", "Unknown error"),
+                        "allow_proceed": False
+                    }
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_block.id,
+                        "content": json.dumps(tool_result)
+                    }
+                ]
+            })
+            
+            final_response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=1024,
+                tools=tools,
+                messages=messages
+            )
+            
+            final_text = ""
+            for block in final_response.content:
+                if hasattr(block, "text"):
+                    final_text = block.text
+                    break
+            
+            print(f"Claude's decision: {final_text}")
+            
+            if result["timed_out"]:
+                return True
+            elif tool_result.get("status") == "success":
+                return True
+            else:
+                return False
+    
+    return True
+
+def main():
+    print("=== Payment Processing System ===\n")
+    
+    test_cases = [
+        {"amount": 99.99, "currency": "USD", "card_number": "4111111111111111"},
+        {"amount": 250.00, "currency": "EUR", "card_number": "5500005555555559"},
+        {"amount": 15.50, "currency": "GBP", "card_number": "340000000000009"},
+    ]
+    
+    for i, payment in enumerate(test_cases, 1):
+        print(f"\nTest Case {i}: Processing payment of {payment['amount']} {payment['currency']}")
+        print(f"Card: ****{payment['card_number'][-4:]}")
+        print("-" * 40)
+        
+        result = process_payment_with_timeout(
+            payment["amount"],
+            payment["currency"],
+            payment["card_number"]
+        )
+        
+        if result:
+            print(f"✓ Payment ALLOWED to proceed")
+        else:
+            print(f"✗ Payment BLOCKED")
+        
+        print("=" * 50)
+
+if __name__ == "__main__":
+    main()
+```

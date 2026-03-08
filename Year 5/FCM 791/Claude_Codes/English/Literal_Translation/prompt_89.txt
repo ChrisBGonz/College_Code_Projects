@@ -1,0 +1,261 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Store conversation history for multi-turn conversations
+const conversationHistory = [];
+
+async function analyzeAndLogError(error, context = {}) {
+  const errorInfo = {
+    message: error.message || String(error),
+    stack: error.stack || "No stack trace available",
+    timestamp: new Date().toISOString(),
+    context: context,
+  };
+
+  // Add error to conversation history
+  conversationHistory.push({
+    role: "user",
+    content: `Analyze this production error and provide a concise log message:
+Error: ${errorInfo.message}
+Stack: ${errorInfo.stack}
+Context: ${JSON.stringify(errorInfo.context)}
+Timestamp: ${errorInfo.timestamp}
+
+Provide a structured log entry with severity level, summary, and recommended action.`,
+  });
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 500,
+      system: `You are a production error logging assistant. When given error information, 
+      you analyze it and provide structured log entries. Always respond with a JSON object containing:
+      - severity: "CRITICAL", "ERROR", "WARNING", or "INFO"
+      - summary: A brief one-line description of the error
+      - details: Technical details about what went wrong
+      - action: Recommended immediate action
+      - logMessage: The formatted console.log message to use`,
+      messages: conversationHistory,
+    });
+
+    const assistantMessage = response.content[0].text;
+
+    // Add assistant response to history
+    conversationHistory.push({
+      role: "assistant",
+      content: assistantMessage,
+    });
+
+    // Parse the JSON response
+    let logData;
+    try {
+      // Extract JSON from the response
+      const jsonMatch = assistantMessage.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        logData = JSON.parse(jsonMatch[0]);
+      } else {
+        throw new Error("No JSON found in response");
+      }
+    } catch (parseError) {
+      // Fallback if JSON parsing fails
+      logData = {
+        severity: "ERROR",
+        summary: error.message,
+        details: error.stack,
+        action: "Investigate immediately",
+        logMessage: `[ERROR] ${error.message}`,
+      };
+    }
+
+    // Log to console with appropriate severity
+    const timestamp = new Date().toISOString();
+    const logPrefix = `[${timestamp}] [${logData.severity}]`;
+
+    switch (logData.severity) {
+      case "CRITICAL":
+        console.log(`${logPrefix} 🚨 CRITICAL: ${logData.summary}`);
+        console.log(`${logPrefix} Details: ${logData.details}`);
+        console.log(`${logPrefix} Action Required: ${logData.action}`);
+        break;
+      case "ERROR":
+        console.log(`${logPrefix} ❌ ERROR: ${logData.summary}`);
+        console.log(`${logPrefix} Details: ${logData.details}`);
+        console.log(`${logPrefix} Action: ${logData.action}`);
+        break;
+      case "WARNING":
+        console.log(`${logPrefix} ⚠️ WARNING: ${logData.summary}`);
+        console.log(`${logPrefix} Details: ${logData.details}`);
+        break;
+      default:
+        console.log(`${logPrefix} ℹ️ INFO: ${logData.summary}`);
+    }
+
+    return logData;
+  } catch (apiError) {
+    // Fallback logging if API call fails
+    console.log(
+      `[${new Date().toISOString()}] [ERROR] Failed to analyze error with AI: ${apiError.message}`
+    );
+    console.log(
+      `[${new Date().toISOString()}] [ERROR] Original error: ${error.message}`
+    );
+    console.log(
+      `[${new Date().toISOString()}] [ERROR] Stack: ${error.stack}`
+    );
+
+    return {
+      severity: "ERROR",
+      summary: error.message,
+      details: error.stack,
+      action: "Investigate immediately",
+      logMessage: `[ERROR] ${error.message}`,
+    };
+  }
+}
+
+async function getErrorInsights(errorType) {
+  // Continue conversation to get more insights about error patterns
+  conversationHistory.push({
+    role: "user",
+    content: `Based on the errors we've discussed, what are the common patterns for "${errorType}" errors and how can we prevent them in production?`,
+  });
+
+  try {
+    const response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 800,
+      system: `You are a production error logging assistant with expertise in Node.js and Express applications. 
+      Provide actionable insights about error patterns and prevention strategies.`,
+      messages: conversationHistory,
+    });
+
+    const insights = response.content[0].text;
+
+    conversationHistory.push({
+      role: "assistant",
+      content: insights,
+    });
+
+    return insights;
+  } catch (error) {
+    return `Unable to get insights: ${error.message}`;
+  }
+}
+
+// Express middleware for error logging
+const productionErrorLogger = async (err, req, res, next) => {
+  const context = {
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+    body: req.body,
+    params: req.params,
+    query: req.query,
+    ip: req.ip,
+  };
+
+  // Log the error using AI analysis
+  const logData = await analyzeAndLogError(err, context);
+
+  // Send appropriate response
+  const statusCode = err.status || err.statusCode || 500;
+  res.status(statusCode).json({
+    error: {
+      message:
+        process.env.NODE_ENV === "production"
+          ? "An internal server error occurred"
+          : err.message,
+      severity: logData.severity,
+      timestamp: new Date().toISOString(),
+    },
+  });
+};
+
+// Example routes to demonstrate error logging
+app.get("/test-error", (req, res, next) => {
+  const error = new Error("Database connection failed");
+  error.status = 500;
+  next(error);
+});
+
+app.get("/test-warning", (req, res, next) => {
+  const error = new Error("Rate limit exceeded for user");
+  error.status = 429;
+  next(error);
+});
+
+app.get("/test-critical", (req, res, next) => {
+  const error = new Error("Payment processing system unavailable");
+  error.status = 503;
+  next(error);
+});
+
+app.get("/insights/:errorType", async (req, res) => {
+  const { errorType } = req.params;
+  const insights = await getErrorInsights(errorType);
+  res.json({ insights });
+});
+
+// Apply error logging middleware
+app.use(productionErrorLogger);
+
+// Main function to demonstrate the error logging system
+async function main() {
+  console.log("Starting Production Error Logging System...\n");
+
+  // Simulate various production errors
+  const testErrors = [
+    {
+      error: new Error("Database connection timeout after 30 seconds"),
+      context: { service: "user-service", operation: "getUserById", userId: 12345 },
+    },
+    {
+      error: new Error("Memory heap out of bounds"),
+      context: { service: "image-processor", memoryUsage: "98%", timestamp: Date.now() },
+    },
+    {
+      error: new Error("API rate limit exceeded"),
+      context: { service: "external-api", endpoint: "/api/v1/data", requestCount: 1000 },
+    },
+  ];
+
+  console.log("=== Testing Error Logging System ===\n");
+
+  for (const testCase of testErrors) {
+    console.log(`\nAnalyzing error: ${testCase.error.message}`);
+    console.log("---");
+    await analyzeAndLogError(testCase.error, testCase.context);
+    console.log("---\n");
+
+    // Small delay between requests
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+  }
+
+  // Get insights about database errors
+  console.log("\n=== Getting Error Pattern Insights ===\n");
+  const insights = await getErrorInsights("database connection");
+  console.log("Error Pattern Insights:");
+  console.log(insights);
+
+  // Start the Express server
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`\n=== Express Server Started ===`);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Test endpoints:`);
+    console.log(`  GET http://localhost:${PORT}/test-error`);
+    console.log(`  GET http://localhost:${PORT}/test-warning`);
+    console.log(`  GET http://localhost:${PORT}/test-critical`);
+    console.log(`  GET http://localhost:${PORT}/insights/database`);
+  });
+}
+
+main().catch(console.error);
+```

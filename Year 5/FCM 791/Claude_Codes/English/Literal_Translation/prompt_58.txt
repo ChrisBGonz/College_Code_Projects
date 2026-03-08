@@ -1,0 +1,339 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import * as readline from "readline";
+
+const client = new Anthropic();
+
+// Simulated localStorage for Node.js environment
+const localStorage = {
+  data: {},
+  setItem(key, value) {
+    this.data[key] = value;
+  },
+  getItem(key) {
+    return this.data[key] || null;
+  },
+  removeItem(key) {
+    delete this.data[key];
+  },
+  clear() {
+    this.data = {};
+  },
+};
+
+// Registration form state
+const STORAGE_KEY = "registration_form_data";
+const STEPS = ["personal", "contact", "account", "preferences"];
+
+function saveFormData(data) {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  console.log("\n[localStorage] Form data saved:", JSON.stringify(data, null, 2));
+}
+
+function loadFormData() {
+  const data = localStorage.getItem(STORAGE_KEY);
+  return data ? JSON.parse(data) : {};
+}
+
+function clearFormData() {
+  localStorage.removeItem(STORAGE_KEY);
+  console.log("\n[localStorage] Form data cleared");
+}
+
+function getFormProgress() {
+  const data = loadFormData();
+  const completedSteps = STEPS.filter(
+    (step) => data[step] && Object.keys(data[step]).length > 0
+  );
+  return {
+    completedSteps,
+    currentStep:
+      completedSteps.length < STEPS.length
+        ? STEPS[completedSteps.length]
+        : "complete",
+    totalSteps: STEPS.length,
+    data,
+  };
+}
+
+// Tool definitions for Claude
+const tools = [
+  {
+    name: "save_step_data",
+    description:
+      "Save data for a specific registration step to localStorage. This preserves the data between steps.",
+    input_schema: {
+      type: "object",
+      properties: {
+        step: {
+          type: "string",
+          enum: ["personal", "contact", "account", "preferences"],
+          description: "The registration step name",
+        },
+        data: {
+          type: "object",
+          description: "The form data for this step",
+        },
+      },
+      required: ["step", "data"],
+    },
+  },
+  {
+    name: "get_saved_data",
+    description:
+      "Retrieve all saved registration data from localStorage to show progress or pre-fill fields",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+  {
+    name: "submit_registration",
+    description:
+      "Submit the complete registration form after all steps are completed. This will clear the localStorage data.",
+    input_schema: {
+      type: "object",
+      properties: {
+        confirm: {
+          type: "boolean",
+          description: "Confirmation that user wants to submit",
+        },
+      },
+      required: ["confirm"],
+    },
+  },
+  {
+    name: "clear_form_data",
+    description:
+      "Clear all saved form data from localStorage (used when user wants to start over)",
+    input_schema: {
+      type: "object",
+      properties: {},
+      required: [],
+    },
+  },
+];
+
+// Tool execution function
+function executeTool(toolName, toolInput) {
+  switch (toolName) {
+    case "save_step_data": {
+      const currentData = loadFormData();
+      currentData[toolInput.step] = toolInput.data;
+      saveFormData(currentData);
+      const progress = getFormProgress();
+      return {
+        success: true,
+        message: `Step '${toolInput.step}' data saved successfully`,
+        progress: `${progress.completedSteps.length}/${progress.totalSteps} steps completed`,
+        nextStep: progress.currentStep,
+      };
+    }
+
+    case "get_saved_data": {
+      const progress = getFormProgress();
+      return {
+        savedData: progress.data,
+        completedSteps: progress.completedSteps,
+        currentStep: progress.currentStep,
+        progress: `${progress.completedSteps.length}/${progress.totalSteps} steps completed`,
+      };
+    }
+
+    case "submit_registration": {
+      if (!toolInput.confirm) {
+        return { success: false, message: "Submission cancelled by user" };
+      }
+
+      const progress = getFormProgress();
+      if (progress.completedSteps.length < progress.totalSteps) {
+        return {
+          success: false,
+          message: `Cannot submit: ${progress.totalSteps - progress.completedSteps.length} steps remaining`,
+          missingSteps: STEPS.filter(
+            (s) => !progress.completedSteps.includes(s)
+          ),
+        };
+      }
+
+      const finalData = progress.data;
+      clearFormData();
+
+      return {
+        success: true,
+        message: "Registration submitted successfully!",
+        registrationId: `REG-${Date.now()}`,
+        submittedData: finalData,
+      };
+    }
+
+    case "clear_form_data": {
+      clearFormData();
+      return {
+        success: true,
+        message: "Form data cleared. You can start the registration over.",
+      };
+    }
+
+    default:
+      return { error: `Unknown tool: ${toolName}` };
+  }
+}
+
+// Main conversation function
+async function runRegistrationForm() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  const question = (prompt) =>
+    new Promise((resolve) => rl.question(prompt, resolve));
+
+  console.log("=== Multi-Step Registration Form Assistant ===");
+  console.log(
+    "This assistant will guide you through a multi-step registration process."
+  );
+  console.log(
+    "Your data is saved at each step, so you can resume if needed.\n"
+  );
+
+  const conversationHistory = [];
+
+  // System message
+  const systemMessage = `You are a helpful registration form assistant. You guide users through a multi-step registration process with these steps:
+1. Personal Information (name, date of birth, gender)
+2. Contact Information (email, phone, address)
+3. Account Setup (username, password, security question)
+4. Preferences (newsletter, notifications, language)
+
+Use the available tools to:
+- Save data at each step using save_step_data
+- Retrieve saved data using get_saved_data to show progress or resume
+- Submit the final form using submit_registration
+- Clear data if user wants to start over using clear_form_data
+
+Always check saved data at the start to see if there's existing progress. Guide users through each step, validate their inputs, and save data after each step is completed. Be conversational and helpful.`;
+
+  // Initial greeting
+  const initialResponse = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 1024,
+    system: systemMessage,
+    tools: tools,
+    messages: [
+      {
+        role: "user",
+        content:
+          "Hello, I want to register. Can you help me with the registration form?",
+      },
+    ],
+  });
+
+  conversationHistory.push({
+    role: "user",
+    content:
+      "Hello, I want to register. Can you help me with the registration form?",
+  });
+
+  // Process initial response
+  let response = initialResponse;
+
+  while (true) {
+    // Handle tool calls
+    while (response.stop_reason === "tool_use") {
+      const assistantMessage = {
+        role: "assistant",
+        content: response.content,
+      };
+      conversationHistory.push(assistantMessage);
+
+      const toolResults = [];
+
+      for (const block of response.content) {
+        if (block.type === "tool_use") {
+          console.log(`\n[Tool Call] ${block.name}:`, JSON.stringify(block.input, null, 2));
+          const result = executeTool(block.name, block.input);
+          console.log(`[Tool Result]:`, JSON.stringify(result, null, 2));
+
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify(result),
+          });
+        }
+      }
+
+      conversationHistory.push({
+        role: "user",
+        content: toolResults,
+      });
+
+      response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        system: systemMessage,
+        tools: tools,
+        messages: conversationHistory,
+      });
+    }
+
+    // Display assistant's text response
+    const textContent = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    if (textContent) {
+      console.log("\nAssistant:", textContent);
+    }
+
+    conversationHistory.push({
+      role: "assistant",
+      content: response.content,
+    });
+
+    // Check if registration is complete
+    if (
+      textContent.toLowerCase().includes("registration submitted successfully") ||
+      textContent.toLowerCase().includes("registration complete")
+    ) {
+      console.log("\n=== Registration Complete! ===");
+      break;
+    }
+
+    // Get user input
+    const userInput = await question("\nYou: ");
+
+    if (
+      userInput.toLowerCase() === "quit" ||
+      userInput.toLowerCase() === "exit"
+    ) {
+      console.log(
+        "\nExiting registration form. Your progress has been saved in localStorage."
+      );
+      break;
+    }
+
+    conversationHistory.push({
+      role: "user",
+      content: userInput,
+    });
+
+    response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      system: systemMessage,
+      tools: tools,
+      messages: conversationHistory,
+    });
+  }
+
+  rl.close();
+}
+
+// Run the registration form
+runRegistrationForm().catch(console.error);
+```

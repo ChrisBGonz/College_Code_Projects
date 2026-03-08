@@ -1,0 +1,244 @@
+
+const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
+const os = require("os");
+
+const client = new Anthropic();
+
+// In-memory storage for polls and votes
+const polls = {};
+const votes = {};
+const conversationHistory = [];
+
+// Get local IP address for simulation
+function getLocalIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of interfaces[name]) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return "127.0.0.1";
+}
+
+// Voting system functions
+function createPoll(question, options) {
+  const pollId = `poll_${Date.now()}`;
+  polls[pollId] = {
+    id: pollId,
+    question,
+    options: options.reduce((acc, opt) => {
+      acc[opt] = 0;
+      return acc;
+    }, {}),
+    createdAt: new Date().toISOString(),
+  };
+  votes[pollId] = {};
+  return pollId;
+}
+
+function vote(pollId, option, ipAddress) {
+  if (!polls[pollId]) {
+    return { success: false, message: "Poll not found" };
+  }
+
+  if (!polls[pollId].options.hasOwnProperty(option)) {
+    return { success: false, message: "Invalid option" };
+  }
+
+  if (votes[pollId][ipAddress]) {
+    return {
+      success: false,
+      message: `IP ${ipAddress} has already voted in this poll`,
+    };
+  }
+
+  polls[pollId].options[option]++;
+  votes[pollId][ipAddress] = option;
+
+  return {
+    success: true,
+    message: `Vote recorded for "${option}" from IP ${ipAddress}`,
+  };
+}
+
+function getPollResults(pollId) {
+  if (!polls[pollId]) {
+    return null;
+  }
+
+  const poll = polls[pollId];
+  const totalVotes = Object.values(poll.options).reduce(
+    (sum, count) => sum + count,
+    0
+  );
+
+  const results = {
+    id: poll.id,
+    question: poll.question,
+    totalVotes,
+    options: Object.entries(poll.options).map(([option, count]) => ({
+      option,
+      votes: count,
+      percentage: totalVotes > 0 ? ((count / totalVotes) * 100).toFixed(1) : 0,
+    })),
+    createdAt: poll.createdAt,
+  };
+
+  return results;
+}
+
+function listPolls() {
+  return Object.values(polls).map((poll) => ({
+    id: poll.id,
+    question: poll.question,
+    totalVotes: Object.values(poll.options).reduce(
+      (sum, count) => sum + count,
+      0
+    ),
+  }));
+}
+
+// Process AI response and execute commands
+function processAIResponse(response) {
+  const lines = response.split("\n");
+  const results = [];
+
+  for (const line of lines) {
+    if (line.startsWith("CREATE_POLL:")) {
+      const data = JSON.parse(line.replace("CREATE_POLL:", ""));
+      const pollId = createPoll(data.question, data.options);
+      results.push(`Poll created with ID: ${pollId}`);
+      results.push(`Question: ${data.question}`);
+      results.push(`Options: ${data.options.join(", ")}`);
+    } else if (line.startsWith("VOTE:")) {
+      const data = JSON.parse(line.replace("VOTE:", ""));
+      const result = vote(data.pollId, data.option, data.ipAddress);
+      results.push(result.message);
+    } else if (line.startsWith("GET_RESULTS:")) {
+      const data = JSON.parse(line.replace("GET_RESULTS:", ""));
+      const results_data = getPollResults(data.pollId);
+      if (results_data) {
+        results.push(`\nPoll Results for: ${results_data.question}`);
+        results.push(`Total Votes: ${results_data.totalVotes}`);
+        results_data.options.forEach((opt) => {
+          results.push(
+            `  ${opt.option}: ${opt.votes} votes (${opt.percentage}%)`
+          );
+        });
+      } else {
+        results.push("Poll not found");
+      }
+    } else if (line.startsWith("LIST_POLLS:")) {
+      const pollList = listPolls();
+      if (pollList.length === 0) {
+        results.push("No polls available");
+      } else {
+        results.push("\nAvailable Polls:");
+        pollList.forEach((poll) => {
+          results.push(
+            `  ID: ${poll.id} | Question: ${poll.question} | Votes: ${poll.totalVotes}`
+          );
+        });
+      }
+    } else if (line.trim() && !line.startsWith("{")) {
+      results.push(line);
+    }
+  }
+
+  return results.join("\n");
+}
+
+async function chat(userMessage) {
+  const userIP = getLocalIP();
+
+  conversationHistory.push({
+    role: "user",
+    content: userMessage,
+  });
+
+  const systemPrompt = `You are a voting system assistant. You help users create polls, vote on them, and view results.
+  
+Current user's IP address: ${userIP}
+Current polls in system: ${JSON.stringify(listPolls())}
+
+You can perform these actions by including special commands in your response:
+- To create a poll: CREATE_POLL:{"question":"...","options":["option1","option2",...]}
+- To vote: VOTE:{"pollId":"...","option":"...","ipAddress":"${userIP}"}
+- To get results: GET_RESULTS:{"pollId":"..."}
+- To list polls: LIST_POLLS:{}
+
+When a user wants to:
+1. Create a poll: Extract the question and options, then use CREATE_POLL command
+2. Vote on a poll: Use the user's IP (${userIP}) and VOTE command
+3. See results: Use GET_RESULTS command
+4. List polls: Use LIST_POLLS command
+
+Always include the command on its own line. After the command, provide a friendly explanation.
+The system will prevent duplicate votes from the same IP address automatically.`;
+
+  const response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system: systemPrompt,
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  // Process any commands in the response
+  const processedResult = processAIResponse(assistantMessage);
+
+  return processedResult;
+}
+
+async function main() {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  console.log("Welcome to the AI-powered Voting System!");
+  console.log(`Your IP address: ${getLocalIP()}`);
+  console.log(
+    "You can create polls, vote on them, and view results through natural conversation."
+  );
+  console.log('Type "exit" to quit.\n');
+
+  const askQuestion = () => {
+    rl.question("You: ", async (input) => {
+      const userInput = input.trim();
+
+      if (userInput.toLowerCase() === "exit") {
+        console.log("Goodbye!");
+        rl.close();
+        return;
+      }
+
+      if (!userInput) {
+        askQuestion();
+        return;
+      }
+
+      try {
+        const response = await chat(userInput);
+        console.log(`\nAssistant: ${response}\n`);
+      } catch (error) {
+        console.error("Error:", error.message);
+      }
+
+      askQuestion();
+    });
+  };
+
+  askQuestion();
+}
+
+main();
