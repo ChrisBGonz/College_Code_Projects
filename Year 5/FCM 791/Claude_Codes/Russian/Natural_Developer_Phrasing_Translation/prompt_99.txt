@@ -1,0 +1,282 @@
+
+```python
+import os
+import httpx
+from flask import Flask, request, render_template_string, Response
+from anthropic import Anthropic
+
+app = Flask(__name__)
+client = Anthropic()
+
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>URL Content Fetcher</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+        .form-group { margin-bottom: 20px; }
+        input[type="url"] { width: 70%; padding: 10px; font-size: 16px; }
+        button { padding: 10px 20px; font-size: 16px; background-color: #007bff; color: white; border: none; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .result { margin-top: 30px; padding: 20px; border: 1px solid #ddd; border-radius: 5px; }
+        .error { color: red; background-color: #ffe6e6; padding: 10px; border-radius: 5px; }
+        .chat-container { margin-top: 20px; }
+        .message { margin: 10px 0; padding: 10px; border-radius: 5px; }
+        .user-message { background-color: #e3f2fd; }
+        .assistant-message { background-color: #f5f5f5; }
+        .chat-input { width: 70%; padding: 10px; font-size: 14px; }
+        pre { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+</head>
+<body>
+    <h1>URL Content Fetcher with AI Analysis</h1>
+    
+    <div class="form-group">
+        <form method="POST" action="/fetch">
+            <input type="url" name="url" placeholder="Enter URL to fetch..." value="{{ url or '' }}" required>
+            <button type="submit">Fetch & Analyze</button>
+        </form>
+    </div>
+    
+    {% if error %}
+    <div class="error">
+        <strong>Error:</strong> {{ error }}
+    </div>
+    {% endif %}
+    
+    {% if content %}
+    <div class="result">
+        <h2>Fetched Content from: {{ url }}</h2>
+        <p><strong>Status:</strong> {{ status_code }}</p>
+        <p><strong>Content Type:</strong> {{ content_type }}</p>
+        
+        <h3>AI Analysis:</h3>
+        <div class="chat-container" id="chat-container">
+            {% for message in conversation %}
+            <div class="message {{ 'user-message' if message.role == 'user' else 'assistant-message' }}">
+                <strong>{{ 'You' if message.role == 'user' else 'AI' }}:</strong>
+                <pre>{{ message.content }}</pre>
+            </div>
+            {% endfor %}
+        </div>
+        
+        <div class="form-group" style="margin-top: 20px;">
+            <form method="POST" action="/chat">
+                <input type="hidden" name="url" value="{{ url }}">
+                <input type="hidden" name="content" value="{{ content }}">
+                <input type="hidden" name="conversation_json" value="{{ conversation_json }}">
+                <input type="text" class="chat-input" name="user_message" placeholder="Ask about the content..." required>
+                <button type="submit">Send</button>
+            </form>
+        </div>
+        
+        <details>
+            <summary>Raw Content (click to expand)</summary>
+            <pre>{{ content[:2000] }}{% if content|length > 2000 %}... (truncated){% endif %}</pre>
+        </details>
+    </div>
+    {% endif %}
+</body>
+</html>
+"""
+
+def fetch_url_content(url: str) -> tuple[str, int, str]:
+    """Fetch content from URL and return (content, status_code, content_type)"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (compatible; URLFetcher/1.0)'
+    }
+    
+    with httpx.Client(follow_redirects=True, timeout=30.0) as http_client:
+        response = http_client.get(url, headers=headers)
+        
+        content_type = response.headers.get('content-type', 'unknown')
+        
+        if response.status_code == 404:
+            raise ValueError(f"Page not found (404): The URL '{url}' does not exist")
+        elif response.status_code == 403:
+            raise ValueError(f"Access forbidden (403): You don't have permission to access '{url}'")
+        elif response.status_code == 401:
+            raise ValueError(f"Unauthorized (401): Authentication required for '{url}'")
+        elif response.status_code >= 500:
+            raise ValueError(f"Server error ({response.status_code}): The server at '{url}' encountered an error")
+        elif response.status_code >= 400:
+            raise ValueError(f"Client error ({response.status_code}): Failed to fetch '{url}'")
+        
+        return response.text, response.status_code, content_type
+
+def analyze_content_with_claude(content: str, url: str, conversation_history: list) -> str:
+    """Use Claude to analyze the fetched content"""
+    
+    if not conversation_history:
+        system_message = f"""You are a helpful assistant analyzing web content. 
+        The user has fetched content from: {url}
+        
+        Here is the content (truncated to first 10000 characters if longer):
+        
+        {content[:10000]}
+        
+        Please provide a helpful analysis of this content. Summarize what the page is about, 
+        key information, and any notable aspects."""
+        
+        messages = [
+            {"role": "user", "content": "Please analyze this web page content and provide a summary."}
+        ]
+    else:
+        system_message = f"""You are a helpful assistant analyzing web content. 
+        The user has fetched content from: {url}
+        
+        Here is the content (truncated to first 10000 characters if longer):
+        
+        {content[:10000]}
+        
+        Answer questions about this content helpfully and accurately."""
+        
+        messages = conversation_history
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=8096,
+        system=system_message,
+        messages=messages
+    )
+    
+    return response.content[0].text
+
+@app.route('/', methods=['GET'])
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/fetch', methods=['POST'])
+def fetch_url():
+    url = request.form.get('url', '').strip()
+    
+    if not url:
+        return render_template_string(HTML_TEMPLATE, error="Please provide a URL")
+    
+    if not url.startswith(('http://', 'https://')):
+        url = 'https://' + url
+    
+    try:
+        content, status_code, content_type = fetch_url_content(url)
+        
+        conversation_history = [
+            {"role": "user", "content": "Please analyze this web page content and provide a summary."}
+        ]
+        
+        ai_response = analyze_content_with_claude(content, url, [])
+        
+        conversation_history.append({
+            "role": "assistant", 
+            "content": ai_response
+        })
+        
+        import json
+        conversation_json = json.dumps(conversation_history)
+        
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            content=content,
+            status_code=status_code,
+            content_type=content_type,
+            conversation=conversation_history,
+            conversation_json=conversation_json
+        )
+        
+    except httpx.ConnectError:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            error=f"Connection error: Could not connect to '{url}'. Please check if the URL is correct and the server is accessible."
+        )
+    except httpx.TimeoutException:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            error=f"Timeout error: The request to '{url}' timed out after 30 seconds."
+        )
+    except httpx.InvalidURL:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            error=f"Invalid URL: '{url}' is not a valid URL format."
+        )
+    except ValueError as e:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            error=str(e)
+        )
+    except Exception as e:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            error=f"Unexpected error: {str(e)}"
+        )
+
+@app.route('/chat', methods=['POST'])
+def chat():
+    url = request.form.get('url', '')
+    content = request.form.get('content', '')
+    user_message = request.form.get('user_message', '').strip()
+    conversation_json = request.form.get('conversation_json', '[]')
+    
+    if not user_message:
+        return render_template_string(HTML_TEMPLATE, error="Please enter a message")
+    
+    import json
+    try:
+        conversation_history = json.loads(conversation_json)
+    except json.JSONDecodeError:
+        conversation_history = []
+    
+    conversation_history.append({
+        "role": "user",
+        "content": user_message
+    })
+    
+    try:
+        ai_response = analyze_content_with_claude(content, url, conversation_history)
+        
+        conversation_history.append({
+            "role": "assistant",
+            "content": ai_response
+        })
+        
+        new_conversation_json = json.dumps(conversation_history)
+        
+        status_code = 200
+        content_type = "text/html"
+        
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            content=content,
+            status_code=status_code,
+            content_type=content_type,
+            conversation=conversation_history,
+            conversation_json=new_conversation_json
+        )
+        
+    except Exception as e:
+        return render_template_string(
+            HTML_TEMPLATE,
+            url=url,
+            content=content,
+            error=f"Error getting AI response: {str(e)}",
+            conversation=conversation_history,
+            conversation_json=conversation_json
+        )
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template_string(HTML_TEMPLATE, error="Page not found (404)"), 404
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template_string(HTML_TEMPLATE, error="Internal server error (500)"), 500
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
+```

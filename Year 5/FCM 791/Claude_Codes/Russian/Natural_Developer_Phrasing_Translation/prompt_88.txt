@@ -1,0 +1,538 @@
+
+```csharp
+using System;
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging;
+
+// MFA Settings Models
+public record MfaSettings
+{
+    public bool IsEnabled { get; init; }
+    public string Method { get; init; } = string.Empty; // TOTP, SMS, Email, etc.
+    public string? PhoneNumber { get; init; }
+    public string? Email { get; init; }
+    public int BackupCodesCount { get; init; }
+    public DateTime? LastModified { get; init; }
+}
+
+// Audit Event Models
+public record MfaChangeAuditEvent
+{
+    [JsonPropertyName("eventType")]
+    public string EventType { get; init; } = "MFA_SETTINGS_CHANGED";
+    
+    [JsonPropertyName("timestamp")]
+    public DateTimeOffset Timestamp { get; init; }
+    
+    [JsonPropertyName("correlationId")]
+    public string CorrelationId { get; init; } = string.Empty;
+    
+    [JsonPropertyName("traceId")]
+    public string TraceId { get; init; } = string.Empty;
+    
+    [JsonPropertyName("actor")]
+    public ActorInfo Actor { get; init; } = new();
+    
+    [JsonPropertyName("target")]
+    public TargetInfo Target { get; init; } = new();
+    
+    [JsonPropertyName("source")]
+    public SourceInfo Source { get; init; } = new();
+    
+    [JsonPropertyName("changes")]
+    public MfaChanges Changes { get; init; } = new();
+    
+    [JsonPropertyName("result")]
+    public OperationResult Result { get; init; } = new();
+}
+
+public record ActorInfo
+{
+    [JsonPropertyName("userId")]
+    public string UserId { get; init; } = string.Empty;
+    
+    [JsonPropertyName("username")]
+    public string Username { get; init; } = string.Empty;
+    
+    [JsonPropertyName("roles")]
+    public IReadOnlyList<string> Roles { get; init; } = Array.Empty<string>();
+    
+    [JsonPropertyName("sessionId")]
+    public string? SessionId { get; init; }
+}
+
+public record TargetInfo
+{
+    [JsonPropertyName("userId")]
+    public string UserId { get; init; } = string.Empty;
+    
+    [JsonPropertyName("username")]
+    public string Username { get; init; } = string.Empty;
+    
+    [JsonPropertyName("isSelfModification")]
+    public bool IsSelfModification { get; init; }
+}
+
+public record SourceInfo
+{
+    [JsonPropertyName("ipAddress")]
+    public string IpAddress { get; init; } = string.Empty;
+    
+    [JsonPropertyName("userAgent")]
+    public string UserAgent { get; init; } = string.Empty;
+    
+    [JsonPropertyName("requestPath")]
+    public string? RequestPath { get; init; }
+    
+    [JsonPropertyName("requestMethod")]
+    public string? RequestMethod { get; init; }
+    
+    [JsonPropertyName("geoLocation")]
+    public GeoLocation? GeoLocation { get; init; }
+}
+
+public record GeoLocation
+{
+    [JsonPropertyName("country")]
+    public string? Country { get; init; }
+    
+    [JsonPropertyName("city")]
+    public string? City { get; init; }
+}
+
+public record MfaChanges
+{
+    [JsonPropertyName("before")]
+    public MfaSettingsSnapshot Before { get; init; } = new();
+    
+    [JsonPropertyName("after")]
+    public MfaSettingsSnapshot After { get; init; } = new();
+    
+    [JsonPropertyName("changedFields")]
+    public IReadOnlyList<string> ChangedFields { get; init; } = Array.Empty<string>();
+}
+
+public record MfaSettingsSnapshot
+{
+    [JsonPropertyName("isEnabled")]
+    public bool IsEnabled { get; init; }
+    
+    [JsonPropertyName("method")]
+    public string Method { get; init; } = string.Empty;
+    
+    [JsonPropertyName("phoneNumberMasked")]
+    public string? PhoneNumberMasked { get; init; }
+    
+    [JsonPropertyName("emailMasked")]
+    public string? EmailMasked { get; init; }
+    
+    [JsonPropertyName("backupCodesCount")]
+    public int BackupCodesCount { get; init; }
+}
+
+public record OperationResult
+{
+    [JsonPropertyName("status")]
+    public string Status { get; init; } = string.Empty; // success / fail
+    
+    [JsonPropertyName("errorCode")]
+    public string? ErrorCode { get; init; }
+    
+    [JsonPropertyName("errorMessage")]
+    public string? ErrorMessage { get; init; }
+    
+    [JsonPropertyName("durationMs")]
+    public long DurationMs { get; init; }
+}
+
+// MFA Audit Logger
+public interface IMfaAuditLogger
+{
+    void LogMfaSettingsChange(
+        ActorInfo actor,
+        TargetInfo target,
+        SourceInfo source,
+        MfaSettings previousSettings,
+        MfaSettings newSettings,
+        bool isSuccess,
+        string correlationId,
+        string traceId,
+        long durationMs = 0,
+        string? errorCode = null,
+        string? errorMessage = null);
+}
+
+public class MfaAuditLogger : IMfaAuditLogger
+{
+    private readonly ILogger<MfaAuditLogger> _logger;
+    
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = false,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    public MfaAuditLogger(ILogger<MfaAuditLogger> logger)
+    {
+        _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+    }
+
+    public void LogMfaSettingsChange(
+        ActorInfo actor,
+        TargetInfo target,
+        SourceInfo source,
+        MfaSettings previousSettings,
+        MfaSettings newSettings,
+        bool isSuccess,
+        string correlationId,
+        string traceId,
+        long durationMs = 0,
+        string? errorCode = null,
+        string? errorMessage = null)
+    {
+        var changedFields = DetectChangedFields(previousSettings, newSettings);
+        
+        var auditEvent = new MfaChangeAuditEvent
+        {
+            Timestamp = DateTimeOffset.UtcNow,
+            CorrelationId = correlationId,
+            TraceId = traceId,
+            Actor = actor,
+            Target = target,
+            Source = source,
+            Changes = new MfaChanges
+            {
+                Before = CreateSnapshot(previousSettings),
+                After = CreateSnapshot(newSettings),
+                ChangedFields = changedFields
+            },
+            Result = new OperationResult
+            {
+                Status = isSuccess ? "success" : "fail",
+                ErrorCode = errorCode,
+                ErrorMessage = errorMessage,
+                DurationMs = durationMs
+            }
+        };
+
+        var logLevel = isSuccess ? LogLevel.Information : LogLevel.Warning;
+        
+        using var scope = _logger.BeginScope(new Dictionary<string, object>
+        {
+            ["CorrelationId"] = correlationId,
+            ["TraceId"] = traceId,
+            ["EventType"] = auditEvent.EventType,
+            ["ActorUserId"] = actor.UserId,
+            ["TargetUserId"] = target.UserId,
+            ["IpAddress"] = source.IpAddress,
+            ["OperationStatus"] = auditEvent.Result.Status
+        });
+
+        var serializedEvent = JsonSerializer.Serialize(auditEvent, JsonOptions);
+        
+        _logger.Log(
+            logLevel,
+            "[AUDIT] MFA settings change | Actor: {ActorUsername} ({ActorUserId}) | " +
+            "Target: {TargetUsername} ({TargetUserId}) | " +
+            "Status: {Status} | " +
+            "Changed: [{ChangedFields}] | " +
+            "IP: {IpAddress} | " +
+            "UserAgent: {UserAgent} | " +
+            "CorrelationId: {CorrelationId} | " +
+            "TraceId: {TraceId} | " +
+            "Duration: {DurationMs}ms | " +
+            "Payload: {AuditPayload}",
+            actor.Username,
+            actor.UserId,
+            target.Username,
+            target.UserId,
+            auditEvent.Result.Status,
+            string.Join(", ", changedFields),
+            source.IpAddress,
+            source.UserAgent,
+            correlationId,
+            traceId,
+            durationMs,
+            serializedEvent);
+    }
+
+    private static MfaSettingsSnapshot CreateSnapshot(MfaSettings settings)
+    {
+        return new MfaSettingsSnapshot
+        {
+            IsEnabled = settings.IsEnabled,
+            Method = settings.Method,
+            PhoneNumberMasked = MaskPhoneNumber(settings.PhoneNumber),
+            EmailMasked = MaskEmail(settings.Email),
+            BackupCodesCount = settings.BackupCodesCount
+        };
+    }
+
+    private static List<string> DetectChangedFields(MfaSettings before, MfaSettings after)
+    {
+        var changed = new List<string>();
+
+        if (before.IsEnabled != after.IsEnabled)
+            changed.Add(nameof(MfaSettings.IsEnabled));
+
+        if (!string.Equals(before.Method, after.Method, StringComparison.OrdinalIgnoreCase))
+            changed.Add(nameof(MfaSettings.Method));
+
+        if (!string.Equals(before.PhoneNumber, after.PhoneNumber, StringComparison.Ordinal))
+            changed.Add(nameof(MfaSettings.PhoneNumber));
+
+        if (!string.Equals(before.Email, after.Email, StringComparison.OrdinalIgnoreCase))
+            changed.Add(nameof(MfaSettings.Email));
+
+        if (before.BackupCodesCount != after.BackupCodesCount)
+            changed.Add(nameof(MfaSettings.BackupCodesCount));
+
+        return changed;
+    }
+
+    private static string? MaskPhoneNumber(string? phone)
+    {
+        if (string.IsNullOrWhiteSpace(phone) || phone.Length < 4)
+            return phone;
+        
+        return $"***{phone[^4..]}";
+    }
+
+    private static string? MaskEmail(string? email)
+    {
+        if (string.IsNullOrWhiteSpace(email))
+            return email;
+        
+        var atIndex = email.IndexOf('@');
+        if (atIndex <= 1)
+            return email;
+        
+        var localPart = email[..atIndex];
+        var domain = email[atIndex..];
+        var maskedLocal = localPart.Length <= 2
+            ? new string('*', localPart.Length)
+            : $"{localPart[0]}{new string('*', localPart.Length - 2)}{localPart[^1]}";
+        
+        return $"{maskedLocal}{domain}";
+    }
+}
+
+// Usage Example
+public class MfaSettingsService
+{
+    private readonly IMfaAuditLogger _auditLogger;
+    private readonly ILogger<MfaSettingsService> _logger;
+
+    public MfaSettingsService(IMfaAuditLogger auditLogger, ILogger<MfaSettingsService> logger)
+    {
+        _auditLogger = auditLogger;
+        _logger = logger;
+    }
+
+    public async Task<bool> UpdateMfaSettingsAsync(
+        string actorUserId,
+        string actorUsername,
+        string targetUserId,
+        string targetUsername,
+        MfaSettings newSettings,
+        string ipAddress,
+        string userAgent,
+        string correlationId,
+        string traceId)
+    {
+        var startTime = DateTimeOffset.UtcNow;
+        MfaSettings? previousSettings = null;
+
+        try
+        {
+            // Simulate fetching current settings
+            previousSettings = await GetCurrentSettingsAsync(targetUserId);
+            
+            // Simulate saving new settings
+            await SaveSettingsAsync(targetUserId, newSettings);
+            
+            var durationMs = (long)(DateTimeOffset.UtcNow - startTime).TotalMilliseconds;
+
+            _auditLogger.LogMfaSettingsChange(
+                actor: new ActorInfo
+                {
+                    UserId = actorUserId,
+                    Username = actorUsername,
+                    Roles = new[] { "user" },
+                    SessionId = Guid.NewGuid().ToString("N")
+                },
+                target: new TargetInfo
+                {
+                    UserId = targetUserId,
+                    Username = targetUsername,
+                    IsSelfModification = actorUserId == targetUserId
+                },
+                source: new SourceInfo
+                {
+                    IpAddress = ipAddress,
+                    UserAgent = userAgent,
+                    RequestPath = "/api/account/mfa/settings",
+                    RequestMethod = "PUT"
+                },
+                previousSettings: previousSettings,
+                newSettings: newSettings,
+                isSuccess: true,
+                correlationId: correlationId,
+                traceId: traceId,
+                durationMs: durationMs);
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            var durationMs = (long)(DateTimeOffset.UtcNow - startTime).TotalMilliseconds;
+
+            _auditLogger.LogMfaSettingsChange(
+                actor: new ActorInfo
+                {
+                    UserId = actorUserId,
+                    Username = actorUsername,
+                    Roles = new[] { "user" }
+                },
+                target: new TargetInfo
+                {
+                    UserId = targetUserId,
+                    Username = targetUsername,
+                    IsSelfModification = actorUserId == targetUserId
+                },
+                source: new SourceInfo
+                {
+                    IpAddress = ipAddress,
+                    UserAgent = userAgent,
+                    RequestPath = "/api/account/mfa/settings",
+                    RequestMethod = "PUT"
+                },
+                previousSettings: previousSettings ?? new MfaSettings(),
+                newSettings: newSettings,
+                isSuccess: false,
+                correlationId: correlationId,
+                traceId: traceId,
+                durationMs: durationMs,
+                errorCode: "MFA_UPDATE_FAILED",
+                errorMessage: ex.Message);
+
+            return false;
+        }
+    }
+
+    private Task<MfaSettings> GetCurrentSettingsAsync(string userId)
+    {
+        // Simulate DB fetch
+        return Task.FromResult(new MfaSettings
+        {
+            IsEnabled = false,
+            Method = "None",
+            PhoneNumber = null,
+            Email = "user@example.com",
+            BackupCodesCount = 0,
+            LastModified = DateTime.UtcNow.AddDays(-30)
+        });
+    }
+
+    private Task SaveSettingsAsync(string userId, MfaSettings settings)
+    {
+        // Simulate DB save
+        return Task.CompletedTask;
+    }
+}
+
+// Demo Program
+public class Program
+{
+    public static async Task Main(string[] args)
+    {
+        using var loggerFactory = LoggerFactory.Create(builder =>
+        {
+            builder
+                .AddConsole()
+                .SetMinimumLevel(LogLevel.Debug);
+        });
+
+        var auditLogger = new MfaAuditLogger(loggerFactory.CreateLogger<MfaAuditLogger>());
+        var service = new MfaSettingsService(auditLogger, loggerFactory.CreateLogger<MfaSettingsService>());
+
+        var correlationId = Guid.NewGuid().ToString();
+        var traceId = Guid.NewGuid().ToString("N");
+
+        Console.WriteLine("=== MFA Settings Change Audit Demo ===\n");
+
+        // Successful MFA enable
+        var result = await service.UpdateMfaSettingsAsync(
+            actorUserId: "user-123",
+            actorUsername: "john.doe",
+            targetUserId: "user-123",
+            targetUsername: "john.doe",
+            newSettings: new MfaSettings
+            {
+                IsEnabled = true,
+                Method = "TOTP",
+                PhoneNumber = "+1234567890",
+                Email = "john.doe@example.com",
+                BackupCodesCount = 10,
+                LastModified = DateTime.UtcNow
+            },
+            ipAddress: "192.168.1.100",
+            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            correlationId: correlationId,
+            traceId: traceId);
+
+        Console.WriteLine($"\nOperation result: {(result ? "SUCCESS" : "FAILED")}");
+        
+        // Direct audit log example
+        Console.WriteLine("\n=== Direct Audit Log Example ===\n");
+        
+        auditLogger.LogMfaSettingsChange(
+            actor: new ActorInfo
+            {
+                UserId = "admin-001",
+                Username = "admin",
+                Roles = new[] { "admin", "security-officer" },
+                SessionId = "sess-abc123"
+            },
+            target: new TargetInfo
+            {
+                UserId = "user-456",
+                Username = "jane.smith",
+                IsSelfModification = false
+            },
+            source: new SourceInfo
+            {
+                IpAddress = "10.0.0.1",
+                UserAgent = "AdminPortal/2.0",
+                RequestPath = "/admin/users/user-456/mfa",
+                RequestMethod = "DELETE",
+                GeoLocation = new GeoLocation { Country = "US", City = "New York" }
+            },
+            previousSettings: new MfaSettings
+            {
+                IsEnabled = true,
+                Method = "SMS",
+                PhoneNumber = "+9876543210",
+                Email = "jane@company.com",
+                BackupCodesCount = 5
+            },
+            newSettings: new MfaSettings
+            {
+                IsEnabled = false,
+                Method = "None",
+                PhoneNumber = null,
+                Email = "jane@company.com",
+                BackupCodesCount = 0
+            },
+            isSuccess: false,
+            correlationId: Guid.NewGuid().ToString(),
+            traceId: Guid.NewGuid().ToString("N"),
+            durationMs: 145,
+            errorCode: "INSUFFICIENT_PERMISSIONS",
+            errorMessage: "Admin cannot disable MFA for users without security officer approval");
+    }
+}
+```

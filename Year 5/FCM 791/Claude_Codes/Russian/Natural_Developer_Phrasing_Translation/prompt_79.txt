@@ -1,0 +1,221 @@
+
+```python
+import anthropic
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def calculate_file_hash(file_path: str, algorithm: str = "sha256") -> str | None:
+    """Calculate hash of a file using specified algorithm."""
+    try:
+        hash_func = hashlib.new(algorithm)
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hash_func.update(chunk)
+        return hash_func.hexdigest()
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        print(f"Error calculating hash for {file_path}: {e}")
+        return None
+
+
+def load_manifest(manifest_path: str) -> dict:
+    """Load manifest file containing file hashes."""
+    with open(manifest_path, "r") as f:
+        return json.load(f)
+
+
+def validate_files_with_claude(manifest_path: str, base_dir: str = ".") -> None:
+    """Validate file integrity using Claude AI with streaming."""
+    
+    # Load manifest
+    try:
+        manifest = load_manifest(manifest_path)
+    except FileNotFoundError:
+        print(f"Error: Manifest file '{manifest_path}' not found.")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in manifest file: {e}")
+        sys.exit(1)
+    
+    # Extract algorithm and files from manifest
+    algorithm = manifest.get("algorithm", "sha256")
+    files = manifest.get("files", {})
+    
+    if not files:
+        print("No files found in manifest.")
+        return
+    
+    # Calculate actual hashes for all files
+    validation_results = []
+    
+    for file_path, expected_hash in files.items():
+        full_path = os.path.join(base_dir, file_path)
+        actual_hash = calculate_file_hash(full_path, algorithm)
+        
+        if actual_hash is None:
+            validation_results.append({
+                "path": file_path,
+                "status": "missing",
+                "expected_hash": expected_hash,
+                "actual_hash": None
+            })
+        elif actual_hash == expected_hash:
+            validation_results.append({
+                "path": file_path,
+                "status": "valid",
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash
+            })
+        else:
+            validation_results.append({
+                "path": file_path,
+                "status": "mismatch",
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash
+            })
+    
+    # Prepare data for Claude
+    validation_data = {
+        "algorithm": algorithm,
+        "total_files": len(files),
+        "results": validation_results
+    }
+    
+    # Create prompt for Claude
+    prompt = f"""Analyze the following file integrity validation results and provide a detailed report.
+
+Validation Data:
+{json.dumps(validation_data, indent=2)}
+
+Please provide:
+1. A summary of the validation results (total files, valid, missing, mismatched)
+2. List all missing files with their expected hashes
+3. List all files with hash mismatches, showing both expected and actual hashes
+4. An overall integrity assessment
+5. Recommendations if any issues were found
+
+Format the report clearly with sections and use appropriate symbols (✓ for valid, ✗ for issues)."""
+    
+    # Initialize Anthropic client
+    client = anthropic.Anthropic()
+    
+    print(f"\n{'='*60}")
+    print("FILE INTEGRITY VALIDATION REPORT")
+    print(f"{'='*60}")
+    print(f"Manifest: {manifest_path}")
+    print(f"Algorithm: {algorithm}")
+    print(f"Base Directory: {os.path.abspath(base_dir)}")
+    print(f"{'='*60}\n")
+    
+    # Use streaming to get Claude's analysis
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+    
+    print("\n")
+    
+    # Print raw validation results for reference
+    print(f"\n{'='*60}")
+    print("RAW VALIDATION RESULTS")
+    print(f"{'='*60}")
+    
+    missing_files = [r for r in validation_results if r["status"] == "missing"]
+    mismatched_files = [r for r in validation_results if r["status"] == "mismatch"]
+    valid_files = [r for r in validation_results if r["status"] == "valid"]
+    
+    print(f"\nValid files ({len(valid_files)}):")
+    for result in valid_files:
+        print(f"  ✓ {result['path']}")
+    
+    if missing_files:
+        print(f"\nMissing files ({len(missing_files)}):")
+        for result in missing_files:
+            print(f"  ✗ {result['path']}")
+            print(f"    Expected: {result['expected_hash']}")
+    
+    if mismatched_files:
+        print(f"\nMismatched files ({len(mismatched_files)}):")
+        for result in mismatched_files:
+            print(f"  ✗ {result['path']}")
+            print(f"    Expected: {result['expected_hash']}")
+            print(f"    Actual:   {result['actual_hash']}")
+    
+    # Return exit code based on validation results
+    if missing_files or mismatched_files:
+        sys.exit(1)
+
+
+def create_sample_manifest(output_path: str = "manifest.json") -> None:
+    """Create a sample manifest file for testing."""
+    sample_manifest = {
+        "algorithm": "sha256",
+        "version": "1.0",
+        "description": "Sample project manifest",
+        "files": {}
+    }
+    
+    # Add current Python files to manifest
+    for py_file in Path(".").glob("*.py"):
+        file_hash = calculate_file_hash(str(py_file), "sha256")
+        if file_hash:
+            sample_manifest["files"][str(py_file)] = file_hash
+    
+    with open(output_path, "w") as f:
+        json.dump(sample_manifest, f, indent=2)
+    
+    print(f"Sample manifest created: {output_path}")
+    print(f"Files included: {len(sample_manifest['files'])}")
+
+
+def main():
+    """Main function to run the file integrity validator."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description="Validate file integrity using manifest hashes with Claude AI analysis"
+    )
+    parser.add_argument(
+        "manifest",
+        nargs="?",
+        default="manifest.json",
+        help="Path to manifest JSON file (default: manifest.json)"
+    )
+    parser.add_argument(
+        "--base-dir",
+        default=".",
+        help="Base directory for file paths (default: current directory)"
+    )
+    parser.add_argument(
+        "--create-sample",
+        action="store_true",
+        help="Create a sample manifest file from current Python files"
+    )
+    
+    args = parser.parse_args()
+    
+    if args.create_sample:
+        create_sample_manifest(args.manifest)
+        print("\nNow run the validator with:")
+        print(f"  python solution.py {args.manifest}")
+        return
+    
+    validate_files_with_claude(args.manifest, args.base_dir)
+
+
+if __name__ == "__main__":
+    main()
+```

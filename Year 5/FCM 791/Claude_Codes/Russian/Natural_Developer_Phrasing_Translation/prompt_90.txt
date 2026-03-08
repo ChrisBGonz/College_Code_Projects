@@ -1,0 +1,258 @@
+
+```python
+import anthropic
+import os
+import time
+import gzip
+import shutil
+import logging
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+def setup_demo_logger(log_file: str) -> logging.Logger:
+    """Setup a demo logger that writes to a file."""
+    logger = logging.getLogger("demo_app")
+    logger.setLevel(logging.DEBUG)
+    
+    handler = logging.FileHandler(log_file)
+    handler.setLevel(logging.DEBUG)
+    
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    
+    logger.addHandler(handler)
+    return logger
+
+
+def rotate_log_file(log_file: str, max_backups: int = 5, compress: bool = True) -> dict:
+    """
+    Rotate a log file by renaming it with timestamp and creating a new empty file.
+    
+    Args:
+        log_file: Path to the log file to rotate
+        max_backups: Maximum number of backup files to keep
+        compress: Whether to compress rotated files with gzip
+    
+    Returns:
+        Dictionary with rotation results
+    """
+    log_path = Path(log_file)
+    
+    if not log_path.exists():
+        return {"status": "skipped", "reason": "Log file does not exist"}
+    
+    file_size = log_path.stat().st_size
+    if file_size == 0:
+        return {"status": "skipped", "reason": "Log file is empty"}
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    if compress:
+        backup_name = f"{log_file}.{timestamp}.gz"
+        with open(log_file, 'rb') as f_in:
+            with gzip.open(backup_name, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+    else:
+        backup_name = f"{log_file}.{timestamp}"
+        shutil.copy2(log_file, backup_name)
+    
+    with open(log_file, 'w') as f:
+        f.write("")
+    
+    log_dir = log_path.parent
+    log_stem = log_path.name
+    
+    if compress:
+        backup_files = sorted(log_dir.glob(f"{log_stem}.*.gz"))
+    else:
+        backup_files = sorted(log_dir.glob(f"{log_stem}.*[0-9]"))
+    
+    removed_files = []
+    while len(backup_files) > max_backups:
+        oldest = backup_files.pop(0)
+        oldest.unlink()
+        removed_files.append(str(oldest))
+    
+    return {
+        "status": "success",
+        "original_size": file_size,
+        "backup_file": backup_name,
+        "removed_old_backups": removed_files,
+        "timestamp": timestamp
+    }
+
+
+def get_log_stats(log_dir: str = ".") -> dict:
+    """Get statistics about log files in a directory."""
+    log_path = Path(log_dir)
+    stats = {
+        "total_files": 0,
+        "total_size_bytes": 0,
+        "files": []
+    }
+    
+    for file in log_path.glob("*.log*"):
+        file_stat = file.stat()
+        stats["total_files"] += 1
+        stats["total_size_bytes"] += file_stat.st_size
+        stats["files"].append({
+            "name": file.name,
+            "size_bytes": file_stat.st_size,
+            "modified": datetime.fromtimestamp(file_stat.st_mtime).isoformat()
+        })
+    
+    return stats
+
+
+def analyze_rotation_with_claude(log_file: str, rotation_result: dict, log_stats: dict) -> str:
+    """Use Claude to analyze log rotation results and provide recommendations."""
+    client = anthropic.Anthropic()
+    
+    prompt = f"""Analyze the following log rotation operation and provide insights and recommendations:
+
+Log File: {log_file}
+Rotation Result: {rotation_result}
+Current Log Statistics: {log_stats}
+
+Please provide:
+1. Summary of what happened during rotation
+2. Assessment of the current log management setup
+3. Recommendations for optimal log rotation settings
+4. Any potential issues or concerns
+5. Best practices for this type of application
+
+Keep the response concise and practical."""
+
+    print("\n🤖 Claude is analyzing the log rotation...\n")
+    print("-" * 50)
+    
+    full_response = ""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    ) as stream:
+        for text in stream.text_stream:
+            print(text, end="", flush=True)
+            full_response += text
+    
+    print("\n" + "-" * 50)
+    return full_response
+
+
+def log_rotation_scheduler(log_file: str, interval_hours: int = 24, max_backups: int = 5, 
+                           compress: bool = True, demo_mode: bool = False):
+    """
+    Schedule log rotation at specified intervals.
+    
+    Args:
+        log_file: Path to the log file to rotate
+        interval_hours: Hours between rotations (default: 24)
+        max_backups: Maximum backup files to keep
+        compress: Whether to compress rotated files
+        demo_mode: If True, run once immediately for demonstration
+    """
+    print(f"🔄 Log Rotation Scheduler Started")
+    print(f"📁 Log file: {log_file}")
+    print(f"⏰ Rotation interval: {interval_hours} hours")
+    print(f"📦 Max backups: {max_backups}")
+    print(f"🗜️  Compression: {'enabled' if compress else 'disabled'}")
+    print("=" * 60)
+    
+    if demo_mode:
+        print("\n📝 Demo mode: Generating sample log entries...")
+        logger = setup_demo_logger(log_file)
+        
+        for i in range(10):
+            logger.info(f"Sample log entry {i+1}: Application running normally")
+            logger.debug(f"Debug info {i+1}: Processing request")
+            if i % 3 == 0:
+                logger.warning(f"Warning {i+1}: High memory usage detected")
+        
+        print(f"✅ Generated sample log entries in {log_file}")
+        
+        print("\n🔄 Performing immediate rotation for demonstration...")
+        rotation_result = rotate_log_file(log_file, max_backups, compress)
+        
+        print(f"\n📊 Rotation Result:")
+        for key, value in rotation_result.items():
+            print(f"  {key}: {value}")
+        
+        log_stats = get_log_stats(str(Path(log_file).parent))
+        print(f"\n📈 Log Directory Statistics:")
+        print(f"  Total files: {log_stats['total_files']}")
+        print(f"  Total size: {log_stats['total_size_bytes']} bytes")
+        
+        if rotation_result["status"] == "success":
+            analyze_rotation_with_claude(log_file, rotation_result, log_stats)
+        
+        return
+    
+    def rotation_loop():
+        while True:
+            next_rotation = datetime.now() + timedelta(hours=interval_hours)
+            print(f"\n⏳ Next rotation scheduled at: {next_rotation.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            time.sleep(interval_hours * 3600)
+            
+            print(f"\n🔄 Starting log rotation at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            rotation_result = rotate_log_file(log_file, max_backups, compress)
+            
+            print(f"📊 Rotation Result: {rotation_result}")
+            
+            log_stats = get_log_stats(str(Path(log_file).parent))
+            
+            if rotation_result["status"] == "success":
+                analyze_rotation_with_claude(log_file, rotation_result, log_stats)
+    
+    rotation_thread = threading.Thread(target=rotation_loop, daemon=True)
+    rotation_thread.start()
+    
+    print("\n✅ Scheduler is running in background thread")
+    print("Press Ctrl+C to stop")
+    
+    try:
+        while True:
+            time.sleep(60)
+    except KeyboardInterrupt:
+        print("\n\n🛑 Log rotation scheduler stopped")
+
+
+def main():
+    """Main function to demonstrate log rotation with Claude analysis."""
+    log_file = "application.log"
+    
+    print("🚀 Log File Rotation System with Claude AI Analysis")
+    print("=" * 60)
+    
+    log_rotation_scheduler(
+        log_file=log_file,
+        interval_hours=24,
+        max_backups=5,
+        compress=True,
+        demo_mode=True
+    )
+    
+    print("\n\n📋 Summary:")
+    print("The log rotation system has been demonstrated successfully.")
+    print("In production, set demo_mode=False to run the 24-hour scheduler.")
+    print("\nKey features:")
+    print("  ✅ Automatic log rotation every 24 hours")
+    print("  ✅ Gzip compression of rotated files")
+    print("  ✅ Configurable backup retention (default: 5 files)")
+    print("  ✅ AI-powered analysis with Claude")
+    print("  ✅ Background thread scheduling")
+    print("  ✅ Disk space protection")
+
+
+if __name__ == "__main__":
+    main()
+```

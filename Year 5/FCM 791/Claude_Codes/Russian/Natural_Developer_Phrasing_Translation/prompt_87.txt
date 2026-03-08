@@ -1,0 +1,246 @@
+
+```python
+import anthropic
+import re
+import time
+from collections import deque
+from datetime import datetime
+import sys
+import os
+
+client = anthropic.Anthropic()
+
+failed_login_timestamps = deque()
+WINDOW_SECONDS = 60
+THRESHOLD = 10
+warning_issued = False
+
+
+def analyze_log_line_with_claude(line: str) -> dict:
+    """Use Claude to analyze a log line and extract relevant information."""
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=200,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Analyze this log line and respond with a JSON object containing:
+- "is_failed_login": true/false (whether this is a failed login attempt)
+- "timestamp": extracted timestamp if present, or null
+- "username": extracted username if present, or null
+- "ip": extracted IP address if present, or null
+
+Log line: {line}
+
+Respond ONLY with the JSON object, no other text."""
+            }
+        ]
+    ) as stream:
+        response_text = ""
+        for text in stream.text_stream:
+            response_text += text
+    
+    try:
+        import json
+        result = json.loads(response_text.strip())
+        return result
+    except:
+        is_failed = "Failed Login" in line or "failed login" in line.lower() or "authentication failure" in line.lower()
+        return {
+            "is_failed_login": is_failed,
+            "timestamp": None,
+            "username": None,
+            "ip": None
+        }
+
+
+def check_and_warn(current_time: float) -> bool:
+    """Check if threshold is exceeded and return True if warning should be issued."""
+    global warning_issued
+    
+    cutoff_time = current_time - WINDOW_SECONDS
+    while failed_login_timestamps and failed_login_timestamps[0] < cutoff_time:
+        failed_login_timestamps.popleft()
+    
+    count = len(failed_login_timestamps)
+    
+    if count > THRESHOLD:
+        if not warning_issued:
+            warning_issued = True
+            return True
+    else:
+        warning_issued = False
+    
+    return False
+
+
+def format_warning(count: int, details: list) -> str:
+    """Format warning message using Claude."""
+    
+    details_str = "\n".join([f"- {d}" for d in details[-5:]])
+    
+    with client.messages.stream(
+        model="claude-opus-4-5",
+        max_tokens=300,
+        messages=[
+            {
+                "role": "user",
+                "content": f"""Generate a security warning message for the following situation:
+- {count} failed login attempts detected in the last {WINDOW_SECONDS} seconds
+- Threshold is {THRESHOLD} attempts
+- Recent failed attempts:
+{details_str}
+
+The warning should be clear, concise, and include the timestamp. Format it as a single warning message."""
+            }
+        ]
+    ) as stream:
+        warning_text = ""
+        for text in stream.text_stream:
+            warning_text += text
+            print(text, end="", flush=True)
+    
+    print()
+    return warning_text
+
+
+def monitor_log_file(log_file_path: str):
+    """Monitor a log file for failed login attempts."""
+    
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Starting log monitor for: {log_file_path}")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Threshold: {THRESHOLD} failed logins in {WINDOW_SECONDS} seconds")
+    print("-" * 60)
+    
+    if not os.path.exists(log_file_path):
+        print(f"Log file not found: {log_file_path}")
+        print("Creating a sample log file for demonstration...")
+        create_sample_log(log_file_path)
+    
+    recent_details = []
+    
+    try:
+        with open(log_file_path, 'r') as f:
+            f.seek(0, 2)
+            
+            while True:
+                line = f.readline()
+                
+                if not line:
+                    time.sleep(0.1)
+                    continue
+                
+                line = line.strip()
+                if not line:
+                    continue
+                
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Processing: {line[:80]}...")
+                
+                analysis = analyze_log_line_with_claude(line)
+                
+                if analysis.get("is_failed_login"):
+                    current_time = time.time()
+                    failed_login_timestamps.append(current_time)
+                    
+                    detail = f"{datetime.now().strftime('%H:%M:%S')}"
+                    if analysis.get("username"):
+                        detail += f" user={analysis['username']}"
+                    if analysis.get("ip"):
+                        detail += f" ip={analysis['ip']}"
+                    recent_details.append(detail)
+                    
+                    count = len(failed_login_timestamps)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠️  Failed login detected! Count in window: {count}/{THRESHOLD}")
+                    
+                    if check_and_warn(current_time):
+                        print("\n" + "=" * 60)
+                        print("🚨 SECURITY WARNING 🚨")
+                        print("=" * 60)
+                        format_warning(count, recent_details)
+                        print("=" * 60 + "\n")
+                        
+                        sys.stdout.flush()
+                
+    except KeyboardInterrupt:
+        print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Monitoring stopped by user")
+    except Exception as e:
+        print(f"Error monitoring log file: {e}")
+        raise
+
+
+def create_sample_log(log_file_path: str):
+    """Create a sample log file for demonstration."""
+    sample_entries = [
+        "2024-01-15 10:00:01 INFO User admin logged in successfully from 192.168.1.100",
+        "2024-01-15 10:00:05 WARNING Failed Login attempt for user john from 10.0.0.1",
+        "2024-01-15 10:00:10 INFO System backup completed",
+        "2024-01-15 10:00:15 WARNING Failed Login attempt for user admin from 10.0.0.2",
+    ]
+    
+    with open(log_file_path, 'w') as f:
+        for entry in sample_entries:
+            f.write(entry + "\n")
+    
+    print(f"Sample log file created: {log_file_path}")
+
+
+def simulate_log_activity(log_file_path: str):
+    """Simulate log activity by writing to the log file."""
+    import threading
+    import random
+    
+    def write_logs():
+        users = ["admin", "root", "user1", "john", "jane"]
+        ips = ["10.0.0.1", "10.0.0.2", "192.168.1.50", "172.16.0.1"]
+        
+        time.sleep(2)
+        
+        print("\n[SIMULATOR] Starting to write failed login attempts...")
+        
+        with open(log_file_path, 'a') as f:
+            for i in range(15):
+                user = random.choice(users)
+                ip = random.choice(ips)
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                log_entry = f"{timestamp} WARNING Failed Login attempt for user {user} from {ip}\n"
+                f.write(log_entry)
+                f.flush()
+                print(f"[SIMULATOR] Written: {log_entry.strip()}")
+                time.sleep(2)
+        
+        print("\n[SIMULATOR] Finished writing failed login attempts")
+        
+        time.sleep(5)
+        print("\n[SIMULATOR] Writing normal log entries...")
+        with open(log_file_path, 'a') as f:
+            for i in range(3):
+                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                log_entry = f"{timestamp} INFO Normal system operation\n"
+                f.write(log_entry)
+                f.flush()
+                time.sleep(2)
+    
+    simulator_thread = threading.Thread(target=write_logs, daemon=True)
+    simulator_thread.start()
+    
+    return simulator_thread
+
+
+if __name__ == "__main__":
+    log_file = "test_monitor.log"
+    
+    if len(sys.argv) > 1:
+        log_file = sys.argv[1]
+        monitor_log_file(log_file)
+    else:
+        print("Running in demonstration mode with simulated log activity...")
+        print(f"Log file: {log_file}")
+        print()
+        
+        if not os.path.exists(log_file):
+            create_sample_log(log_file)
+        
+        simulator = simulate_log_activity(log_file)
+        
+        monitor_log_file(log_file)
+```

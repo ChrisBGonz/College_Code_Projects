@@ -1,0 +1,323 @@
+
+```python
+import anthropic
+import subprocess
+import sys
+import json
+from datetime import datetime
+
+client = anthropic.Anthropic()
+
+def run_command(command: str) -> tuple[int, str, str]:
+    """Execute a shell command and return exit code, stdout, stderr."""
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+    stdout, stderr = process.communicate()
+    return process.returncode, stdout, stderr
+
+def log(message: str, level: str = "INFO"):
+    """Log a message with timestamp."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] [{level}] {message}")
+
+def execute_pipeline_step(step_name: str, command: str) -> dict:
+    """Execute a pipeline step and return results."""
+    log(f"Executing step: {step_name}")
+    log(f"Command: {command}")
+    
+    exit_code, stdout, stderr = run_command(command)
+    
+    result = {
+        "step": step_name,
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "success": exit_code == 0
+    }
+    
+    if exit_code == 0:
+        log(f"Step '{step_name}' completed successfully")
+        if stdout:
+            log(f"Output: {stdout.strip()}")
+    else:
+        log(f"Step '{step_name}' failed with exit code {exit_code}", "ERROR")
+        if stderr:
+            log(f"Error: {stderr.strip()}", "ERROR")
+    
+    return result
+
+def run_cicd_pipeline_with_claude(image_name: str, registry: str, tag: str, container_name: str, port_mapping: str):
+    """Run CI/CD pipeline using Claude with tool use for Docker operations."""
+    
+    tools = [
+        {
+            "name": "docker_pull",
+            "description": "Pull a Docker image from a registry",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "image": {
+                        "type": "string",
+                        "description": "Full image name with registry and tag (e.g., registry.example.com/myapp:latest)"
+                    }
+                },
+                "required": ["image"]
+            }
+        },
+        {
+            "name": "docker_stop_container",
+            "description": "Stop and remove an existing Docker container",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "container_name": {
+                        "type": "string",
+                        "description": "Name of the container to stop and remove"
+                    }
+                },
+                "required": ["container_name"]
+            }
+        },
+        {
+            "name": "docker_run",
+            "description": "Run a Docker container in production",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "image": {
+                        "type": "string",
+                        "description": "Docker image to run"
+                    },
+                    "container_name": {
+                        "type": "string",
+                        "description": "Name for the new container"
+                    },
+                    "port_mapping": {
+                        "type": "string",
+                        "description": "Port mapping in format host_port:container_port"
+                    },
+                    "additional_flags": {
+                        "type": "string",
+                        "description": "Additional Docker run flags (e.g., --restart=always -d)"
+                    }
+                },
+                "required": ["image", "container_name", "port_mapping"]
+            }
+        },
+        {
+            "name": "docker_health_check",
+            "description": "Check if a Docker container is running and healthy",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "container_name": {
+                        "type": "string",
+                        "description": "Name of the container to check"
+                    }
+                },
+                "required": ["container_name"]
+            }
+        },
+        {
+            "name": "docker_cleanup",
+            "description": "Clean up old Docker images to free disk space",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "prune_all": {
+                        "type": "boolean",
+                        "description": "Whether to prune all unused images (true) or just dangling ones (false)"
+                    }
+                },
+                "required": ["prune_all"]
+            }
+        }
+    ]
+    
+    pipeline_results = []
+    
+    log("=" * 60)
+    log("Starting CI/CD Pipeline with Claude AI")
+    log("=" * 60)
+    log(f"Image: {registry}/{image_name}:{tag}")
+    log(f"Container: {container_name}")
+    log(f"Port mapping: {port_mapping}")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"""Execute a complete CI/CD deployment pipeline for the following configuration:
+            
+- Registry: {registry}
+- Image name: {image_name}
+- Tag: {tag}
+- Full image: {registry}/{image_name}:{tag}
+- Container name: {container_name}
+- Port mapping: {port_mapping}
+
+Please perform these steps in order:
+1. Pull the Docker image from the registry
+2. Stop and remove any existing container with the same name
+3. Deploy the new container in production (detached mode with restart policy)
+4. Perform a health check to verify deployment
+5. Clean up old/unused Docker images
+
+Execute each step and report the results."""
+        }
+    ]
+    
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=4096,
+            tools=tools,
+            messages=messages
+        )
+        
+        if response.stop_reason == "tool_use":
+            tool_results = []
+            
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_use_id = content_block.id
+                    
+                    log(f"\n{'='*40}")
+                    log(f"Claude is executing tool: {tool_name}")
+                    
+                    result = None
+                    
+                    if tool_name == "docker_pull":
+                        image = tool_input["image"]
+                        step_result = execute_pipeline_step(
+                            "Docker Pull",
+                            f"docker pull {image}"
+                        )
+                        pipeline_results.append(step_result)
+                        result = json.dumps(step_result)
+                        
+                    elif tool_name == "docker_stop_container":
+                        container = tool_input["container_name"]
+                        step_result = execute_pipeline_step(
+                            "Stop Container",
+                            f"docker stop {container} 2>/dev/null || true && docker rm {container} 2>/dev/null || true"
+                        )
+                        pipeline_results.append(step_result)
+                        result = json.dumps(step_result)
+                        
+                    elif tool_name == "docker_run":
+                        image = tool_input["image"]
+                        container = tool_input["container_name"]
+                        ports = tool_input["port_mapping"]
+                        flags = tool_input.get("additional_flags", "-d --restart=always")
+                        
+                        step_result = execute_pipeline_step(
+                            "Deploy Container",
+                            f"docker run {flags} --name {container} -p {ports} {image}"
+                        )
+                        pipeline_results.append(step_result)
+                        result = json.dumps(step_result)
+                        
+                    elif tool_name == "docker_health_check":
+                        container = tool_input["container_name"]
+                        step_result = execute_pipeline_step(
+                            "Health Check",
+                            f"docker inspect --format='{{{{.State.Status}}}}' {container}"
+                        )
+                        pipeline_results.append(step_result)
+                        result = json.dumps(step_result)
+                        
+                    elif tool_name == "docker_cleanup":
+                        prune_all = tool_input.get("prune_all", False)
+                        if prune_all:
+                            cmd = "docker image prune -a -f"
+                        else:
+                            cmd = "docker image prune -f"
+                        
+                        step_result = execute_pipeline_step(
+                            "Cleanup Images",
+                            cmd
+                        )
+                        pipeline_results.append(step_result)
+                        result = json.dumps(step_result)
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": result
+                    })
+            
+            messages.append({"role": "assistant", "content": response.content})
+            messages.append({"role": "user", "content": tool_results})
+            
+        else:
+            final_message = ""
+            for content_block in response.content:
+                if hasattr(content_block, 'text'):
+                    final_message += content_block.text
+            
+            log("\n" + "=" * 60)
+            log("Pipeline Execution Complete")
+            log("=" * 60)
+            log("\nClaude's Summary:")
+            print(final_message)
+            
+            log("\n" + "=" * 60)
+            log("Pipeline Results Summary")
+            log("=" * 60)
+            
+            success_count = sum(1 for r in pipeline_results if r.get("success", False))
+            total_count = len(pipeline_results)
+            
+            for result in pipeline_results:
+                status = "✓" if result.get("success", False) else "✗"
+                log(f"{status} {result['step']}: {'SUCCESS' if result.get('success', False) else 'FAILED'}")
+            
+            log(f"\nTotal: {success_count}/{total_count} steps successful")
+            
+            if success_count == total_count:
+                log("🚀 Deployment completed successfully!", "SUCCESS")
+                return True
+            else:
+                log("❌ Deployment failed!", "ERROR")
+                return False
+
+def main():
+    REGISTRY = "registry.example.com"
+    IMAGE_NAME = "myapp"
+    TAG = "latest"
+    CONTAINER_NAME = "myapp-production"
+    PORT_MAPPING = "8080:80"
+    
+    if len(sys.argv) > 1:
+        if len(sys.argv) >= 5:
+            REGISTRY = sys.argv[1]
+            IMAGE_NAME = sys.argv[2]
+            TAG = sys.argv[3]
+            CONTAINER_NAME = sys.argv[4]
+            PORT_MAPPING = sys.argv[5] if len(sys.argv) > 5 else PORT_MAPPING
+        else:
+            print("Usage: python solution.py [registry] [image_name] [tag] [container_name] [port_mapping]")
+            print("Example: python solution.py registry.example.com myapp latest myapp-prod 8080:80")
+            sys.exit(1)
+    
+    success = run_cicd_pipeline_with_claude(
+        image_name=IMAGE_NAME,
+        registry=REGISTRY,
+        tag=TAG,
+        container_name=CONTAINER_NAME,
+        port_mapping=PORT_MAPPING
+    )
+    
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
+```

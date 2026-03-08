@@ -1,0 +1,365 @@
+<?php
+
+declare(strict_types=1);
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+
+define('ADMIN_EMAIL', 'admin@example.com');
+define('ADMIN_EMAIL_FROM', 'security@example.com');
+define('SLACK_WEBHOOK_URL', 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL');
+define('ALERT_LOG_FILE', __DIR__ . '/admin_alerts.log');
+define('ENABLE_EMAIL', true);
+define('ENABLE_SLACK', true);
+define('SESSION_TIMEOUT', 1800);
+
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
+
+session_start();
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function getClientIp(): string
+{
+    $headers = [
+        'HTTP_CLIENT_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_X_FORWARDED',
+        'HTTP_X_CLUSTER_CLIENT_IP',
+        'HTTP_FORWARDED_FOR',
+        'HTTP_FORWARDED',
+        'REMOTE_ADDR',
+    ];
+
+    foreach ($headers as $header) {
+        if (!empty($_SERVER[$header])) {
+            $ips = explode(',', $_SERVER[$header]);
+            $ip  = trim($ips[0]);
+            if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE)) {
+                return $ip;
+            }
+        }
+    }
+
+    return $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+}
+
+function getUserAgent(): string
+{
+    return $_SERVER['HTTP_USER_AGENT'] ?? 'unknown';
+}
+
+function getRequestedUrl(): string
+{
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'unknown';
+    $uri    = $_SERVER['REQUEST_URI'] ?? '/';
+    return $scheme . '://' . $host . $uri;
+}
+
+function getReferer(): string
+{
+    return $_SERVER['HTTP_REFERER'] ?? 'none';
+}
+
+function getCurrentUser(): array
+{
+    return [
+        'id'       => $_SESSION['user_id']   ?? null,
+        'username' => $_SESSION['username']  ?? 'anonymous',
+        'role'     => $_SESSION['role']      ?? 'guest',
+        'email'    => $_SESSION['user_email'] ?? 'unknown',
+    ];
+}
+
+function isSessionExpired(): bool
+{
+    if (isset($_SESSION['last_activity'])) {
+        return (time() - $_SESSION['last_activity']) > SESSION_TIMEOUT;
+    }
+    return false;
+}
+
+function logAlert(array $data): void
+{
+    $line = sprintf(
+        "[%s] UNAUTHORIZED_ADMIN_ACCESS | IP: %s | User: %s (ID: %s, Role: %s) | URL: %s | UA: %s | Referer: %s\n",
+        date('Y-m-d H:i:s'),
+        $data['ip'],
+        $data['username'],
+        $data['user_id'] ?? 'null',
+        $data['role'],
+        $data['url'],
+        $data['user_agent'],
+        $data['referer']
+    );
+
+    file_put_contents(ALERT_LOG_FILE, $line, FILE_APPEND | LOCK_EX);
+}
+
+function sendEmailAlert(array $data): bool
+{
+    if (!ENABLE_EMAIL) {
+        return false;
+    }
+
+    $subject = '[SECURITY ALERT] Unauthorized /admin access attempt';
+
+    $body = "Administrator Security Alert\n";
+    $body .= str_repeat('=', 50) . "\n\n";
+    $body .= "An unauthorized attempt to access the admin panel was detected.\n\n";
+    $body .= "Details:\n";
+    $body .= "  Date/Time   : " . $data['datetime'] . "\n";
+    $body .= "  IP Address  : " . $data['ip'] . "\n";
+    $body .= "  Username    : " . $data['username'] . "\n";
+    $body .= "  User ID     : " . ($data['user_id'] ?? 'not authenticated') . "\n";
+    $body .= "  User Role   : " . $data['role'] . "\n";
+    $body .= "  User Email  : " . $data['user_email'] . "\n";
+    $body .= "  Requested URL: " . $data['url'] . "\n";
+    $body .= "  Referer     : " . $data['referer'] . "\n";
+    $body .= "  User Agent  : " . $data['user_agent'] . "\n";
+    $body .= "  Session ID  : " . $data['session_id'] . "\n\n";
+    $body .= "Please review this activity immediately.\n";
+
+    $headers  = "From: " . ADMIN_EMAIL_FROM . "\r\n";
+    $headers .= "Reply-To: " . ADMIN_EMAIL_FROM . "\r\n";
+    $headers .= "X-Mailer: PHP/" . phpversion() . "\r\n";
+    $headers .= "X-Priority: 1 (Highest)\r\n";
+    $headers .= "Importance: High\r\n";
+    $headers .= "Content-Type: text/plain; charset=UTF-8\r\n";
+
+    return mail(ADMIN_EMAIL, $subject, $body, $headers);
+}
+
+function sendSlackAlert(array $data): bool
+{
+    if (!ENABLE_SLACK || empty(SLACK_WEBHOOK_URL) || SLACK_WEBHOOK_URL === 'https://hooks.slack.com/services/YOUR/WEBHOOK/URL') {
+        return false;
+    }
+
+    $payload = [
+        'username'   => 'Security Bot',
+        'icon_emoji' => ':rotating_light:',
+        'text'       => ':rotating_light: *ADMINISTRATOR ALERT* — Unauthorized `/admin` access attempt!',
+        'attachments' => [
+            [
+                'color'  => 'danger',
+                'title'  => 'Unauthorized Admin Access Detected',
+                'fields' => [
+                    ['title' => 'Date/Time',    'value' => $data['datetime'],                          'short' => true],
+                    ['title' => 'IP Address',   'value' => $data['ip'],                                'short' => true],
+                    ['title' => 'Username',     'value' => $data['username'],                          'short' => true],
+                    ['title' => 'User Role',    'value' => $data['role'],                              'short' => true],
+                    ['title' => 'User ID',      'value' => $data['user_id'] ?? 'not authenticated',   'short' => true],
+                    ['title' => 'User Email',   'value' => $data['user_email'],                        'short' => true],
+                    ['title' => 'Requested URL','value' => $data['url'],                               'short' => false],
+                    ['title' => 'Referer',      'value' => $data['referer'],                           'short' => false],
+                    ['title' => 'User Agent',   'value' => $data['user_agent'],                        'short' => false],
+                    ['title' => 'Session ID',   'value' => $data['session_id'],                        'short' => false],
+                ],
+                'footer' => 'Security Alert System',
+                'ts'     => time(),
+            ],
+        ],
+    ];
+
+    $jsonPayload = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+
+    $ch = curl_init(SLACK_WEBHOOK_URL);
+    curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_POST           => true,
+        CURLOPT_POSTFIELDS     => $jsonPayload,
+        CURLOPT_HTTPHEADER     => ['Content-Type: application/json'],
+        CURLOPT_TIMEOUT        => 10,
+        CURLOPT_SSL_VERIFYPEER => true,
+    ]);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    return $httpCode === 200 && $response === 'ok';
+}
+
+function triggerAdminAlert(): void
+{
+    $user = getCurrentUser();
+
+    $data = [
+        'datetime'   => date('Y-m-d H:i:s'),
+        'ip'         => getClientIp(),
+        'username'   => $user['username'],
+        'user_id'    => $user['id'],
+        'role'       => $user['role'],
+        'user_email' => $user['email'],
+        'url'        => getRequestedUrl(),
+        'referer'    => getReferer(),
+        'user_agent' => getUserAgent(),
+        'session_id' => session_id(),
+    ];
+
+    logAlert($data);
+    sendEmailAlert($data);
+    sendSlackAlert($data);
+}
+
+function hasAdminAccess(): bool
+{
+    if (empty($_SESSION['user_id'])) {
+        return false;
+    }
+
+    if (isSessionExpired()) {
+        session_destroy();
+        return false;
+    }
+
+    $_SESSION['last_activity'] = time();
+
+    $allowedRoles = ['admin', 'superadmin'];
+    $userRole     = $_SESSION['role'] ?? 'guest';
+
+    return in_array($userRole, $allowedRoles, true);
+}
+
+function denyAccess(): void
+{
+    triggerAdminAlert();
+
+    http_response_code(403);
+
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>403 — Access Denied</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f0f;
+            color: #e0e0e0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        .container {
+            text-align: center;
+            padding: 2rem;
+            max-width: 500px;
+        }
+        .icon { font-size: 5rem; margin-bottom: 1rem; }
+        h1 { font-size: 2rem; color: #ff4444; margin-bottom: 0.5rem; }
+        p  { color: #aaa; line-height: 1.6; margin-bottom: 1.5rem; }
+        .code { font-size: 6rem; font-weight: 900; color: #222; }
+        a {
+            display: inline-block;
+            padding: 0.6rem 1.5rem;
+            background: #333;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 6px;
+            transition: background 0.2s;
+        }
+        a:hover { background: #555; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="code">403</div>
+        <div class="icon">🚫</div>
+        <h1>Access Denied</h1>
+        <p>You do not have permission to access this page.<br>
+           This incident has been reported to the administrator.</p>
+        <a href="/">← Go Home</a>
+    </div>
+</body>
+</html>
+HTML;
+
+    exit;
+}
+
+// ─── Simulate demo users (replace with real DB auth) ─────────────────────────
+
+function simulateDemoSession(string $role): void
+{
+    $_SESSION['user_id']    = rand(100, 999);
+    $_SESSION['username']   = 'demo_' . $role;
+    $_SESSION['role']       = $role;
+    $_SESSION['user_email'] = 'demo_' . $role . '@example.com';
+    $_SESSION['last_activity'] = time();
+}
+
+// Uncomment one of the lines below to test different scenarios:
+// simulateDemoSession('admin');       // ✅ will be granted access
+// simulateDemoSession('editor');      // ❌ will trigger alert
+// simulateDemoSession('guest');       // ❌ will trigger alert
+// (no session = anonymous)           // ❌ will trigger alert
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+
+$requestUri  = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
+$requestPath = rtrim($requestUri, '/');
+
+if ($requestPath === '/admin') {
+
+    if (!hasAdminAccess()) {
+        denyAccess();
+    }
+
+    // ── Admin panel (authorized users only) ──────────────────────────────────
+    $user = getCurrentUser();
+    http_response_code(200);
+
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin Panel</title>
+    <style>
+        body { font-family: sans-serif; background: #1a1a2e; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .box { background: #16213e; padding: 2rem 3rem; border-radius: 12px; text-align: center; }
+        h1 { color: #4ecca3; }
+        p  { color: #aaa; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>✅ Admin Panel</h1>
+        <p>Welcome, <strong>{$user['username']}</strong>!</p>
+        <p>Role: <strong>{$user['role']}</strong></p>
+    </div>
+</body>
+</html>
+HTML;
+
+} else {
+
+    // ── Public page ──────────────────────────────────────────────────────────
+    http_response_code(200);
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Home</title>
+    <style>
+        body { font-family: sans-serif; background: #111; color: #eee; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+        .box { text-align: center; }
+        a { color: #4ecca3; }
+    </style>
+</head>
+<body>
+    <div class="box">
+        <h1>Public Page</h1>
+        <p><a href="/admin">Try to access /admin</a></p>
+    </div>
+</body>
+</html>
+HTML;
+}

@@ -1,0 +1,325 @@
+
+```python
+import os
+import logging
+from anthropic import Anthropic
+from flask import Flask, request, jsonify
+import hashlib
+import sqlite3
+from contextlib import contextmanager
+
+app = Flask(__name__)
+client = Anthropic()
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+DB_PATH = "users.db"
+
+
+def init_db():
+    """Initialize the database with a users table and sample data."""
+    with get_db_connection() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                email TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        test_users = [
+            ("admin", "password123"),
+            ("user1", "mypassword"),
+            ("testuser", "test123")
+        ]
+        
+        for username, password in test_users:
+            password_hash = hashlib.sha256(password.encode()).hexdigest()
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO users (username, password_hash) VALUES (?, ?)",
+                    (username, password_hash)
+                )
+            except sqlite3.Error:
+                pass
+        
+        conn.commit()
+
+
+@contextmanager
+def get_db_connection():
+    """Context manager for database connections."""
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        yield conn
+    except sqlite3.Error as e:
+        logger.error(f"Database connection error: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA-256."""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def validate_credentials_with_ai(username: str, password: str, db_result: dict) -> dict:
+    """Use Claude to analyze the login attempt and provide intelligent response."""
+    conversation_history = []
+    
+    system_prompt = """You are a security-focused authentication assistant. 
+    Your role is to analyze login attempts and provide appropriate responses.
+    You should:
+    1. Analyze the authentication result
+    2. Provide clear, security-conscious feedback
+    3. Suggest appropriate actions based on the scenario
+    
+    Always respond in JSON format with fields:
+    - success: boolean
+    - message: string (user-friendly message)
+    - security_note: string (optional security advice)
+    - action: string (recommended action)"""
+    
+    context = f"""
+    Login attempt analysis:
+    - Username provided: {username}
+    - User found in database: {db_result.get('user_found', False)}
+    - Password correct: {db_result.get('password_correct', False)}
+    - Database error occurred: {db_result.get('db_error', False)}
+    - Error details: {db_result.get('error_message', 'None')}
+    """
+    
+    conversation_history.append({
+        "role": "user",
+        "content": f"Analyze this login attempt and provide appropriate response:\n{context}"
+    })
+    
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=500,
+        system=system_prompt,
+        messages=conversation_history
+    )
+    
+    ai_response = response.content[0].text
+    conversation_history.append({
+        "role": "assistant",
+        "content": ai_response
+    })
+    
+    if db_result.get('user_found') and db_result.get('password_correct'):
+        conversation_history.append({
+            "role": "user",
+            "content": "The user has successfully authenticated. What additional security recommendations would you provide?"
+        })
+        
+        follow_up_response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=300,
+            system=system_prompt,
+            messages=conversation_history
+        )
+        
+        security_advice = follow_up_response.content[0].text
+        conversation_history.append({
+            "role": "assistant",
+            "content": security_advice
+        })
+    
+    import json
+    try:
+        result = json.loads(ai_response)
+    except json.JSONDecodeError:
+        result = {
+            "success": db_result.get('user_found') and db_result.get('password_correct'),
+            "message": ai_response,
+            "action": "proceed" if db_result.get('password_correct') else "retry"
+        }
+    
+    return result
+
+
+@app.route('/login', methods=['POST'])
+def login():
+    """
+    Login endpoint that validates credentials against the database.
+    
+    Expected JSON body:
+    {
+        "username": "string",
+        "password": "string"
+    }
+    
+    Returns:
+    - 200: Successful login
+    - 400: Missing or invalid input
+    - 401: Invalid credentials
+    - 404: User not found
+    - 500: Database or server error
+    """
+    if not request.is_json:
+        return jsonify({
+            "success": False,
+            "error": "Content-Type must be application/json",
+            "code": "INVALID_CONTENT_TYPE"
+        }), 400
+    
+    data = request.get_json()
+    
+    if not data:
+        return jsonify({
+            "success": False,
+            "error": "Request body is empty or invalid JSON",
+            "code": "INVALID_JSON"
+        }), 400
+    
+    username = data.get('username', '').strip()
+    password = data.get('password', '')
+    
+    if not username:
+        return jsonify({
+            "success": False,
+            "error": "Username is required",
+            "code": "MISSING_USERNAME"
+        }), 400
+    
+    if not password:
+        return jsonify({
+            "success": False,
+            "error": "Password is required",
+            "code": "MISSING_PASSWORD"
+        }), 400
+    
+    if len(username) > 255:
+        return jsonify({
+            "success": False,
+            "error": "Username too long",
+            "code": "INVALID_USERNAME"
+        }), 400
+    
+    db_result = {
+        "user_found": False,
+        "password_correct": False,
+        "db_error": False,
+        "error_message": None
+    }
+    
+    user = None
+    
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.execute(
+                "SELECT id, username, password_hash FROM users WHERE username = ?",
+                (username,)
+            )
+            user = cursor.fetchone()
+            
+            if user:
+                db_result["user_found"] = True
+                
+                provided_hash = hash_password(password)
+                if provided_hash == user['password_hash']:
+                    db_result["password_correct"] = True
+            
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database operational error: {e}")
+        db_result["db_error"] = True
+        db_result["error_message"] = str(e)
+        
+        return jsonify({
+            "success": False,
+            "error": "Database is unavailable. Please try again later.",
+            "code": "DB_UNAVAILABLE"
+        }), 500
+        
+    except sqlite3.Error as e:
+        logger.error(f"Database error during login: {e}")
+        db_result["db_error"] = True
+        db_result["error_message"] = str(e)
+        
+        return jsonify({
+            "success": False,
+            "error": "An error occurred while processing your request",
+            "code": "DB_ERROR"
+        }), 500
+    
+    try:
+        ai_analysis = validate_credentials_with_ai(username, password, db_result)
+    except Exception as e:
+        logger.error(f"AI analysis error: {e}")
+        ai_analysis = {
+            "success": db_result["user_found"] and db_result["password_correct"],
+            "message": "Login processed",
+            "action": "proceed" if db_result["password_correct"] else "retry"
+        }
+    
+    if not db_result["user_found"]:
+        logger.warning(f"Login attempt for non-existent user: {username}")
+        return jsonify({
+            "success": False,
+            "error": "Invalid username or password",
+            "code": "INVALID_CREDENTIALS",
+            "ai_message": ai_analysis.get("message", "User not found"),
+            "recommendation": ai_analysis.get("action", "verify_username")
+        }), 401
+    
+    if not db_result["password_correct"]:
+        logger.warning(f"Failed login attempt for user: {username}")
+        return jsonify({
+            "success": False,
+            "error": "Invalid username or password",
+            "code": "INVALID_CREDENTIALS",
+            "ai_message": ai_analysis.get("message", "Incorrect password"),
+            "recommendation": ai_analysis.get("action", "retry")
+        }), 401
+    
+    logger.info(f"Successful login for user: {username}")
+    
+    response_data = {
+        "success": True,
+        "message": "Login successful",
+        "user": {
+            "id": user['id'],
+            "username": user['username']
+        },
+        "ai_message": ai_analysis.get("message", "Welcome!"),
+        "security_note": ai_analysis.get("security_note", ""),
+        "recommendation": ai_analysis.get("action", "proceed")
+    }
+    
+    return jsonify(response_data), 200
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    try:
+        with get_db_connection() as conn:
+            conn.execute("SELECT 1")
+        db_status = "healthy"
+    except Exception:
+        db_status = "unhealthy"
+    
+    return jsonify({
+        "status": "ok",
+        "database": db_status
+    }), 200
+
+
+if __name__ == '__main__':
+    init_db()
+    logger.info("Database initialized with test users")
+    logger.info("Test credentials:")
+    logger.info("  admin / password123")
+    logger.info("  user1 / mypassword")
+    logger.info("  testuser / test123")
+    
+    app.run(debug=True, host='0.0.0.0', port=5000)
+```

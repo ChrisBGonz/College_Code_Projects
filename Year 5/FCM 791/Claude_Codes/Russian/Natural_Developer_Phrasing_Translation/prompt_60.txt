@@ -1,0 +1,821 @@
+```javascript
+// ============================================================
+// VOTING SYSTEM - Node.js + Express + PostgreSQL + Redis
+// ============================================================
+
+// package.json dependencies:
+// express, pg, redis, ioredis, express-rate-limit, helmet,
+// joi, uuid, dotenv, morgan, compression, express-validator
+
+// ============================================================
+// FILE STRUCTURE:
+// src/
+//   config/         - database, redis, app config
+//   models/         - data models
+//   routes/         - API routes
+//   controllers/    - business logic
+//   middleware/     - auth, validation, rate limiting
+//   services/       - vote service, ip service
+//   utils/          - helpers
+//   migrations/     - SQL migrations
+// ============================================================
+
+// ============================================================
+// src/config/database.js
+// ============================================================
+const { Pool } = require('pg');
+
+const pool = new Pool({
+  host: process.env.DB_HOST || 'localhost',
+  port: parseInt(process.env.DB_PORT) || 5432,
+  database: process.env.DB_NAME || 'voting_db',
+  user: process.env.DB_USER || 'postgres',
+  password: process.env.DB_PASSWORD,
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 2000,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: true } : false,
+});
+
+pool.on('error', (err) => {
+  console.error('Unexpected error on idle client', err);
+  process.exit(-1);
+});
+
+module.exports = pool;
+
+// ============================================================
+// src/config/redis.js
+// ============================================================
+const Redis = require('ioredis');
+
+const redisClient = new Redis({
+  host: process.env.REDIS_HOST || 'localhost',
+  port: parseInt(process.env.REDIS_PORT) || 6379,
+  password: process.env.REDIS_PASSWORD,
+  db: parseInt(process.env.REDIS_DB) || 0,
+  retryStrategy: (times) => {
+    const delay = Math.min(times * 50, 2000);
+    return delay;
+  },
+  maxRetriesPerRequest: 3,
+  enableReadyCheck: true,
+  lazyConnect: false,
+});
+
+redisClient.on('error', (err) => console.error('Redis Client Error', err));
+redisClient.on('connect', () => console.log('Redis connected'));
+
+module.exports = redisClient;
+
+// ============================================================
+// src/migrations/001_initial_schema.sql
+// ============================================================
+/*
+-- Enable UUID extension
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================================
+-- POLLS TABLE
+-- ============================================================
+CREATE TABLE polls (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    title           VARCHAR(500) NOT NULL,
+    description     TEXT,
+    created_by      VARCHAR(255),
+    status          VARCHAR(20) NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('draft', 'active', 'closed', 'archived')),
+    allow_multiple  BOOLEAN NOT NULL DEFAULT FALSE,
+    max_choices     INTEGER DEFAULT 1 CHECK (max_choices >= 1 AND max_choices <= 10),
+    starts_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ends_at         TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_polls_status ON polls(status);
+CREATE INDEX idx_polls_starts_at ON polls(starts_at);
+CREATE INDEX idx_polls_ends_at ON polls(ends_at);
+
+-- ============================================================
+-- OPTIONS TABLE
+-- ============================================================
+CREATE TABLE poll_options (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    poll_id         UUID NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    text            VARCHAR(500) NOT NULL,
+    description     TEXT,
+    position        INTEGER NOT NULL DEFAULT 0,
+    vote_count      INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_poll_options_poll_id ON poll_options(poll_id);
+CREATE INDEX idx_poll_options_position ON poll_options(poll_id, position);
+
+-- ============================================================
+-- VOTES TABLE
+-- ============================================================
+CREATE TABLE votes (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    poll_id         UUID NOT NULL REFERENCES polls(id) ON DELETE CASCADE,
+    option_id       UUID NOT NULL REFERENCES poll_options(id) ON DELETE CASCADE,
+    
+    -- IP storage: store both normalized forms
+    ip_address      INET NOT NULL,          -- PostgreSQL INET type handles both IPv4/IPv6
+    ip_normalized   VARCHAR(45) NOT NULL,   -- normalized string for dedup
+    ip_hash         VARCHAR(64) NOT NULL,   -- SHA-256 hash for privacy
+    
+    -- Additional fingerprinting (optional, for NAT mitigation)
+    user_agent_hash VARCHAR(64),
+    session_token   VARCHAR(64),            -- optional anonymous session
+    
+    -- Metadata
+    voted_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB DEFAULT '{}'::jsonb
+);
+
+-- Critical: unique constraint for deduplication
+-- One IP per poll (not per option)
+CREATE UNIQUE INDEX idx_votes_ip_poll_unique 
+    ON votes(poll_id, ip_normalized);
+
+-- Additional indexes
+CREATE INDEX idx_votes_poll_id ON votes(poll_id);
+CREATE INDEX idx_votes_option_id ON votes(option_id);
+CREATE INDEX idx_votes_ip_hash ON votes(ip_hash);
+CREATE INDEX idx_votes_voted_at ON votes(voted_at);
+
+-- ============================================================
+-- VOTE ATTEMPTS LOG (for security/analytics)
+-- ============================================================
+CREATE TABLE vote_attempts (
+    id              BIGSERIAL PRIMARY KEY,
+    poll_id         UUID REFERENCES polls(id) ON DELETE SET NULL,
+    ip_address      INET NOT NULL,
+    ip_normalized   VARCHAR(45) NOT NULL,
+    attempt_type    VARCHAR(20) NOT NULL 
+                    CHECK (attempt_type IN ('success', 'duplicate', 'invalid', 'rate_limited', 'closed')),
+    attempted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX idx_vote_attempts_ip ON vote_attempts(ip_normalized);
+CREATE INDEX idx_vote_attempts_poll ON vote_attempts(poll_id);
+CREATE INDEX idx_vote_attempts_time ON vote_attempts(attempted_at);
+CREATE INDEX idx_vote_attempts_type ON vote_attempts(attempt_type);
+
+-- Auto-cleanup old attempts (keep 30 days)
+CREATE INDEX idx_vote_attempts_cleanup ON vote_attempts(attempted_at) 
+    WHERE attempted_at < NOW() - INTERVAL '30 days';
+
+-- ============================================================
+-- POLL RESULTS VIEW (materialized for performance)
+-- ============================================================
+CREATE MATERIALIZED VIEW poll_results AS
+SELECT 
+    p.id AS poll_id,
+    p.title,
+    p.status,
+    po.id AS option_id,
+    po.text AS option_text,
+    po.position,
+    po.vote_count,
+    COUNT(v.id) AS actual_vote_count,
+    ROUND(
+        COUNT(v.id) * 100.0 / NULLIF(SUM(COUNT(v.id)) OVER (PARTITION BY p.id), 0), 
+        2
+    ) AS percentage
+FROM polls p
+JOIN poll_options po ON po.poll_id = p.id
+LEFT JOIN votes v ON v.option_id = po.id
+GROUP BY p.id, p.title, p.status, po.id, po.text, po.position, po.vote_count;
+
+CREATE UNIQUE INDEX idx_poll_results_unique ON poll_results(poll_id, option_id);
+
+-- ============================================================
+-- FUNCTION: Update vote count atomically
+-- ============================================================
+CREATE OR REPLACE FUNCTION increment_vote_count()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE poll_options 
+    SET vote_count = vote_count + 1 
+    WHERE id = NEW.option_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_increment_vote_count
+    AFTER INSERT ON votes
+    FOR EACH ROW EXECUTE FUNCTION increment_vote_count();
+
+-- ============================================================
+-- FUNCTION: Decrement on delete (for vote changes)
+-- ============================================================
+CREATE OR REPLACE FUNCTION decrement_vote_count()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE poll_options 
+    SET vote_count = GREATEST(vote_count - 1, 0)
+    WHERE id = OLD.option_id;
+    RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_decrement_vote_count
+    AFTER DELETE ON votes
+    FOR EACH ROW EXECUTE FUNCTION decrement_vote_count();
+
+-- ============================================================
+-- FUNCTION: Auto-update updated_at
+-- ============================================================
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trigger_polls_updated_at
+    BEFORE UPDATE ON polls
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+*/
+
+// ============================================================
+// src/utils/ipUtils.js
+// ============================================================
+const crypto = require('crypto');
+const { promisify } = require('util');
+const dns = require('dns');
+const dnsReverse = promisify(dns.reverse);
+
+/**
+ * IP Utility Functions
+ * Handles IPv4, IPv6, IPv4-mapped IPv6, NAT detection
+ */
+
+// Known datacenter/proxy CIDR ranges (simplified - use MaxMind in production)
+const SUSPICIOUS_RANGES = [
+  // Tor exit nodes would be checked via API
+  // VPN providers - simplified examples
+  '10.0.0.0/8',    // Private (should not appear as real IP)
+  '172.16.0.0/12', // Private
+  '192.168.0.0/16', // Private
+  '127.0.0.0/8',   // Loopback
+  '::1/128',        // IPv6 loopback
+  'fc00::/7',       // IPv6 private
+];
+
+/**
+ * Normalize IP address:
+ * - Convert IPv4-mapped IPv6 (::ffff:x.x.x.x) to IPv4
+ * - Lowercase IPv6
+ * - Remove zone IDs from IPv6
+ */
+function normalizeIP(ip) {
+  if (!ip || typeof ip !== 'string') {
+    throw new Error('Invalid IP address');
+  }
+
+  let normalized = ip.trim();
+
+  // Remove IPv6 zone ID (e.g., fe80::1%eth0)
+  normalized = normalized.replace(/%.*$/, '');
+
+  // Convert IPv4-mapped IPv6 to IPv4
+  // ::ffff:192.168.1.1 -> 192.168.1.1
+  const ipv4MappedRegex = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/i;
+  const ipv4MappedMatch = normalized.match(ipv4MappedRegex);
+  if (ipv4MappedMatch) {
+    normalized = ipv4MappedMatch[1];
+  }
+
+  // Convert IPv4-mapped IPv6 hex form
+  // ::ffff:c0a8:0101 -> 192.168.1.1
+  const ipv4MappedHexRegex = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
+  const ipv4MappedHexMatch = normalized.match(ipv4MappedHexRegex);
+  if (ipv4MappedHexMatch) {
+    const part1 = parseInt(ipv4MappedHexMatch[1], 16);
+    const part2 = parseInt(ipv4MappedHexMatch[2], 16);
+    normalized = `${(part1 >> 8) & 0xff}.${part1 & 0xff}.${(part2 >> 8) & 0xff}.${part2 & 0xff}`;
+  }
+
+  // Lowercase IPv6
+  if (normalized.includes(':')) {
+    normalized = normalized.toLowerCase();
+  }
+
+  return normalized;
+}
+
+/**
+ * Validate IP address format
+ */
+function isValidIP(ip) {
+  const ipv4Regex = /^(\d{1,3}\.){3}\d{1,3}$/;
+  const ipv6Regex = /^([0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}$/;
+  
+  if (ipv4Regex.test(ip)) {
+    const parts = ip.split('.').map(Number);
+    return parts.every(p => p >= 0 && p <= 255);
+  }
+  
+  return ipv6Regex.test(ip) || ip === '::1' || ip === '::';
+}
+
+/**
+ * Hash IP for privacy-preserving storage
+ * Uses HMAC-SHA256 with server secret
+ */
+function hashIP(ip, salt = process.env.IP_HASH_SECRET || 'default-secret-change-in-prod') {
+  return crypto
+    .createHmac('sha256', salt)
+    .update(ip)
+    .digest('hex');
+}
+
+/**
+ * Extract real IP from request
+ * Handles various proxy headers with trust levels
+ */
+function extractRealIP(req) {
+  const trustProxy = process.env.TRUST_PROXY === 'true';
+  
+  if (trustProxy) {
+    // X-Forwarded-For: client, proxy1, proxy2
+    // Take the leftmost (original client) IP
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (xForwardedFor) {
+      const ips = xForwardedFor.split(',').map(ip => ip.trim());
+      // Filter out private/invalid IPs from the chain
+      for (const ip of ips) {
+        const normalized = normalizeIP(ip);
+        if (isValidIP(normalized) && !isPrivateIP(normalized)) {
+          return normalized;
+        }
+      }
+    }
+
+    // Cloudflare
+    const cfConnectingIP = req.headers['cf-connecting-ip'];
+    if (cfConnectingIP) {
+      const normalized = normalizeIP(cfConnectingIP.trim());
+      if (isValidIP(normalized)) return normalized;
+    }
+
+    // True-Client-IP (Akamai, Cloudflare Enterprise)
+    const trueClientIP = req.headers['true-client-ip'];
+    if (trueClientIP) {
+      const normalized = normalizeIP(trueClientIP.trim());
+      if (isValidIP(normalized)) return normalized;
+    }
+
+    // X-Real-IP (nginx)
+    const xRealIP = req.headers['x-real-ip'];
+    if (xRealIP) {
+      const normalized = normalizeIP(xRealIP.trim());
+      if (isValidIP(normalized)) return normalized;
+    }
+  }
+
+  // Fallback to direct connection IP
+  const remoteAddress = req.socket?.remoteAddress || req.connection?.remoteAddress || '0.0.0.0';
+  return normalizeIP(remoteAddress);
+}
+
+/**
+ * Check if IP is private/reserved
+ */
+function isPrivateIP(ip) {
+  if (!ip) return true;
+  
+  // IPv4 private ranges
+  if (!ip.includes(':')) {
+    const parts = ip.split('.').map(Number);
+    if (parts[0] === 10) return true;
+    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    if (parts[0] === 192 && parts[1] === 168) return true;
+    if (parts[0] === 127) return true;
+    if (parts[0] === 169 && parts[1] === 254) return true; // Link-local
+    if (parts[0] === 0) return true;
+  }
+  
+  // IPv6 private
+  if (ip === '::1') return true;
+  if (ip.startsWith('fc') || ip.startsWith('fd')) return true; // ULA
+  if (ip.startsWith('fe80')) return true; // Link-local
+  
+  return false;
+}
+
+/**
+ * Get IP subnet for NAT grouping analysis
+ * For IPv4: /24 subnet, For IPv6: /48 subnet
+ */
+function getIPSubnet(ip) {
+  if (!ip.includes(':')) {
+    // IPv4: return /24
+    const parts = ip.split('.');
+    return `${parts[0]}.${parts[1]}.${parts[2]}.0/24`;
+  } else {
+    // IPv6: return /48 (first 3 groups)
+    const groups = ip.split(':');
+    return `${groups.slice(0, 3).join(':')}::/48`;
+  }
+}
+
+/**
+ * Detect if IP might be a proxy/VPN
+ * In production, integrate with MaxMind GeoIP2 or IPQualityScore
+ */
+async function detectProxyRisk(ip) {
+  const risk = {
+    isPrivate: isPrivateIP(ip),
+    isLoopback: ip === '127.0.0.1' || ip === '::1',
+    suspicionScore: 0,
+    flags: [],
+  };
+
+  if (risk.isPrivate) {
+    risk.suspicionScore += 50;
+    risk.flags.push('private_ip');
+  }
+
+  // Check for datacenter IP via reverse DNS (simplified)
+  try {
+    const hostnames = await dnsReverse(ip);
+    const datacenterKeywords = ['amazonaws', 'googlecloud', 'azure', 'digitalocean', 
+                                 'linode', 'vultr', 'ovh', 'hetzner', 'tor-exit'];
+    for (const hostname of hostnames) {
+      for (const keyword of datacenterKeywords) {
+        if (hostname.toLowerCase().includes(keyword)) {
+          risk.suspicionScore += 30;
+          risk.flags.push(`datacenter_${keyword}`);
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    // DNS lookup failed - not necessarily suspicious
+  }
+
+  return risk;
+}
+
+module.exports = {
+  normalizeIP,
+  isValidIP,
+  hashIP,
+  extractRealIP,
+  isPrivateIP,
+  getIPSubnet,
+  detectProxyRisk,
+};
+
+// ============================================================
+// src/services/voteService.js
+// ============================================================
+const pool = require('../config/database');
+const redis = require('../config/redis');
+const { normalizeIP, hashIP, getIPSubnet } = require('../utils/ipUtils');
+
+const VOTE_LOCK_TTL = 10; // seconds - distributed lock TTL
+const RESULTS_CACHE_TTL = 30; // seconds - cache poll results
+const SUBNET_VOTE_WINDOW = 3600; // 1 hour window for subnet analysis
+
+class VoteService {
+  
+  /**
+   * Cast a vote with full deduplication and validation
+   */
+  async castVote({ pollId, optionIds, ipAddress, userAgent, sessionToken }) {
+    const normalizedIP = normalizeIP(ipAddress);
+    const ipHash = hashIP(normalizedIP);
+    const subnet = getIPSubnet(normalizedIP);
+    
+    // Acquire distributed lock to prevent race conditions
+    const lockKey = `vote_lock:${pollId}:${normalizedIP}`;
+    const lockAcquired = await this._acquireLock(lockKey, VOTE_LOCK_TTL);
+    
+    if (!lockAcquired) {
+      await this._logAttempt(pollId, normalizedIP, 'duplicate', { reason: 'concurrent_request' });
+      throw new VoteError('CONCURRENT_VOTE', 'Vote already in progress for this IP', 429);
+    }
+
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+
+      // 1. Validate poll exists and is active
+      const poll = await this._getPollForVoting(client, pollId);
+      
+      // 2. Validate options belong to poll
+      await this._validateOptions(client, pollId, optionIds, poll.max_choices, poll.allow_multiple);
+      
+      // 3. Check for duplicate vote (primary dedup)
+      const existingVote = await this._checkExistingVote(client, pollId, normalizedIP);
+      
+      if (existingVote) {
+        await client.query('ROLLBACK');
+        await this._logAttempt(pollId, normalizedIP, 'duplicate', { 
+          existing_vote_id: existingVote.id,
+          voted_at: existingVote.voted_at 
+        });
+        throw new VoteError('DUPLICATE_VOTE', 'This IP has already voted in this poll', 409);
+      }
+
+      // 4. Check subnet saturation (NAT/proxy detection)
+      const subnetVoteCount = await this._getSubnetVoteCount(pollId, subnet);
+      const subnetThreshold = parseInt(process.env.SUBNET_VOTE_THRESHOLD) || 50;
+      
+      if (subnetVoteCount >= subnetThreshold) {
+        // Log but don't block - just flag for review
+        console.warn(`High subnet vote count: ${subnet} has ${subnetVoteCount} votes for poll ${pollId}`);
+      }
+
+      // 5. Insert vote(s)
+      const votes = [];
+      for (const optionId of optionIds) {
+        const voteResult = await client.query(
+          `INSERT INTO votes (
+            poll_id, option_id, ip_address, ip_normalized, ip_hash,
+            user_agent_hash, session_token, metadata
+          ) VALUES ($1, $2, $3::inet, $4, $5, $6, $7, $8)
+          RETURNING id, voted_at`,
+          [
+            pollId,
+            optionId,
+            normalizedIP,
+            normalizedIP,
+            ipHash,
+            userAgent ? hashIP(userAgent, 'ua-salt') : null,
+            sessionToken || null,
+            JSON.stringify({ subnet, ip_version: normalizedIP.includes(':') ? 6 : 4 }),
+          ]
+        );
+        votes.push(voteResult.rows[0]);
+      }
+
+      await client.query('COMMIT');
+
+      // 6. Update caches
+      await this._invalidatePollCache(pollId);
+      await this._incrementSubnetCount(pollId, subnet);
+      await this._logAttempt(pollId, normalizedIP, 'success', { vote_ids: votes.map(v => v.id) });
+
+      return {
+        success: true,
+        voteIds: votes.map(v => v.id),
+        votedAt: votes[0].voted_at,
+        pollId,
+        optionIds,
+      };
+
+    } catch (error) {
+      await client.query('ROLLBACK');
+      
+      // Handle unique constraint violation (race condition fallback)
+      if (error.code === '23505' && error.constraint === 'idx_votes_ip_poll_unique') {
+        await this._logAttempt(pollId, normalizedIP, 'duplicate', { reason: 'constraint_violation' });
+        throw new VoteError('DUPLICATE_VOTE', 'This IP has already voted in this poll', 409);
+      }
+      
+      throw error;
+    } finally {
+      client.release();
+      await this._releaseLock(lockKey);
+    }
+  }
+
+  /**
+   * Get poll with options and current results
+   */
+  async getPollResults(pollId, useCache = true) {
+    const cacheKey = `poll_results:${pollId}`;
+    
+    if (useCache) {
+      const cached = await redis.get(cacheKey);
+      if (cached) {
+        return JSON.parse(cached);
+      }
+    }
+
+    const result = await pool.query(
+      `SELECT 
+        p.id, p.title, p.description, p.status, p.allow_multiple, 
+        p.max_choices, p.starts_at, p.ends_at, p.created_at,
+        json_agg(
+          json_build_object(
+            'id', po.id,
+            'text', po.text,
+            'description', po.description,
+            'position', po.position,
+            'vote_count', po.vote_count
+          ) ORDER BY po.position
+        ) AS options,
+        (SELECT COUNT(*) FROM votes v WHERE v.poll_id = p.id) AS total_votes
+      FROM polls p
+      JOIN poll_options po ON po.poll_id = p.id
+      WHERE p.id = $1
+      GROUP BY p.id`,
+      [pollId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new VoteError('POLL_NOT_FOUND', 'Poll not found', 404);
+    }
+
+    const poll = result.rows[0];
+    const totalVotes = parseInt(poll.total_votes) || 0;
+    
+    // Calculate percentages
+    poll.options = poll.options.map(opt => ({
+      ...opt,
+      percentage: totalVotes > 0 
+        ? Math.round((opt.vote_count / totalVotes) * 10000) / 100 
+        : 0,
+    }));
+    
+    poll.total_votes = totalVotes;
+
+    // Cache results
+    await redis.setex(cacheKey, RESULTS_CACHE_TTL, JSON.stringify(poll));
+    
+    return poll;
+  }
+
+  /**
+   * Check if IP has voted in a poll
+   */
+  async hasVoted(pollId, ipAddress) {
+    const normalizedIP = normalizeIP(ipAddress);
+    const cacheKey = `voted:${pollId}:${hashIP(normalizedIP)}`;
+    
+    // Check cache first
+    const cached = await redis.get(cacheKey);
+    if (cached !== null) {
+      return cached === '1';
+    }
+
+    const result = await pool.query(
+      'SELECT id, option_id, voted_at FROM votes WHERE poll_id = $1 AND ip_normalized = $2',
+      [pollId, normalizedIP]
+    );
+
+    const hasVoted = result.rows.length > 0;
+    
+    // Cache for 5 minutes
+    await redis.setex(cacheKey, 300, hasVoted ? '1' : '0');
+    
+    return hasVoted ? result.rows : false;
+  }
+
+  /**
+   * Create a new poll
+   */
+  async createPoll({ title, description, options, allowMultiple, maxChoices, endsAt, createdBy }) {
+    const client = await pool.connect();
+    
+    try {
+      await client.query('BEGIN');
+
+      const pollResult = await client.query(
+        `INSERT INTO polls (title, description, allow_multiple, max_choices, ends_at, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING *`,
+        [title, description, allowMultiple || false, maxChoices || 1, endsAt || null, createdBy || null]
+      );
+
+      const poll = pollResult.rows[0];
+
+      // Insert options
+      const insertedOptions = [];
+      for (let i = 0; i < options.length; i++) {
+        const optResult = await client.query(
+          `INSERT INTO poll_options (poll_id, text, description, position)
+           VALUES ($1, $2, $3, $4)
+           RETURNING *`,
+          [poll.id, options[i].text, options[i].description || null, i]
+        );
+        insertedOptions.push(optResult.rows[0]);
+      }
+
+      await client.query('COMMIT');
+
+      return { ...poll, options: insertedOptions };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Get vote statistics for admin
+   */
+  async getVoteStats(pollId) {
+    const result = await pool.query(
+      `SELECT 
+        COUNT(*) AS total_votes,
+        COUNT(DISTINCT ip_normalized) AS unique_ips,
+        COUNT(CASE WHEN (metadata->>'ip_version')::int = 4 THEN 1 END) AS ipv4_votes,
+        COUNT(CASE WHEN (metadata->>'ip_version')::int = 6 THEN 1 END) AS ipv6_votes,
+        MIN(voted_at) AS first_vote,
+        MAX(voted_at) AS last_vote,
+        COUNT(CASE WHEN voted_at > NOW() - INTERVAL '1 hour' THEN 1 END) AS votes_last_hour,
+        COUNT(CASE WHEN voted_at > NOW() - INTERVAL '24 hours' THEN 1 END) AS votes_last_24h
+      FROM votes
+      WHERE poll_id = $1`,
+      [pollId]
+    );
+
+    // Subnet analysis for NAT detection
+    const subnetResult = await pool.query(
+      `SELECT 
+        metadata->>'subnet' AS subnet,
+        COUNT(*) AS vote_count
+      FROM votes
+      WHERE poll_id = $1
+      GROUP BY metadata->>'subnet'
+      HAVING COUNT(*) > 5
+      ORDER BY vote_count DESC
+      LIMIT 20`,
+      [pollId]
+    );
+
+    // Attempt analysis
+    const attemptResult = await pool.query(
+      `SELECT attempt_type, COUNT(*) AS count
+       FROM vote_attempts
+       WHERE poll_id = $1
+       GROUP BY attempt_type`,
+      [pollId]
+    );
+
+    return {
+      ...result.rows[0],
+      suspicious_subnets: subnetResult.rows,
+      attempt_breakdown: attemptResult.rows,
+    };
+  }
+
+  // ============================================================
+  // Private helper methods
+  // ============================================================
+
+  async _getPollForVoting(client, pollId) {
+    const result = await client.query(
+      `SELECT id, status, allow_multiple, max_choices, starts_at, ends_at
+       FROM polls 
+       WHERE id = $1
+       FOR SHARE`, // Shared lock - allow concurrent reads, prevent writes
+      [pollId]
+    );
+
+    if (result.rows.length === 0) {
+      throw new VoteError('POLL_NOT_FOUND', 'Poll not found', 404);
+    }
+
+    const poll = result.rows[0];
+    const now = new Date();
+
+    if (poll.status !== 'active') {
+      throw new VoteError('POLL_NOT_ACTIVE', `Poll is ${poll.status}`, 400);
+    }
+
+    if (poll.starts_at > now) {
+      throw new VoteError('POLL_NOT_STARTED', 'Poll has not started yet', 400);
+    }
+
+    if (poll.ends_at && poll.ends_at < now) {
+      // Auto-close expired poll
+      await client.query(
+        "UPDATE polls SET status = 'closed' WHERE id = $1",
+        [pollId]
+      );
+      throw new VoteError('POLL_CLOSED', 'Poll has ended', 400);
+    }
+
+    return poll;
+  }
+
+  async _validateOptions(client, pollId, optionIds, maxChoices, allowMultiple) {
+    if (!Array.isArray(optionIds) || optionIds.length === 0) {
+      throw new VoteError('INVALID_OPTIONS', 'At least one option must be selected', 400);
+    }
+
+    if (!allowMultiple && optionIds.length > 1) {
+      throw new VoteError('MULTIPLE_NOT_ALLOWED', 'This poll only allows one choice', 400);
+    }
+
+    if (optionIds.length > maxChoices) {
+      throw new VoteError('TOO_MANY_CHOICES', `Maximum ${maxChoices} choices allowed`, 400);
+    }
+
+    // Check for duplicates in

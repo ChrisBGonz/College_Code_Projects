@@ -1,0 +1,545 @@
+```javascript
+// ============================================================
+// circuit-breaker.js
+// ============================================================
+
+const STATE = Object.freeze({
+  CLOSED: "CLOSED",
+  OPEN: "OPEN",
+  HALF_OPEN: "HALF_OPEN",
+});
+
+class CircuitBreakerError extends Error {
+  constructor(message, state) {
+    super(message);
+    this.name = "CircuitBreakerError";
+    this.state = state;
+  }
+}
+
+class CircuitBreaker {
+  /**
+   * @param {object} options
+   * @param {number} options.failureThreshold   – кол-во ошибок подряд до открытия (default: 5)
+   * @param {number} options.successThreshold   – кол-во успехов подряд в half-open до закрытия (default: 2)
+   * @param {number} options.resetTimeout       – мс до перехода open → half-open (default: 30_000)
+   * @param {number} options.requestTimeout     – мс до таймаута одного запроса (default: 10_000)
+   * @param {Function} options.onStateChange    – колбэк (prevState, nextState, stats)
+   */
+  constructor(options = {}) {
+    this.failureThreshold = options.failureThreshold ?? 5;
+    this.successThreshold = options.successThreshold ?? 2;
+    this.resetTimeout = options.resetTimeout ?? 30_000;
+    this.requestTimeout = options.requestTimeout ?? 10_000;
+    this.onStateChange = options.onStateChange ?? null;
+
+    this._state = STATE.CLOSED;
+    this._failureCount = 0;
+    this._successCount = 0;
+    this._lastFailureTime = null;
+    this._openedAt = null;
+    this._totalRequests = 0;
+    this._totalFailures = 0;
+    this._totalSuccesses = 0;
+    this._listeners = [];
+  }
+
+  // ── публичные геттеры ──────────────────────────────────────
+
+  get state() {
+    return this._state;
+  }
+
+  get stats() {
+    return {
+      state: this._state,
+      failureCount: this._failureCount,
+      successCount: this._successCount,
+      totalRequests: this._totalRequests,
+      totalFailures: this._totalFailures,
+      totalSuccesses: this._totalSuccesses,
+      lastFailureTime: this._lastFailureTime,
+      openedAt: this._openedAt,
+      nextRetryAt:
+        this._openedAt && this._state === STATE.OPEN
+          ? new Date(this._openedAt.getTime() + this.resetTimeout)
+          : null,
+    };
+  }
+
+  // ── подписка на изменения состояния ───────────────────────
+
+  subscribe(listener) {
+    this._listeners.push(listener);
+    return () => {
+      this._listeners = this._listeners.filter((l) => l !== listener);
+    };
+  }
+
+  // ── основной метод выполнения запроса ─────────────────────
+
+  /**
+   * Выполняет переданную async-функцию через Circuit Breaker.
+   * @param {Function} fn – () => Promise<any>
+   * @returns {Promise<any>}
+   */
+  async execute(fn) {
+    this._checkOpenToHalfOpen();
+
+    if (this._state === STATE.OPEN) {
+      const err = new CircuitBreakerError(
+        `Circuit breaker is OPEN. Next retry at ${this.stats.nextRetryAt?.toISOString()}`,
+        STATE.OPEN
+      );
+      this._notifyListeners("fast-fail", err);
+      throw err;
+    }
+
+    this._totalRequests++;
+
+    try {
+      const result = await this._withTimeout(fn(), this.requestTimeout);
+      this._onSuccess();
+      return result;
+    } catch (error) {
+      if (error instanceof CircuitBreakerError) throw error;
+      this._onFailure(error);
+      throw error;
+    }
+  }
+
+  // ── принудительные переходы (для тестов / admin-панели) ───
+
+  forceOpen() {
+    this._transition(STATE.OPEN);
+    this._openedAt = new Date();
+  }
+
+  forceClose() {
+    this._failureCount = 0;
+    this._successCount = 0;
+    this._transition(STATE.CLOSED);
+  }
+
+  reset() {
+    this.forceClose();
+    this._totalRequests = 0;
+    this._totalFailures = 0;
+    this._totalSuccesses = 0;
+    this._lastFailureTime = null;
+    this._openedAt = null;
+  }
+
+  // ── приватные методы ──────────────────────────────────────
+
+  _checkOpenToHalfOpen() {
+    if (
+      this._state === STATE.OPEN &&
+      this._openedAt &&
+      Date.now() - this._openedAt.getTime() >= this.resetTimeout
+    ) {
+      this._transition(STATE.HALF_OPEN);
+    }
+  }
+
+  _onSuccess() {
+    this._totalSuccesses++;
+    this._failureCount = 0;
+
+    if (this._state === STATE.HALF_OPEN) {
+      this._successCount++;
+      if (this._successCount >= this.successThreshold) {
+        this._successCount = 0;
+        this._transition(STATE.CLOSED);
+      }
+    }
+  }
+
+  _onFailure(error) {
+    this._totalFailures++;
+    this._failureCount++;
+    this._successCount = 0;
+    this._lastFailureTime = new Date();
+
+    if (
+      this._state === STATE.CLOSED &&
+      this._failureCount >= this.failureThreshold
+    ) {
+      this._openedAt = new Date();
+      this._transition(STATE.OPEN);
+      return;
+    }
+
+    if (this._state === STATE.HALF_OPEN) {
+      // Одна ошибка в half-open → снова открываем
+      this._openedAt = new Date();
+      this._transition(STATE.OPEN);
+    }
+  }
+
+  _transition(nextState) {
+    const prevState = this._state;
+    if (prevState === nextState) return;
+    this._state = nextState;
+
+    const stats = this.stats;
+    this._listeners.forEach((l) => l(prevState, nextState, stats));
+    this.onStateChange?.(prevState, nextState, stats);
+
+    console.info(
+      `[CircuitBreaker] ${prevState} → ${nextState}`,
+      `| failures: ${this._failureCount}`,
+      `| successes: ${this._successCount}`
+    );
+  }
+
+  _notifyListeners(event, payload) {
+    this._listeners.forEach((l) => l(event, payload, this.stats));
+  }
+
+  _withTimeout(promise, ms) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Request timed out after ${ms}ms`));
+      }, ms);
+
+      promise.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error) => {
+          clearTimeout(timer);
+          reject(error);
+        }
+      );
+    });
+  }
+}
+
+// ============================================================
+// fetch-wrapper.js
+// ============================================================
+
+/**
+ * Создаёт обёртку над fetch с Circuit Breaker.
+ *
+ * @param {CircuitBreaker} breaker
+ * @param {object} fetchDefaults – дефолтные опции fetch (headers, mode, …)
+ * @returns {Function} resilientFetch(url, options) → Promise<Response>
+ */
+function createResilientFetch(breaker, fetchDefaults = {}) {
+  return async function resilientFetch(url, options = {}) {
+    return breaker.execute(async () => {
+      const mergedOptions = {
+        ...fetchDefaults,
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          ...fetchDefaults.headers,
+          ...options.headers,
+        },
+      };
+
+      const response = await fetch(url, mergedOptions);
+
+      // Считаем 5xx ошибками сервера (можно настроить)
+      if (response.status >= 500) {
+        const body = await response.text().catch(() => "");
+        throw new Error(`Server error ${response.status}: ${body}`);
+      }
+
+      return response;
+    });
+  };
+}
+
+// ============================================================
+// api-client.js – пример конкретного API-клиента
+// ============================================================
+
+const apiBreaker = new CircuitBreaker({
+  failureThreshold: 3,
+  successThreshold: 2,
+  resetTimeout: 15_000,
+  requestTimeout: 8_000,
+  onStateChange(prev, next, stats) {
+    // Можно отправить метрику в Sentry / Datadog
+    console.warn(`[API] Circuit: ${prev} → ${next}`, stats);
+  },
+});
+
+const resilientFetch = createResilientFetch(apiBreaker, {
+  headers: { "X-Client": "my-app/1.0" },
+});
+
+const apiClient = {
+  async getUser(id) {
+    const res = await resilientFetch(`/api/users/${id}`);
+    return res.json();
+  },
+
+  async createOrder(payload) {
+    const res = await resilientFetch("/api/orders", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    return res.json();
+  },
+
+  async healthCheck() {
+    const res = await resilientFetch("/api/health");
+    return res.json();
+  },
+};
+
+// ============================================================
+// ui-example.js – минимальный пример использования в UI
+// ============================================================
+
+/**
+ * Компонент-менеджер состояния Circuit Breaker для UI.
+ * Не зависит от фреймворка – работает с чистым DOM.
+ */
+class CircuitBreakerUI {
+  constructor(breaker, containerSelector) {
+    this.breaker = breaker;
+    this.container = document.querySelector(containerSelector);
+    this._retryTimer = null;
+    this._countdownInterval = null;
+
+    // Подписываемся на изменения состояния
+    this._unsubscribe = breaker.subscribe((prev, next, stats) => {
+      this._render(stats);
+      if (next === "OPEN") this._startCountdown(stats);
+      if (next !== "OPEN") this._stopCountdown();
+    });
+
+    this._render(breaker.stats);
+  }
+
+  destroy() {
+    this._unsubscribe();
+    this._stopCountdown();
+  }
+
+  _render(stats) {
+    if (!this.container) return;
+
+    const stateColors = {
+      CLOSED: "#22c55e",
+      OPEN: "#ef4444",
+      HALF_OPEN: "#f59e0b",
+    };
+
+    this.container.innerHTML = `
+      <div class="cb-widget" style="
+        font-family: monospace;
+        border: 2px solid ${stateColors[stats.state]};
+        border-radius: 8px;
+        padding: 12px 16px;
+        max-width: 320px;
+        background: #1e1e2e;
+        color: #cdd6f4;
+      ">
+        <div style="display:flex; align-items:center; gap:8px; margin-bottom:8px;">
+          <span style="
+            width:12px; height:12px; border-radius:50%;
+            background:${stateColors[stats.state]};
+            display:inline-block;
+          "></span>
+          <strong style="color:${stateColors[stats.state]}; font-size:14px;">
+            Circuit Breaker: ${stats.state}
+          </strong>
+        </div>
+        <div style="font-size:12px; line-height:1.8; color:#a6adc8;">
+          <div>Requests: <b style="color:#cdd6f4">${stats.totalRequests}</b></div>
+          <div>Successes: <b style="color:#a6e3a1">${stats.totalSuccesses}</b></div>
+          <div>Failures: <b style="color:#f38ba8">${stats.totalFailures}</b></div>
+          <div>Failure streak: <b style="color:#fab387">${stats.failureCount}</b></div>
+          ${
+            stats.state === "OPEN"
+              ? `<div id="cb-countdown" style="color:#f38ba8; margin-top:4px;">
+                   Retry in: <b>calculating…</b>
+                 </div>`
+              : ""
+          }
+          ${
+            stats.lastFailureTime
+              ? `<div>Last failure: <b>${stats.lastFailureTime.toLocaleTimeString()}</b></div>`
+              : ""
+          }
+        </div>
+        ${
+          stats.state === "OPEN"
+            ? `<button id="cb-force-close" style="
+                margin-top:10px; padding:4px 10px;
+                background:#313244; color:#cdd6f4;
+                border:1px solid #45475a; border-radius:4px;
+                cursor:pointer; font-size:11px;
+              ">Force Close (dev)</button>`
+            : ""
+        }
+      </div>
+    `;
+
+    // Навешиваем обработчик кнопки
+    const btn = this.container.querySelector("#cb-force-close");
+    btn?.addEventListener("click", () => {
+      this.breaker.forceClose();
+      this._render(this.breaker.stats);
+    });
+  }
+
+  _startCountdown(stats) {
+    this._stopCountdown();
+    this._countdownInterval = setInterval(() => {
+      const el = document.querySelector("#cb-countdown b");
+      if (!el || !stats.nextRetryAt) return;
+      const remaining = Math.max(
+        0,
+        Math.ceil((stats.nextRetryAt.getTime() - Date.now()) / 1000)
+      );
+      el.textContent = `${remaining}s`;
+      if (remaining === 0) this._stopCountdown();
+    }, 500);
+  }
+
+  _stopCountdown() {
+    if (this._countdownInterval) {
+      clearInterval(this._countdownInterval);
+      this._countdownInterval = null;
+    }
+  }
+}
+
+// ============================================================
+// app.js – точка входа, пример использования
+// ============================================================
+
+async function initApp() {
+  // Монтируем виджет состояния
+  const cbUI = new CircuitBreakerUI(apiBreaker, "#circuit-breaker-status");
+
+  // ── Кнопка "Загрузить пользователя" ──────────────────────
+  document.querySelector("#btn-load-user")?.addEventListener("click", async () => {
+    const output = document.querySelector("#output");
+    output.textContent = "Loading…";
+
+    try {
+      const user = await apiClient.getUser(1);
+      output.textContent = JSON.stringify(user, null, 2);
+    } catch (error) {
+      if (error.name === "CircuitBreakerError") {
+        output.textContent = `⚡ Fail-fast: ${error.message}`;
+        showToast("Backend недоступен. Запросы временно заблокированы.", "error");
+      } else {
+        output.textContent = `❌ Error: ${error.message}`;
+        showToast(`Ошибка запроса: ${error.message}`, "warning");
+      }
+    }
+  });
+
+  // ── Кнопка "Health Check" ─────────────────────────────────
+  document.querySelector("#btn-health")?.addEventListener("click", async () => {
+    try {
+      const health = await apiClient.healthCheck();
+      showToast(`✅ Backend OK: ${JSON.stringify(health)}`, "success");
+    } catch (error) {
+      if (error.name === "CircuitBreakerError") {
+        showToast("⚡ Circuit OPEN – запрос не отправлен", "error");
+      } else {
+        showToast(`❌ ${error.message}`, "error");
+      }
+    }
+  });
+
+  // ── Кнопка "Сбросить" ─────────────────────────────────────
+  document.querySelector("#btn-reset")?.addEventListener("click", () => {
+    apiBreaker.reset();
+    showToast("Circuit Breaker сброшен", "info");
+  });
+}
+
+function showToast(message, type = "info") {
+  const colors = {
+    success: "#22c55e",
+    error: "#ef4444",
+    warning: "#f59e0b",
+    info: "#3b82f6",
+  };
+
+  const toast = document.createElement("div");
+  toast.style.cssText = `
+    position: fixed; bottom: 20px; right: 20px;
+    background: #1e1e2e; color: #cdd6f4;
+    border-left: 4px solid ${colors[type]};
+    padding: 12px 16px; border-radius: 6px;
+    font-family: monospace; font-size: 13px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+    max-width: 360px; z-index: 9999;
+    animation: slideIn 0.2s ease;
+  `;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  setTimeout(() => {
+    toast.style.opacity = "0";
+    toast.style.transition = "opacity 0.3s";
+    setTimeout(() => toast.remove(), 300);
+  }, 4000);
+}
+
+// ── HTML-разметка (для справки) ───────────────────────────
+/*
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>Circuit Breaker Demo</title>
+  <style>
+    body { background: #181825; color: #cdd6f4; font-family: monospace; padding: 24px; }
+    button {
+      padding: 8px 16px; margin: 4px;
+      background: #313244; color: #cdd6f4;
+      border: 1px solid #45475a; border-radius: 6px;
+      cursor: pointer; font-size: 13px;
+    }
+    button:hover { background: #45475a; }
+    pre#output {
+      background: #1e1e2e; padding: 12px;
+      border-radius: 6px; min-height: 60px;
+      border: 1px solid #313244; margin-top: 12px;
+    }
+  </style>
+</head>
+<body>
+  <h2>Circuit Breaker Demo</h2>
+
+  <div id="circuit-breaker-status" style="margin-bottom: 16px;"></div>
+
+  <div>
+    <button id="btn-load-user">Загрузить пользователя</button>
+    <button id="btn-health">Health Check</button>
+    <button id="btn-reset">Сбросить CB</button>
+  </div>
+
+  <pre id="output">Нажмите кнопку…</pre>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
+*/
+
+// ── Запуск ────────────────────────────────────────────────
+document.addEventListener("DOMContentLoaded", initApp);
+
+// ── Экспорт для использования как модуля ─────────────────
+export {
+  CircuitBreaker,
+  CircuitBreakerError,
+  CircuitBreakerUI,
+  createResilientFetch,
+  STATE,
+};
+```

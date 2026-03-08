@@ -1,0 +1,203 @@
+
+```php
+<?php
+
+require_once __DIR__ . '/vendor/autoload.php';
+
+use Anthropic\Client;
+
+class UserPreferences
+{
+    public string $theme;
+    public string $language;
+    public int $fontSize;
+    public bool $notifications;
+    public string $timezone;
+    public array $recentSearches;
+
+    public function __construct(
+        string $theme = 'light',
+        string $language = 'en',
+        int $fontSize = 14,
+        bool $notifications = true,
+        string $timezone = 'UTC',
+        array $recentSearches = []
+    ) {
+        $this->theme = $theme;
+        $this->language = $language;
+        $this->fontSize = $fontSize;
+        $this->notifications = $notifications;
+        $this->timezone = $timezone;
+        $this->recentSearches = $recentSearches;
+    }
+
+    public function toArray(): array
+    {
+        return [
+            'theme' => $this->theme,
+            'language' => $this->language,
+            'fontSize' => $this->fontSize,
+            'notifications' => $this->notifications,
+            'timezone' => $this->timezone,
+            'recentSearches' => $this->recentSearches,
+        ];
+    }
+}
+
+function loadPreferencesFromCookie(): UserPreferences
+{
+    if (isset($_COOKIE['user_preferences'])) {
+        $serialized = base64_decode($_COOKIE['user_preferences']);
+        if ($serialized !== false) {
+            $prefs = unserialize($serialized);
+            if ($prefs instanceof UserPreferences) {
+                return $prefs;
+            }
+        }
+    }
+    return new UserPreferences();
+}
+
+function savePreferencesToCookie(UserPreferences $prefs): void
+{
+    $serialized = serialize($prefs);
+    $encoded = base64_encode($serialized);
+    setcookie('user_preferences', $encoded, time() + (86400 * 30), '/');
+    $_COOKIE['user_preferences'] = $encoded;
+}
+
+function updatePreferencesWithAI(UserPreferences $prefs, string $userRequest): array
+{
+    $client = Anthropic::client(getenv('ANTHROPIC_API_KEY'));
+
+    $currentPrefs = json_encode($prefs->toArray(), JSON_PRETTY_PRINT);
+
+    $systemPrompt = "You are a helpful assistant that manages user preferences for a web application. 
+    You will receive the current user preferences and a request to update them.
+    You must respond with a JSON object containing only the fields that need to be updated.
+    Valid fields are: theme (light/dark/system), language (en/ru/de/fr/es), fontSize (10-24), 
+    notifications (true/false), timezone (valid timezone string), recentSearches (array of strings).
+    Respond ONLY with valid JSON, no explanations.";
+
+    $userMessage = "Current preferences:\n{$currentPrefs}\n\nUser request: {$userRequest}";
+
+    $stream = $client->messages()->stream([
+        'model' => 'claude-opus-4-5',
+        'max_tokens' => 1024,
+        'system' => $systemPrompt,
+        'messages' => [
+            ['role' => 'user', 'content' => $userMessage],
+        ],
+    ]);
+
+    $fullResponse = '';
+    echo "AI is processing your request: ";
+
+    foreach ($stream as $event) {
+        if ($event->type === 'content_block_delta' && isset($event->delta->text)) {
+            $fullResponse .= $event->delta->text;
+            echo $event->delta->text;
+            flush();
+        }
+    }
+
+    echo "\n";
+
+    $updates = json_decode($fullResponse, true);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        return [];
+    }
+
+    return $updates;
+}
+
+function applyUpdatesToPreferences(UserPreferences $prefs, array $updates): UserPreferences
+{
+    if (isset($updates['theme']) && in_array($updates['theme'], ['light', 'dark', 'system'])) {
+        $prefs->theme = $updates['theme'];
+    }
+
+    if (isset($updates['language']) && in_array($updates['language'], ['en', 'ru', 'de', 'fr', 'es'])) {
+        $prefs->language = $updates['language'];
+    }
+
+    if (isset($updates['fontSize']) && is_numeric($updates['fontSize'])) {
+        $fontSize = (int)$updates['fontSize'];
+        if ($fontSize >= 10 && $fontSize <= 24) {
+            $prefs->fontSize = $fontSize;
+        }
+    }
+
+    if (isset($updates['notifications'])) {
+        $prefs->notifications = (bool)$updates['notifications'];
+    }
+
+    if (isset($updates['timezone']) && is_string($updates['timezone'])) {
+        try {
+            new DateTimeZone($updates['timezone']);
+            $prefs->timezone = $updates['timezone'];
+        } catch (Exception $e) {
+        }
+    }
+
+    if (isset($updates['recentSearches']) && is_array($updates['recentSearches'])) {
+        $prefs->recentSearches = array_slice($updates['recentSearches'], 0, 10);
+    }
+
+    return $prefs;
+}
+
+function displayPreferences(UserPreferences $prefs): void
+{
+    echo "\n=== Current User Preferences ===\n";
+    echo "Theme: {$prefs->theme}\n";
+    echo "Language: {$prefs->language}\n";
+    echo "Font Size: {$prefs->fontSize}px\n";
+    echo "Notifications: " . ($prefs->notifications ? 'enabled' : 'disabled') . "\n";
+    echo "Timezone: {$prefs->timezone}\n";
+    echo "Recent Searches: " . (empty($prefs->recentSearches) ? 'none' : implode(', ', $prefs->recentSearches)) . "\n";
+    echo "================================\n\n";
+}
+
+echo "=== User Preferences Manager with AI ===\n\n";
+
+$preferences = loadPreferencesFromCookie();
+
+echo "Loaded preferences from cookie (or using defaults):\n";
+displayPreferences($preferences);
+
+$testRequests = [
+    "Switch to dark theme and increase font size to 18",
+    "Change language to Russian and disable notifications",
+    "Set timezone to Europe/Moscow and add 'PHP tutorial' to recent searches",
+];
+
+foreach ($testRequests as $request) {
+    echo "Processing request: \"{$request}\"\n";
+
+    $updates = updatePreferencesWithAI($preferences, $request);
+
+    if (!empty($updates)) {
+        $preferences = applyUpdatesToPreferences($preferences, $updates);
+        savePreferencesToCookie($preferences);
+        echo "Preferences updated and saved to cookie!\n";
+        displayPreferences($preferences);
+    } else {
+        echo "No valid updates received from AI.\n\n";
+    }
+
+    sleep(1);
+}
+
+echo "=== Final Preferences (as stored in cookie) ===\n";
+$serialized = serialize($preferences);
+$encoded = base64_encode($serialized);
+echo "Cookie value (base64 encoded): " . substr($encoded, 0, 50) . "...\n";
+echo "Cookie size: " . strlen($encoded) . " bytes\n\n";
+
+echo "=== Simulating page reload - loading from cookie ===\n";
+$reloadedPrefs = loadPreferencesFromCookie();
+displayPreferences($reloadedPrefs);
+
+echo "Script completed successfully!\n";
+```

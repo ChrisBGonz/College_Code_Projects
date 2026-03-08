@@ -1,0 +1,267 @@
+
+```javascript
+import Anthropic from "@anthropic-ai/sdk";
+import express from "express";
+import { Request, Response, NextFunction } from "express";
+
+const client = new Anthropic();
+
+// Custom error classes
+class AppError extends Error {
+  statusCode: number;
+  isOperational: boolean;
+
+  constructor(message: string, statusCode: number) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = true;
+    Error.captureStackTrace(this, this.constructor);
+  }
+}
+
+class ValidationError extends AppError {
+  constructor(message: string) {
+    super(message, 400);
+  }
+}
+
+class NotFoundError extends AppError {
+  constructor(message: string) {
+    super(message, 404);
+  }
+}
+
+// Error analysis using Claude AI
+async function analyzeErrorWithClaude(error: Error): Promise<string> {
+  const errorInfo = {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+  };
+
+  const stream = await client.messages.stream({
+    model: "claude-opus-4-5",
+    max_tokens: 500,
+    messages: [
+      {
+        role: "user",
+        content: `Analyze this Node.js/Express error and provide a brief, helpful explanation for the developer:
+        
+Error Name: ${errorInfo.name}
+Error Message: ${errorInfo.message}
+Stack Trace: ${errorInfo.stack?.substring(0, 500)}
+
+Provide:
+1. What likely caused this error
+2. How to fix it
+3. Prevention tips
+
+Keep response concise (max 3-4 sentences per point).`,
+      },
+    ],
+  });
+
+  let analysis = "";
+  for await (const chunk of stream) {
+    if (
+      chunk.type === "content_block_delta" &&
+      chunk.delta.type === "text_delta"
+    ) {
+      analysis += chunk.delta.text;
+    }
+  }
+
+  return analysis;
+}
+
+// Global error handler middleware
+async function globalErrorHandler(
+  err: Error | AppError,
+  req: Request,
+  res: Response,
+  _next: NextFunction
+): Promise<void> {
+  const isDevelopment = process.env.NODE_ENV === "development";
+
+  // Determine status code
+  let statusCode = 500;
+  if (err instanceof AppError) {
+    statusCode = err.statusCode;
+  }
+
+  // Base error response
+  const errorResponse: {
+    status: string;
+    statusCode: number;
+    message: string;
+    timestamp: string;
+    path: string;
+    method: string;
+    errorType: string;
+    stack?: string;
+    aiAnalysis?: string;
+  } = {
+    status: "error",
+    statusCode,
+    message: err.message || "Internal Server Error",
+    timestamp: new Date().toISOString(),
+    path: req.path,
+    method: req.method,
+    errorType: err.constructor.name,
+  };
+
+  // Add stack trace in development
+  if (isDevelopment && err.stack) {
+    errorResponse.stack = err.stack;
+  }
+
+  // Get AI analysis for unhandled/unexpected errors
+  if (!(err instanceof AppError) || statusCode >= 500) {
+    try {
+      console.log("Getting AI analysis for error...");
+      const aiAnalysis = await analyzeErrorWithClaude(err);
+      errorResponse.aiAnalysis = aiAnalysis;
+    } catch (aiError) {
+      console.error("Failed to get AI analysis:", aiError);
+    }
+  }
+
+  // Log error
+  console.error(`[${new Date().toISOString()}] Error:`, {
+    statusCode,
+    message: err.message,
+    path: req.path,
+    method: req.method,
+    stack: err.stack,
+  });
+
+  res.status(statusCode).json(errorResponse);
+}
+
+// Async error wrapper
+function asyncHandler(
+  fn: (req: Request, res: Response, next: NextFunction) => Promise<void>
+) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
+// Setup unhandled exception handlers
+function setupUnhandledExceptionHandlers(): void {
+  process.on("uncaughtException", async (error: Error) => {
+    console.error("UNCAUGHT EXCEPTION! Shutting down...");
+    console.error(error.name, error.message);
+
+    try {
+      const analysis = await analyzeErrorWithClaude(error);
+      console.error("AI Analysis:", analysis);
+    } catch (aiError) {
+      console.error("Failed to get AI analysis for uncaught exception");
+    }
+
+    process.exit(1);
+  });
+
+  process.on("unhandledRejection", async (reason: unknown) => {
+    console.error("UNHANDLED REJECTION! Shutting down...");
+
+    const error =
+      reason instanceof Error ? reason : new Error(String(reason));
+    console.error(error.name, error.message);
+
+    try {
+      const analysis = await analyzeErrorWithClaude(error);
+      console.error("AI Analysis:", analysis);
+    } catch (aiError) {
+      console.error("Failed to get AI analysis for unhandled rejection");
+    }
+
+    process.exit(1);
+  });
+}
+
+// Create Express app
+const app = express();
+app.use(express.json());
+
+// Test routes
+app.get("/", (_req: Request, res: Response) => {
+  res.json({
+    message: "Error Handler Demo API",
+    endpoints: {
+      "/test/validation": "Triggers ValidationError (400)",
+      "/test/not-found": "Triggers NotFoundError (404)",
+      "/test/server-error": "Triggers generic server error (500)",
+      "/test/async-error": "Triggers async error",
+      "/test/unhandled": "Triggers unhandled promise rejection",
+    },
+  });
+});
+
+app.get(
+  "/test/validation",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    throw new ValidationError("Invalid input: email field is required");
+  })
+);
+
+app.get(
+  "/test/not-found",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    throw new NotFoundError("Resource with ID 123 not found");
+  })
+);
+
+app.get(
+  "/test/server-error",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    throw new Error("Database connection failed: ECONNREFUSED 127.0.0.1:5432");
+  })
+);
+
+app.get(
+  "/test/async-error",
+  asyncHandler(async (_req: Request, _res: Response) => {
+    await new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Async operation timed out")), 100);
+    });
+  })
+);
+
+app.get("/test/unhandled", (_req: Request, _res: Response) => {
+  Promise.reject(new Error("This is an unhandled promise rejection"));
+  _res.json({ message: "Request processed (check server logs)" });
+});
+
+// 404 handler for unknown routes
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  next(new NotFoundError(`Route ${req.method} ${req.path} not found`));
+});
+
+// Global error handler (must be last)
+app.use(
+  (err: Error, req: Request, res: Response, next: NextFunction): void => {
+    globalErrorHandler(err, req, res, next);
+  }
+);
+
+// Setup unhandled exception handlers
+setupUnhandledExceptionHandlers();
+
+// Start server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
+  console.log("\nTest endpoints:");
+  console.log(`  GET http://localhost:${PORT}/`);
+  console.log(`  GET http://localhost:${PORT}/test/validation`);
+  console.log(`  GET http://localhost:${PORT}/test/not-found`);
+  console.log(`  GET http://localhost:${PORT}/test/server-error`);
+  console.log(`  GET http://localhost:${PORT}/test/async-error`);
+  console.log(`  GET http://localhost:${PORT}/test/unhandled`);
+});
+
+export { app, AppError, ValidationError, NotFoundError, asyncHandler };
+```

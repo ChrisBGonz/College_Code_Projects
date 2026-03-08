@@ -1,0 +1,350 @@
+
+```python
+import os
+import re
+from flask import Flask, request, jsonify, session
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash
+from anthropic import Anthropic
+from datetime import datetime
+
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-change-in-production")
+app.config["SQLALCHEMY_DATABASE_URI"] = os.environ.get(
+    "DATABASE_URL", "sqlite:///users.db"
+)
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+db = SQLAlchemy(app)
+anthropic_client = Anthropic()
+
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(256), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "username": self.username,
+            "email": self.email,
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+        }
+
+
+conversation_history = {}
+
+
+def get_ai_password_validation(password: str, conversation_id: str) -> dict:
+    """Use Claude AI to validate password with multi-turn conversation support."""
+    if conversation_id not in conversation_history:
+        conversation_history[conversation_id] = []
+
+    conversation_history[conversation_id].append(
+        {
+            "role": "user",
+            "content": f"""Analyze this password for security: '{password}'
+            
+Please evaluate:
+1. Length (minimum 8 characters)
+2. Complexity (uppercase, lowercase, numbers, special characters)
+3. Common patterns to avoid
+4. Overall security score (1-10)
+
+Respond in JSON format with fields: 
+- is_valid (boolean)
+- score (1-10)
+- issues (list of strings)
+- suggestions (list of strings)
+- message (string summary)""",
+        }
+    )
+
+    response = anthropic_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        system="""You are a security expert specializing in password validation. 
+        Always respond with valid JSON. Be strict about security requirements.
+        A valid password must have at least 8 characters, contain uppercase and lowercase letters,
+        at least one number, and at least one special character.""",
+        messages=conversation_history[conversation_id],
+    )
+
+    assistant_message = response.content[0].text
+    conversation_history[conversation_id].append(
+        {"role": "assistant", "content": assistant_message}
+    )
+
+    try:
+        import json
+
+        json_match = re.search(r"\{.*\}", assistant_message, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group())
+        else:
+            return {
+                "is_valid": False,
+                "score": 0,
+                "issues": ["Could not parse AI response"],
+                "suggestions": [],
+                "message": "Validation error occurred",
+            }
+    except Exception:
+        return {
+            "is_valid": False,
+            "score": 0,
+            "issues": ["AI validation failed"],
+            "suggestions": [],
+            "message": "Could not validate password",
+        }
+
+
+def basic_password_validation(password: str) -> tuple[bool, list]:
+    """Basic password validation without AI."""
+    errors = []
+
+    if not password:
+        errors.append("Password cannot be empty")
+        return False, errors
+
+    if len(password) < 8:
+        errors.append("Password must be at least 8 characters long")
+
+    if len(password) > 128:
+        errors.append("Password cannot exceed 128 characters")
+
+    if not re.search(r"[A-Z]", password):
+        errors.append("Password must contain at least one uppercase letter")
+
+    if not re.search(r"[a-z]", password):
+        errors.append("Password must contain at least one lowercase letter")
+
+    if not re.search(r"\d", password):
+        errors.append("Password must contain at least one number")
+
+    if not re.search(r'[!@#$%^&*(),.?":{}|<>]', password):
+        errors.append("Password must contain at least one special character")
+
+    return len(errors) == 0, errors
+
+
+@app.route("/api/change-password", methods=["POST"])
+def change_password():
+    """
+    Change password endpoint with AI-powered validation.
+    
+    Expected JSON body:
+    {
+        "new_password": "string",
+        "confirm_password": "string" (optional),
+        "use_ai_validation": boolean (optional, default: true)
+    }
+    
+    Session must contain 'user_id'.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "Authentication required", "code": "UNAUTHORIZED"}), 401
+
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Content-Type must be application/json", "code": "INVALID_CONTENT_TYPE"}), 400
+
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "error": "Request body is required", "code": "EMPTY_BODY"}), 400
+
+    new_password = data.get("new_password", "").strip()
+    confirm_password = data.get("confirm_password", "").strip()
+    use_ai_validation = data.get("use_ai_validation", True)
+
+    if not new_password:
+        return jsonify({"success": False, "error": "new_password is required", "code": "MISSING_PASSWORD"}), 400
+
+    if confirm_password and new_password != confirm_password:
+        return jsonify({"success": False, "error": "Passwords do not match", "code": "PASSWORD_MISMATCH"}), 400
+
+    is_valid_basic, basic_errors = basic_password_validation(new_password)
+    if not is_valid_basic:
+        return jsonify({
+            "success": False,
+            "error": "Password does not meet basic requirements",
+            "code": "WEAK_PASSWORD",
+            "validation_errors": basic_errors,
+        }), 400
+
+    ai_validation_result = None
+    if use_ai_validation:
+        try:
+            conversation_id = f"user_{user_id}_{datetime.utcnow().timestamp()}"
+            ai_validation_result = get_ai_password_validation(new_password, conversation_id)
+
+            if not ai_validation_result.get("is_valid", False):
+                return jsonify({
+                    "success": False,
+                    "error": "Password does not meet security requirements",
+                    "code": "AI_VALIDATION_FAILED",
+                    "ai_analysis": ai_validation_result,
+                }), 400
+
+        except Exception as e:
+            app.logger.warning(f"AI validation failed, falling back to basic validation: {str(e)}")
+
+    try:
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"success": False, "error": "User not found", "code": "USER_NOT_FOUND"}), 404
+
+        password_hash = generate_password_hash(new_password, method="pbkdf2:sha256", salt_length=16)
+
+        user.password_hash = password_hash
+        user.updated_at = datetime.utcnow()
+        db.session.commit()
+
+        response_data = {
+            "success": True,
+            "message": "Password changed successfully",
+            "user": user.to_dict(),
+        }
+
+        if ai_validation_result:
+            response_data["security_analysis"] = {
+                "score": ai_validation_result.get("score"),
+                "message": ai_validation_result.get("message"),
+                "suggestions": ai_validation_result.get("suggestions", []),
+            }
+
+        return jsonify(response_data), 200
+
+    except Exception as e:
+        db.session.rollback()
+        app.logger.error(f"Database error while changing password: {str(e)}")
+        return jsonify({"success": False, "error": "Failed to update password", "code": "DATABASE_ERROR"}), 500
+
+
+@app.route("/api/change-password/analyze", methods=["POST"])
+def analyze_password():
+    """
+    Analyze password strength without changing it.
+    Supports multi-turn conversation for password improvement suggestions.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Content-Type must be application/json"}), 400
+
+    data = request.get_json()
+    password = data.get("password", "").strip()
+    conversation_id = data.get("conversation_id", f"analyze_{user_id}_{datetime.utcnow().timestamp()}")
+
+    if not password:
+        return jsonify({"success": False, "error": "password is required"}), 400
+
+    try:
+        analysis = get_ai_password_validation(password, conversation_id)
+        return jsonify({
+            "success": True,
+            "conversation_id": conversation_id,
+            "analysis": analysis,
+        }), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Analysis failed: {str(e)}"}), 500
+
+
+@app.route("/api/change-password/improve", methods=["POST"])
+def improve_password_suggestion():
+    """
+    Continue conversation to get improved password suggestions.
+    Uses existing conversation history for context.
+    """
+    user_id = session.get("user_id")
+    if not user_id:
+        return jsonify({"success": False, "error": "Authentication required"}), 401
+
+    if not request.is_json:
+        return jsonify({"success": False, "error": "Content-Type must be application/json"}), 400
+
+    data = request.get_json()
+    conversation_id = data.get("conversation_id")
+    user_message = data.get("message", "Can you suggest a stronger password?")
+
+    if not conversation_id or conversation_id not in conversation_history:
+        return jsonify({"success": False, "error": "Invalid or expired conversation_id"}), 400
+
+    try:
+        conversation_history[conversation_id].append({"role": "user", "content": user_message})
+
+        response = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            system="""You are a security expert helping users create strong passwords.
+            Provide helpful, specific suggestions while maintaining conversation context.
+            When suggesting passwords, ensure they meet all security requirements.""",
+            messages=conversation_history[conversation_id],
+        )
+
+        assistant_message = response.content[0].text
+        conversation_history[conversation_id].append({"role": "assistant", "content": assistant_message})
+
+        return jsonify({
+            "success": True,
+            "conversation_id": conversation_id,
+            "response": assistant_message,
+            "conversation_length": len(conversation_history[conversation_id]),
+        }), 200
+
+    except Exception as e:
+        return jsonify({"success": False, "error": f"Failed to get suggestions: {str(e)}"}), 500
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def login():
+    """Simple login endpoint for testing."""
+    if not request.is_json:
+        return jsonify({"error": "Content-Type must be application/json"}), 400
+
+    data = request.get_json()
+    username = data.get("username")
+
+    if not username:
+        return jsonify({"error": "username is required"}), 400
+
+    user = User.query.filter_by(username=username).first()
+    if not user:
+        user = User(
+            username=username,
+            email=f"{username}@example.com",
+            password_hash=generate_password_hash("TempPass123!"),
+        )
+        db.session.add(user)
+        db.session.commit()
+
+    session["user_id"] = user.id
+    return jsonify({"success": True, "user": user.to_dict()}), 200
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def logout():
+    """Logout endpoint."""
+    session.pop("user_id", None)
+    return jsonify({"success": True, "message": "Logged out successfully"}), 200
+
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({"status": "healthy", "timestamp": datetime.utcnow().isoformat()}), 200
+
+
+with app.app_context():
+    db.create_all()
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=5000)
+```

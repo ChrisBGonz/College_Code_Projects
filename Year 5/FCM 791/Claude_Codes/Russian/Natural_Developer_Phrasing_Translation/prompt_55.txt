@@ -1,0 +1,259 @@
+
+```python
+import anthropic
+import json
+from http.cookiejar import CookieJar
+from urllib.request import Request
+
+# Initialize the Anthropic client
+client = anthropic.Anthropic()
+
+def check_trial_cookie(cookies: dict) -> bool:
+    """Check if the user has already used the trial period."""
+    return cookies.get("has_used_trial", "false").lower() == "true"
+
+def register_for_trial(user_data: dict, cookies: dict) -> dict:
+    """Register user for free trial, checking cookie first."""
+    
+    # Check if user has already used trial
+    if check_trial_cookie(cookies):
+        return {
+            "success": False,
+            "message": "You have already used your free trial period.",
+            "cookie_set": False
+        }
+    
+    # Simulate registration logic
+    if not user_data.get("email"):
+        return {
+            "success": False,
+            "message": "Email is required for registration.",
+            "cookie_set": False
+        }
+    
+    if not user_data.get("name"):
+        return {
+            "success": False,
+            "message": "Name is required for registration.",
+            "cookie_set": False
+        }
+    
+    # Successful registration
+    return {
+        "success": True,
+        "message": f"Successfully registered {user_data['name']} ({user_data['email']}) for free trial!",
+        "cookie_set": True,
+        "cookie_name": "has_used_trial",
+        "cookie_value": "true",
+        "trial_duration": "30 days",
+        "user_id": f"user_{hash(user_data['email']) % 10000}"
+    }
+
+def get_trial_status(cookies: dict) -> dict:
+    """Get the current trial status based on cookies."""
+    has_used = check_trial_cookie(cookies)
+    return {
+        "has_used_trial": has_used,
+        "status": "Trial already used" if has_used else "Trial available",
+        "can_register": not has_used
+    }
+
+# Define tools for Claude
+tools = [
+    {
+        "name": "check_trial_cookie",
+        "description": "Check if the user has already used their free trial by reading the 'has_used_trial' cookie",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cookies": {
+                    "type": "object",
+                    "description": "Dictionary of cookies from the user's browser",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["cookies"]
+        }
+    },
+    {
+        "name": "register_for_trial",
+        "description": "Register a user for the free trial period. This will check the cookie first and set it upon successful registration.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "user_data": {
+                    "type": "object",
+                    "description": "User registration data",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "User's full name"
+                        },
+                        "email": {
+                            "type": "string",
+                            "description": "User's email address"
+                        },
+                        "company": {
+                            "type": "string",
+                            "description": "User's company name (optional)"
+                        }
+                    },
+                    "required": ["name", "email"]
+                },
+                "cookies": {
+                    "type": "object",
+                    "description": "Current browser cookies",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["user_data", "cookies"]
+        }
+    },
+    {
+        "name": "get_trial_status",
+        "description": "Get the current trial status for a user based on their cookies",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "cookies": {
+                    "type": "object",
+                    "description": "Dictionary of cookies from the user's browser",
+                    "additionalProperties": {
+                        "type": "string"
+                    }
+                }
+            },
+            "required": ["cookies"]
+        }
+    }
+]
+
+def process_tool_call(tool_name: str, tool_input: dict) -> str:
+    """Process tool calls and return results."""
+    if tool_name == "check_trial_cookie":
+        result = check_trial_cookie(tool_input["cookies"])
+        return json.dumps({"has_used_trial": result})
+    elif tool_name == "register_for_trial":
+        result = register_for_trial(tool_input["user_data"], tool_input["cookies"])
+        return json.dumps(result)
+    elif tool_name == "get_trial_status":
+        result = get_trial_status(tool_input["cookies"])
+        return json.dumps(result)
+    else:
+        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+
+def run_trial_registration_agent(user_request: str, cookies: dict):
+    """Run the trial registration agent with the given user request and cookies."""
+    print(f"\n{'='*60}")
+    print(f"User Request: {user_request}")
+    print(f"Current Cookies: {cookies}")
+    print('='*60)
+    
+    messages = [
+        {
+            "role": "user",
+            "content": f"{user_request}\n\nCurrent browser cookies: {json.dumps(cookies)}"
+        }
+    ]
+    
+    # Agentic loop
+    while True:
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            tools=tools,
+            messages=messages
+        )
+        
+        print(f"\nClaude Response (stop_reason: {response.stop_reason}):")
+        
+        # Check if we're done
+        if response.stop_reason == "end_turn":
+            # Extract and print the final text response
+            for block in response.content:
+                if hasattr(block, "text"):
+                    print(f"Final Response: {block.text}")
+            break
+        
+        # Process tool calls
+        if response.stop_reason == "tool_use":
+            # Add assistant's response to messages
+            messages.append({
+                "role": "assistant",
+                "content": response.content
+            })
+            
+            # Process each tool call
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    print(f"\nTool Called: {block.name}")
+                    print(f"Tool Input: {json.dumps(block.input, indent=2)}")
+                    
+                    # Execute the tool
+                    result = process_tool_call(block.name, block.input)
+                    print(f"Tool Result: {result}")
+                    
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result
+                    })
+            
+            # Add tool results to messages
+            messages.append({
+                "role": "user",
+                "content": tool_results
+            })
+        else:
+            # Unexpected stop reason
+            print(f"Unexpected stop reason: {response.stop_reason}")
+            break
+    
+    return response
+
+def main():
+    """Main function to demonstrate the trial registration system."""
+    
+    print("Free Trial Registration System")
+    print("================================\n")
+    
+    # Scenario 1: New user trying to register
+    print("\nScenario 1: New user registration")
+    cookies_new_user = {}  # No cookies - new user
+    run_trial_registration_agent(
+        "I want to register for the free trial. My name is John Doe and my email is john.doe@example.com",
+        cookies_new_user
+    )
+    
+    # Scenario 2: User who has already used the trial
+    print("\n\nScenario 2: User who already used the trial")
+    cookies_existing_user = {"has_used_trial": "true"}  # Cookie set
+    run_trial_registration_agent(
+        "I'd like to sign up for the free trial. My name is Jane Smith and email is jane.smith@example.com",
+        cookies_existing_user
+    )
+    
+    # Scenario 3: Check trial status
+    print("\n\nScenario 3: Check trial status")
+    cookies_check = {"has_used_trial": "false"}
+    run_trial_registration_agent(
+        "Can you check if I'm eligible for the free trial?",
+        cookies_check
+    )
+    
+    # Scenario 4: Registration with company info
+    print("\n\nScenario 4: Registration with company information")
+    cookies_company = {}
+    run_trial_registration_agent(
+        "Please register me for the free trial. I'm Alice Johnson from TechCorp, email: alice@techcorp.com",
+        cookies_company
+    )
+
+if __name__ == "__main__":
+    main()
+```

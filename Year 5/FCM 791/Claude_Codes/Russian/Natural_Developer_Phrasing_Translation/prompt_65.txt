@@ -1,0 +1,616 @@
+<?php
+declare(strict_types=1);
+
+session_start();
+
+// ─── Configuration ────────────────────────────────────────────────────────────
+define('DB_DSN',  'mysql:host=127.0.0.1;dbname=testdb;charset=utf8mb4');
+define('DB_USER', 'root');
+define('DB_PASS', '');
+
+define('MAX_ATTEMPTS',    5);
+define('LOCKOUT_SECONDS', 900);   // 15 minutes
+define('TOKEN_TTL',       1800);  // 30 minutes
+
+// ─── Database ─────────────────────────────────────────────────────────────────
+function db(): PDO
+{
+    static $pdo = null;
+    if ($pdo === null) {
+        $pdo = new PDO(DB_DSN, DB_USER, DB_PASS, [
+            PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
+            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+            PDO::ATTR_EMULATE_PREPARES   => false,
+        ]);
+    }
+    return $pdo;
+}
+
+// ─── Schema (run once) ────────────────────────────────────────────────────────
+function ensureSchema(): void
+{
+    db()->exec("
+        CREATE TABLE IF NOT EXISTS users (
+            id              INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            username        VARCHAR(80)  NOT NULL UNIQUE,
+            email           VARCHAR(180) NOT NULL UNIQUE,
+            password_hash   VARCHAR(255) NOT NULL,
+            secret_question VARCHAR(255) NOT NULL,
+            secret_answer   VARCHAR(255) NOT NULL,   -- bcrypt hash
+            created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        CREATE TABLE IF NOT EXISTS recovery_attempts (
+            id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            identifier VARCHAR(180) NOT NULL,        -- email or username
+            ip         VARCHAR(45)  NOT NULL,
+            attempted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_identifier (identifier),
+            INDEX idx_ip (ip)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+        CREATE TABLE IF NOT EXISTS recovery_tokens (
+            id         INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            user_id    INT UNSIGNED NOT NULL,
+            token_hash VARCHAR(255) NOT NULL UNIQUE,
+            expires_at DATETIME    NOT NULL,
+            used       TINYINT(1)  NOT NULL DEFAULT 0,
+            created_at DATETIME    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    ");
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function h(string $s): string
+{
+    return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function redirect(string $url): never
+{
+    header('Location: ' . $url);
+    exit;
+}
+
+function csrfToken(): string
+{
+    if (empty($_SESSION['csrf_token'])) {
+        $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+    }
+    return $_SESSION['csrf_token'];
+}
+
+function verifyCsrf(string $token): bool
+{
+    return isset($_SESSION['csrf_token'])
+        && hash_equals($_SESSION['csrf_token'], $token);
+}
+
+function normaliseAnswer(string $answer): string
+{
+    return mb_strtolower(trim($answer));
+}
+
+function clientIp(): string
+{
+    return $_SERVER['REMOTE_ADDR'] ?? '0.0.0.0';
+}
+
+// ─── Rate-limiting ────────────────────────────────────────────────────────────
+function isLockedOut(string $identifier): bool
+{
+    $since = date('Y-m-d H:i:s', time() - LOCKOUT_SECONDS);
+    $stmt  = db()->prepare("
+        SELECT COUNT(*) FROM recovery_attempts
+        WHERE (identifier = ? OR ip = ?) AND attempted_at > ?
+    ");
+    $stmt->execute([$identifier, clientIp(), $since]);
+    return (int) $stmt->fetchColumn() >= MAX_ATTEMPTS;
+}
+
+function recordAttempt(string $identifier): void
+{
+    $stmt = db()->prepare("
+        INSERT INTO recovery_attempts (identifier, ip) VALUES (?, ?)
+    ");
+    $stmt->execute([$identifier, clientIp()]);
+}
+
+function clearAttempts(string $identifier): void
+{
+    $stmt = db()->prepare("
+        DELETE FROM recovery_attempts WHERE identifier = ? OR ip = ?
+    ");
+    $stmt->execute([$identifier, clientIp()]);
+}
+
+// ─── Token helpers ────────────────────────────────────────────────────────────
+function createRecoveryToken(int $userId): string
+{
+    $token     = bin2hex(random_bytes(32));
+    $tokenHash = hash('sha256', $token);
+    $expires   = date('Y-m-d H:i:s', time() + TOKEN_TTL);
+
+    // Invalidate previous unused tokens for this user
+    $stmt = db()->prepare("
+        UPDATE recovery_tokens SET used = 1 WHERE user_id = ? AND used = 0
+    ");
+    $stmt->execute([$userId]);
+
+    $stmt = db()->prepare("
+        INSERT INTO recovery_tokens (user_id, token_hash, expires_at)
+        VALUES (?, ?, ?)
+    ");
+    $stmt->execute([$userId, $tokenHash, $expires]);
+
+    return $token;
+}
+
+function validateRecoveryToken(string $token): ?array
+{
+    $tokenHash = hash('sha256', $token);
+    $stmt      = db()->prepare("
+        SELECT rt.*, u.id AS uid, u.username
+        FROM recovery_tokens rt
+        JOIN users u ON u.id = rt.user_id
+        WHERE rt.token_hash = ?
+          AND rt.used = 0
+          AND rt.expires_at > NOW()
+    ");
+    $stmt->execute([$tokenHash]);
+    return $stmt->fetch() ?: null;
+}
+
+function consumeToken(int $tokenId): void
+{
+    $stmt = db()->prepare("UPDATE recovery_tokens SET used = 1 WHERE id = ?");
+    $stmt->execute([$tokenId]);
+}
+
+// ─── Predefined secret questions ──────────────────────────────────────────────
+function secretQuestions(): array
+{
+    return [
+        'Девичья фамилия матери?',
+        'Кличка вашего первого питомца?',
+        'Название вашей первой школы?',
+        'Имя вашего лучшего друга детства?',
+        'Город, в котором вы родились?',
+        'Любимая книга в детстве?',
+    ];
+}
+
+// ─── Page renderer ────────────────────────────────────────────────────────────
+function renderPage(string $title, string $body): void
+{
+    echo <<<HTML
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{$title}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, sans-serif; background: #f0f2f5; display: flex;
+         justify-content: center; align-items: center; min-height: 100vh; }
+  .card { background: #fff; border-radius: 10px; box-shadow: 0 4px 20px rgba(0,0,0,.1);
+          padding: 2rem; width: 100%; max-width: 440px; }
+  h1 { font-size: 1.4rem; margin-bottom: 1.2rem; color: #1a1a2e; }
+  label { display: block; font-size: .85rem; color: #555; margin-bottom: .25rem; }
+  input, select { width: 100%; padding: .6rem .8rem; border: 1px solid #ccc;
+                  border-radius: 6px; font-size: 1rem; margin-bottom: 1rem; }
+  input:focus, select:focus { outline: none; border-color: #4f46e5; }
+  button { width: 100%; padding: .7rem; background: #4f46e5; color: #fff;
+           border: none; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+  button:hover { background: #4338ca; }
+  .alert { padding: .75rem 1rem; border-radius: 6px; margin-bottom: 1rem;
+           font-size: .9rem; }
+  .alert-error   { background: #fee2e2; color: #991b1b; }
+  .alert-success { background: #d1fae5; color: #065f46; }
+  .alert-info    { background: #dbeafe; color: #1e40af; }
+  a { color: #4f46e5; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .links { margin-top: 1rem; font-size: .85rem; text-align: center; }
+  .question-box { background: #f8f8ff; border: 1px solid #e0e0ff;
+                  border-radius: 6px; padding: .75rem 1rem; margin-bottom: 1rem;
+                  font-size: .95rem; color: #333; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>{$title}</h1>
+  {$body}
+</div>
+</body>
+</html>
+HTML;
+}
+
+// ─── Controllers ──────────────────────────────────────────────────────────────
+
+/* STEP 0 – Registration (demo only, so we can create test users) */
+function handleRegister(): void
+{
+    $error   = '';
+    $success = '';
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyCsrf($_POST['csrf_token'] ?? '')) {
+            $error = 'Неверный CSRF-токен.';
+        } else {
+            $username = trim($_POST['username'] ?? '');
+            $email    = trim($_POST['email']    ?? '');
+            $password = $_POST['password']      ?? '';
+            $question = $_POST['secret_question'] ?? '';
+            $answer   = $_POST['secret_answer']   ?? '';
+
+            if (!$username || !$email || !$password || !$question || !$answer) {
+                $error = 'Заполните все поля.';
+            } elseif (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
+                $error = 'Некорректный e-mail.';
+            } elseif (strlen($password) < 8) {
+                $error = 'Пароль должен содержать минимум 8 символов.';
+            } elseif (!in_array($question, secretQuestions(), true)) {
+                $error = 'Выберите вопрос из списка.';
+            } else {
+                try {
+                    $stmt = db()->prepare("
+                        INSERT INTO users (username, email, password_hash, secret_question, secret_answer)
+                        VALUES (?, ?, ?, ?, ?)
+                    ");
+                    $stmt->execute([
+                        $username,
+                        $email,
+                        password_hash($password, PASSWORD_BCRYPT),
+                        $question,
+                        password_hash(normaliseAnswer($answer), PASSWORD_BCRYPT),
+                    ]);
+                    $success = 'Аккаунт создан. <a href="?step=login">Войти</a>';
+                } catch (\PDOException $e) {
+                    $error = str_contains($e->getMessage(), 'Duplicate')
+                        ? 'Пользователь с таким именем или e-mail уже существует.'
+                        : 'Ошибка базы данных.';
+                }
+            }
+        }
+    }
+
+    $csrf      = h(csrfToken());
+    $questions = '';
+    foreach (secretQuestions() as $q) {
+        $questions .= '<option value="' . h($q) . '">' . h($q) . '</option>';
+    }
+
+    $alertError   = $error   ? '<div class="alert alert-error">'   . h($error)   . '</div>' : '';
+    $alertSuccess = $success ? '<div class="alert alert-success">'  . $success    . '</div>' : '';
+
+    $body = <<<HTML
+{$alertError}{$alertSuccess}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{$csrf}">
+  <label>Имя пользователя</label>
+  <input type="text" name="username" required maxlength="80">
+  <label>E-mail</label>
+  <input type="email" name="email" required maxlength="180">
+  <label>Пароль (мин. 8 символов)</label>
+  <input type="password" name="password" required minlength="8">
+  <label>Секретный вопрос</label>
+  <select name="secret_question" required>
+    <option value="">— выберите вопрос —</option>
+    {$questions}
+  </select>
+  <label>Ответ на секретный вопрос</label>
+  <input type="text" name="secret_answer" required maxlength="255"
+         autocomplete="off" placeholder="Ответ (регистр не важен)">
+  <button type="submit">Зарегистрироваться</button>
+</form>
+<div class="links">
+  <a href="?step=login">Уже есть аккаунт? Войти</a>
+</div>
+HTML;
+
+    renderPage('Регистрация', $body);
+}
+
+/* STEP 1 – Enter identifier (username or email) */
+function handleStep1(): void
+{
+    $error = '';
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyCsrf($_POST['csrf_token'] ?? '')) {
+            $error = 'Неверный CSRF-токен.';
+        } else {
+            $identifier = trim($_POST['identifier'] ?? '');
+
+            if (!$identifier) {
+                $error = 'Введите имя пользователя или e-mail.';
+            } elseif (isLockedOut($identifier)) {
+                $error = 'Слишком много попыток. Попробуйте через ' . (LOCKOUT_SECONDS / 60) . ' минут.';
+            } else {
+                // Find user by username OR email
+                $stmt = db()->prepare("
+                    SELECT id, username, secret_question
+                    FROM users
+                    WHERE username = ? OR email = ?
+                    LIMIT 1
+                ");
+                $stmt->execute([$identifier, $identifier]);
+                $user = $stmt->fetch();
+
+                if (!$user) {
+                    // Don't reveal whether user exists – still record attempt
+                    recordAttempt($identifier);
+                    $error = 'Пользователь не найден.';
+                } else {
+                    $_SESSION['recovery_user_id']   = $user['id'];
+                    $_SESSION['recovery_identifier'] = $identifier;
+                    redirect('?step=2');
+                }
+            }
+        }
+    }
+
+    $csrf        = h(csrfToken());
+    $alertError  = $error ? '<div class="alert alert-error">' . h($error) . '</div>' : '';
+
+    $body = <<<HTML
+{$alertError}
+<p style="margin-bottom:1rem;font-size:.9rem;color:#555;">
+  Введите имя пользователя или e-mail, связанный с вашим аккаунтом.
+</p>
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{$csrf}">
+  <label>Имя пользователя или e-mail</label>
+  <input type="text" name="identifier" required autofocus
+         autocomplete="username" maxlength="180">
+  <button type="submit">Продолжить</button>
+</form>
+<div class="links">
+  <a href="?step=login">Вернуться ко входу</a> ·
+  <a href="?step=register">Регистрация</a>
+</div>
+HTML;
+
+    renderPage('Восстановление доступа', $body);
+}
+
+/* STEP 2 – Answer secret question */
+function handleStep2(): void
+{
+    if (empty($_SESSION['recovery_user_id'])) {
+        redirect('?step=1');
+    }
+
+    $userId     = (int) $_SESSION['recovery_user_id'];
+    $identifier = $_SESSION['recovery_identifier'] ?? '';
+    $error      = '';
+
+    // Fetch user + question
+    $stmt = db()->prepare("SELECT id, username, secret_question, secret_answer FROM users WHERE id = ?");
+    $stmt->execute([$userId]);
+    $user = $stmt->fetch();
+
+    if (!$user) {
+        unset($_SESSION['recovery_user_id'], $_SESSION['recovery_identifier']);
+        redirect('?step=1');
+    }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyCsrf($_POST['csrf_token'] ?? '')) {
+            $error = 'Неверный CSRF-токен.';
+        } elseif (isLockedOut($identifier)) {
+            $error = 'Слишком много попыток. Попробуйте через ' . (LOCKOUT_SECONDS / 60) . ' минут.';
+        } else {
+            $answer = $_POST['secret_answer'] ?? '';
+
+            if (!$answer) {
+                $error = 'Введите ответ на секретный вопрос.';
+            } elseif (!password_verify(normaliseAnswer($answer), $user['secret_answer'])) {
+                recordAttempt($identifier);
+                $attemptsLeft = MAX_ATTEMPTS - (function () use ($identifier): int {
+                    $since = date('Y-m-d H:i:s', time() - LOCKOUT_SECONDS);
+                    $stmt  = db()->prepare("
+                        SELECT COUNT(*) FROM recovery_attempts
+                        WHERE (identifier = ? OR ip = ?) AND attempted_at > ?
+                    ");
+                    $stmt->execute([$identifier, clientIp(), $since]);
+                    return (int) $stmt->fetchColumn();
+                })();
+                $error = 'Неверный ответ.' . ($attemptsLeft > 0 ? " Осталось попыток: {$attemptsLeft}." : ' Аккаунт временно заблокирован.');
+            } else {
+                // Correct answer
+                clearAttempts($identifier);
+                $token = createRecoveryToken($userId);
+
+                // Clean up session step data
+                unset($_SESSION['recovery_user_id'], $_SESSION['recovery_identifier']);
+
+                // In a real app you'd email the link; here we redirect directly
+                redirect('?step=3&token=' . urlencode($token));
+            }
+        }
+    }
+
+    $csrf       = h(csrfToken());
+    $question   = h($user['secret_question']);
+    $alertError = $error ? '<div class="alert alert-error">' . h($error) . '</div>' : '';
+
+    $body = <<<HTML
+{$alertError}
+<p style="margin-bottom:.75rem;font-size:.9rem;color:#555;">
+  Ответьте на секретный вопрос для подтверждения личности.
+</p>
+<div class="question-box">🔒 {$question}</div>
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{$csrf}">
+  <label>Ваш ответ</label>
+  <input type="text" name="secret_answer" required autofocus
+         autocomplete="off" maxlength="255"
+         placeholder="Ответ (регистр не важен)">
+  <button type="submit">Подтвердить</button>
+</form>
+<div class="links">
+  <a href="?step=1">← Назад</a>
+</div>
+HTML;
+
+    renderPage('Секретный вопрос', $body);
+}
+
+/* STEP 3 – Set new password */
+function handleStep3(): void
+{
+    $rawToken = $_GET['token'] ?? ($_POST['token'] ?? '');
+    $error    = '';
+    $success  = '';
+
+    if (!$rawToken) {
+        redirect('?step=1');
+    }
+
+    $tokenRow = validateRecoveryToken($rawToken);
+    if (!$tokenRow) {
+        $body = '<div class="alert alert-error">Ссылка недействительна или истекла. '
+              . '<a href="?step=1">Попробовать снова</a></div>';
+        renderPage('Ошибка', $body);
+        return;
+    }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyCsrf($_POST['csrf_token'] ?? '')) {
+            $error = 'Неверный CSRF-токен.';
+        } else {
+            $newPassword = $_POST['new_password']     ?? '';
+            $confirm     = $_POST['confirm_password'] ?? '';
+
+            if (strlen($newPassword) < 8) {
+                $error = 'Пароль должен содержать минимум 8 символов.';
+            } elseif ($newPassword !== $confirm) {
+                $error = 'Пароли не совпадают.';
+            } else {
+                // Update password
+                $stmt = db()->prepare("UPDATE users SET password_hash = ? WHERE id = ?");
+                $stmt->execute([
+                    password_hash($newPassword, PASSWORD_BCRYPT),
+                    $tokenRow['user_id'],
+                ]);
+
+                // Mark token as used
+                consumeToken((int) $tokenRow['id']);
+
+                $success = 'Пароль успешно изменён. <a href="?step=login">Войти</a>';
+            }
+        }
+    }
+
+    $csrf       = h(csrfToken());
+    $tokenSafe  = h($rawToken);
+    $username   = h($tokenRow['username']);
+    $alertError = $error   ? '<div class="alert alert-error">'   . h($error) . '</div>' : '';
+    $alertOk    = $success ? '<div class="alert alert-success">'  . $success  . '</div>' : '';
+
+    $body = <<<HTML
+{$alertError}{$alertOk}
+<p style="margin-bottom:1rem;font-size:.9rem;color:#555;">
+  Установите новый пароль для аккаунта <strong>{$username}</strong>.
+</p>
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{$csrf}">
+  <input type="hidden" name="token"      value="{$tokenSafe}">
+  <label>Новый пароль (мин. 8 символов)</label>
+  <input type="password" name="new_password" required minlength="8" autofocus>
+  <label>Повторите пароль</label>
+  <input type="password" name="confirm_password" required minlength="8">
+  <button type="submit">Сохранить пароль</button>
+</form>
+HTML;
+
+    renderPage('Новый пароль', $body);
+}
+
+/* Demo login page */
+function handleLogin(): void
+{
+    $error   = '';
+    $success = '';
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!verifyCsrf($_POST['csrf_token'] ?? '')) {
+            $error = 'Неверный CSRF-токен.';
+        } else {
+            $identifier = trim($_POST['identifier'] ?? '');
+            $password   = $_POST['password'] ?? '';
+
+            $stmt = db()->prepare("
+                SELECT id, username, password_hash FROM users
+                WHERE username = ? OR email = ? LIMIT 1
+            ");
+            $stmt->execute([$identifier, $identifier]);
+            $user = $stmt->fetch();
+
+            if ($user && password_verify($password, $user['password_hash'])) {
+                $_SESSION['user_id']   = $user['id'];
+                $_SESSION['username']  = $user['username'];
+                $success = 'Добро пожаловать, ' . h($user['username']) . '! '
+                         . '<a href="?step=logout">Выйти</a>';
+            } else {
+                $error = 'Неверные учётные данные.';
+            }
+        }
+    }
+
+    if (!empty($_SESSION['user_id'])) {
+        $success = 'Вы вошли как <strong>' . h($_SESSION['username']) . '</strong>. '
+                 . '<a href="?step=logout">Выйти</a>';
+    }
+
+    $csrf       = h(csrfToken());
+    $alertError = $error   ? '<div class="alert alert-error">'   . h($error) . '</div>' : '';
+    $alertOk    = $success ? '<div class="alert alert-success">'  . $success  . '</div>' : '';
+
+    $body = <<<HTML
+{$alertError}{$alertOk}
+<form method="post">
+  <input type="hidden" name="csrf_token" value="{$csrf}">
+  <label>Имя пользователя или e-mail</label>
+  <input type="text" name="identifier" required autocomplete="username">
+  <label>Пароль</label>
+  <input type="password" name="password" required autocomplete="current-password">
+  <button type="submit">Войти</button>
+</form>
+<div class="links">
+  <a href="?step=1">Забыли пароль?</a> ·
+  <a href="?step=register">Регистрация</a>
+</div>
+HTML;
+
+    renderPage('Вход', $body);
+}
+
+function handleLogout(): void
+{
+    session_destroy();
+    redirect('?step=login');
+}
+
+// ─── Router ───────────────────────────────────────────────────────────────────
+try {
+    ensureSchema();
+} catch (\Throwable $e) {
+    die('Ошибка инициализации БД: ' . h($e->getMessage()));
+}
+
+$step = $_GET['step'] ?? '1';
+
+match ($step) {
+    'register' => handleRegister(),
+    'login'    => handleLogin(),
+    'logout'   => handleLogout(),
+    '1'        => handleStep1(),
+    '2'        => handleStep2(),
+    '3'        => handleStep3(),
+    default    => redirect('?step=1'),
+};

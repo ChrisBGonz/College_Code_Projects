@@ -1,0 +1,183 @@
+
+```java
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.mail.javamail.JavaMailSender;
+import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.stereotype.Service;
+import jakarta.mail.MessagingException;
+import jakarta.mail.internet.MimeMessage;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+@Service
+public class PasswordResetService {
+
+    private final ChatClient chatClient;
+    private final RedisTemplate<String, String> redisTemplate;
+    private final JavaMailSender mailSender;
+    private final UserRepository userRepository;
+
+    @Value("${app.base-url:http://localhost:8080}")
+    private String baseUrl;
+
+    @Value("${app.reset-token.ttl-minutes:30}")
+    private long tokenTtlMinutes;
+
+    private static final String RESET_TOKEN_PREFIX = "password_reset:";
+
+    @Autowired
+    public PasswordResetService(
+            ChatClient.Builder chatClientBuilder,
+            RedisTemplate<String, String> redisTemplate,
+            JavaMailSender mailSender,
+            UserRepository userRepository) {
+        this.chatClient = chatClientBuilder.build();
+        this.redisTemplate = redisTemplate;
+        this.mailSender = mailSender;
+        this.userRepository = userRepository;
+    }
+
+    public void processForgotPassword(String email) {
+        // Check if user exists
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new UserNotFoundException("User not found with email: " + email));
+
+        // Generate unique token
+        String resetToken = generateUniqueToken();
+
+        // Save token to Redis with TTL
+        saveTokenToCache(email, resetToken);
+
+        // Generate reset link
+        String resetLink = buildResetLink(resetToken);
+
+        // Generate personalized email content using AI
+        String emailContent = generateEmailContent(user.getFirstName(), resetLink);
+
+        // Send email to user
+        sendResetEmail(email, user.getFirstName(), emailContent, resetLink);
+    }
+
+    private String generateUniqueToken() {
+        return UUID.randomUUID().toString().replace("-", "") +
+               Long.toHexString(System.currentTimeMillis());
+    }
+
+    private void saveTokenToCache(String email, String token) {
+        String key = RESET_TOKEN_PREFIX + token;
+        redisTemplate.opsForValue().set(key, email, tokenTtlMinutes, TimeUnit.MINUTES);
+    }
+
+    private String buildResetLink(String token) {
+        return baseUrl + "/api/auth/reset-password?token=" + token;
+    }
+
+    private String generateEmailContent(String userName, String resetLink) {
+        String prompt = String.format(
+            "Generate a professional and friendly password reset email body for a user named '%s'. " +
+            "The email should: " +
+            "1. Greet the user by name " +
+            "2. Explain that a password reset was requested " +
+            "3. Mention the link will expire in %d minutes " +
+            "4. Include a placeholder [RESET_LINK] where the actual link should go " +
+            "5. Add a security note that if they didn't request this, they should ignore the email " +
+            "6. Be concise and professional " +
+            "Return only the email body text, no subject line.",
+            userName, tokenTtlMinutes
+        );
+
+        String aiGeneratedContent = chatClient.prompt()
+                .user(prompt)
+                .call()
+                .content();
+
+        // Replace placeholder with actual link
+        return aiGeneratedContent.replace("[RESET_LINK]", resetLink);
+    }
+
+    private void sendResetEmail(String toEmail, String userName, String emailContent, String resetLink) {
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+
+            helper.setTo(toEmail);
+            helper.setSubject("Password Reset Request");
+            helper.setFrom("noreply@yourapp.com");
+
+            // Create HTML version of the email
+            String htmlContent = buildHtmlEmail(userName, emailContent, resetLink);
+            helper.setText(emailContent, htmlContent);
+
+            mailSender.send(message);
+        } catch (MessagingException e) {
+            throw new EmailSendingException("Failed to send password reset email to: " + toEmail, e);
+        }
+    }
+
+    private String buildHtmlEmail(String userName, String textContent, String resetLink) {
+        return """
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <style>
+                        body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
+                        .container { max-width: 600px; margin: 0 auto; padding: 20px; }
+                        .header { background-color: #4A90E2; color: white; padding: 20px; text-align: center; }
+                        .content { padding: 20px; background-color: #f9f9f9; }
+                        .button { display: inline-block; padding: 12px 24px; background-color: #4A90E2;
+                                  color: white; text-decoration: none; border-radius: 4px; margin: 20px 0; }
+                        .footer { padding: 10px; text-align: center; font-size: 12px; color: #666; }
+                    </style>
+                </head>
+                <body>
+                    <div class="container">
+                        <div class="header">
+                            <h1>Password Reset</h1>
+                        </div>
+                        <div class="content">
+                            <p>%s</p>
+                            <a href="%s" class="button">Reset Password</a>
+                            <p>Or copy this link: <a href="%s">%s</a></p>
+                        </div>
+                        <div class="footer">
+                            <p>This is an automated message, please do not reply.</p>
+                        </div>
+                    </div>
+                </body>
+                </html>
+                """.formatted(textContent.replace("\n", "<br>"), resetLink, resetLink, resetLink);
+    }
+
+    public boolean validateResetToken(String token) {
+        String key = RESET_TOKEN_PREFIX + token;
+        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    }
+
+    public String getEmailByToken(String token) {
+        String key = RESET_TOKEN_PREFIX + token;
+        return redisTemplate.opsForValue().get(key);
+    }
+
+    public void invalidateToken(String token) {
+        String key = RESET_TOKEN_PREFIX + token;
+        redisTemplate.delete(key);
+    }
+
+    // Custom exceptions
+    public static class UserNotFoundException extends RuntimeException {
+        public UserNotFoundException(String message) {
+            super(message);
+        }
+    }
+
+    public static class EmailSendingException extends RuntimeException {
+        public EmailSendingException(String message, Throwable cause) {
+            super(message, cause);
+        }
+    }
+}
+```

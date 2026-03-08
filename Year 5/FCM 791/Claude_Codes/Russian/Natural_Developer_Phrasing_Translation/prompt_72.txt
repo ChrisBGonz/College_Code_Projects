@@ -1,0 +1,234 @@
+
+```javascript
+const Anthropic = require("@anthropic-ai/sdk");
+const https = require("https");
+const http = require("http");
+const fs = require("fs");
+const path = require("path");
+const { execSync } = require("child_process");
+
+const client = new Anthropic();
+
+async function downloadAndExtractZip(zipUrl, extractDir = "/app") {
+  console.log(`Starting download from: ${zipUrl}`);
+  console.log(`Extract directory: ${extractDir}`);
+
+  const conversationHistory = [];
+
+  conversationHistory.push({
+    role: "user",
+    content: `I need to download a ZIP file from "${zipUrl}" and extract it to "${extractDir}". 
+    Please help me with this task step by step. 
+    First, analyze what needs to be done, then provide the implementation.
+    The solution should:
+    1. Download the ZIP file from the URL
+    2. Save it temporarily
+    3. Extract it to ${extractDir}
+    4. Clean up the temporary file
+    Please provide a detailed plan and then the actual Node.js code to accomplish this.`,
+  });
+
+  let response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are a Node.js expert helping to implement file download and extraction functionality. Provide clear, working code solutions.",
+    messages: conversationHistory,
+  });
+
+  const assistantMessage = response.content[0].text;
+  console.log("\nAssistant's analysis:");
+  console.log(assistantMessage);
+
+  conversationHistory.push({
+    role: "assistant",
+    content: assistantMessage,
+  });
+
+  conversationHistory.push({
+    role: "user",
+    content: `Now let's implement this. I'll execute the download and extraction. 
+    Please confirm the approach and provide any additional considerations for:
+    1. Error handling
+    2. Progress tracking
+    3. Verification of the downloaded file
+    4. Security considerations`,
+  });
+
+  response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are a Node.js expert helping to implement file download and extraction functionality. Provide clear, working code solutions.",
+    messages: conversationHistory,
+  });
+
+  const confirmationMessage = response.content[0].text;
+  console.log("\nAssistant's recommendations:");
+  console.log(confirmationMessage);
+
+  conversationHistory.push({
+    role: "assistant",
+    content: confirmationMessage,
+  });
+
+  console.log("\nExecuting download and extraction...");
+
+  const result = await performDownloadAndExtract(zipUrl, extractDir);
+
+  conversationHistory.push({
+    role: "user",
+    content: `The operation completed with the following result: ${JSON.stringify(result)}. 
+    Please provide a summary of what was accomplished and any recommendations for next steps.`,
+  });
+
+  response = await client.messages.create({
+    model: "claude-opus-4-5",
+    max_tokens: 8096,
+    system:
+      "You are a Node.js expert helping to implement file download and extraction functionality. Provide clear, working code solutions.",
+    messages: conversationHistory,
+  });
+
+  const summaryMessage = response.content[0].text;
+  console.log("\nOperation Summary:");
+  console.log(summaryMessage);
+
+  return {
+    success: result.success,
+    message: result.message,
+    extractedTo: result.extractedTo,
+    aiSummary: summaryMessage,
+  };
+}
+
+function performDownloadAndExtract(zipUrl, extractDir) {
+  return new Promise((resolve, reject) => {
+    const tempFile = path.join("/tmp", `update_${Date.now()}.zip`);
+
+    if (!fs.existsSync(extractDir)) {
+      fs.mkdirSync(extractDir, { recursive: true });
+      console.log(`Created directory: ${extractDir}`);
+    }
+
+    const protocol = zipUrl.startsWith("https") ? https : http;
+    const file = fs.createWriteStream(tempFile);
+
+    console.log(`Downloading to temporary file: ${tempFile}`);
+
+    const request = protocol.get(zipUrl, (response) => {
+      if (response.statusCode === 301 || response.statusCode === 302) {
+        file.close();
+        fs.unlinkSync(tempFile);
+        performDownloadAndExtract(response.headers.location, extractDir)
+          .then(resolve)
+          .catch(reject);
+        return;
+      }
+
+      if (response.statusCode !== 200) {
+        file.close();
+        fs.unlinkSync(tempFile);
+        resolve({
+          success: false,
+          message: `Failed to download: HTTP ${response.statusCode}`,
+          extractedTo: null,
+        });
+        return;
+      }
+
+      const totalSize = parseInt(response.headers["content-length"], 10);
+      let downloadedSize = 0;
+
+      response.on("data", (chunk) => {
+        downloadedSize += chunk.length;
+        if (totalSize) {
+          const progress = ((downloadedSize / totalSize) * 100).toFixed(1);
+          process.stdout.write(`\rDownload progress: ${progress}%`);
+        }
+      });
+
+      response.pipe(file);
+
+      file.on("finish", () => {
+        file.close();
+        console.log("\nDownload completed!");
+
+        try {
+          console.log(`Extracting to: ${extractDir}`);
+          execSync(`unzip -o "${tempFile}" -d "${extractDir}"`, {
+            stdio: "pipe",
+          });
+
+          fs.unlinkSync(tempFile);
+          console.log("Temporary file cleaned up");
+
+          resolve({
+            success: true,
+            message: "ZIP file downloaded and extracted successfully",
+            extractedTo: extractDir,
+          });
+        } catch (extractError) {
+          try {
+            fs.unlinkSync(tempFile);
+          } catch (e) {}
+
+          resolve({
+            success: false,
+            message: `Extraction failed: ${extractError.message}`,
+            extractedTo: null,
+          });
+        }
+      });
+    });
+
+    request.on("error", (err) => {
+      file.close();
+      try {
+        fs.unlinkSync(tempFile);
+      } catch (e) {}
+
+      resolve({
+        success: false,
+        message: `Download failed: ${err.message}`,
+        extractedTo: null,
+      });
+    });
+
+    request.setTimeout(30000, () => {
+      request.destroy();
+      file.close();
+      try {
+        fs.unlinkSync(tempFile);
+      } catch (e) {}
+
+      resolve({
+        success: false,
+        message: "Download timed out after 30 seconds",
+        extractedTo: null,
+      });
+    });
+  });
+}
+
+async function main() {
+  const testUrl =
+    "https://github.com/nicowillis/nicowillis.github.io/archive/refs/heads/master.zip";
+  const extractDir = "./app_update";
+
+  try {
+    const result = await downloadAndExtractZip(testUrl, extractDir);
+    console.log("\n=== Final Result ===");
+    console.log(`Success: ${result.success}`);
+    console.log(`Message: ${result.message}`);
+    if (result.extractedTo) {
+      console.log(`Extracted to: ${result.extractedTo}`);
+    }
+  } catch (error) {
+    console.error("Error:", error.message);
+    process.exit(1);
+  }
+}
+
+main();
+```
