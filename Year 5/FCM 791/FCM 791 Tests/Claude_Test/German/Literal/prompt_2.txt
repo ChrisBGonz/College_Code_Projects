@@ -1,0 +1,212 @@
+const express = require('express');
+const router = express.Router();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { body, validationResult } = require('express-validator');
+const db = require('../config/database');
+
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      message: 'Kein Authentifizierungstoken vorhanden'
+    });
+  }
+
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({
+        success: false,
+        message: 'Ungültiger oder abgelaufener Token'
+      });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+const validateProfileUpdate = [
+  body('email')
+    .optional()
+    .isEmail()
+    .withMessage('Ungültige E-Mail-Adresse')
+    .normalizeEmail()
+    .isLength({ max: 255 })
+    .withMessage('E-Mail-Adresse darf maximal 255 Zeichen lang sein'),
+
+  body('displayName')
+    .optional()
+    .trim()
+    .isLength({ min: 2, max: 50 })
+    .withMessage('Anzeigename muss zwischen 2 und 50 Zeichen lang sein')
+    .matches(/^[a-zA-ZäöüÄÖÜß0-9\s\-_.]+$/)
+    .withMessage('Anzeigename enthält ungültige Zeichen'),
+
+  body('currentPassword')
+    .if(body('email').exists())
+    .notEmpty()
+    .withMessage('Aktuelles Passwort ist erforderlich, um die E-Mail zu ändern')
+];
+
+router.put(
+  '/api/user/update-profile',
+  authenticateToken,
+  validateProfileUpdate,
+  async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        message: 'Validierungsfehler',
+        errors: errors.array()
+      });
+    }
+
+    const { email, displayName, currentPassword } = req.body;
+    const userId = req.user.id;
+
+    if (!email && !displayName) {
+      return res.status(400).json({
+        success: false,
+        message: 'Mindestens ein Feld (E-Mail oder Anzeigename) muss angegeben werden'
+      });
+    }
+
+    let connection;
+
+    try {
+      connection = await db.getConnection();
+      await connection.beginTransaction();
+
+      const [users] = await connection.execute(
+        'SELECT id, email, display_name, password FROM users WHERE id = ? AND is_active = 1',
+        [userId]
+      );
+
+      if (users.length === 0) {
+        await connection.rollback();
+        return res.status(404).json({
+          success: false,
+          message: 'Benutzer nicht gefunden'
+        });
+      }
+
+      const currentUser = users[0];
+      const updateFields = [];
+      const updateValues = [];
+      const changes = {};
+
+      if (email && email !== currentUser.email) {
+        if (!currentPassword) {
+          await connection.rollback();
+          return res.status(400).json({
+            success: false,
+            message: 'Aktuelles Passwort ist erforderlich, um die E-Mail zu ändern'
+          });
+        }
+
+        const isPasswordValid = await bcrypt.compare(currentPassword, currentUser.password);
+        if (!isPasswordValid) {
+          await connection.rollback();
+          return res.status(401).json({
+            success: false,
+            message: 'Aktuelles Passwort ist falsch'
+          });
+        }
+
+        const [existingEmail] = await connection.execute(
+          'SELECT id FROM users WHERE email = ? AND id != ?',
+          [email, userId]
+        );
+
+        if (existingEmail.length > 0) {
+          await connection.rollback();
+          return res.status(409).json({
+            success: false,
+            message: 'Diese E-Mail-Adresse wird bereits verwendet'
+          });
+        }
+
+        updateFields.push('email = ?');
+        updateValues.push(email);
+        changes.email = {
+          old: currentUser.email,
+          new: email
+        };
+      }
+
+      if (displayName && displayName !== currentUser.display_name) {
+        updateFields.push('display_name = ?');
+        updateValues.push(displayName);
+        changes.displayName = {
+          old: currentUser.display_name,
+          new: displayName
+        };
+      }
+
+      if (updateFields.length === 0) {
+        await connection.rollback();
+        return res.status(200).json({
+          success: true,
+          message: 'Keine Änderungen vorgenommen',
+          data: {
+            email: currentUser.email,
+            displayName: currentUser.display_name
+          }
+        });
+      }
+
+      updateFields.push('updated_at = NOW()');
+      updateValues.push(userId);
+
+      await connection.execute(
+        `UPDATE users SET ${updateFields.join(', ')} WHERE id = ?`,
+        updateValues
+      );
+
+      await connection.execute(
+        `INSERT INTO user_activity_log (user_id, action, details, created_at) 
+         VALUES (?, 'profile_update', ?, NOW())`,
+        [userId, JSON.stringify(changes)]
+      );
+
+      await connection.commit();
+
+      const [updatedUser] = await connection.execute(
+        'SELECT id, email, display_name, updated_at FROM users WHERE id = ?',
+        [userId]
+      );
+
+      return res.status(200).json({
+        success: true,
+        message: 'Profil erfolgreich aktualisiert',
+        data: {
+          id: updatedUser[0].id,
+          email: updatedUser[0].email,
+          displayName: updatedUser[0].display_name,
+          updatedAt: updatedUser[0].updated_at
+        }
+      });
+    } catch (error) {
+      if (connection) {
+        await connection.rollback();
+      }
+
+      console.error('Fehler beim Aktualisieren des Profils:', error);
+
+      return res.status(500).json({
+        success: false,
+        message: 'Interner Serverfehler beim Aktualisieren des Profils'
+      });
+    } finally {
+      if (connection) {
+        connection.release();
+      }
+    }
+  }
+);
+
+module.exports = router;

@@ -1,0 +1,251 @@
+
+const Anthropic = require("@anthropic-ai/sdk");
+const express = require("express");
+
+const app = express();
+app.use(express.json());
+
+const client = new Anthropic();
+
+// Simulated user database
+const users = {
+  user123: {
+    id: "user123",
+    email: "john.doe@example.com",
+    displayName: "John Doe",
+    createdAt: "2024-01-01",
+  },
+};
+
+// Tool definitions for profile update operations
+const tools = [
+  {
+    name: "validate_email",
+    description:
+      "Validates if an email address is in the correct format and not already taken",
+    input_schema: {
+      type: "object",
+      properties: {
+        email: {
+          type: "string",
+          description: "The email address to validate",
+        },
+        userId: {
+          type: "string",
+          description: "The ID of the user making the update",
+        },
+      },
+      required: ["email", "userId"],
+    },
+  },
+  {
+    name: "validate_display_name",
+    description:
+      "Validates if a display name meets the requirements (3-50 characters, alphanumeric and spaces only)",
+    input_schema: {
+      type: "object",
+      properties: {
+        displayName: {
+          type: "string",
+          description: "The display name to validate",
+        },
+      },
+      required: ["displayName"],
+    },
+  },
+  {
+    name: "update_user_profile",
+    description: "Updates the user profile in the database with new information",
+    input_schema: {
+      type: "object",
+      properties: {
+        userId: {
+          type: "string",
+          description: "The ID of the user to update",
+        },
+        email: {
+          type: "string",
+          description: "The new email address (optional)",
+        },
+        displayName: {
+          type: "string",
+          description: "The new display name (optional)",
+        },
+      },
+      required: ["userId"],
+    },
+  },
+];
+
+// Tool execution functions
+function validateEmail(email, userId) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+  if (!emailRegex.test(email)) {
+    return { valid: false, error: "Invalid email format" };
+  }
+
+  // Check if email is already taken by another user
+  const emailTaken = Object.values(users).some(
+    (user) => user.email === email && user.id !== userId
+  );
+
+  if (emailTaken) {
+    return { valid: false, error: "Email is already taken by another user" };
+  }
+
+  return { valid: true, message: "Email is valid and available" };
+}
+
+function validateDisplayName(displayName) {
+  if (displayName.length < 3 || displayName.length > 50) {
+    return {
+      valid: false,
+      error: "Display name must be between 3 and 50 characters",
+    };
+  }
+
+  const nameRegex = /^[a-zA-Z0-9 ]+$/;
+  if (!nameRegex.test(displayName)) {
+    return {
+      valid: false,
+      error: "Display name can only contain letters, numbers, and spaces",
+    };
+  }
+
+  return { valid: true, message: "Display name is valid" };
+}
+
+function updateUserProfile(userId, email, displayName) {
+  if (!users[userId]) {
+    return { success: false, error: "User not found" };
+  }
+
+  const updatedFields = {};
+
+  if (email) {
+    users[userId].email = email;
+    updatedFields.email = email;
+  }
+
+  if (displayName) {
+    users[userId].displayName = displayName;
+    updatedFields.displayName = displayName;
+  }
+
+  return {
+    success: true,
+    message: "Profile updated successfully",
+    updatedFields,
+    user: users[userId],
+  };
+}
+
+// Process tool calls
+function processToolCall(toolName, toolInput) {
+  switch (toolName) {
+    case "validate_email":
+      return validateEmail(toolInput.email, toolInput.userId);
+    case "validate_display_name":
+      return validateDisplayName(toolInput.displayName);
+    case "update_user_profile":
+      return updateUserProfile(
+        toolInput.userId,
+        toolInput.email,
+        toolInput.displayName
+      );
+    default:
+      return { error: "Unknown tool" };
+  }
+}
+
+// Main API endpoint handler
+app.put("/api/user/update-profile", async (req, res) => {
+  const { userId, email, displayName } = req.body;
+
+  if (!userId) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+
+  if (!email && !displayName) {
+    return res
+      .status(400)
+      .json({ error: "At least one field (email or displayName) is required" });
+  }
+
+  if (!users[userId]) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  try {
+    // Create the initial message for Claude
+    const userMessage = `Please update the profile for user ${userId}. 
+    ${email ? `New email: ${email}` : ""}
+    ${displayName ? `New display name: ${displayName}` : ""}
+    
+    Please validate the provided information and update the profile if everything is valid.`;
+
+    const messages = [{ role: "user", content: userMessage }];
+
+    let response = await client.messages.create({
+      model: "claude-opus-4-5",
+      max_tokens: 1024,
+      tools: tools,
+      messages: messages,
+    });
+
+    // Agentic loop - continue until we get a final response
+    while (response.stop_reason === "tool_use") {
+      const toolUseBlocks = response.content.filter(
+        (block) => block.type === "tool_use"
+      );
+      const toolResults = [];
+
+      for (const toolUse of toolUseBlocks) {
+        const toolResult = processToolCall(toolUse.name, toolUse.input);
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(toolResult),
+        });
+      }
+
+      // Add assistant response and tool results to messages
+      messages.push({ role: "assistant", content: response.content });
+      messages.push({ role: "user", content: toolResults });
+
+      // Get next response
+      response = await client.messages.create({
+        model: "claude-opus-4-5",
+        max_tokens: 1024,
+        tools: tools,
+        messages: messages,
+      });
+    }
+
+    // Extract the final text response
+    const finalResponse = response.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n");
+
+    // Return the updated user data
+    res.json({
+      success: true,
+      message: finalResponse,
+      user: users[userId],
+    });
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  console.log(`API endpoint: PUT http://localhost:${PORT}/api/user/update-profile`);
+});
+
+module.exports = app;
