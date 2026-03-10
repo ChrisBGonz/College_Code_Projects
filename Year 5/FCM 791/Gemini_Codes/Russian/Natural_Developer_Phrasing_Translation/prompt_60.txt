@@ -1,0 +1,122 @@
+const express = require('express');
+const mongoose = require('mongoose');
+const requestIp = require('request-ip');
+const rateLimit = require('express-rate-limit');
+const { body, validationResult } = require('express-validator');
+
+const app = express();
+app.set('trust proxy', true);
+app.use(express.json());
+app.use(requestIp.mw());
+
+mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/voting_system');
+
+const PollSchema = new mongoose.Schema({
+    question: { type: String, required: true },
+    options: [{
+        text: String,
+        votesCount: { type: Number, default: 0 }
+    }],
+    createdAt: { type: Date, default: Date.now }
+});
+
+const VoteSchema = new mongoose.Schema({
+    pollId: { type: mongoose.Schema.Types.ObjectId, ref: 'Poll', required: true },
+    ip: { type: String, required: true },
+    votedAt: { type: Date, default: Date.now }
+});
+
+VoteSchema.index({ pollId: 1, ip: 1 }, { unique: true });
+
+const Poll = mongoose.model('Poll', PollSchema);
+const Vote = mongoose.model('Vote', VoteSchema);
+
+const voteLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max: 100,
+    message: { error: 'Too many requests from this IP, please try again later.' }
+});
+
+app.post('/api/polls', [
+    body('question').isString().trim().notEmpty(),
+    body('options').isArray({ min: 2 }).custom(opt => opt.every(o => typeof o === 'string' && o.trim() !== ''))
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    try {
+        const poll = new Poll({
+            question: req.body.question,
+            options: req.body.options.map(text => ({ text }))
+        });
+        await poll.save();
+        res.status(201).json(poll);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/polls/:id', async (req, res) => {
+    try {
+        const poll = await Poll.findById(req.params.id);
+        if (!poll) return res.status(404).json({ error: 'Poll not found' });
+        res.json(poll);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/api/polls/:id/vote', voteLimiter, [
+    body('optionIndex').isInt({ min: 0 })
+], async (req, res) => {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+    const pollId = req.params.id;
+    const optionIndex = req.body.optionIndex;
+    const rawIp = req.clientIp;
+
+    const normalizedIp = rawIp.startsWith('::ffff:') ? rawIp.substring(7) : rawIp;
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const poll = await Poll.findById(pollId).session(session);
+        if (!poll) {
+            await session.abortTransaction();
+            return res.status(404).json({ error: 'Poll not found' });
+        }
+
+        if (!poll.options[optionIndex]) {
+            await session.abortTransaction();
+            return res.status(400).json({ error: 'Invalid option index' });
+        }
+
+        const existingVote = await Vote.findOne({ pollId, ip: normalizedIp }).session(session);
+        if (existingVote) {
+            await session.abortTransaction();
+            return res.status(403).json({ error: 'IP address has already voted in this poll' });
+        }
+
+        const vote = new Vote({ pollId, ip: normalizedIp });
+        await vote.save({ session });
+
+        poll.options[optionIndex].votesCount += 1;
+        await poll.save({ session });
+
+        await session.commitTransaction();
+        res.json({ message: 'Vote recorded successfully' });
+    } catch (err) {
+        await session.abortTransaction();
+        if (err.code === 11000) {
+            return res.status(403).json({ error: 'Duplicate vote detected' });
+        }
+        res.status(500).json({ error: err.message });
+    } finally {
+        session.endSession();
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
