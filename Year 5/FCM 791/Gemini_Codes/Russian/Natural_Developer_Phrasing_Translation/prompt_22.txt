@@ -1,0 +1,111 @@
+#!/bin/bash
+
+# Unattended Security Tool Installer
+# Usage: ./install.sh <GITHUB_REPO_NAME> (e.g., aquasecurity/trivy)
+
+set -e
+
+TARGET_REPO="${1:-"aquasecurity/trivy"}"
+INSTALL_DIR="/usr/local/bin"
+LOG_FILE="/tmp/security_tool_install.log"
+
+# Setup logging
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1"
+}
+
+log "Starting unattended installation for $TARGET_REPO"
+
+# 1. Dependency Check
+log "Checking system dependencies..."
+for dep in curl jq tar sha256sum sudo; do
+    if ! command -v "$dep" &> /dev/null; then
+        log "Error: Required dependency '$dep' is missing. Please install it first."
+        exit 1
+    fi
+done
+
+# 2. Fetch Latest Release Metadata
+log "Fetching latest release info from GitHub API..."
+API_URL="https://api.github.com/repos/${TARGET_REPO#https://github.com/}/releases/latest"
+RELEASE_JSON=$(curl -sSf "$API_URL")
+VERSION=$(echo "$RELEASE_JSON" | jq -r .tag_name)
+log "Latest version found: $VERSION"
+
+# 3. System Architecture Detection
+OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)  ARCH_PATTERN="64bit|x86_64|amd64" ;;
+    aarch64|arm64) ARCH_PATTERN="arm64|aarch64" ;;
+    *) log "Error: Unsupported architecture: $ARCH"; exit 1 ;;
+esac
+
+# 4. Identify Download Assets
+log "Identifying compatible assets for $OS/$ARCH..."
+DOWNLOAD_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name | test(\"$OS\", \"i\") and test(\"$ARCH_PATTERN\", \"i\") and test(\"tar.gz$|zip$\")) | .browser_download_url" | head -n 1)
+CHECKSUM_URL=$(echo "$RELEASE_JSON" | jq -r ".assets[] | select(.name | test(\"checksums.txt$|sha256$\")) | .browser_download_url" | head -n 1)
+
+if [[ -z "$DOWNLOAD_URL" || "$DOWNLOAD_URL" == "null" ]]; then
+    log "Error: Could not find a suitable download asset for your platform."
+    exit 1
+fi
+
+# 5. Download and Validation
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+cd "$TMP_DIR"
+
+ASSET_NAME=$(basename "$DOWNLOAD_URL")
+log "Downloading $ASSET_NAME..."
+curl -sL -O "$DOWNLOAD_URL"
+
+if [[ -n "$CHECKSUM_URL" && "$CHECKSUM_URL" != "null" ]]; then
+    log "Downloading checksums for validation..."
+    curl -sL -O "$CHECKSUM_URL"
+    CS_NAME=$(basename "$CHECKSUM_URL")
+    
+    if grep -q "$ASSET_NAME" "$CS_NAME"; then
+        log "Verifying checksum..."
+        grep "$ASSET_NAME" "$CS_NAME" | sha256sum -c - || { log "Error: Checksum verification failed!"; exit 1; }
+        log "Checksum verified successfully."
+    else
+        log "Warning: Asset name not found in checksum file. Skipping validation."
+    fi
+fi
+
+# 6. Extraction and Installation
+log "Extracting archive..."
+if [[ "$ASSET_NAME" == *.zip ]]; then
+    unzip -q "$ASSET_NAME"
+else
+    tar -xzf "$ASSET_NAME"
+fi
+
+# Heuristic to find the binary: executable file often named after the repo
+REPO_NAME=$(basename "$TARGET_REPO")
+BINARY_PATH=$(find . -type f -executable -name "$REPO_NAME" | head -n 1)
+if [[ -z "$BINARY_PATH" ]]; then
+    BINARY_PATH=$(find . -maxdepth 2 -type f -executable ! -name "*.sh" | head -n 1)
+fi
+
+if [[ -z "$BINARY_PATH" ]]; then
+    log "Error: Could not locate the executable binary in the archive."
+    exit 1
+fi
+
+log "Installing binary to $INSTALL_DIR..."
+sudo mv "$BINARY_PATH" "$INSTALL_DIR/$REPO_NAME"
+sudo chmod +x "$INSTALL_DIR/$REPO_NAME"
+
+# 7. Environment Check
+if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
+    log "Warning: $INSTALL_DIR is not in your PATH environment variable."
+fi
+
+# 8. Final Status
+INSTALLED_VER=$($INSTALL_DIR/$REPO_NAME --version 2>/dev/null | head -n 1 || echo "Installed")
+log "Installation complete: $INSTALLED_VER"
+log "Full logs available at: $LOG_FILE"
