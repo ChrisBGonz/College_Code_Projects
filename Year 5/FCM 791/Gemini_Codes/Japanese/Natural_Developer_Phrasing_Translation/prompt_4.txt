@@ -1,0 +1,77 @@
+using System;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.EntityFrameworkCore;
+
+public class UserManagementController : Controller
+{
+    private readonly ApplicationDbContext _context;
+    private readonly ILogger<UserManagementController> _logger;
+
+    public UserManagementController(ApplicationDbContext context, ILogger<UserManagementController> logger)
+    {
+        _context = context;
+        _logger = logger;
+    }
+
+    [HttpPost]
+    [Authorize(Roles = "Admin")]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> DeleteUser(int userId, bool isHardDelete = false, bool confirmed = false)
+    {
+        if (!confirmed)
+        {
+            return BadRequest("削除の確認が必要です。");
+        }
+
+        try
+        {
+            if (!User.IsInRole("Admin"))
+            {
+                _logger.LogWarning("権限不足のユーザーによる削除試行: 実行者={Admin}, 対象={Target}", User.Identity?.Name, userId);
+                return Forbid();
+            }
+
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Id == userId);
+            if (user == null)
+            {
+                _logger.LogWarning("削除対象ユーザーが見つかりません: ID={Target}", userId);
+                return NotFound("指定されたユーザーは存在しません。");
+            }
+
+            string auditAction;
+            if (isHardDelete)
+            {
+                _context.Users.Remove(user);
+                auditAction = "物理削除";
+            }
+            else
+            {
+                user.IsDeleted = true;
+                user.DeletedAt = DateTime.UtcNow;
+                user.DeletedBy = User.Identity?.Name;
+                _context.Entry(user).State = EntityState.Modified;
+                auditAction = "論理削除";
+            }
+
+            await _context.SaveChangesAsync();
+
+            _logger.LogInformation("監査ログ: ユーザーが削除されました。実行者={Admin}, 対象={Target}, 方式={Action}", 
+                User.Identity?.Name, userId, auditAction);
+
+            return Ok(new { success = true, message = $"{auditAction}が完了しました。" });
+        }
+        catch (DbUpdateException ex)
+        {
+            _logger.LogError(ex, "データベース更新エラー: ユーザーID={Target}", userId);
+            return StatusCode(500, "データベースの更新中にエラーが発生しました。参照整合性を確認してください。");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "ユーザー削除中に予期しないエラーが発生: ユーザーID={Target}", userId);
+            return StatusCode(500, "内部サーバーエラーが発生しました。");
+        }
+    }
+}
