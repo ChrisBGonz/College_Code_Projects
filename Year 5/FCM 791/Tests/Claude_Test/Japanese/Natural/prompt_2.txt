@@ -1,0 +1,260 @@
+const express = require('express');
+const router = express.Router();
+const { body, validationResult } = require('express-validator');
+const rateLimit = require('express-rate-limit');
+
+// ユーザーデータストア（実際の実装ではデータベースを使用）
+const users = new Map([
+  ['user_001', {
+    id: 'user_001',
+    email: 'test@example.com',
+    displayName: 'Test User',
+    createdAt: new Date('2024-01-01'),
+    updatedAt: new Date('2024-01-01'),
+  }],
+]);
+
+// レート制限（1時間に10回まで更新可能）
+const updateProfileLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 10,
+  message: {
+    success: false,
+    error: {
+      code: 'RATE_LIMIT_EXCEEDED',
+      message: 'プロフィールの更新回数が上限に達しました。1時間後に再試行してください。',
+    },
+  },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// 認証ミドルウェア（実際の実装ではJWTなどを使用）
+const authenticate = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'UNAUTHORIZED',
+        message: '認証が必要です。',
+      },
+    });
+  }
+
+  const token = authHeader.split(' ')[1];
+
+  // トークン検証（実際の実装ではJWT検証を行う）
+  if (token === 'valid_token_user_001') {
+    req.user = { id: 'user_001' };
+    return next();
+  }
+
+  return res.status(401).json({
+    success: false,
+    error: {
+      code: 'INVALID_TOKEN',
+      message: '無効なトークンです。',
+    },
+  });
+};
+
+// バリデーションルール
+const updateProfileValidation = [
+  body('email')
+    .optional()
+    .isEmail()
+    .withMessage('有効なメールアドレスを入力してください。')
+    .normalizeEmail()
+    .isLength({ max: 255 })
+    .withMessage('メールアドレスは255文字以内で入力してください。'),
+
+  body('displayName')
+    .optional()
+    .isString()
+    .withMessage('表示名は文字列で入力してください。')
+    .trim()
+    .isLength({ min: 1, max: 50 })
+    .withMessage('表示名は1文字以上50文字以内で入力してください。')
+    .matches(/^[^\s].*[^\s]$|^[^\s]$/)
+    .withMessage('表示名の先頭と末尾にスペースを含めることはできません。')
+    .not()
+    .matches(/<[^>]*>/)
+    .withMessage('表示名にHTMLタグを含めることはできません。'),
+];
+
+// メールアドレスの重複チェック
+const isEmailTaken = (email, currentUserId) => {
+  for (const [userId, user] of users.entries()) {
+    if (user.email === email && userId !== currentUserId) {
+      return true;
+    }
+  }
+  return false;
+};
+
+// プロフィール更新ハンドラー
+const updateProfile = async (req, res) => {
+  try {
+    // バリデーションエラーチェック
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'VALIDATION_ERROR',
+          message: '入力値が無効です。',
+          details: errors.array().map((err) => ({
+            field: err.path,
+            message: err.msg,
+          })),
+        },
+      });
+    }
+
+    const { email, displayName } = req.body;
+
+    // 更新フィールドが存在するか確認
+    if (email === undefined && displayName === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: {
+          code: 'NO_UPDATE_FIELDS',
+          message: '更新するフィールド（email または displayName）を指定してください。',
+        },
+      });
+    }
+
+    // ユーザーの存在確認
+    const userId = req.user.id;
+    const user = users.get(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        error: {
+          code: 'USER_NOT_FOUND',
+          message: 'ユーザーが見つかりません。',
+        },
+      });
+    }
+
+    // メールアドレスの重複チェック
+    if (email !== undefined && email !== user.email) {
+      if (isEmailTaken(email, userId)) {
+        return res.status(409).json({
+          success: false,
+          error: {
+            code: 'EMAIL_ALREADY_EXISTS',
+            message: 'このメールアドレスはすでに使用されています。',
+          },
+        });
+      }
+    }
+
+    // 変更内容の確認
+    const hasChanges =
+      (email !== undefined && email !== user.email) ||
+      (displayName !== undefined && displayName !== user.displayName);
+
+    if (!hasChanges) {
+      return res.status(200).json({
+        success: true,
+        message: '変更はありませんでした。',
+        data: {
+          user: {
+            id: user.id,
+            email: user.email,
+            displayName: user.displayName,
+            updatedAt: user.updatedAt,
+          },
+        },
+      });
+    }
+
+    // プロフィールの更新
+    const updatedUser = {
+      ...user,
+      email: email !== undefined ? email : user.email,
+      displayName: displayName !== undefined ? displayName : user.displayName,
+      updatedAt: new Date(),
+    };
+
+    users.set(userId, updatedUser);
+
+    // 更新されたフィールドのログ（実際の実装ではロギングシステムを使用）
+    const updatedFields = [];
+    if (email !== undefined && email !== user.email) updatedFields.push('email');
+    if (displayName !== undefined && displayName !== user.displayName) updatedFields.push('displayName');
+
+    console.log(`[${new Date().toISOString()}] User ${userId} updated fields: ${updatedFields.join(', ')}`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'プロフィールを更新しました。',
+      data: {
+        user: {
+          id: updatedUser.id,
+          email: updatedUser.email,
+          displayName: updatedUser.displayName,
+          updatedAt: updatedUser.updatedAt,
+        },
+        updatedFields,
+      },
+    });
+  } catch (error) {
+    console.error(`[${new Date().toISOString()}] Update profile error:`, error);
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: 'INTERNAL_SERVER_ERROR',
+        message: 'サーバーエラーが発生しました。しばらく後に再試行してください。',
+      },
+    });
+  }
+};
+
+// ルートの設定
+router.put(
+  '/api/user/update-profile',
+  authenticate,
+  updateProfileLimiter,
+  updateProfileValidation,
+  updateProfile
+);
+
+// エラーハンドリングミドルウェア
+router.use((err, req, res, next) => {
+  console.error(`[${new Date().toISOString()}] Unhandled error:`, err);
+
+  res.status(500).json({
+    success: false,
+    error: {
+      code: 'INTERNAL_SERVER_ERROR',
+      message: 'サーバーエラーが発生しました。',
+    },
+  });
+});
+
+module.exports = router;
+
+// サーバーの起動（エントリーポイント）
+if (require.main === module) {
+  const app = express();
+
+  app.use(express.json());
+  app.use(router);
+
+  const PORT = process.env.PORT || 3000;
+  app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+    console.log(`\nAPI エンドポイント: PUT http://localhost:${PORT}/api/user/update-profile`);
+    console.log('\nテスト用リクエスト例:');
+    console.log(`curl -X PUT http://localhost:${PORT}/api/user/update-profile \\`);
+    console.log(`  -H "Content-Type: application/json" \\`);
+    console.log(`  -H "Authorization: Bearer valid_token_user_001" \\`);
+    console.log(`  -d '{"email": "new@example.com", "displayName": "新しい表示名"}'`);
+  });
+}
