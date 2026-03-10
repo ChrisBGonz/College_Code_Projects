@@ -1,0 +1,112 @@
+#include <stdio.h>
+#include <jpeglib.h>
+#include <setjmp.h>
+#include <vector>
+
+struct my_error_mgr {
+    struct jpeg_error_mgr pub;
+    jmp_buf setjmp_buffer;
+};
+
+typedef struct my_error_mgr *my_error_ptr;
+
+void my_error_exit(j_common_ptr cinfo) {
+    my_error_ptr myerr = (my_error_ptr)cinfo->err;
+    (*cinfo->err->output_message)(cinfo);
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+bool process_jpeg_to_grayscale(const char* input_filename, const char* output_filename) {
+    struct jpeg_decompress_struct cinfo;
+    struct my_error_mgr jerr;
+    FILE* infile;
+    int row_stride;
+
+    if ((infile = fopen(input_filename, "rb")) == NULL) {
+        return false;
+    }
+
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+    if (setjmp(jerr.setjmp_buffer)) {
+        jpeg_destroy_decompress(&cinfo);
+        fclose(infile);
+        return false;
+    }
+
+    jpeg_create_decompress(&cinfo);
+    jpeg_stdio_src(&cinfo, infile);
+    jpeg_read_header(&cinfo, TRUE);
+    jpeg_start_decompress(&cinfo);
+
+    int width = cinfo.output_width;
+    int height = cinfo.output_height;
+    int components = cinfo.output_components;
+    std::vector<unsigned char> raw_image(width * height * components);
+
+    row_stride = width * components;
+    while (cinfo.output_scanline < cinfo.output_height) {
+        unsigned char* buffer_array[1];
+        buffer_array[0] = &raw_image[cinfo.output_scanline * row_stride];
+        jpeg_read_scanlines(&cinfo, buffer_array, 1);
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    fclose(infile);
+
+    std::vector<unsigned char> gray_image(width * height);
+    if (components >= 3) {
+        for (int i = 0; i < width * height; ++i) {
+            unsigned char r = raw_image[i * components];
+            unsigned char g = raw_image[i * components + 1];
+            unsigned char b = raw_image[i * components + 2];
+            gray_image[i] = (unsigned char)(0.299 * r + 0.587 * g + 0.114 * b);
+        }
+    } else {
+        for (int i = 0; i < width * height; ++i) {
+            gray_image[i] = raw_image[i * components];
+        }
+    }
+
+    struct jpeg_compress_struct cinfo_out;
+    struct jpeg_error_mgr jerr_out;
+    FILE* outfile;
+
+    if ((outfile = fopen(output_filename, "wb")) == NULL) {
+        return false;
+    }
+
+    cinfo_out.err = jpeg_std_error(&jerr_out);
+    jpeg_create_compress(&cinfo_out);
+    jpeg_stdio_dest(&cinfo_out, outfile);
+
+    cinfo_out.image_width = width;
+    cinfo_out.image_height = height;
+    cinfo_out.input_components = 1;
+    cinfo_out.in_color_space = JCS_GRAYSCALE;
+
+    jpeg_set_defaults(&cinfo_out);
+    jpeg_set_quality(&cinfo_out, 85, TRUE);
+    jpeg_start_compress(&cinfo_out, TRUE);
+
+    while (cinfo_out.next_scanline < cinfo_out.image_height) {
+        JSAMPROW row_pointer[1];
+        row_pointer[0] = &gray_image[cinfo_out.next_scanline * width];
+        jpeg_write_scanlines(&cinfo_out, row_pointer, 1);
+    }
+
+    jpeg_finish_compress(&cinfo_out);
+    fclose(outfile);
+    jpeg_destroy_compress(&cinfo_out);
+
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc != 3) return 1;
+    if (process_jpeg_to_grayscale(argv[1], argv[2])) {
+        return 0;
+    }
+    return 1;
+}
