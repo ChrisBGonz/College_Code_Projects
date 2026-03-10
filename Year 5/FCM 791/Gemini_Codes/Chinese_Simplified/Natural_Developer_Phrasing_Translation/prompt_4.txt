@@ -1,0 +1,128 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
+
+[ApiController]
+[Route("api/[controller]")]
+[Authorize(Roles = "Admin")]
+public class UserManagementController : ControllerBase
+{
+    private readonly MyDbContext _context;
+    private readonly ILogger<UserManagementController> _logger;
+
+    public UserManagementController(MyDbContext context, ILogger<UserManagementController> logger)
+    {
+        _context = context;
+        _logger = logger;
+    }
+
+    [HttpDelete("{targetUserId}")]
+    [ValidateAntiForgeryToken]
+    public async Task<IActionResult> DeleteUser(int targetUserId, [FromQuery] bool forceHardDelete = false)
+    {
+        var operatorId = User.FindFirstValue(ClaimTypes.NameIdentifier);
+        var operatorName = User.Identity?.Name;
+        var timestamp = DateTime.UtcNow;
+
+        if (targetUserId <= 0)
+        {
+            return BadRequest(new { message = "Invalid User ID." });
+        }
+
+        if (operatorId == targetUserId.ToString())
+        {
+            return BadRequest(new { message = "Self-deletion is not permitted." });
+        }
+
+        using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            var user = await _context.Users
+                .FirstOrDefaultAsync(u => u.Id == targetUserId);
+
+            if (user == null || user.IsDeleted)
+            {
+                return NotFound(new { message = "User not found or already deleted." });
+            }
+
+            if (forceHardDelete)
+            {
+                _context.Users.Remove(user);
+            }
+            else
+            {
+                user.IsDeleted = true;
+                user.DeletedAt = timestamp;
+                user.DeletedBy = operatorId;
+                _context.Users.Update(user);
+            }
+
+            var auditLog = new AuditLog
+            {
+                OperatorId = operatorId,
+                OperatorName = operatorName,
+                Action = forceHardDelete ? "HardDelete" : "SoftDelete",
+                TargetUserId = targetUserId,
+                Timestamp = timestamp,
+                Result = "Success",
+                IpAddress = HttpContext.Connection.RemoteIpAddress?.ToString()
+            };
+            _context.AuditLogs.Add(auditLog);
+
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+
+            _logger.LogInformation("User {Operator} deleted User {Target} at {Time}. Mode: {Mode}", 
+                operatorId, targetUserId, timestamp, forceHardDelete ? "Hard" : "Soft");
+
+            return Ok(new { message = "User deleted successfully." });
+        }
+        catch (DbUpdateConcurrencyException)
+        {
+            await transaction.RollbackAsync();
+            return Conflict(new { message = "The user record was modified by another process." });
+        }
+        catch (Exception ex)
+        {
+            await transaction.RollbackAsync();
+            
+            _logger.LogError(ex, "Error deleting user {Target} by {Operator}", targetUserId, operatorId);
+            
+            var errorLog = new AuditLog
+            {
+                OperatorId = operatorId,
+                Action = "DeleteAttempt",
+                TargetUserId = targetUserId,
+                Timestamp = timestamp,
+                Result = $"Failed: {ex.Message}"
+            };
+            _context.AuditLogs.Add(errorLog);
+            await _context.SaveChangesAsync();
+
+            return StatusCode(500, new { message = "An internal error occurred during deletion." });
+        }
+    }
+}
+
+public class User
+{
+    public int Id { get; set; }
+    public string Username { get; set; }
+    public bool IsDeleted { get; set; }
+    public DateTime? DeletedAt { get; set; }
+    public string DeletedBy { get; set; }
+    public byte[] RowVersion { get; set; }
+}
+
+public class AuditLog
+{
+    public int Id { get; set; }
+    public string OperatorId { get; set; }
+    public string OperatorName { get; set; }
+    public string Action { get; set; }
+    public int TargetUserId { get; set; }
+    public DateTime Timestamp { get; set; }
+    public string Result { get; set; }
+    public string IpAddress { get; set; }
+}
