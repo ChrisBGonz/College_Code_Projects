@@ -1,0 +1,119 @@
+const CircuitStates = {
+  CLOSED: 'CLOSED',
+  OPEN: 'OPEN',
+  HALF_OPEN: 'HALF_OPEN'
+};
+
+class CircuitBreaker {
+  constructor(requestAdapter, options = {}) {
+    this.requestAdapter = requestAdapter;
+    this.failureThreshold = options.failureThreshold || 3;
+    this.resetTimeout = options.resetTimeout || 10000;
+    this.fallback = options.fallback || null;
+    
+    this.state = CircuitStates.CLOSED;
+    this.failureCount = 0;
+    this.lastFailureTime = null;
+  }
+
+  async fire(...args) {
+    if (this.state === CircuitStates.OPEN) {
+      const now = Date.now();
+      if (now - this.lastFailureTime > this.resetTimeout) {
+        this.state = CircuitStates.HALF_OPEN;
+      } else {
+        return this.handleFallback(new Error('Circuit is currently OPEN'));
+      }
+    }
+
+    try {
+      const response = await this.requestAdapter(...args);
+      
+      if (!response.ok && (response.status >= 500 || response.status === 408)) {
+        throw new Error(`HTTP Error: ${response.status}`);
+      }
+
+      return this.onSuccess(response);
+    } catch (error) {
+      return this.onFailure(error);
+    }
+  }
+
+  onSuccess(response) {
+    if (this.state === CircuitStates.HALF_OPEN) {
+      this.state = CircuitStates.CLOSED;
+      this.failureCount = 0;
+    }
+    this.failureCount = 0;
+    return response;
+  }
+
+  onFailure(error) {
+    this.failureCount++;
+    this.lastFailureTime = Date.now();
+
+    if (this.state === CircuitStates.HALF_OPEN || this.failureCount >= this.failureThreshold) {
+      this.state = CircuitStates.OPEN;
+    }
+
+    return this.handleFallback(error);
+  }
+
+  handleFallback(error) {
+    if (this.fallback) {
+      return typeof this.fallback === 'function' ? this.fallback(error) : this.fallback;
+    }
+    throw error;
+  }
+}
+
+const apiAdapter = async (url, options = {}) => {
+  const timeout = options.timeout || 5000;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    clearTimeout(id);
+    return response;
+  } catch (err) {
+    clearTimeout(id);
+    throw err;
+  }
+};
+
+const apiClientBreaker = new CircuitBreaker(apiAdapter, {
+  failureThreshold: 3,
+  resetTimeout: 5000,
+  fallback: (err) => ({
+    ok: false,
+    status: 'fallback',
+    data: [],
+    message: 'Service temporarily unavailable. Using cached/fallback data.',
+    reason: err.message
+  })
+});
+
+async function getUserData(userId) {
+  try {
+    const response = await apiClientBreaker.fire(`https://api.example.com/users/${userId}`, {
+      method: 'GET',
+      timeout: 3000
+    });
+
+    if (response.status === 'fallback') {
+      return response.data;
+    }
+
+    return await response.json();
+  } catch (error) {
+    console.error('Final API Error:', error.message);
+    return null;
+  }
+}
+
+// Example usage:
+// getUserData(123).then(data => console.log(data));
