@@ -1,0 +1,75 @@
+#include <iostream>
+#include <cstdint>
+#include <sys/socket.h>
+#include <endian.h>
+#include <new>
+#include <stddef.h>
+
+/**
+ * Reads a size-prefixed payload from a socket and allocates a buffer for it.
+ * 
+ * @param socket_fd The connected network socket file descriptor.
+ * @param out_len Pointer to store the size of the allocated buffer.
+ * @return Pointer to the allocated buffer, or nullptr on failure.
+ */
+char* receive_safe_payload(int socket_fd, size_t* out_len) {
+    if (socket_fd < 0 || out_len == nullptr) {
+        return nullptr;
+    }
+
+    uint64_t network_len = 0;
+    size_t size_bytes_read = 0;
+
+    // Read the 8-byte size header (handling short reads)
+    while (size_bytes_read < sizeof(network_len)) {
+        ssize_t result = recv(socket_fd, 
+                              reinterpret_cast<char*>(&network_len) + size_bytes_read, 
+                              sizeof(network_len) - size_bytes_read, 
+                              0);
+        if (result <= 0) {
+            // Socket error or connection closed
+            return nullptr;
+        }
+        size_bytes_read += static_cast<size_t>(result);
+    }
+
+    // Convert from Network Byte Order (Big Endian) to Host Byte Order
+    uint64_t host_len = be64toh(network_len);
+
+    // Sanity Check: Define a maximum cap (e.g., 100 MB) to prevent OOM attacks
+    const uint64_t MAX_ALLOWED_SIZE = 100 * 1024 * 1024; 
+    if (host_len == 0 || host_len > MAX_ALLOWED_SIZE) {
+        return nullptr;
+    }
+
+    // Allocation with error handling
+    char* buffer = nullptr;
+    try {
+        // Note: size_t might be 32-bit on some systems, check for overflow
+        if (host_len > SIZE_MAX) {
+            return nullptr;
+        }
+        buffer = new char[host_len];
+    } catch (const std::bad_alloc&) {
+        // Allocation failure
+        return nullptr;
+    }
+
+    // Read the actual data into the buffer (handling short reads)
+    size_t total_payload_read = 0;
+    while (total_payload_read < host_len) {
+        ssize_t result = recv(socket_fd, 
+                              buffer + total_payload_read, 
+                              host_len - total_payload_read, 
+                              0);
+        if (result <= 0) {
+            // Read error or connection closed mid-stream
+            delete[] buffer;
+            return nullptr;
+        }
+        total_payload_read += static_cast<size_t>(result);
+    }
+
+    *out_len = static_cast<size_t>(host_len);
+    return buffer;
+}
