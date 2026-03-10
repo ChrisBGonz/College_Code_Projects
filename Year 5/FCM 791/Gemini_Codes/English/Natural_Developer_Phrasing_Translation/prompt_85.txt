@@ -1,0 +1,70 @@
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Mail;
+
+class AdminGuard
+{
+    public function handle(Request $request, Closure $next)
+    {
+        if ($request->is('admin*')) {
+            $user = Auth::user();
+
+            if (!$user || !$user->is_admin) {
+                $this->triggerSecurityAlert($request, $user);
+                return response()->json(['error' => 'Unauthorized. Access Denied.'], 403);
+            }
+        }
+
+        return $next($request);
+    }
+
+    protected function triggerSecurityAlert(Request $request, $user)
+    {
+        $context = [
+            'timestamp'  => now()->toDateTimeString(),
+            'ip_address' => $request->ip(),
+            'target_url' => $request->fullUrl(),
+            'user_agent' => $request->userAgent(),
+            'user_id'    => $user ? $user->id : 'Guest/Unauthenticated',
+            'username'   => $user ? $user->email : 'N/A',
+            'payload'    => $request->except(['password', 'password_confirmation']),
+        ];
+
+        $this->sendSlackNotification($context);
+        $this->sendEmailNotification($context);
+    }
+
+    protected function sendSlackNotification(array $context)
+    {
+        $webhookUrl = config('services.slack.security_webhook');
+        if (!$webhookUrl) return;
+
+        Http::post($webhookUrl, [
+            'text' => "🚨 *Administrator Alert: Unauthorized Access Attempt* 🚨",
+            'attachments' => [[
+                'color' => '#ff0000',
+                'fields' => [
+                    ['title' => 'User', 'value' => $context['username'], 'short' => true],
+                    ['title' => 'IP Address', 'value' => $context['ip_address'], 'short' => true],
+                    ['title' => 'Target URL', 'value' => $context['target_url'], 'short' => false],
+                    ['title' => 'User Agent', 'value' => $context['user_agent'], 'short' => false],
+                ]
+            ]]
+        ]);
+    }
+
+    protected function sendEmailNotification(array $context)
+    {
+        $adminEmail = config('mail.admin_address');
+        if (!$adminEmail) return;
+
+        Mail::raw("Unauthorized access attempt detected.\n\nDetails:\n" . json_encode($context, JSON_PRETTY_PRINT), function ($message) use ($adminEmail) {
+            $message->to($adminEmail)
+                ->subject('SECURITY ALERT: Unauthorized Admin Access Attempt');
+        });
+    }
+}
